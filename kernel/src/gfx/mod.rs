@@ -22,7 +22,8 @@ pub mod frame_pacing;
 pub mod cluster_cull;
 pub mod optical_flow;
 pub mod tile_compact;
-pub mod micromesh;
+pub mod micromesh;
+pub mod async_compute;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -45,7 +46,8 @@ pub use frame_pacing::*;
 pub use cluster_cull::*;
 pub use optical_flow::*;
 pub use tile_compact::*;
-pub use micromesh::*;
+pub use micromesh::*;
+pub use async_compute::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
