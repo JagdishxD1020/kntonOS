@@ -1,10 +1,12 @@
 //! Sensor Drivers and Governors for Handheld Devices.
 
 pub mod als;
+pub mod als_governor;
 pub mod brightness;
 pub mod imu_fusion;
 
 pub use als::*;
+pub use als_governor::*;
 pub use brightness::*;
 pub use imu_fusion::*;
 
