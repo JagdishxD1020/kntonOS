@@ -1,8 +1,10 @@
 //! Power Management Drivers and USB-PD Controllers for Handheld Devices.
 
 pub mod battery_balance;
+pub mod battery_gauge;
 
 pub use battery_balance::*;
+pub use battery_gauge::*;
 
 /// Verification self-test suite for Handheld PC Dual-Battery Balance Manager & USB-PD 3.1 Extended Power Profile Engine.
 pub fn test_dual_battery_balance_subsystem() -> bool {
