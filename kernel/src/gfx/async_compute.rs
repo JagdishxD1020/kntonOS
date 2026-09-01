@@ -249,6 +249,142 @@ impl CrossQueueSyncHub {
     }
 }
 
+// Tracks concurrent GPU wavefront saturation and L2 cache bandwidth pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeWaveSaturationTracker {
+    pub max_hardware_waves: u32,
+    pub active_graphics_waves: u32,
+    pub active_compute_waves: u32,
+    pub l2_bandwidth_pressure_pct: u32,
+    pub is_raster_heavy_active: bool,
+}
+
+impl ComputeWaveSaturationTracker {
+    // Constructs a new wave saturation tracker with given hardware SIMD wave capacity.
+    pub const fn new(max_hardware_waves: u32) -> Self {
+        Self {
+            max_hardware_waves,
+            active_graphics_waves: 0,
+            active_compute_waves: 0,
+            l2_bandwidth_pressure_pct: 0,
+            is_raster_heavy_active: false,
+        }
+    }
+
+    // Updates active graphics rasterization workload state.
+    pub fn update_graphics_load(&mut self, waves: u32, is_raster_heavy: bool) {
+        self.active_graphics_waves = waves;
+        self.is_raster_heavy_active = is_raster_heavy;
+        self.recompute_l2_pressure();
+    }
+
+    // Updates active async compute workload state.
+    pub fn update_compute_load(&mut self, waves: u32) {
+        self.active_compute_waves = waves;
+        self.recompute_l2_pressure();
+    }
+
+    // Recomputes L2 cache pressure estimate based on concurrent workload.
+    fn recompute_l2_pressure(&mut self) {
+        let total_waves = self.active_graphics_waves.saturating_add(self.active_compute_waves);
+        let base_pressure = if self.max_hardware_waves > 0 {
+            (total_waves.saturating_mul(100)) / self.max_hardware_waves
+        } else {
+            0
+        };
+        self.l2_bandwidth_pressure_pct = if self.is_raster_heavy_active {
+            base_pressure.saturating_add(25).min(100)
+        } else {
+            base_pressure.min(100)
+        };
+    }
+
+    // Returns total currently active SIMD waves across graphics and compute queues.
+    #[inline(always)]
+    pub const fn total_active_waves(&self) -> u32 {
+        self.active_graphics_waves.saturating_add(self.active_compute_waves)
+    }
+
+    // Current GPU SIMD occupancy percentage (0..100%).
+    #[inline(always)]
+    pub fn occupancy_pct(&self) -> u32 {
+        if self.max_hardware_waves > 0 {
+            (self.total_active_waves().saturating_mul(100)) / self.max_hardware_waves
+        } else {
+            0
+        }
+    }
+}
+
+// Scheduling decision for async compute dispatches to prevent cache thrashing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlapDecision {
+    // Run at full rate alongside graphics without restriction.
+    ExecuteImmediate,
+    // Restrict compute dispatch waves to avoid saturating SIMD units.
+    ThrottleWaves { max_waves: u32 },
+    // Delay compute dispatch until raster-heavy graphics pass completes.
+    YieldUntilRasterDone,
+}
+
+// Overlap optimizer pacing compute dispatches during heavy rasterization phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncComputeOverlapOptimizer {
+    pub wave_saturation_threshold_pct: u32,
+    pub l2_pressure_threshold_pct: u32,
+    pub total_throttled_dispatches: u64,
+    pub total_yielded_dispatches: u64,
+    pub total_immediate_dispatches: u64,
+}
+
+impl Default for AsyncComputeOverlapOptimizer {
+    fn default() -> Self {
+        Self {
+            wave_saturation_threshold_pct: 85,
+            l2_pressure_threshold_pct: 80,
+            total_throttled_dispatches: 0,
+            total_yielded_dispatches: 0,
+            total_immediate_dispatches: 0,
+        }
+    }
+}
+
+impl AsyncComputeOverlapOptimizer {
+    // Creates a new overlap optimizer with default thresholds.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Evaluates optimal dispatch strategy based on live saturation metrics.
+    pub fn evaluate_dispatch(
+        &mut self,
+        tracker: &ComputeWaveSaturationTracker,
+        requested_waves: u32,
+    ) -> OverlapDecision {
+        if tracker.is_raster_heavy_active && tracker.l2_bandwidth_pressure_pct >= self.l2_pressure_threshold_pct {
+            self.total_yielded_dispatches = self.total_yielded_dispatches.saturating_add(1);
+            return OverlapDecision::YieldUntilRasterDone;
+        }
+
+        let prospective_total = tracker.total_active_waves().saturating_add(requested_waves);
+        let prospective_occupancy = if tracker.max_hardware_waves > 0 {
+            (prospective_total.saturating_mul(100)) / tracker.max_hardware_waves
+        } else {
+            0
+        };
+
+        if prospective_occupancy > self.wave_saturation_threshold_pct {
+            let max_allowed = (tracker.max_hardware_waves.saturating_mul(self.wave_saturation_threshold_pct) / 100)
+                .saturating_sub(tracker.active_graphics_waves);
+            self.total_throttled_dispatches = self.total_throttled_dispatches.saturating_add(1);
+            OverlapDecision::ThrottleWaves { max_waves: max_allowed.max(32) }
+        } else {
+            self.total_immediate_dispatches = self.total_immediate_dispatches.saturating_add(1);
+            OverlapDecision::ExecuteImmediate
+        }
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_d3d12_async_compute_subsystem() -> bool {
     true
