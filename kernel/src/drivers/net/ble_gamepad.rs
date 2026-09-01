@@ -216,3 +216,100 @@ pub fn verify_low_latency_input_framer() -> bool {
 
     true
 }
+
+/// LC3 audio frame duration mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lc3FrameDuration {
+    Frame7_5ms,
+    Frame10ms,
+}
+
+/// LE Audio Isochronous Stream (CIS/BIS) packet framer for LC3 gaming earbuds.
+#[derive(Debug, Clone, Copy)]
+pub struct LeAudioIsochronousStreamer {
+    pub isochronous_handle: u16,
+    pub frame_duration: Lc3FrameDuration,
+    pub octets_per_codec_frame: u16, // 100 octets at 80kbps (48kHz/16-bit/10ms)
+    pub sequence_number: u32,
+    pub presentation_delay_us: u32,
+    pub dropouts_prevented: u32,
+}
+
+impl LeAudioIsochronousStreamer {
+    /// Creates a new LE Audio isochronous streamer configured for 10ms LC3 frames (48kHz, 80kbps).
+    pub const fn new() -> Self {
+        Self {
+            isochronous_handle: 0x00E0,
+            frame_duration: Lc3FrameDuration::Frame10ms,
+            octets_per_codec_frame: 100, // 80 kbps LC3 frame
+            sequence_number: 0,
+            presentation_delay_us: 10_000, // 10ms presentation delay
+            dropouts_prevented: 0,
+        }
+    }
+
+    /// Encapsulates raw LC3 encoded audio payload into a BLE Isochronous Data Packet (HCI ISO Data Pkt).
+    /// ISO Data Packet header:
+    /// Bytes 0-1: Handle (12 bits) + PB flag (2 bits) + TS flag (2 bits)
+    /// Bytes 2-3: ISO SDU Length (14 bits)
+    /// Bytes 4-7: Time Stamp (32 bits, if TS flag set)
+    /// Bytes 8-9: Packet Sequence Number (16 bits)
+    /// Bytes 10-11: SDU Length (12 bits)
+    pub fn frame_isochronous_packet(&mut self, lc3_payload: &[u8], out_buffer: &mut [u8]) -> usize {
+        if out_buffer.len() < 12 + lc3_payload.len() {
+            self.dropouts_prevented += 1;
+            return 0;
+        }
+
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+
+        // Header: Handle 0x00E0 | PB=00 (start of SDU) | TS=1 (timestamp present)
+        let handle_flags = (self.isochronous_handle & 0x0FFF) | (1 << 14); // TS = 1
+        let hf_bytes = handle_flags.to_le_bytes();
+        out_buffer[0] = hf_bytes[0];
+        out_buffer[1] = hf_bytes[1];
+
+        let total_iso_len = (8 + lc3_payload.len()) as u16; // 4 ts + 2 seq + 2 sdu_len + payload
+        let iso_len_bytes = total_iso_len.to_le_bytes();
+        out_buffer[2] = iso_len_bytes[0];
+        out_buffer[3] = iso_len_bytes[1];
+
+        // 32-bit presentation timestamp in us
+        let ts = self.sequence_number * 10_000;
+        let ts_bytes = ts.to_le_bytes();
+        out_buffer[4..8].copy_from_slice(&ts_bytes);
+
+        // 16-bit sequence number
+        let seq_bytes = (self.sequence_number as u16).to_le_bytes();
+        out_buffer[8] = seq_bytes[0];
+        out_buffer[9] = seq_bytes[1];
+
+        // 12-bit SDU length
+        let sdu_bytes = (lc3_payload.len() as u16).to_le_bytes();
+        out_buffer[10] = sdu_bytes[0];
+        out_buffer[11] = sdu_bytes[1];
+
+        out_buffer[12..12 + lc3_payload.len()].copy_from_slice(lc3_payload);
+        12 + lc3_payload.len()
+    }
+}
+
+/// Unit verification for LE Audio isochronous streamer.
+pub fn verify_le_audio_streamer() -> bool {
+    let mut streamer = LeAudioIsochronousStreamer::new();
+    let mut out_pkt = [0u8; 128];
+    let mock_lc3 = [0xAA; 100]; // 100 octets 10ms frame
+
+    let framed_len = streamer.frame_isochronous_packet(&mock_lc3, &mut out_pkt);
+    if framed_len != 112 {
+        return false;
+    }
+    if streamer.sequence_number != 1 || streamer.dropouts_prevented != 0 {
+        return false;
+    }
+    if out_pkt[12] != 0xAA || out_pkt[111] != 0xAA {
+        return false;
+    }
+
+    true
+}
