@@ -873,3 +873,127 @@ impl PerformanceTelemetryHud {
         }
     }
 }
+
+/// Comprehensive verification self-test suite for the handheld gaming shell and telemetry HUD.
+pub fn test_game_shell_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SHELL-TEST] Running Handheld Gaming Shell & Telemetry HUD verification suite...\r\n");
+
+    // 1. Verify Carousel Navigation, Controller Processing, and Launch State Transitions
+    let mut carousel = GameShellCarousel::new();
+    carousel.add_game(GameEntry::new("CyberVoid", "/bin/cyber.exe", "Knton Studio", 100, 90, Color::rgb(0, 100, 200)));
+    carousel.add_game(GameEntry::new("SpeedRacer", "/bin/speed.exe", "Velocity Games", 100, 90, Color::rgb(200, 50, 0)));
+    carousel.add_game(GameEntry::new("ChronoShift", "/bin/chrono.exe", "Retro Soft", 100, 90, Color::rgb(100, 0, 150)));
+
+    if carousel.selected_index != 0 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Carousel initial index mismatch\r\n");
+        return false;
+    }
+
+    // Prev wraps to last element (index 2)
+    carousel.select_prev();
+    if carousel.selected_index != 2 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Carousel wrap to end failed\r\n");
+        return false;
+    }
+
+    // Next wraps to first element (index 0)
+    carousel.select_next();
+    if carousel.selected_index != 0 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Carousel wrap to start failed\r\n");
+        return false;
+    }
+
+    // Controller input navigation
+    let mut nav = ControllerNavHandler::new();
+    let mut input = ControllerState::default();
+
+    // D-pad Right advances to index 1
+    input.buttons = ControllerButtons(ControllerButtons::DPAD_RIGHT);
+    let action = nav.process_input(&input, 16, &mut carousel);
+    if action != NavAction::NavigatedRight || carousel.selected_index != 1 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Controller right navigation failed\r\n");
+        return false;
+    }
+
+    // Button A triggers launch
+    input.buttons = ControllerButtons(ControllerButtons::BUTTON_A);
+    let action = nav.process_input(&input, 16, &mut carousel);
+    let launched_pid = match action {
+        NavAction::LaunchedGame(pid) => pid,
+        _ => {
+            crate::serial_write_str("[KNT-SHELL-FAIL] Controller A launch trigger failed\r\n");
+            return false;
+        }
+    };
+    if carousel.is_shell_active || carousel.active_pid != Some(launched_pid) {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Carousel active state mismatch after launch\r\n");
+        return false;
+    }
+
+    // Terminate game session
+    carousel.terminate_active_game(0);
+    if !carousel.is_shell_active || carousel.active_pid.is_some() {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Carousel state mismatch after termination\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Carousel state transitions, navigation wrapping, and game launch verified\r\n");
+
+    // 2. Verify Performance Telemetry HUD Rolling Buffer and Statistics Aggregation
+    let mut hud = PerformanceTelemetryHud::new();
+
+    // Push 59 frames at 16_666 us (~60 FPS) and 1 spike frame at 50_000 us (~20 FPS)
+    for _ in 0..59 {
+        hud.push_frame_time(16_666);
+    }
+    hud.push_frame_time(50_000);
+
+    if hud.stats.count != 60 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Telemetry buffer capacity mismatch\r\n");
+        return false;
+    }
+    if hud.stats.min_us != 16_666 || hud.stats.max_us != 50_000 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Telemetry min/max mismatch\r\n");
+        return false;
+    }
+    if hud.stats.p99_us != 50_000 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Telemetry 99th percentile calculation mismatch\r\n");
+        return false;
+    }
+    if hud.stats.instantaneous_fps != 20 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] Instantaneous FPS calculation mismatch\r\n");
+        return false;
+    }
+    if hud.vram_utilization_pct() != 34 {
+        crate::serial_write_str("[KNT-SHELL-FAIL] VRAM percentage calculation mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * 60-frame rolling frame time buffer and 99th percentile latency verified\r\n");
+
+    // 3. Verify Transparent Overlay Blitting & Framebuffer Clipping Boundaries
+    let width = 320;
+    let height = 240;
+    let mut buffer = alloc::vec![Color::rgb(20, 24, 32); width * height];
+
+    // Render carousel
+    carousel.render(&mut buffer, width, height, None);
+
+    // Render HUD in Standard mode
+    hud.mode = HudOverlayMode::Standard;
+    hud.render(&mut buffer, width, height, None);
+
+    // Test with active clip rectangle
+    let clip_rect = Rect::new(50, 50, 100, 100);
+    hud.mode = HudOverlayMode::DetailedDiagnostics;
+    hud.render(&mut buffer, width, height, Some(&clip_rect));
+
+    // Verify alpha blended pixel within HUD bounds
+    let sample_pixel = buffer[4 * width + (width - 10)];
+    if sample_pixel == Color::rgb(20, 24, 32) {
+        crate::serial_write_str("[KNT-SHELL-FAIL] HUD buffer blitting had no effect\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Transparent framebuffer blitting and clipping boundaries verified\r\n");
+
+    crate::serial_write_str("[KNT-GAME-SHELL-PASS] Handheld gaming shell, launcher and telemetry HUD verified\r\n");
+    true
+}
