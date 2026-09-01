@@ -134,3 +134,82 @@ pub fn verify_precision_coulomb_counter() -> bool {
 
     true
 }
+
+/// PMIC battery charge and power path modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmicPowerPathMode {
+    Charging,
+    Discharging,
+    PureAcPassthroughBypass,
+    ThermalCutoff,
+}
+
+/// Docked bypass charge limiter to protect lithium cell health.
+#[derive(Debug, Clone, Copy)]
+pub struct DockedChargeLimiter {
+    pub charge_ceiling_percent: u8,
+    pub ac_connected: bool,
+    pub pmic_mode: PmicPowerPathMode,
+}
+
+impl DockedChargeLimiter {
+    /// Creates a new docked charge limiter with default 80% ceiling.
+    pub const fn new() -> Self {
+        Self {
+            charge_ceiling_percent: 80,
+            ac_connected: false,
+            pmic_mode: PmicPowerPathMode::Discharging,
+        }
+    }
+
+    /// Configures the charge ceiling (e.g. 80% or 85% for docked gaming stations).
+    pub fn set_charge_ceiling(&mut self, ceiling_pct: u8) {
+        self.charge_ceiling_percent = ceiling_pct.min(100).max(50);
+    }
+
+    /// Evaluates power path based on AC status and current battery state of charge.
+    pub fn evaluate_power_path(&mut self, current_soc_pct: u8, ac_connected: bool) -> PmicPowerPathMode {
+        self.ac_connected = ac_connected;
+        if !ac_connected {
+            self.pmic_mode = PmicPowerPathMode::Discharging;
+            return self.pmic_mode;
+        }
+
+        // When connected to AC power and SoC reaches or exceeds ceiling, switch PMIC to pure AC passthrough
+        if current_soc_pct >= self.charge_ceiling_percent {
+            self.pmic_mode = PmicPowerPathMode::PureAcPassthroughBypass;
+        } else {
+            self.pmic_mode = PmicPowerPathMode::Charging;
+        }
+
+        self.pmic_mode
+    }
+}
+
+/// Unit verification for docked bypass charge limiter.
+pub fn verify_docked_charge_limiter() -> bool {
+    let mut limiter = DockedChargeLimiter::new();
+    limiter.set_charge_ceiling(80);
+
+    // On battery (no AC): must discharge
+    if limiter.evaluate_power_path(70, false) != PmicPowerPathMode::Discharging {
+        return false;
+    }
+
+    // Plugged into AC at 70% (<80%): should charge
+    if limiter.evaluate_power_path(70, true) != PmicPowerPathMode::Charging {
+        return false;
+    }
+
+    // Reaches 80%: must switch to pure AC passthrough bypass
+    if limiter.evaluate_power_path(80, true) != PmicPowerPathMode::PureAcPassthroughBypass {
+        return false;
+    }
+
+    // Still at 82%: stays in pure AC passthrough bypass
+    if limiter.evaluate_power_path(82, true) != PmicPowerPathMode::PureAcPassthroughBypass {
+        return false;
+    }
+
+    true
+}
