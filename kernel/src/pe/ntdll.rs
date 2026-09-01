@@ -182,3 +182,236 @@ impl ProcessEnvironmentBlock {
         }
     }
 }
+
+/// I/O Status Block structure holding completion status and information.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoStatusBlock {
+    pub status: NtStatus,
+    pub information: usize,
+}
+
+/// Unicode String structure for NT object names.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnicodeString {
+    pub length: u16,
+    pub maximum_length: u16,
+    pub buffer: *mut u16,
+}
+
+/// Object Attributes descriptor for object creation/opening.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObjectAttributes {
+    pub length: u32,
+    pub root_directory: u64,
+    pub object_name: *const UnicodeString,
+    pub attributes: u32,
+    pub security_descriptor: *const u8,
+    pub security_quality_of_service: *const u8,
+}
+
+/// System Information Class enumeration.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemInformationClass {
+    SystemBasicInformation = 0,
+    SystemProcessorInformation = 1,
+    SystemPerformanceInformation = 2,
+    SystemTimeOfDayInformation = 3,
+}
+
+/// Allocates or commits a region of virtual memory within the user address space.
+pub unsafe fn nt_allocate_virtual_memory(
+    process_handle: u64,
+    base_address: *mut usize,
+    zero_bits: usize,
+    region_size: *mut usize,
+    allocation_type: u32,
+    protect: u32,
+) -> NtStatus {
+    let _ = (zero_bits, allocation_type);
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_ALLOCATE_VIRTUAL_MEMORY,
+        process_handle,
+        base_address as u64,
+        region_size as u64,
+        protect as u64,
+    )
+}
+
+/// Frees or decommits a region of virtual memory within the user address space.
+pub unsafe fn nt_free_virtual_memory(
+    process_handle: u64,
+    base_address: *mut usize,
+    region_size: *mut usize,
+    free_type: u32,
+) -> NtStatus {
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_FREE_VIRTUAL_MEMORY,
+        process_handle,
+        base_address as u64,
+        region_size as u64,
+        free_type as u64,
+    )
+}
+
+/// Creates a new file or opens an existing file or device object.
+pub unsafe fn nt_create_file(
+    file_handle: *mut u64,
+    desired_access: u32,
+    object_attributes: *const ObjectAttributes,
+    io_status_block: *mut IoStatusBlock,
+    allocation_size: *const u64,
+    file_attributes: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    ea_buffer: *const u8,
+    ea_length: u32,
+) -> NtStatus {
+    let _ = (
+        allocation_size,
+        file_attributes,
+        share_access,
+        create_disposition,
+        create_options,
+        ea_buffer,
+        ea_length,
+    );
+    let name_ptr = if !object_attributes.is_null() && !(*object_attributes).object_name.is_null() {
+        (*(*object_attributes).object_name).buffer as u64
+    } else {
+        0
+    };
+
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_CREATE_FILE,
+        file_handle as u64,
+        desired_access as u64,
+        name_ptr,
+        io_status_block as u64,
+    )
+}
+
+/// Reads data from an open file or device into a userland buffer.
+pub unsafe fn nt_read_file(
+    file_handle: u64,
+    event: u64,
+    apc_routine: u64,
+    apc_context: u64,
+    io_status_block: *mut IoStatusBlock,
+    buffer: *mut u8,
+    length: u32,
+    byte_offset: *const u64,
+    key: *const u32,
+) -> NtStatus {
+    let _ = (apc_routine, apc_context, byte_offset, key);
+    let status = crate::syscall::table::dispatch(
+        crate::syscall::table::NT_READ_FILE,
+        file_handle,
+        event,
+        buffer as u64,
+        length as u64,
+    );
+    if !io_status_block.is_null() {
+        (*io_status_block).status = status;
+        if status == STATUS_SUCCESS {
+            (*io_status_block).information = length as usize;
+        }
+    }
+    status
+}
+
+/// Writes data from a userland buffer to an open file or device.
+pub unsafe fn nt_write_file(
+    file_handle: u64,
+    event: u64,
+    apc_routine: u64,
+    apc_context: u64,
+    io_status_block: *mut IoStatusBlock,
+    buffer: *const u8,
+    length: u32,
+    byte_offset: *const u64,
+    key: *const u32,
+) -> NtStatus {
+    let _ = (apc_routine, apc_context, byte_offset, key);
+    let status = crate::syscall::table::dispatch(
+        crate::syscall::table::NT_WRITE_FILE,
+        file_handle,
+        event,
+        buffer as u64,
+        length as u64,
+    );
+    if !io_status_block.is_null() {
+        (*io_status_block).status = status;
+        if status == STATUS_SUCCESS {
+            (*io_status_block).information = length as usize;
+        }
+    }
+    status
+}
+
+/// Closes an open handle to a kernel object, file, or device.
+pub unsafe fn nt_close(handle: u64) -> NtStatus {
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_CLOSE,
+        handle,
+        0,
+        0,
+        0,
+    )
+}
+
+/// Sends a device I/O control code (IOCTL) directly to a device driver.
+pub unsafe fn nt_device_io_control_file(
+    file_handle: u64,
+    event: u64,
+    apc_routine: u64,
+    apc_context: u64,
+    io_status_block: *mut IoStatusBlock,
+    io_control_code: u32,
+    input_buffer: *const u8,
+    input_buffer_length: u32,
+    output_buffer: *mut u8,
+    output_buffer_length: u32,
+) -> NtStatus {
+    let _ = (
+        apc_routine,
+        apc_context,
+        input_buffer,
+        input_buffer_length,
+        output_buffer_length,
+    );
+    let status = crate::syscall::table::dispatch(
+        crate::syscall::table::NT_DEVICE_IO_CONTROL_FILE,
+        file_handle,
+        event,
+        io_control_code as u64,
+        output_buffer as u64,
+    );
+    if !io_status_block.is_null() {
+        (*io_status_block).status = status;
+        if status == STATUS_SUCCESS {
+            (*io_status_block).information = output_buffer_length as usize;
+        }
+    }
+    status
+}
+
+/// Queries internal kernel telemetry, memory limits, and hardware information.
+pub unsafe fn nt_query_system_information(
+    system_information_class: SystemInformationClass,
+    system_information: *mut u8,
+    system_information_length: u32,
+    return_length: *mut u32,
+) -> NtStatus {
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_QUERY_SYSTEM_INFORMATION,
+        system_information_class as u64,
+        system_information as u64,
+        system_information_length as u64,
+        return_length as u64,
+    )
+}
