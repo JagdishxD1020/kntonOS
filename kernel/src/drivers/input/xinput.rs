@@ -141,3 +141,171 @@ pub fn verify_xinput_structures() -> bool {
 
     true
 }
+
+use super::imu::sqrt_f32;
+
+// Stick curvature response types for analog sticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeadzoneCurve {
+    #[default]
+    Linear,
+    Quadratic,
+    Cubic,
+}
+
+/// Configuration parameters for radial inner and outer thumbstick deadzones.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadialDeadzoneConfig {
+    pub inner_deadzone: f32,
+    pub outer_saturation: f32,
+    pub curve: DeadzoneCurve,
+}
+
+impl Default for RadialDeadzoneConfig {
+    fn default() -> Self {
+        Self {
+            inner_deadzone: XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as f32,
+            outer_saturation: 32767.0,
+            curve: DeadzoneCurve::Linear,
+        }
+    }
+}
+
+impl RadialDeadzoneConfig {
+    // Creates a new configuration for left thumbstick with standard defaults.
+    pub const fn left_thumb() -> Self {
+        Self {
+            inner_deadzone: XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE as f32,
+            outer_saturation: 32767.0,
+            curve: DeadzoneCurve::Linear,
+        }
+    }
+
+    // Creates a new configuration for right thumbstick with standard defaults.
+    pub const fn right_thumb() -> Self {
+        Self {
+            inner_deadzone: XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE as f32,
+            outer_saturation: 32767.0,
+            curve: DeadzoneCurve::Linear,
+        }
+    }
+
+    // Filters raw 2D analog stick inputs using radial deadzone and saturation scaling.
+    pub fn apply(&self, raw_x: i16, raw_y: i16) -> (i16, i16) {
+        let fx = raw_x as f32;
+        let fy = raw_y as f32;
+        let mag = sqrt_f32(fx * fx + fy * fy);
+
+        if mag <= self.inner_deadzone || mag < 1.0 {
+            return (0, 0);
+        }
+
+        let clamped_mag = if mag > self.outer_saturation {
+            self.outer_saturation
+        } else {
+            mag
+        };
+
+        let span = self.outer_saturation - self.inner_deadzone;
+        if span <= 1.0 {
+            return (0, 0);
+        }
+
+        let normalized = (clamped_mag - self.inner_deadzone) / span;
+        let scaled_factor = match self.curve {
+            DeadzoneCurve::Linear => normalized,
+            DeadzoneCurve::Quadratic => normalized * normalized,
+            DeadzoneCurve::Cubic => normalized * normalized * normalized,
+        };
+
+        let target_mag = scaled_factor * 32767.0;
+        let scale = target_mag / mag;
+
+        let out_x = (fx * scale).clamp(-32768.0, 32767.0) as i16;
+        let out_y = (fy * scale).clamp(-32768.0, 32767.0) as i16;
+        (out_x, out_y)
+    }
+}
+
+/// XInput thumbstick and trigger deadzone shaping and saturation filter engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XInputFilterEngine {
+    pub left_stick: RadialDeadzoneConfig,
+    pub right_stick: RadialDeadzoneConfig,
+    pub left_trigger_threshold: u8,
+    pub right_trigger_threshold: u8,
+}
+
+impl Default for XInputFilterEngine {
+    fn default() -> Self {
+        Self {
+            left_stick: RadialDeadzoneConfig::left_thumb(),
+            right_stick: RadialDeadzoneConfig::right_thumb(),
+            left_trigger_threshold: XINPUT_GAMEPAD_TRIGGER_THRESHOLD,
+            right_trigger_threshold: XINPUT_GAMEPAD_TRIGGER_THRESHOLD,
+        }
+    }
+}
+
+impl XInputFilterEngine {
+    // Normalizes analog trigger input against deadzone threshold.
+    pub fn filter_trigger(&self, raw_val: u8, threshold: u8) -> u8 {
+        if raw_val <= threshold {
+            return 0;
+        }
+        let span = (255 - threshold) as f32;
+        let norm = ((raw_val - threshold) as f32) / span;
+        (norm * 255.0).clamp(0.0, 255.0) as u8
+    }
+
+    // Applies full radial deadzone filtering and trigger thresholding to gamepad state.
+    pub fn process_gamepad(&self, raw: &XInputGamepad) -> XInputGamepad {
+        let (lx, ly) = self.left_stick.apply(raw.sThumbLX, raw.sThumbLY);
+        let (rx, ry) = self.right_stick.apply(raw.sThumbRX, raw.sThumbRY);
+        let lt = self.filter_trigger(raw.bLeftTrigger, self.left_trigger_threshold);
+        let rt = self.filter_trigger(raw.bRightTrigger, self.right_trigger_threshold);
+
+        XInputGamepad {
+            wButtons: raw.wButtons,
+            bLeftTrigger: lt,
+            bRightTrigger: rt,
+            sThumbLX: lx,
+            sThumbLY: ly,
+            sThumbRX: rx,
+            sThumbRY: ry,
+        }
+    }
+}
+
+/// Verifies radial deadzone attenuation, saturation scaling, and trigger thresholding.
+pub fn verify_xinput_deadzone_filter() -> bool {
+    let engine = XInputFilterEngine::default();
+
+    // 1. Stick noise within deadzone must yield exactly zero.
+    let (lx0, ly0) = engine.left_stick.apply(3000, -4000);
+    if lx0 != 0 || ly0 != 0 {
+        return false;
+    }
+
+    // 2. Stick value exceeding outer saturation must clamp to 32767.
+    let (lx_max, ly_max) = engine.left_stick.apply(0, 32767);
+    if lx_max != 0 || ly_max < 32760 {
+        return false;
+    }
+
+    // 3. Right stick with deadzone 8689 should attenuate noise below 8689.
+    let (rx0, ry0) = engine.right_stick.apply(8000, 0);
+    if rx0 != 0 || ry0 != 0 {
+        return false;
+    }
+
+    // 4. Trigger values <= threshold must be 0, while full pull must reach 255.
+    if engine.filter_trigger(25, XINPUT_GAMEPAD_TRIGGER_THRESHOLD) != 0 {
+        return false;
+    }
+    if engine.filter_trigger(255, XINPUT_GAMEPAD_TRIGGER_THRESHOLD) != 255 {
+        return false;
+    }
+
+    true
+}
