@@ -305,3 +305,177 @@ impl ControllerNavHandler {
         }
     }
 }
+
+/// Maximum frame duration history preserved for statistical aggregation.
+pub const ROLLING_FRAME_BUFFER_CAP: usize = 60;
+
+/// Rolling 60-frame latency tracker calculating instantaneous FPS, min, avg, max, and 99th percentile.
+#[derive(Debug, Clone, Copy)]
+pub struct RollingFrameStats {
+    pub frame_times_us: [u32; ROLLING_FRAME_BUFFER_CAP],
+    pub head: usize,
+    pub count: usize,
+    pub last_frame_us: u32,
+    pub min_us: u32,
+    pub avg_us: u32,
+    pub max_us: u32,
+    pub p99_us: u32,
+    pub instantaneous_fps: u32,
+}
+
+impl RollingFrameStats {
+    /// Creates an initialized frame latency tracker.
+    pub fn new() -> Self {
+        Self {
+            frame_times_us: [16_666; ROLLING_FRAME_BUFFER_CAP],
+            head: 0,
+            count: 0,
+            last_frame_us: 16_666,
+            min_us: 16_666,
+            avg_us: 16_666,
+            max_us: 16_666,
+            p99_us: 16_666,
+            instantaneous_fps: 60,
+        }
+    }
+
+    /// Appends a new frame presentation duration in microseconds and recalculates statistics.
+    pub fn push_frame_time(&mut self, us: u32) {
+        let valid_us = us.max(1);
+        self.frame_times_us[self.head] = valid_us;
+        self.head = (self.head + 1) % ROLLING_FRAME_BUFFER_CAP;
+        if self.count < ROLLING_FRAME_BUFFER_CAP {
+            self.count += 1;
+        }
+        self.last_frame_us = valid_us;
+        self.instantaneous_fps = (1_000_000 / valid_us).min(999);
+        self.compute_statistics();
+    }
+
+    /// Computes minimum, average, maximum, and 99th percentile frame latency over the rolling window.
+    pub fn compute_statistics(&mut self) {
+        if self.count == 0 {
+            return;
+        }
+
+        let mut sorted = [0u32; ROLLING_FRAME_BUFFER_CAP];
+        let mut sum: u64 = 0;
+        let mut min_val = u32::MAX;
+        let mut max_val = 0u32;
+
+        for i in 0..self.count {
+            let val = self.frame_times_us[i];
+            sorted[i] = val;
+            sum += val as u64;
+            if val < min_val {
+                min_val = val;
+            }
+            if val > max_val {
+                max_val = val;
+            }
+        }
+
+        // In-place insertion sort over the active sample window
+        for i in 1..self.count {
+            let key = sorted[i];
+            let mut j = i;
+            while j > 0 && sorted[j - 1] > key {
+                sorted[j] = sorted[j - 1];
+                j -= 1;
+            }
+            sorted[j] = key;
+        }
+
+        self.min_us = min_val;
+        self.max_us = max_val;
+        self.avg_us = (sum / self.count as u64) as u32;
+
+        // 99th percentile index for the active count
+        let p99_idx = ((self.count * 99 + 99) / 100).saturating_sub(1).min(self.count - 1);
+        self.p99_us = sorted[p99_idx];
+    }
+}
+
+/// Instantaneous battery, power draw, and active cooling status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThermalPowerStatus {
+    pub battery_pct: u8,
+    pub is_charging: bool,
+    pub power_draw_mw: u32,
+    pub peltier_active: bool,
+    pub fan_rpm: u16,
+    pub soc_temp_celsius: u8,
+    pub cpu_load_pct: u8,
+    pub gpu_vram_used_mb: u32,
+    pub gpu_vram_total_mb: u32,
+}
+
+impl Default for ThermalPowerStatus {
+    fn default() -> Self {
+        Self {
+            battery_pct: 85,
+            is_charging: false,
+            power_draw_mw: 14_500,
+            peltier_active: true,
+            fan_rpm: 3200,
+            soc_temp_celsius: 54,
+            cpu_load_pct: 42,
+            gpu_vram_used_mb: 2850,
+            gpu_vram_total_mb: 8192,
+        }
+    }
+}
+
+/// Visual presentation detail level for the performance telemetry overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudOverlayMode {
+    Off,
+    CompactFps,
+    Standard,
+    DetailedDiagnostics,
+}
+
+/// Real-time performance telemetry overlay manager.
+#[derive(Debug, Clone)]
+pub struct PerformanceTelemetryHud {
+    pub stats: RollingFrameStats,
+    pub hardware: ThermalPowerStatus,
+    pub mode: HudOverlayMode,
+    pub alpha: u8,
+}
+
+impl PerformanceTelemetryHud {
+    /// Creates a performance HUD overlay with standard layout and default telemetry.
+    pub fn new() -> Self {
+        Self {
+            stats: RollingFrameStats::new(),
+            hardware: ThermalPowerStatus::default(),
+            mode: HudOverlayMode::Standard,
+            alpha: 210,
+        }
+    }
+
+    /// Records a new frame duration in microseconds into the rolling statistics engine.
+    pub fn push_frame_time(&mut self, us: u32) {
+        self.stats.push_frame_time(us);
+    }
+
+    /// Cycles the HUD overlay visibility mode through Off, Compact, Standard, and Detailed.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            HudOverlayMode::Off => HudOverlayMode::CompactFps,
+            HudOverlayMode::CompactFps => HudOverlayMode::Standard,
+            HudOverlayMode::Standard => HudOverlayMode::DetailedDiagnostics,
+            HudOverlayMode::DetailedDiagnostics => HudOverlayMode::Off,
+        };
+    }
+
+    /// Calculates the percentage of allocated GPU video memory.
+    pub fn vram_utilization_pct(&self) -> u8 {
+        if self.hardware.gpu_vram_total_mb == 0 {
+            0
+        } else {
+            ((self.hardware.gpu_vram_used_mb as u64 * 100) / self.hardware.gpu_vram_total_mb as u64) as u8
+        }
+    }
+}
