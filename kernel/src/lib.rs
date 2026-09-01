@@ -549,6 +549,10 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_biometric_fingerprint_subsystem() {
         serial_write_str("[KNT-PANIC] Biometric fingerprint and Windows Hello token self-test failed!\r\n");
     }
+    // Initialize and verify Userland Game Controller & Win32 XInput Runtime Service (TASK-KNT-135)
+    if !drivers::input::test_xinput_service_subsystem() {
+        serial_write_str("[KNT-PANIC] Userland game controller and XInput runtime service self-test failed!\r\n");
+    }
 
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {

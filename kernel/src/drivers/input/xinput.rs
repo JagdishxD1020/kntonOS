@@ -192,37 +192,33 @@ impl RadialDeadzoneConfig {
 
     // Filters raw 2D analog stick inputs using radial deadzone and saturation scaling.
     pub fn apply(&self, raw_x: i16, raw_y: i16) -> (i16, i16) {
-        let fx = raw_x as f32;
-        let fy = raw_y as f32;
-        let mag = sqrt_f32(fx * fx + fy * fy);
+        let nx = (raw_x as f32) / 32767.0;
+        let ny = (raw_y as f32) / 32767.0;
+        let mag = sqrt_f32(nx * nx + ny * ny);
 
-        if mag <= self.inner_deadzone || mag < 1.0 {
+        let inner_norm = self.inner_deadzone / 32767.0;
+        let outer_norm = self.outer_saturation / 32767.0;
+
+        if mag <= inner_norm || mag < 0.0001 {
             return (0, 0);
         }
 
-        let clamped_mag = if mag > self.outer_saturation {
-            self.outer_saturation
-        } else {
-            mag
-        };
-
-        let span = self.outer_saturation - self.inner_deadzone;
-        if span <= 1.0 {
+        let clamped_mag = if mag > outer_norm { outer_norm } else { mag };
+        let span = outer_norm - inner_norm;
+        if span <= 0.0001 {
             return (0, 0);
         }
 
-        let normalized = (clamped_mag - self.inner_deadzone) / span;
+        let normalized = (clamped_mag - inner_norm) / span;
         let scaled_factor = match self.curve {
             DeadzoneCurve::Linear => normalized,
             DeadzoneCurve::Quadratic => normalized * normalized,
             DeadzoneCurve::Cubic => normalized * normalized * normalized,
         };
 
-        let target_mag = scaled_factor * 32767.0;
-        let scale = target_mag / mag;
-
-        let out_x = (fx * scale).clamp(-32768.0, 32767.0) as i16;
-        let out_y = (fy * scale).clamp(-32768.0, 32767.0) as i16;
+        let scale = scaled_factor / mag;
+        let out_x = (nx * scale * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        let out_y = (ny * scale * 32767.0).clamp(-32768.0, 32767.0) as i16;
         (out_x, out_y)
     }
 }
@@ -733,5 +729,106 @@ pub fn verify_xinput_service_and_gyro_mapper() -> bool {
         return false;
     }
 
+    true
+}
+
+use crate::serial_write_str;
+
+/// Verifies sequential polling, state retrieval, vibration distribution, and capabilities reporting.
+pub fn verify_end_to_end_xinput_pipeline() -> bool {
+    let mut service = XInputRuntimeService::new();
+
+    // 1. Initial disconnected query for slot 1
+    let mut state = XInputState::default();
+    if service.get_state(1, &mut state) != ERROR_DEVICE_NOT_CONNECTED {
+        return false;
+    }
+
+    // 2. Poll 3 sequential frames on slot 0
+    for frame in 1..=3 {
+        let report = RawGamepadReport {
+            buttons: if frame % 2 == 1 { GamepadButtons::B.0 } else { GamepadButtons::X.0 },
+            left_stick_x: (frame as i16) * 10000,
+            left_stick_y: -(frame as i16) * 10000,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: (frame as u16) * 50 << 8,
+            right_trigger: 255 << 8,
+            imu_sample: None,
+            timestamp_us: (frame as u64) * 1000,
+        };
+
+        if service.update_slot(0, &report, 0.0, 0.0, 0.001) != ERROR_SUCCESS {
+            return false;
+        }
+
+        if service.get_state(0, &mut state) != ERROR_SUCCESS {
+            return false;
+        }
+
+        if state.dwPacketNumber != (frame as u32) {
+            return false;
+        }
+    }
+
+    // 3. Test dual-motor rumble dispatch
+    let vibe = XInputVibration {
+        wLeftMotorSpeed: 45000,
+        wRightMotorSpeed: 28000,
+    };
+    if service.set_state(0, &vibe) != ERROR_SUCCESS {
+        return false;
+    }
+
+    // 4. Test capabilities reporting
+    let mut caps = XInputCapabilities::default();
+    if service.get_capabilities(0, 0, &mut caps) != ERROR_SUCCESS {
+        return false;
+    }
+    if caps.Type != XINPUT_DEVTYPE_GAMEPAD || caps.Vibration.wLeftMotorSpeed != 45000 {
+        return false;
+    }
+
+    // 5. Test battery reporting
+    let mut batt = XInputBatteryInformation::default();
+    if service.get_battery_information(0, 0, &mut batt) != ERROR_SUCCESS {
+        return false;
+    }
+    if batt.BatteryType != BATTERY_TYPE_WIRED {
+        return false;
+    }
+
+    true
+}
+
+/// Verification self-test suite for Userland Game Controller & Win32 XInput Runtime Service.
+pub fn test_xinput_service_subsystem() -> bool {
+    serial_write_str("[KNT-INPUT] Testing userland game controller & XInput runtime service...\r\n");
+
+    // 1. Verify memory layout, struct alignment, and Win32 field compatibility
+    if !verify_xinput_structures() {
+        serial_write_str("[KNT-PANIC] Win32 XInput data structure verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify radial deadzone attenuation, saturation scaling, and trigger thresholding
+    if !verify_xinput_deadzone_filter() {
+        serial_write_str("[KNT-PANIC] XInput radial deadzone and saturation filter verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify motion aiming injection, trigger haptic resistance evaluation, and runtime service routing
+    if !verify_xinput_service_and_gyro_mapper() {
+        serial_write_str("[KNT-PANIC] XInput gyro aim mapper and haptic profile verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify end-to-end ring buffer polling, vibration motor distribution, and packet sequencing
+    if !verify_end_to_end_xinput_pipeline() {
+        serial_write_str("[KNT-PANIC] End-to-end XInput controller polling pipeline verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-XINPUT-PASS] Userland game controller and XInput runtime service verified\r\n");
     true
 }
