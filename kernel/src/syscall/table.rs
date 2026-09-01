@@ -8,7 +8,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const NT_TEST_SYS: u64 = 0x0000;
 pub const NT_WRITE_FILE: u64 = 0x0008;
 pub const NT_READ_FILE: u64 = 0x000A;
+pub const NT_DEVICE_IO_CONTROL_FILE: u64 = 0x0007;
+pub const NT_CLOSE: u64 = 0x000F;
 pub const NT_ALLOCATE_VIRTUAL_MEMORY: u64 = 0x0018;
+pub const NT_FREE_VIRTUAL_MEMORY: u64 = 0x001E;
+pub const NT_QUERY_SYSTEM_INFORMATION: u64 = 0x0036;
+pub const NT_CREATE_FILE: u64 = 0x0055;
 pub const NT_MAP_VIEW_OF_SECTION: u64 = 0x0028;
 pub const NT_TERMINATE_PROCESS: u64 = 0x002C;
 pub const NT_YIELD_EXECUTION: u64 = 0x0046;
@@ -31,6 +36,11 @@ static DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 pub const fn syscall_name(id: u64) -> &'static str {
     match id {
         NT_TEST_SYS => "NtTestSys",
+        NT_DEVICE_IO_CONTROL_FILE => "NtDeviceIoControlFile",
+        NT_CLOSE => "NtClose",
+        NT_FREE_VIRTUAL_MEMORY => "NtFreeVirtualMemory",
+        NT_QUERY_SYSTEM_INFORMATION => "NtQuerySystemInformation",
+        NT_CREATE_FILE => "NtCreateFile",
         NT_WRITE_FILE => "NtWriteFile",
         NT_READ_FILE => "NtReadFile",
         NT_ALLOCATE_VIRTUAL_MEMORY => "NtAllocateVirtualMemory",
@@ -58,6 +68,17 @@ pub fn dispatch(id: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u32 {
     DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
 
     match id {
+        NT_DEVICE_IO_CONTROL_FILE => {
+            handlers::sys_device_io_control_file(arg1, arg2, arg3, arg4)
+        }
+        NT_CLOSE => handlers::sys_close(arg1),
+        NT_FREE_VIRTUAL_MEMORY => {
+            handlers::sys_free_virtual_memory(arg1, arg2, arg3, arg4)
+        }
+        NT_QUERY_SYSTEM_INFORMATION => {
+            handlers::sys_query_system_information(arg1, arg2, arg3, arg4)
+        }
+        NT_CREATE_FILE => handlers::sys_create_file(arg1, arg2, arg3, arg4),
         NT_TEST_SYS => {
             crate::serial_write_str("[KNT-SYSCALL] NtTestSys dispatch verified\r\n");
             STATUS_SUCCESS

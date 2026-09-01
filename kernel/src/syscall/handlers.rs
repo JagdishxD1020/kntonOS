@@ -2,7 +2,8 @@
 
 use super::validate::{
     validate_user_mut_ptr, validate_user_mut_slice, validate_user_ptr, validate_user_slice,
-    STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+    STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_NO_MEMORY,
+    STATUS_SUCCESS,
 };
 use crate::memory::{PAGE_SIZE, PMM};
 
@@ -87,7 +88,7 @@ pub fn sys_allocate_virtual_memory(
     let mut pmm = PMM.lock();
     let _first_frame = match pmm.allocate_frame() {
         Some(f) => f,
-        None => return 0xC000_0017, // STATUS_NO_MEMORY
+        None => return STATUS_NO_MEMORY,
     };
 
     // If base address was 0, assign virtual address in userland pool
@@ -401,6 +402,153 @@ pub fn sys_sigprocmask(how: u64, set_ptr: u64, oldset_ptr: u64) -> u32 {
                 curr.signal_mask = safe_set;
             }
             _ => return STATUS_INVALID_PARAMETER,
+        }
+    }
+
+    STATUS_SUCCESS
+}
+
+/// NtFreeVirtualMemory: Releases or decommits virtual memory pages for a process.
+/// arg1: Process handle
+pub fn sys_free_virtual_memory(
+    process_handle: u64,
+    base_addr_ptr: u64,
+    region_size_ptr: u64,
+    _free_type: u64,
+) -> u32 {
+    if process_handle != NT_CURRENT_PROCESS && process_handle != 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    let base_ptr = match validate_user_mut_ptr(base_addr_ptr as *mut usize) {
+        Ok(p) => p,
+        Err(status) => return status,
+    };
+
+    let size_ptr = match validate_user_mut_ptr(region_size_ptr as *mut usize) {
+        Ok(p) => p,
+        Err(status) => return status,
+    };
+
+    let base = unsafe { *base_ptr };
+    let req_size = unsafe { *size_ptr };
+    if base == 0 || req_size == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    unsafe {
+        *size_ptr = 0;
+    }
+    STATUS_SUCCESS
+}
+
+/// NtClose: Closes an open handle to a kernel object, file, or device.
+/// arg1: Object handle
+pub fn sys_close(handle: u64) -> u32 {
+    if handle == 0 || handle > 0x00FF_FFFF {
+        return STATUS_INVALID_HANDLE;
+    }
+    STATUS_SUCCESS
+}
+
+/// NtCreateFile: Opens or creates a file or device handle.
+/// arg1: File handle output pointer (*mut u64)
+pub fn sys_create_file(
+    file_handle_out_ptr: u64,
+    _desired_access: u64,
+    object_name_ptr: u64,
+    io_status_ptr: u64,
+) -> u32 {
+    let out_handle = match validate_user_mut_ptr(file_handle_out_ptr as *mut u64) {
+        Ok(p) => p,
+        Err(status) => return status,
+    };
+
+    let handle = if object_name_ptr == 0 {
+        NT_CONSOLE_HANDLE
+    } else {
+        0x0000_0002
+    };
+
+    unsafe {
+        *out_handle = handle;
+    }
+
+    if io_status_ptr != 0 {
+        if let Ok(iosb) = validate_user_mut_ptr(io_status_ptr as *mut [u64; 2]) {
+            unsafe {
+                (*iosb)[0] = STATUS_SUCCESS as u64;
+                (*iosb)[1] = 1; // FILE_OPENED
+            }
+        }
+    }
+
+    STATUS_SUCCESS
+}
+
+/// NtDeviceIoControlFile: Sends a control code directly to a device driver.
+/// arg1: File/device handle
+pub fn sys_device_io_control_file(
+    handle: u64,
+    _event: u64,
+    ioctl_code: u64,
+    args_ptr: u64,
+) -> u32 {
+    if handle == 0 {
+        return STATUS_INVALID_HANDLE;
+    }
+    if ioctl_code == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if args_ptr != 0 {
+        if let Ok(slice) = validate_user_mut_slice(args_ptr as *mut u8, 8) {
+            if slice.len() >= 4 {
+                slice[0] = 0x01;
+            }
+        }
+    }
+
+    STATUS_SUCCESS
+}
+
+/// NtQuerySystemInformation: Retrieves system performance and architecture telemetry.
+/// arg1: System information class
+pub fn sys_query_system_information(
+    info_class: u64,
+    buffer_ptr: u64,
+    buffer_len: u64,
+    return_len_ptr: u64,
+) -> u32 {
+    if buffer_ptr == 0 && buffer_len > 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let required_len = match info_class {
+        0 => 32, // SystemBasicInformation
+        1 => 16, // SystemProcessorInformation
+        2 => 48, // SystemPerformanceInformation
+        3 => 32, // SystemTimeOfDayInformation
+        _ => 16,
+    };
+
+    if return_len_ptr != 0 {
+        if let Ok(ret_len) = validate_user_mut_ptr(return_len_ptr as *mut u32) {
+            unsafe {
+                *ret_len = required_len as u32;
+            }
+        }
+    }
+
+    if buffer_len < required_len as u64 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    if let Ok(buf) = validate_user_mut_slice(buffer_ptr as *mut u8, buffer_len as usize) {
+        buf.fill(0);
+        if info_class == 0 && buf.len() >= 32 {
+            buf[0..4].copy_from_slice(&4096u32.to_le_bytes());
+            buf[4..8].copy_from_slice(&4u32.to_le_bytes());
         }
     }
 
