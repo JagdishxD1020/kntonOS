@@ -676,6 +676,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Micro-checkpoint state snapshot and instant resumption self-test failed!\r\n");
     }
 
+    // Verify Win32 Userland Runtime & NTDLL Emulation Layer (TASK-KNT-134)
+    if !pe::test_ntdll_emulation_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 NTDLL emulation layer self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

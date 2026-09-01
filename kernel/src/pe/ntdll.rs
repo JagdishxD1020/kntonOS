@@ -415,3 +415,199 @@ pub unsafe fn nt_query_system_information(
         return_length as u64,
     )
 }
+
+/// Comprehensive self-test suite verifying the Win32 userland runtime and NTDLL emulation layer.
+pub fn test_ntdll_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-NTDLL-TEST] Executing Win32 NTDLL userland runtime verification...\r\n");
+
+    // 1. Verify Status Code translation and error bounds handling
+    {
+        if !nt_success(STATUS_SUCCESS) || nt_error(STATUS_SUCCESS) {
+            return false;
+        }
+        if !nt_error(STATUS_UNSUCCESSFUL) || !nt_error(STATUS_INVALID_PARAMETER) || !nt_error(STATUS_NO_MEMORY) {
+            return false;
+        }
+        if nt_status_to_str(STATUS_SUCCESS) != "STATUS_SUCCESS" {
+            return false;
+        }
+        if nt_status_to_str(STATUS_INVALID_PARAMETER) != "STATUS_INVALID_PARAMETER" {
+            return false;
+        }
+        if nt_status_to_str(STATUS_NO_MEMORY) != "STATUS_NO_MEMORY" {
+            return false;
+        }
+        if nt_status_to_str(STATUS_BUFFER_TOO_SMALL) != "STATUS_BUFFER_TOO_SMALL" {
+            return false;
+        }
+    }
+
+    // 2. Verify TEB and PEB structure alignment and initial setup
+    {
+        if core::mem::align_of::<ThreadEnvironmentBlock>() < 64 {
+            return false;
+        }
+        if core::mem::align_of::<ProcessEnvironmentBlock>() < 64 {
+            return false;
+        }
+
+        let peb = ProcessEnvironmentBlock::new(0x0040_0000, 0x0000_1000_0000, 4);
+        if peb.image_base_address != 0x0040_0000 || peb.process_heap != 0x0000_1000_0000 {
+            return false;
+        }
+        if peb.number_of_processors != 4 || peb.os_major_version != 10 || peb.os_platform_id != 2 {
+            return false;
+        }
+
+        let teb = ThreadEnvironmentBlock::new(101, 10, 0x0000_7FFF_FFFF_0000, 0x0000_7FFF_FFF0_0000, 0x0000_7FFF_FFE0_0000);
+        if teb.client_id.unique_thread != 101 || teb.client_id.unique_process != 10 {
+            return false;
+        }
+        if teb.tib.stack_base != 0x0000_7FFF_FFFF_0000 || teb.tib.stack_limit != 0x0000_7FFF_FFF0_0000 {
+            return false;
+        }
+        if teb.process_environment_block != 0x0000_7FFF_FFE0_0000 || teb.current_locale != 0x0409 {
+            return false;
+        }
+    }
+
+    // 3. Verify userland virtual memory allocation and release dispatch
+    unsafe {
+        let base_slot = (crate::syscall::validate::USER_SPACE_START + 0x4000) as *mut usize;
+        let size_slot = (crate::syscall::validate::USER_SPACE_START + 0x4008) as *mut usize;
+        *base_slot = 0;
+        *size_slot = 8192;
+
+        let alloc_status = nt_allocate_virtual_memory(
+            crate::syscall::NT_CURRENT_PROCESS,
+            base_slot,
+            0,
+            size_slot,
+            0x1000,
+            0x04,
+        );
+        if !nt_success(alloc_status) || *base_slot == 0 || *size_slot != 8192 {
+            return false;
+        }
+
+        let free_status = nt_free_virtual_memory(
+            crate::syscall::NT_CURRENT_PROCESS,
+            base_slot,
+            size_slot,
+            0x8000,
+        );
+        if !nt_success(free_status) || *size_slot != 0 {
+            return false;
+        }
+
+        let err_status = nt_allocate_virtual_memory(
+            crate::syscall::NT_CURRENT_PROCESS,
+            base_slot,
+            0,
+            core::ptr::null_mut(),
+            0x1000,
+            0x04,
+        );
+        if !nt_error(err_status) {
+            return false;
+        }
+    }
+
+    // 4. Verify userland file I/O and device I/O control dispatch
+    unsafe {
+        let handle_slot = (crate::syscall::validate::USER_SPACE_START + 0x4010) as *mut u64;
+        let iosb_slot = (crate::syscall::validate::USER_SPACE_START + 0x4020) as *mut IoStatusBlock;
+        *handle_slot = 0;
+
+        let create_status = nt_create_file(
+            handle_slot,
+            0x8000_0000,
+            core::ptr::null(),
+            iosb_slot,
+            core::ptr::null(),
+            0,
+            0,
+            1,
+            0,
+            core::ptr::null(),
+            0,
+        );
+        if !nt_success(create_status) || *handle_slot == 0 {
+            return false;
+        }
+
+        let msg = b"[KNT-NTDLL-TEST] Userland NTDLL write verified\r\n";
+        let write_buf = (crate::syscall::validate::USER_SPACE_START + 0x4040) as *mut u8;
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), write_buf, msg.len());
+
+        let write_status = nt_write_file(
+            *handle_slot,
+            0,
+            0,
+            0,
+            iosb_slot,
+            write_buf,
+            msg.len() as u32,
+            core::ptr::null(),
+            core::ptr::null(),
+        );
+        if !nt_success(write_status) || (*iosb_slot).information != msg.len() {
+            return false;
+        }
+
+        let read_buf = (crate::syscall::validate::USER_SPACE_START + 0x4080) as *mut u8;
+        let read_status = nt_read_file(
+            *handle_slot,
+            0,
+            0,
+            0,
+            iosb_slot,
+            read_buf,
+            16,
+            core::ptr::null(),
+            core::ptr::null(),
+        );
+        if !nt_success(read_status) {
+            return false;
+        }
+
+        let ioctl_buf = (crate::syscall::validate::USER_SPACE_START + 0x40C0) as *mut u8;
+        *ioctl_buf = 0;
+        let ioctl_status = nt_device_io_control_file(
+            *handle_slot,
+            0,
+            0,
+            0,
+            iosb_slot,
+            0x0001,
+            core::ptr::null(),
+            0,
+            ioctl_buf,
+            8,
+        );
+        if !nt_success(ioctl_status) {
+            return false;
+        }
+
+        let sys_info_buf = (crate::syscall::validate::USER_SPACE_START + 0x4100) as *mut u8;
+        let ret_len_slot = (crate::syscall::validate::USER_SPACE_START + 0x4140) as *mut u32;
+        *ret_len_slot = 0;
+        let query_status = nt_query_system_information(
+            SystemInformationClass::SystemBasicInformation,
+            sys_info_buf,
+            32,
+            ret_len_slot,
+        );
+        if !nt_success(query_status) || *ret_len_slot != 32 {
+            return false;
+        }
+
+        let close_status = nt_close(*handle_slot);
+        if !nt_success(close_status) {
+            return false;
+        }
+    }
+
+    crate::serial_write_str("[KNT-NTDLL-EMU-PASS] Win32 NTDLL userland runtime and syscall dispatch verified\r\n");
+    true
+}
