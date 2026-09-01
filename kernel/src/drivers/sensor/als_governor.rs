@@ -273,3 +273,62 @@ pub fn verify_night_mode_color_engine() -> bool {
 
     true
 }
+
+/// Hysteresis stabilization governor with dual-threshold deadband to eliminate backlight flutter.
+#[derive(Debug, Clone, Copy)]
+pub struct HysteresisStabilizer {
+    pub deadband_percent: u8,
+    pub last_settled_duty: u8,
+    pub flutter_count: u32,
+}
+
+impl HysteresisStabilizer {
+    /// Creates a new hysteresis stabilizer with 5% deadband window.
+    pub const fn new() -> Self {
+        Self {
+            deadband_percent: 5,
+            last_settled_duty: 50,
+            flutter_count: 0,
+        }
+    }
+
+    /// Filters candidate PWM duty through the dual-threshold deadband.
+    /// If candidate change is within +/- deadband_percent of last settled duty, the change is suppressed.
+    pub fn filter_candidate_duty(&mut self, candidate_duty: u8) -> u8 {
+        let diff = if candidate_duty > self.last_settled_duty {
+            candidate_duty - self.last_settled_duty
+        } else {
+            self.last_settled_duty - candidate_duty
+        };
+
+        if diff >= self.deadband_percent {
+            self.last_settled_duty = candidate_duty;
+        } else {
+            self.flutter_count += 1;
+        }
+
+        self.last_settled_duty
+    }
+}
+
+/// Unit verification for hysteresis stabilization governor.
+pub fn verify_hysteresis_stabilizer() -> bool {
+    let mut stab = HysteresisStabilizer::new();
+    stab.last_settled_duty = 50;
+
+    // Small fluctuations (+/- 3%) inside 5% deadband must be suppressed
+    let f1 = stab.filter_candidate_duty(52);
+    let f2 = stab.filter_candidate_duty(48);
+    let f3 = stab.filter_candidate_duty(53);
+    if f1 != 50 || f2 != 50 || f3 != 50 || stab.flutter_count != 3 {
+        return false;
+    }
+
+    // Significant ambient change (jump to 60%, diff = 10% >= 5%): updates settled duty
+    let f4 = stab.filter_candidate_duty(60);
+    if f4 != 60 || stab.last_settled_duty != 60 {
+        return false;
+    }
+
+    true
+}
