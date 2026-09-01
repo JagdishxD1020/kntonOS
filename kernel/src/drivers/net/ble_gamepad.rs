@@ -112,3 +112,107 @@ pub fn verify_ble_hci_parser() -> bool {
 
     true
 }
+
+/// Unpacked standard gamepad HID input state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GamepadInputState {
+    pub buttons: u16,       // A, B, X, Y, LB, RB, LT, RT, View, Menu, LSB, RSB
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
+    pub trigger_left: u16,
+    pub trigger_right: u16,
+}
+
+/// Sub-4ms low-latency connection interval negotiator and HID report framer.
+#[derive(Debug, Clone, Copy)]
+pub struct LowLatencyInputFramer {
+    pub connection_interval_slots: u16, // 1 slot = 1.25ms; 3 slots = 3.75ms (<4ms)
+    pub supervision_timeout_ms: u16,
+    pub slave_latency: u16,
+    pub last_state: GamepadInputState,
+    pub packets_processed: u64,
+}
+
+impl LowLatencyInputFramer {
+    /// Creates a new input framer configured for sub-4ms BLE connection interval (3 slots = 3.75ms).
+    pub const fn new() -> Self {
+        Self {
+            connection_interval_slots: 3, // 3.75ms
+            supervision_timeout_ms: 1000,
+            slave_latency: 0,
+            last_state: GamepadInputState {
+                buttons: 0,
+                left_stick_x: 0,
+                left_stick_y: 0,
+                right_stick_x: 0,
+                right_stick_y: 0,
+                trigger_left: 0,
+                trigger_right: 0,
+            },
+            packets_processed: 0,
+        }
+    }
+
+    /// Verifies if connection parameters meet competitive gaming sub-4ms latency budget.
+    pub fn is_sub_4ms(&self) -> bool {
+        // Interval time in ms: slots * 1.25ms. For 3 slots: 3.75ms <= 4.0ms
+        self.connection_interval_slots <= 3 && self.slave_latency == 0
+    }
+
+    /// Unpacks raw 16-byte HID gamepad report into normalized input state.
+    pub fn unpack_hid_report(&mut self, report: &[u8]) -> Option<GamepadInputState> {
+        if report.len() < 12 {
+            return None;
+        }
+
+        self.packets_processed += 1;
+        let buttons = u16::from_le_bytes([report[0], report[1]]);
+        let lx = i16::from_le_bytes([report[2], report[3]]);
+        let ly = i16::from_le_bytes([report[4], report[5]]);
+        let rx = i16::from_le_bytes([report[6], report[7]]);
+        let ry = i16::from_le_bytes([report[8], report[9]]);
+        let lt = u16::from_le_bytes([report[10], (report[10] >> 4)]); // 10-bit trigger
+        let rt = if report.len() >= 12 { report[11] as u16 * 4 } else { 0 };
+
+        self.last_state = GamepadInputState {
+            buttons,
+            left_stick_x: lx,
+            left_stick_y: ly,
+            right_stick_x: rx,
+            right_stick_y: ry,
+            trigger_left: lt,
+            trigger_right: rt,
+        };
+
+        Some(self.last_state)
+    }
+}
+
+/// Unit verification for sub-4ms input report framer.
+pub fn verify_low_latency_input_framer() -> bool {
+    let mut framer = LowLatencyInputFramer::new();
+    if !framer.is_sub_4ms() {
+        return false;
+    }
+
+    let mut report = [0u8; 16];
+    report[0] = 0x01; // Button A pressed
+    report[1] = 0x00;
+    report[2] = 0x00; // LX = 1000
+    report[3] = 0x03; // (0x03E8 = 1000)
+    report[4] = 0x00; // LY = 0
+    report[5] = 0x00;
+
+    let state = framer.unpack_hid_report(&report);
+    if state.is_none() {
+        return false;
+    }
+    let s = state.unwrap();
+    if s.buttons != 0x0001 || s.left_stick_x != 1000 || framer.packets_processed != 1 {
+        return false;
+    }
+
+    true
+}
