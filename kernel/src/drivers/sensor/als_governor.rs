@@ -168,3 +168,108 @@ pub fn verify_perceptual_backlight_governor() -> bool {
 
     true
 }
+
+/// Circadian night-mode color temperature range.
+pub const COLOR_TEMP_DAYLIGHT_K: u32 = 6500;
+pub const COLOR_TEMP_NIGHT_K: u32 = 3200;
+
+/// Night-mode circadian white-point matrix adjustment and RGB gamma ramp engine.
+#[derive(Debug, Clone, Copy)]
+pub struct NightModeColorEngine {
+    pub enabled: bool,
+    pub current_temp_k: u32,
+    pub target_temp_k: u32,
+    pub red_gain_q8: u16,   // 256 = 1.0x
+    pub green_gain_q8: u16, // 256 = 1.0x
+    pub blue_gain_q8: u16,  // 256 = 1.0x
+}
+
+impl NightModeColorEngine {
+    /// Creates a new circadian color engine initialized at 6500K daylight white-point.
+    pub const fn new() -> Self {
+        Self {
+            enabled: true,
+            current_temp_k: COLOR_TEMP_DAYLIGHT_K,
+            target_temp_k: COLOR_TEMP_DAYLIGHT_K,
+            red_gain_q8: 256,
+            green_gain_q8: 256,
+            blue_gain_q8: 256,
+        }
+    }
+
+    /// Evaluates ambient light level to determine target color temperature (warm night mode in dark conditions).
+    pub fn evaluate_ambient_lux(&mut self, lux: u32) -> u32 {
+        if !self.enabled {
+            self.target_temp_k = COLOR_TEMP_DAYLIGHT_K;
+            self.compute_gains();
+            return self.target_temp_k;
+        }
+
+        // Under 50 lux (bedside/dark gaming room): warm down toward 3200K
+        // 50 to 500 lux: linear blend from 3200K to 6500K
+        // >500 lux: full daylight 6500K
+        let temp = if lux <= 50 {
+            COLOR_TEMP_NIGHT_K
+        } else if lux >= 500 {
+            COLOR_TEMP_DAYLIGHT_K
+        } else {
+            let factor = (lux - 50) as u64;
+            let span = (COLOR_TEMP_DAYLIGHT_K - COLOR_TEMP_NIGHT_K) as u64;
+            (COLOR_TEMP_NIGHT_K as u64 + (factor * span) / 450) as u32
+        };
+
+        self.target_temp_k = temp;
+        self.compute_gains();
+        self.target_temp_k
+    }
+
+    /// Computes RGB white-point gains based on target color temperature.
+    pub fn compute_gains(&mut self) {
+        let temp = self.target_temp_k.min(COLOR_TEMP_DAYLIGHT_K).max(COLOR_TEMP_NIGHT_K);
+        // Red remains 1.0x (256)
+        self.red_gain_q8 = 256;
+
+        // As temperature drops toward 3200K, green drops slightly (~0.85x = 217), blue drops strongly (~0.50x = 128)
+        let ratio = (temp - COLOR_TEMP_NIGHT_K) as u32; // 0 (night) to 3300 (daylight)
+        let g_drop = (39 * (3300 - ratio)) / 3300; // 0 to 39
+        let b_drop = (128 * (3300 - ratio)) / 3300; // 0 to 128
+
+        self.green_gain_q8 = 256 - g_drop as u16;
+        self.blue_gain_q8 = 256 - b_drop as u16;
+    }
+
+    /// Transforms an RGB pixel via the circadian white-point matrix.
+    pub fn transform_rgb(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let tr = ((r as u32 * self.red_gain_q8 as u32) / 256) as u8;
+        let tg = ((g as u32 * self.green_gain_q8 as u32) / 256) as u8;
+        let tb = ((b as u32 * self.blue_gain_q8 as u32) / 256) as u8;
+        (tr, tg, tb)
+    }
+}
+
+/// Unit verification for night-mode circadian color engine.
+pub fn verify_night_mode_color_engine() -> bool {
+    let mut engine = NightModeColorEngine::new();
+
+    // Daylight (6500K, >500 lux): no attenuation
+    engine.evaluate_ambient_lux(1000);
+    if engine.target_temp_k != 6500 || engine.blue_gain_q8 != 256 {
+        return false;
+    }
+    let (dr, dg, db) = engine.transform_rgb(200, 200, 200);
+    if dr != 200 || dg != 200 || db != 200 {
+        return false;
+    }
+
+    // Pitch dark (<50 lux): warm night mode (3200K)
+    engine.evaluate_ambient_lux(10);
+    if engine.target_temp_k != 3200 || engine.blue_gain_q8 != 128 {
+        return false;
+    }
+    let (nr, ng, nb) = engine.transform_rgb(200, 200, 200);
+    if nr != 200 || ng >= 200 || nb != 100 {
+        return false;
+    }
+
+    true
+}
