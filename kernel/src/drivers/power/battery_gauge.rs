@@ -213,3 +213,65 @@ pub fn verify_docked_charge_limiter() -> bool {
 
     true
 }
+
+/// Cell critical thermal tripwire threshold in degrees Celsius.
+pub const BATTERY_THERMAL_TRIPWIRE_TEMP_C: i8 = 50;
+
+/// Battery thermal safety tripwire service terminating fast charging upon over-temperature.
+#[derive(Debug, Clone, Copy)]
+pub struct BatteryThermalTripwire {
+    pub tripwire_threshold_c: i8,
+    pub tripwire_triggered: bool,
+    pub fast_charge_inhibited: bool,
+}
+
+impl BatteryThermalTripwire {
+    /// Creates a new thermal tripwire monitor with 50°C safety threshold.
+    pub const fn new() -> Self {
+        Self {
+            tripwire_threshold_c: BATTERY_THERMAL_TRIPWIRE_TEMP_C,
+            tripwire_triggered: false,
+            fast_charge_inhibited: false,
+        }
+    }
+
+    /// Evaluates current cell temperature and triggers safety shutdown of fast charging.
+    pub fn evaluate_temperature(&mut self, temp_c: i8) -> bool {
+        if temp_c >= self.tripwire_threshold_c {
+            self.tripwire_triggered = true;
+            self.fast_charge_inhibited = true;
+        } else if temp_c <= self.tripwire_threshold_c - 5 {
+            // 5°C thermal hysteresis recovery (e.g. 45°C)
+            self.tripwire_triggered = false;
+            self.fast_charge_inhibited = false;
+        }
+        self.fast_charge_inhibited
+    }
+}
+
+/// Unit verification for battery thermal safety tripwire.
+pub fn verify_battery_thermal_tripwire() -> bool {
+    let mut tripwire = BatteryThermalTripwire::new();
+
+    // Normal gaming temperature 38°C: fast charge allowed
+    if tripwire.evaluate_temperature(38) || tripwire.fast_charge_inhibited {
+        return false;
+    }
+
+    // Heavy load temperature spikes to 51°C (>= 50°C): tripwire fires, fast charge inhibited
+    if !tripwire.evaluate_temperature(51) || !tripwire.fast_charge_inhibited {
+        return false;
+    }
+
+    // Cooling down to 48°C: stays inhibited due to hysteresis
+    if !tripwire.evaluate_temperature(48) || !tripwire.fast_charge_inhibited {
+        return false;
+    }
+
+    // Cools down to 44°C (<= 45°C): recovers
+    if tripwire.evaluate_temperature(44) || tripwire.fast_charge_inhibited {
+        return false;
+    }
+
+    true
+}
