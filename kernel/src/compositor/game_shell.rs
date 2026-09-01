@@ -5,6 +5,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::display::color::Color;
+use crate::compositor::dirty::Rect;
+use crate::display::font::{get_glyph, FONT_HEIGHT, FONT_WIDTH};
 
 /// Operational state of a game title in the handheld shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +478,398 @@ impl PerformanceTelemetryHud {
             0
         } else {
             ((self.hardware.gpu_vram_used_mb as u64 * 100) / self.hardware.gpu_vram_total_mb as u64) as u8
+        }
+    }
+}
+
+// Framebuffer Alpha Blitting & Visual Composition Primitives
+
+/// Formats an unsigned integer into an ASCII stack buffer without heap allocation.
+pub fn format_u32_into(mut val: u32, buf: &mut [u8; 16]) -> usize {
+    if val == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut temp = [0u8; 16];
+    let mut i = 0;
+    while val > 0 && i < 16 {
+        temp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    for j in 0..i {
+        buf[j] = temp[i - 1 - j];
+    }
+    i
+}
+
+/// Blits an alpha-blended pixel with boundary and clip rectangle enforcement.
+#[inline(always)]
+pub fn blit_pixel_alpha(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    x: usize,
+    y: usize,
+    src_color: Color,
+    clip: Option<&Rect>,
+) {
+    if x >= screen_width || y >= screen_height {
+        return;
+    }
+    if let Some(cl) = clip {
+        if !cl.contains_point(x, y) {
+            return;
+        }
+    }
+    let idx = y * screen_width + x;
+    buffer[idx] = src_color.blend(buffer[idx]);
+}
+
+/// Blits a solid alpha-blended rectangle clipped to destination boundaries.
+pub fn blit_rect_alpha(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    rect: &Rect,
+    color: Color,
+    clip: Option<&Rect>,
+) {
+    let x_end = rect.right().min(screen_width);
+    let y_end = rect.bottom().min(screen_height);
+    for ty in rect.y..y_end {
+        let row_offset = ty * screen_width;
+        for tx in rect.x..x_end {
+            if let Some(cl) = clip {
+                if !cl.contains_point(tx, ty) {
+                    continue;
+                }
+            }
+            let idx = row_offset + tx;
+            buffer[idx] = color.blend(buffer[idx]);
+        }
+    }
+}
+
+/// Blits a 1-pixel border rectangle outline.
+pub fn blit_rect_outline(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    rect: &Rect,
+    border_color: Color,
+    clip: Option<&Rect>,
+) {
+    if rect.is_empty() {
+        return;
+    }
+    let x_end = rect.right().saturating_sub(1);
+    let y_end = rect.bottom().saturating_sub(1);
+
+    for tx in rect.x..=x_end {
+        blit_pixel_alpha(buffer, screen_width, screen_height, tx, rect.y, border_color, clip);
+        blit_pixel_alpha(buffer, screen_width, screen_height, tx, y_end, border_color, clip);
+    }
+    for ty in rect.y..=y_end {
+        blit_pixel_alpha(buffer, screen_width, screen_height, rect.x, ty, border_color, clip);
+        blit_pixel_alpha(buffer, screen_width, screen_height, x_end, ty, border_color, clip);
+    }
+}
+
+/// Blits a horizontal ratio progress bar for telemetry meters.
+pub fn blit_progress_bar(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pct: u8,
+    fill_color: Color,
+    bg_color: Color,
+    clip: Option<&Rect>,
+) {
+    let bg_rect = Rect::new(x, y, w, h);
+    blit_rect_alpha(buffer, screen_width, screen_height, &bg_rect, bg_color, clip);
+
+    let clamped_pct = pct.min(100);
+    let fill_w = (w * clamped_pct as usize) / 100;
+    if fill_w > 0 {
+        let fill_rect = Rect::new(x, y, fill_w, h);
+        blit_rect_alpha(buffer, screen_width, screen_height, &fill_rect, fill_color, clip);
+    }
+    blit_rect_outline(buffer, screen_width, screen_height, &bg_rect, Color::rgba(255, 255, 255, 80), clip);
+}
+
+/// Blits a single 8x16 font glyph with alpha blending and clipping.
+pub fn blit_char_clipped(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    x: usize,
+    y: usize,
+    c: char,
+    fg: Color,
+    clip: Option<&Rect>,
+) {
+    if c == '\n' {
+        return;
+    }
+    let glyph = get_glyph(c);
+    for row in 0..FONT_HEIGHT {
+        let ty = y + row;
+        if ty >= screen_height {
+            break;
+        }
+        let bits = glyph[row];
+        for col in 0..FONT_WIDTH {
+            let tx = x + col;
+            if tx >= screen_width {
+                break;
+            }
+            if (bits & (0x80 >> col)) != 0 {
+                blit_pixel_alpha(buffer, screen_width, screen_height, tx, ty, fg, clip);
+            }
+        }
+    }
+}
+
+/// Blits an ASCII string across multiple character cells.
+pub fn blit_string_clipped(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    x: usize,
+    y: usize,
+    s: &str,
+    fg: Color,
+    clip: Option<&Rect>,
+) {
+    let mut cur_x = x;
+    for c in s.chars() {
+        if cur_x + FONT_WIDTH > screen_width {
+            break;
+        }
+        blit_char_clipped(buffer, screen_width, screen_height, cur_x, y, c, fg, clip);
+        cur_x += FONT_WIDTH;
+    }
+}
+
+/// Blits an integer followed by a suffix string.
+pub fn blit_u32_with_suffix(
+    buffer: &mut [Color],
+    screen_width: usize,
+    screen_height: usize,
+    x: usize,
+    y: usize,
+    val: u32,
+    suffix: &str,
+    fg: Color,
+    clip: Option<&Rect>,
+) -> usize {
+    let mut buf = [0u8; 16];
+    let len = format_u32_into(val, &mut buf);
+    if let Ok(s) = core::str::from_utf8(&buf[..len]) {
+        blit_string_clipped(buffer, screen_width, screen_height, x, y, s, fg, clip);
+        let next_x = x + len * FONT_WIDTH;
+        blit_string_clipped(buffer, screen_width, screen_height, next_x, y, suffix, fg, clip);
+        next_x + suffix.len() * FONT_WIDTH
+    } else {
+        x
+    }
+}
+
+impl GameShellCarousel {
+    /// Renders the fullscreen handheld game launcher shell into the target backbuffer.
+    pub fn render(
+        &self,
+        buffer: &mut [Color],
+        screen_width: usize,
+        screen_height: usize,
+        clip: Option<&Rect>,
+    ) {
+        if !self.is_shell_active || screen_width < 100 || screen_height < 100 {
+            return;
+        }
+
+        // Fill background with deep slate dark gaming theme
+        let full_screen = Rect::new(0, 0, screen_width, screen_height);
+        blit_rect_alpha(buffer, screen_width, screen_height, &full_screen, Color::rgb(18, 22, 28), clip);
+
+        // Header bar
+        let header_rect = Rect::new(0, 0, screen_width, 28);
+        blit_rect_alpha(buffer, screen_width, screen_height, &header_rect, Color::rgba(28, 36, 48, 240), clip);
+        blit_string_clipped(buffer, screen_width, screen_height, 12, 6, "KNTON HANDHELD GAMING SHELL", Color::rgb(0, 180, 255), clip);
+
+        if self.entries.is_empty() {
+            blit_string_clipped(buffer, screen_width, screen_height, 20, 80, "No games installed.", Color::WHITE, clip);
+            return;
+        }
+
+        // Render carousel cards horizontally centered
+        let card_w = 90;
+        let card_h = 95;
+        let card_gap = 12;
+        let center_x = screen_width / 2;
+        let base_y = (screen_height.saturating_sub(card_h)) / 2;
+
+        let total_entries = self.entries.len();
+        for i in 0..total_entries {
+            let offset_from_sel = i as isize - self.selected_index as isize;
+            let card_x_isize = center_x as isize + offset_from_sel * (card_w as isize + card_gap as isize) - (card_w as isize / 2);
+            if card_x_isize + (card_w as isize) < 0 || card_x_isize >= screen_width as isize {
+                continue;
+            }
+            let card_x = card_x_isize as usize;
+            let is_selected = i == self.selected_index;
+            let card_y = if is_selected { base_y.saturating_sub(6) } else { base_y };
+
+            let card_rect = Rect::new(card_x, card_y, card_w, card_h);
+            let entry = &self.entries[i];
+
+            // Card body
+            blit_rect_alpha(buffer, screen_width, screen_height, &card_rect, entry.theme_color, clip);
+
+            // Selection border highlight
+            let border_color = if is_selected {
+                Color::rgb(255, 255, 255)
+            } else {
+                Color::rgba(80, 90, 105, 180)
+            };
+            blit_rect_outline(buffer, screen_width, screen_height, &card_rect, border_color, clip);
+
+            // Title & Status
+            let title_preview = if entry.title.len() > 10 { &entry.title[..10] } else { &entry.title };
+            blit_string_clipped(buffer, screen_width, screen_height, card_x + 4, card_y + 6, title_preview, Color::WHITE, clip);
+
+            let status_str = match entry.launch_state {
+                GameLaunchState::Idle => "IDLE",
+                GameLaunchState::Launching { .. } => "LOAD",
+                GameLaunchState::Running { .. } => "PLAY",
+                GameLaunchState::Terminated { .. } => "STOP",
+            };
+            blit_string_clipped(buffer, screen_width, screen_height, card_x + 4, card_y + card_h - 20, status_str, Color::rgb(255, 215, 0), clip);
+        }
+
+        // Navigation hint footer
+        let footer_y = screen_height.saturating_sub(22);
+        let footer_rect = Rect::new(0, footer_y, screen_width, 22);
+        blit_rect_alpha(buffer, screen_width, screen_height, &footer_rect, Color::rgba(24, 30, 40, 230), clip);
+        blit_string_clipped(buffer, screen_width, screen_height, 8, footer_y + 3, "[A] Launch  [< >] Select  [Back] HUD", Color::rgb(180, 195, 215), clip);
+    }
+}
+
+impl PerformanceTelemetryHud {
+    /// Renders the real-time performance telemetry overlay plane according to the selected mode.
+    pub fn render(
+        &self,
+        buffer: &mut [Color],
+        screen_width: usize,
+        screen_height: usize,
+        clip: Option<&Rect>,
+    ) {
+        if self.mode == HudOverlayMode::Off || screen_width < 80 || screen_height < 40 {
+            return;
+        }
+
+        let bg_color = Color::rgba(18, 22, 28, self.alpha);
+        let border_color = Color::rgba(0, 180, 255, 180);
+        let text_color = Color::WHITE;
+        let accent_color = Color::rgb(0, 255, 128);
+
+        match self.mode {
+            HudOverlayMode::Off => {}
+            HudOverlayMode::CompactFps => {
+                let hud_w = 96;
+                let hud_h = 24;
+                let hud_x = screen_width.saturating_sub(hud_w + 4);
+                let hud_y = 4;
+                let hud_rect = Rect::new(hud_x, hud_y, hud_w, hud_h);
+
+                blit_rect_alpha(buffer, screen_width, screen_height, &hud_rect, bg_color, clip);
+                blit_rect_outline(buffer, screen_width, screen_height, &hud_rect, border_color, clip);
+
+                let fps = self.stats.instantaneous_fps;
+                blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 6, hud_y + 4, fps, " FPS", accent_color, clip);
+            }
+            HudOverlayMode::Standard => {
+                let hud_w = 210;
+                let hud_h = 76;
+                let hud_x = screen_width.saturating_sub(hud_w + 4);
+                let hud_y = 4;
+                let hud_rect = Rect::new(hud_x, hud_y, hud_w, hud_h);
+
+                blit_rect_alpha(buffer, screen_width, screen_height, &hud_rect, bg_color, clip);
+                blit_rect_outline(buffer, screen_width, screen_height, &hud_rect, border_color, clip);
+
+                // FPS & Frame Latency
+                let next_x = blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 6, hud_y + 6, self.stats.instantaneous_fps, " FPS | ", accent_color, clip);
+                let ms = self.stats.avg_us / 1000;
+                let next_x2 = blit_u32_with_suffix(buffer, screen_width, screen_height, next_x, hud_y + 6, ms, "ms (p99: ", text_color, clip);
+                let p99_ms = self.stats.p99_us / 1000;
+                blit_u32_with_suffix(buffer, screen_width, screen_height, next_x2, hud_y + 6, p99_ms, "ms)", text_color, clip);
+
+                // CPU Load Meter
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 24, "CPU:", text_color, clip);
+                blit_progress_bar(buffer, screen_width, screen_height, hud_x + 44, hud_y + 27, 70, 10, self.hardware.cpu_load_pct, Color::rgb(0, 150, 255), Color::rgb(40, 50, 65), clip);
+                blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 120, hud_y + 24, self.hardware.cpu_load_pct as u32, "%", text_color, clip);
+
+                // GPU VRAM Meter
+                let vram_pct = self.vram_utilization_pct();
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 40, "VRAM:", text_color, clip);
+                blit_progress_bar(buffer, screen_width, screen_height, hud_x + 44, hud_y + 43, 70, 10, vram_pct, Color::rgb(255, 120, 0), Color::rgb(40, 50, 65), clip);
+                blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 120, hud_y + 40, vram_pct as u32, "%", text_color, clip);
+
+                // Battery & Power
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 56, "BAT:", text_color, clip);
+                let bat_next = blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 44, hud_y + 56, self.hardware.battery_pct as u32, "% ", accent_color, clip);
+                let watts = self.hardware.power_draw_mw / 1000;
+                blit_u32_with_suffix(buffer, screen_width, screen_height, bat_next, hud_y + 56, watts, "W", Color::rgb(255, 215, 0), clip);
+            }
+            HudOverlayMode::DetailedDiagnostics => {
+                let hud_w = 224;
+                let hud_h = 108;
+                let hud_x = screen_width.saturating_sub(hud_w + 4);
+                let hud_y = 4;
+                let hud_rect = Rect::new(hud_x, hud_y, hud_w, hud_h);
+
+                blit_rect_alpha(buffer, screen_width, screen_height, &hud_rect, bg_color, clip);
+                blit_rect_outline(buffer, screen_width, screen_height, &hud_rect, border_color, clip);
+
+                // Line 1: FPS and percentiles
+                let next_x = blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 6, hud_y + 6, self.stats.instantaneous_fps, " FPS  AVG:", accent_color, clip);
+                let ms = self.stats.avg_us / 1000;
+                blit_u32_with_suffix(buffer, screen_width, screen_height, next_x, hud_y + 6, ms, "ms", text_color, clip);
+
+                // Line 2: Frame min/max/p99
+                let p99_next = blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 6, hud_y + 22, self.stats.p99_us / 1000, "ms P99  MIN:", text_color, clip);
+                let min_next = blit_u32_with_suffix(buffer, screen_width, screen_height, p99_next, hud_y + 22, self.stats.min_us / 1000, "ms  MAX:", text_color, clip);
+                blit_u32_with_suffix(buffer, screen_width, screen_height, min_next, hud_y + 22, self.stats.max_us / 1000, "ms", text_color, clip);
+
+                // Line 3: CPU & VRAM
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 38, "CPU:", text_color, clip);
+                blit_progress_bar(buffer, screen_width, screen_height, hud_x + 44, hud_y + 41, 60, 8, self.hardware.cpu_load_pct, Color::rgb(0, 150, 255), Color::rgb(40, 50, 65), clip);
+                let vram_pct = self.vram_utilization_pct();
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 114, hud_y + 38, "VRAM:", text_color, clip);
+                blit_progress_bar(buffer, screen_width, screen_height, hud_x + 158, hud_y + 41, 55, 8, vram_pct, Color::rgb(255, 120, 0), Color::rgb(40, 50, 65), clip);
+
+                // Line 4: Thermal & Fan
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 54, "SOC:", text_color, clip);
+                let soc_next = blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 40, hud_y + 54, self.hardware.soc_temp_celsius as u32, "C  FAN:", text_color, clip);
+                blit_u32_with_suffix(buffer, screen_width, screen_height, soc_next, hud_y + 54, self.hardware.fan_rpm as u32, "RPM", text_color, clip);
+
+                // Line 5: Peltier & Power
+                let peltier_str = if self.hardware.peltier_active { "PELTIER:ON  " } else { "PELTIER:OFF " };
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 70, peltier_str, Color::rgb(0, 255, 255), clip);
+                let watts = self.hardware.power_draw_mw / 1000;
+                blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 110, hud_y + 70, watts, "W", Color::rgb(255, 215, 0), clip);
+
+                // Line 6: Battery
+                let bat_str = if self.hardware.is_charging { "BAT (CHG):" } else { "BATTERY:" };
+                blit_string_clipped(buffer, screen_width, screen_height, hud_x + 6, hud_y + 86, bat_str, text_color, clip);
+                blit_u32_with_suffix(buffer, screen_width, screen_height, hud_x + 90, hud_y + 86, self.hardware.battery_pct as u32, "%", accent_color, clip);
+            }
         }
     }
 }
