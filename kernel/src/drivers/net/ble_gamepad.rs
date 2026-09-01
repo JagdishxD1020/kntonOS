@@ -313,3 +313,88 @@ pub fn verify_le_audio_streamer() -> bool {
 
     true
 }
+
+/// Link quality grade based on Received Signal Strength Indication (RSSI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleLinkQuality {
+    Excellent, // > -60 dBm
+    Good,      // -60 to -75 dBm
+    Poor,      // -75 to -88 dBm
+    Critical,  // < -88 dBm
+}
+
+/// Dynamic connection quality monitor, adaptive retransmission, and health telemetry.
+#[derive(Debug, Clone, Copy)]
+pub struct BleLinkQualityMonitor {
+    pub current_rssi_dbm: i8,
+    pub packet_loss_rate_ppm: u32, // Parts per million
+    pub retransmissions_requested: u32,
+    pub link_quality: BleLinkQuality,
+}
+
+impl BleLinkQualityMonitor {
+    /// Creates a new BLE link quality monitor.
+    pub const fn new() -> Self {
+        Self {
+            current_rssi_dbm: -65,
+            packet_loss_rate_ppm: 0,
+            retransmissions_requested: 0,
+            link_quality: BleLinkQuality::Good,
+        }
+    }
+
+    /// Ingests a new RSSI measurement from HCI and updates quality grade.
+    pub fn update_rssi(&mut self, rssi_dbm: i8) -> BleLinkQuality {
+        self.current_rssi_dbm = rssi_dbm;
+        self.link_quality = if rssi_dbm > -60 {
+            BleLinkQuality::Excellent
+        } else if rssi_dbm >= -75 {
+            BleLinkQuality::Good
+        } else if rssi_dbm >= -88 {
+            BleLinkQuality::Poor
+        } else {
+            BleLinkQuality::Critical
+        };
+        self.link_quality
+    }
+
+    /// Evaluates whether an immediate packet retransmission should be requested based on ACK timeout / CRC error.
+    pub fn record_packet_event(&mut self, success: bool) -> bool {
+        if !success {
+            self.retransmissions_requested += 1;
+            self.packet_loss_rate_ppm = (self.packet_loss_rate_ppm + 10_000).min(1_000_000);
+            true
+        } else {
+            self.packet_loss_rate_ppm = self.packet_loss_rate_ppm.saturating_sub(1_000);
+            false
+        }
+    }
+}
+
+/// Unit verification for RSSI link quality monitor.
+pub fn verify_ble_link_quality_monitor() -> bool {
+    let mut mon = BleLinkQualityMonitor::new();
+
+    if mon.update_rssi(-55) != BleLinkQuality::Excellent {
+        return false;
+    }
+    if mon.update_rssi(-70) != BleLinkQuality::Good {
+        return false;
+    }
+    if mon.update_rssi(-80) != BleLinkQuality::Poor {
+        return false;
+    }
+    if mon.update_rssi(-92) != BleLinkQuality::Critical {
+        return false;
+    }
+
+    // Packet loss recording
+    if !mon.record_packet_event(false) || mon.retransmissions_requested != 1 {
+        return false;
+    }
+    if mon.record_packet_event(true) {
+        return false;
+    }
+
+    true
+}
