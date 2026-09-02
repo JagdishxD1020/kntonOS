@@ -17,6 +17,7 @@ pub mod trackball;
 pub mod hall_effect;
 pub mod biometric;
 pub mod trigger_motor;
+pub mod xinput;
 
 pub use imu::*;
 pub use gamepad::*;
@@ -35,6 +36,7 @@ pub use trackball::*;
 pub use hall_effect::*;
 pub use biometric::*;
 pub use trigger_motor::*;
+pub use xinput::*;
 
 use crate::serial_write_str;
 
