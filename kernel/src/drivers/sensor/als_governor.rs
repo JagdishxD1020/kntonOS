@@ -332,3 +332,28 @@ pub fn verify_hysteresis_stabilizer() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld Ambient Light Sensor (ALS) Dynamic Screen Dimming & Color Governor.
+pub fn test_als_governor_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SENSOR] Testing Handheld ALS Dynamic Backlight & Color Temperature Governor...\r\n");
+
+    if !verify_als_sensor_model() {
+        crate::serial_write_str("[KNT-PANIC] ALS hardware sensor model verification failed!\r\n");
+        return false;
+    }
+    if !verify_perceptual_backlight_governor() {
+        crate::serial_write_str("[KNT-PANIC] Perceptual backlight governor verification failed!\r\n");
+        return false;
+    }
+    if !verify_night_mode_color_engine() {
+        crate::serial_write_str("[KNT-PANIC] Night-mode color temperature engine verification failed!\r\n");
+        return false;
+    }
+    if !verify_hysteresis_stabilizer() {
+        crate::serial_write_str("[KNT-PANIC] Hysteresis stabilization governor verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-SENSOR-ALS-PASS] Handheld ALS dynamic backlight and color temperature governor verified\r\n");
+    true
+}
