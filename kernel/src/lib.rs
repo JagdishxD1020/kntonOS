@@ -657,6 +657,10 @@ pub extern "C" fn kmain() -> ! {
     if !audio::test_audio_vad_subsystem() {
         serial_write_str("[KNT-PANIC] Audio VAD and acoustic echo canceler self-test failed!\r\n");
     }
+    // Initialize and verify Userland XAudio2 Game Audio Service & Voice Graph (TASK-KNT-138)
+    if !audio::test_xaudio2_service_subsystem() {
+        serial_write_str("[KNT-PANIC] Userland XAudio2 game audio service self-test failed!\r\n");
+    }
 
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
