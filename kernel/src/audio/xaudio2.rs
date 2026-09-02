@@ -660,3 +660,31 @@ pub fn verify_xaudio2_mastering_voice_and_matrix() -> bool {
 
     true
 }
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Userland XAudio2 Low-Latency Game Audio API Service.
+pub fn test_xaudio2_service_subsystem() -> bool {
+    serial_write_str("[KNT-AUDIO] Testing userland XAudio2 game audio service & voice graph...\r\n");
+
+    // 1. Verify audio format descriptors and buffer representations
+    if !verify_xaudio2_format_structures() {
+        serial_write_str("[KNT-PANIC] XAudio2 format descriptors verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify source voice lifecycle, multi-buffer queuing, and pitch ratio resampling
+    if !verify_xaudio2_source_voice() {
+        serial_write_str("[KNT-PANIC] XAudio2 source voice processing verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify channel matrix routing, surround upmix/downmix, and master voice mixdown
+    if !verify_xaudio2_mastering_voice_and_matrix() {
+        serial_write_str("[KNT-PANIC] XAudio2 mastering voice and channel matrix verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-XAUDIO2-PASS] Userland XAudio2 game audio service and voice graph verified\r\n");
+    true
+}
