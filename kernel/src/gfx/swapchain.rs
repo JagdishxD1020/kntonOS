@@ -439,3 +439,133 @@ impl UmdCommandStreamer {
         self.fence.is_completed(fence_val)
     }
 }
+
+/// Comprehensive verification self-test suite for Direct3D 12 UMD Command Streamer & Swapchain Service.
+pub fn test_swapchain_service_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 UMD Command Streamer & Swapchain Service...\r\n");
+
+    // 1. Verify DXGI Swapchain Creation and Backbuffer Allocation
+    let desc = DXGISwapChainDesc {
+        width: 64,
+        height: 48,
+        format: DxgiFormat::R8G8B8A8Unorm,
+        buffer_count: 3,
+        swap_effect: DxgiSwapEffect::FlipDiscard,
+        sample_desc: DxgiSampleDesc::default(),
+        buffer_usage: DxgiUsage::RENDER_TARGET_OUTPUT,
+        flags: 0,
+    };
+    let mut swapchain = match DXGISwapChain::new(desc) {
+        Ok(sc) => sc,
+        Err(_) => {
+            crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Failed to create swapchain\r\n");
+            return false;
+        }
+    };
+
+    if swapchain.backbuffers.len() != 3 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Backbuffer count mismatch\r\n");
+        return false;
+    }
+    if swapchain.current_backbuffer_index != 0 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Initial backbuffer index must be 0\r\n");
+        return false;
+    }
+
+    // 2. Verify Flip-Model Buffer Rotation and Present Latency Statistics
+    let p0 = swapchain.present(1, 0, 1_000_000);
+    if p0 != Ok(0) || swapchain.current_backbuffer_index != 1 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present frame 0 rotation failed\r\n");
+        return false;
+    }
+
+    let p1 = swapchain.present(1, 0, 17_666_000);
+    if p1 != Ok(1) || swapchain.current_backbuffer_index != 2 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present frame 1 rotation failed\r\n");
+        return false;
+    }
+
+    let p2 = swapchain.present(0, 0, 34_333_000);
+    if p2 != Ok(2) || swapchain.current_backbuffer_index != 0 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present frame 2 wrap-around failed\r\n");
+        return false;
+    }
+
+    if swapchain.present_count != 3 || swapchain.present_mode != DXGIPresentationMode::Mailbox {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Swapchain present count or mode mismatch\r\n");
+        return false;
+    }
+    let avg_latency = swapchain.average_present_latency_us();
+    if avg_latency == 0 || avg_latency > 30_000 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present latency average out of expected bounds\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Swapchain allocation, flip rotation, and present latency verified\r\n");
+
+    // 3. Verify User-Mode Command Streamer and Timeline Fence Synchronization
+    let mut streamer = UmdCommandStreamer::new(1, 42, 1024);
+
+    streamer.record_clear_backbuffer(swapchain.get_current_backbuffer_mut(), Color::rgb(30, 40, 50));
+    if let Err(_) = streamer.record_set_pipeline_state(1001) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Failed to record set pipeline state\r\n");
+        return false;
+    }
+    if let Err(_) = streamer.record_draw_indexed(36, 0, 0) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Failed to record draw indexed\r\n");
+        return false;
+    }
+    if let Err(_) = streamer.record_resource_barrier(0x2000_0000, ResourceState::RENDER_TARGET, ResourceState::PRESENT) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Failed to record resource barrier\r\n");
+        return false;
+    }
+
+    let (cmdbuf, fence_val) = match streamer.submit() {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Failed to submit command buffer\r\n");
+            return false;
+        }
+    };
+    if cmdbuf.packet_count() < 3 || fence_val != 1 {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Submission packet count or fence value mismatch\r\n");
+        return false;
+    }
+    if !streamer.fence.is_signaled(1) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Fence signal check failed\r\n");
+        return false;
+    }
+    if streamer.is_fence_completed(1) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Fence should not be completed prior to complete_frame\r\n");
+        return false;
+    }
+
+    streamer.complete_frame(1);
+    if !streamer.is_fence_completed(1) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Fence completed check failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * UMD command streamer packet encoding and timeline fence synchronization verified\r\n");
+
+    // 4. Verify Present Blit to Compositor Surface
+    let mut compositor_target = alloc::vec![Color::BLACK; 64 * 48];
+    let front = swapchain.get_current_backbuffer_mut();
+    front.set_pixel(32, 24, Color::rgb(255, 128, 0));
+
+    present_blit(front, &mut compositor_target, 64, 48, 0, 0, None);
+    if compositor_target[24 * 64 + 32] != Color::rgb(255, 128, 0) {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present blit pixel mismatch\r\n");
+        return false;
+    }
+
+    let clip_box = Rect::new(0, 0, 10, 10);
+    compositor_target[24 * 64 + 32] = Color::BLACK;
+    present_blit(front, &mut compositor_target, 64, 48, 0, 0, Some(&clip_box));
+    if compositor_target[24 * 64 + 32] != Color::BLACK {
+        crate::serial_write_str("[KNT-SWAPCHAIN-FAIL] Present blit clip boundary failure\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Direct present blit to compositor plane and clipping boundary verified\r\n");
+
+    crate::serial_write_str("[KNT-SWAPCHAIN-PASS] Direct3D 12 UMD command streamer and swapchain service verified\r\n");
+    true
+}
