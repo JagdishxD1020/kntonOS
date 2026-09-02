@@ -461,3 +461,161 @@ pub fn win32_exit_process(exit_code: u32) {
         0,
     );
 }
+
+/// Comprehensive self-test suite verifying the Win32 Kernel32 API & Dynamic Symbol Resolution Emulation layer.
+pub fn test_kernel32_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-KERNEL32-TEST] Executing Win32 Kernel32 API & symbol resolution verification...\r\n");
+
+    // 1. Verify module loading and export symbol resolution
+    {
+        let h_kernel32 = win32_load_library("kernel32.dll");
+        if h_kernel32 != HMODULE_KERNEL32 {
+            return false;
+        }
+
+        if win32_load_library("KERNEL32") != HMODULE_KERNEL32 {
+            return false;
+        }
+        if win32_load_library("user32") != HMODULE_USER32 {
+            return false;
+        }
+        if win32_load_library("gdi32.dll") != HMODULE_GDI32 {
+            return false;
+        }
+        if win32_load_library("nonexistent.dll") != HMODULE_INVALID {
+            return false;
+        }
+
+        let p_virtual_alloc = win32_get_proc_address(h_kernel32, "VirtualAlloc");
+        if p_virtual_alloc != 0x7FFF_0001_1010 {
+            return false;
+        }
+
+        let p_create_file = win32_get_proc_address(h_kernel32, "CreateFileA");
+        if p_create_file != 0x7FFF_0001_1040 {
+            return false;
+        }
+
+        let p_get_proc_addr = win32_get_proc_address(h_kernel32, "GetProcAddress");
+        if p_get_proc_addr != 0x7FFF_0001_1080 {
+            return false;
+        }
+
+        let h_user32 = win32_load_library("user32.dll");
+        if win32_get_proc_address(h_user32, "MessageBoxA") != 0x7FFF_0002_1010 {
+            return false;
+        }
+
+        let h_gdi32 = win32_load_library("gdi32.dll");
+        if win32_get_proc_address(h_gdi32, "BitBlt") != 0x7FFF_0003_1040 {
+            return false;
+        }
+
+        if win32_get_proc_address(h_kernel32, "NonExistentFunction") != 0 {
+            return false;
+        }
+    }
+
+    // 2. Verify virtual memory allocation via Win32 page protection flags
+    unsafe {
+        let mem = win32_virtual_alloc(
+            core::ptr::null_mut(),
+            4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        );
+        if mem.is_null() {
+            return false;
+        }
+
+        let mut old_protect = 0u32;
+        let protect_res = win32_virtual_protect(
+            mem,
+            4096,
+            PAGE_EXECUTE_READWRITE,
+            &mut old_protect as *mut u32,
+        );
+        if !protect_res || old_protect != PAGE_READWRITE {
+            return false;
+        }
+
+        let free_res = win32_virtual_free(mem, 0, MEM_RELEASE);
+        if !free_res {
+            return false;
+        }
+
+        let invalid_alloc = win32_virtual_alloc(
+            core::ptr::null_mut(),
+            0,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+        );
+        if !invalid_alloc.is_null() || win32_get_last_error() != ERROR_INVALID_PARAMETER {
+            return false;
+        }
+    }
+
+    // 3. Verify file handle mapping and table disposal
+    unsafe {
+        let h_file = win32_create_file(
+            "CONOUT$",
+            GENERIC_WRITE | GENERIC_READ,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+        );
+        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+            return false;
+        }
+
+        let banner = b"[KNT-KERNEL32-TEST] Win32 console write verified\r\n";
+        let mut bytes_written = 0u32;
+        let write_ok = win32_write_file(
+            h_file,
+            banner.as_ptr(),
+            banner.len() as u32,
+            &mut bytes_written as *mut u32,
+        );
+        if !write_ok || bytes_written != banner.len() as u32 {
+            return false;
+        }
+
+        let mut read_buf = [0u8; 16];
+        let mut bytes_read = 0u32;
+        let read_ok = win32_read_file(
+            h_file,
+            read_buf.as_mut_ptr(),
+            read_buf.len() as u32,
+            &mut bytes_read as *mut u32,
+        );
+        if !read_ok {
+            return false;
+        }
+
+        let close_ok = win32_close_handle(h_file);
+        if !close_ok {
+            return false;
+        }
+
+        let bad_close = win32_close_handle(INVALID_HANDLE_VALUE);
+        if bad_close || win32_get_last_error() != ERROR_INVALID_HANDLE {
+            return false;
+        }
+    }
+
+    // 4. Verify process environment and module handle helpers
+    {
+        let h_mod = win32_get_module_handle(None);
+        if h_mod != HMODULE_KERNEL32 {
+            return false;
+        }
+
+        let cmdline = win32_get_command_line();
+        if !cmdline.starts_with("init.exe") {
+            return false;
+        }
+    }
+
+    crate::serial_write_str("[KNT-KERNEL32-PASS] Win32 Kernel32 API and dynamic symbol resolution verified\r\n");
+    true
+}
