@@ -385,6 +385,185 @@ impl AsyncComputeOverlapOptimizer {
     }
 }
 
+// Execution state for an individual hardware queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareQueueState {
+    pub desc: D3D12_COMMAND_QUEUE_DESC,
+    pub pending_batches: Vec<CommandBatch>,
+    pub in_flight_batches: Vec<CommandBatch>,
+    pub total_executed_batches: u64,
+}
+
+impl HardwareQueueState {
+    pub const fn new(desc: D3D12_COMMAND_QUEUE_DESC) -> Self {
+        Self {
+            desc,
+            pending_batches: Vec::new(),
+            in_flight_batches: Vec::new(),
+            total_executed_batches: 0,
+        }
+    }
+
+    // Pushes a new command batch to the queue's pending list.
+    pub fn push_batch(&mut self, batch: CommandBatch) {
+        self.pending_batches.push(batch);
+    }
+}
+
+// Multi-queue scheduler orchestrating Direct, Compute, and Copy queues with priority preemption.
+#[derive(Debug)]
+pub struct MultiQueueScheduler {
+    pub direct_queue: HardwareQueueState,
+    pub compute_queue: HardwareQueueState,
+    pub copy_queue: HardwareQueueState,
+    pub sync_hub: CrossQueueSyncHub,
+    pub saturation_tracker: ComputeWaveSaturationTracker,
+    pub overlap_optimizer: AsyncComputeOverlapOptimizer,
+    pub preemption_events_count: u64,
+}
+
+impl MultiQueueScheduler {
+    // Creates a new multi-queue scheduler with standard hardware queue configurations.
+    pub fn new(max_hardware_waves: u32) -> Self {
+        Self {
+            direct_queue: HardwareQueueState::new(D3D12_COMMAND_QUEUE_DESC::new(
+                D3D12_COMMAND_LIST_TYPE::Direct,
+                D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+            )),
+            compute_queue: HardwareQueueState::new(D3D12_COMMAND_QUEUE_DESC::new(
+                D3D12_COMMAND_LIST_TYPE::Compute,
+                D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+            )),
+            copy_queue: HardwareQueueState::new(D3D12_COMMAND_QUEUE_DESC::new(
+                D3D12_COMMAND_LIST_TYPE::Copy,
+                D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+            )),
+            sync_hub: CrossQueueSyncHub::new(),
+            saturation_tracker: ComputeWaveSaturationTracker::new(max_hardware_waves),
+            overlap_optimizer: AsyncComputeOverlapOptimizer::new(),
+            preemption_events_count: 0,
+        }
+    }
+
+    // Submits a command batch to the specified hardware queue.
+    pub fn submit_batch(&mut self, batch: CommandBatch) {
+        match batch.queue_type {
+            D3D12_COMMAND_LIST_TYPE::Direct => self.direct_queue.push_batch(batch),
+            D3D12_COMMAND_LIST_TYPE::Compute => self.compute_queue.push_batch(batch),
+            D3D12_COMMAND_LIST_TYPE::Copy => self.copy_queue.push_batch(batch),
+            _ => {}
+        }
+    }
+
+    // Sets execution priority for a specific hardware queue.
+    pub fn set_queue_priority(
+        &mut self,
+        queue_type: D3D12_COMMAND_LIST_TYPE,
+        priority: D3D12_COMMAND_QUEUE_PRIORITY,
+    ) {
+        match queue_type {
+            D3D12_COMMAND_LIST_TYPE::Direct => self.direct_queue.desc.priority = priority,
+            D3D12_COMMAND_LIST_TYPE::Compute => self.compute_queue.desc.priority = priority,
+            D3D12_COMMAND_LIST_TYPE::Copy => self.copy_queue.desc.priority = priority,
+            _ => {}
+        }
+    }
+
+    // Selects and schedules the next eligible command batch based on priority and overlap rules.
+    pub fn schedule_next(&mut self) -> Option<(D3D12_COMMAND_LIST_TYPE, CommandBatch, OverlapDecision)> {
+        let direct_ready = !self.direct_queue.pending_batches.is_empty()
+            && self.sync_hub.can_queue_proceed(D3D12_COMMAND_LIST_TYPE::Direct);
+        let compute_ready = !self.compute_queue.pending_batches.is_empty()
+            && self.sync_hub.can_queue_proceed(D3D12_COMMAND_LIST_TYPE::Compute);
+        let copy_ready = !self.copy_queue.pending_batches.is_empty()
+            && self.sync_hub.can_queue_proceed(D3D12_COMMAND_LIST_TYPE::Copy);
+
+        let mut candidates = Vec::new();
+        if direct_ready {
+            candidates.push((self.direct_queue.desc.priority, D3D12_COMMAND_LIST_TYPE::Direct));
+        }
+        if compute_ready {
+            candidates.push((self.compute_queue.desc.priority, D3D12_COMMAND_LIST_TYPE::Compute));
+        }
+        if copy_ready {
+            candidates.push((self.copy_queue.desc.priority, D3D12_COMMAND_LIST_TYPE::Copy));
+        }
+
+        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for &(_prio, q_type) in &candidates {
+            match q_type {
+                D3D12_COMMAND_LIST_TYPE::Direct => {
+                    let batch = self.direct_queue.pending_batches.remove(0);
+                    self.saturation_tracker.update_graphics_load(batch.estimated_waves, batch.is_raster_heavy);
+                    self.direct_queue.in_flight_batches.push(batch.clone());
+                    return Some((D3D12_COMMAND_LIST_TYPE::Direct, batch, OverlapDecision::ExecuteImmediate));
+                }
+                D3D12_COMMAND_LIST_TYPE::Compute => {
+                    let batch = &self.compute_queue.pending_batches[0];
+                    let decision = self.overlap_optimizer.evaluate_dispatch(&self.saturation_tracker, batch.estimated_waves);
+                    if decision == OverlapDecision::YieldUntilRasterDone {
+                        continue;
+                    }
+                    let batch = self.compute_queue.pending_batches.remove(0);
+                    let waves = match decision {
+                        OverlapDecision::ThrottleWaves { max_waves } => max_waves.min(batch.estimated_waves),
+                        _ => batch.estimated_waves,
+                    };
+                    self.saturation_tracker.update_compute_load(waves);
+                    self.compute_queue.in_flight_batches.push(batch.clone());
+                    return Some((D3D12_COMMAND_LIST_TYPE::Compute, batch, decision));
+                }
+                D3D12_COMMAND_LIST_TYPE::Copy => {
+                    let batch = self.copy_queue.pending_batches.remove(0);
+                    self.copy_queue.in_flight_batches.push(batch.clone());
+                    return Some((D3D12_COMMAND_LIST_TYPE::Copy, batch, OverlapDecision::ExecuteImmediate));
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
+    // Completes an in-flight batch and updates synchronization dependencies.
+    pub fn complete_batch(
+        &mut self,
+        queue_type: D3D12_COMMAND_LIST_TYPE,
+        batch_id: u64,
+        signal_op: Option<(u64, u64)>,
+    ) -> bool {
+        let queue = match queue_type {
+            D3D12_COMMAND_LIST_TYPE::Direct => &mut self.direct_queue,
+            D3D12_COMMAND_LIST_TYPE::Compute => &mut self.compute_queue,
+            D3D12_COMMAND_LIST_TYPE::Copy => &mut self.copy_queue,
+            _ => return false,
+        };
+
+        let pos = queue.in_flight_batches.iter().position(|b| b.batch_id == batch_id);
+        if let Some(idx) = pos {
+            queue.in_flight_batches.remove(idx);
+            queue.total_executed_batches = queue.total_executed_batches.saturating_add(1);
+
+            if queue_type == D3D12_COMMAND_LIST_TYPE::Direct {
+                self.saturation_tracker.update_graphics_load(0, false);
+            } else if queue_type == D3D12_COMMAND_LIST_TYPE::Compute {
+                self.saturation_tracker.update_compute_load(0);
+            }
+
+            if let Some((sem_id, val)) = signal_op {
+                let _ = self.sync_hub.queue_signal(queue_type, sem_id, val);
+                self.sync_hub.resolve_completed_waits(D3D12_COMMAND_LIST_TYPE::Direct);
+                self.sync_hub.resolve_completed_waits(D3D12_COMMAND_LIST_TYPE::Compute);
+                self.sync_hub.resolve_completed_waits(D3D12_COMMAND_LIST_TYPE::Copy);
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_d3d12_async_compute_subsystem() -> bool {
     true
