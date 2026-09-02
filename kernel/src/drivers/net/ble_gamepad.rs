@@ -200,8 +200,8 @@ pub fn verify_low_latency_input_framer() -> bool {
     let mut report = [0u8; 16];
     report[0] = 0x01; // Button A pressed
     report[1] = 0x00;
-    report[2] = 0x00; // LX = 1000
-    report[3] = 0x03; // (0x03E8 = 1000)
+    report[2] = 0xE8; // LX = 1000 (0x03E8 in LE: [0xE8, 0x03])
+    report[3] = 0x03;
     report[4] = 0x00; // LY = 0
     report[5] = 0x00;
 
@@ -396,5 +396,30 @@ pub fn verify_ble_link_quality_monitor() -> bool {
         return false;
     }
 
+    true
+}
+
+/// Comprehensive verification self-test suite for Handheld Bluetooth Low Energy (BLE) Gamepad & Low-Latency Audio Transceiver Engine.
+pub fn test_ble_gamepad_subsystem() -> bool {
+    crate::serial_write_str("[KNT-NET] Testing Handheld BLE Gamepad & LE Audio Transceiver...\r\n");
+
+    if !verify_ble_hci_parser() {
+        crate::serial_write_str("[KNT-PANIC] BLE HCI packet parser verification failed!\r\n");
+        return false;
+    }
+    if !verify_low_latency_input_framer() {
+        crate::serial_write_str("[KNT-PANIC] Low-latency input framer verification failed!\r\n");
+        return false;
+    }
+    if !verify_le_audio_streamer() {
+        crate::serial_write_str("[KNT-PANIC] LE Audio isochronous streamer verification failed!\r\n");
+        return false;
+    }
+    if !verify_ble_link_quality_monitor() {
+        crate::serial_write_str("[KNT-PANIC] BLE link quality monitor verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-BLE-GAMEPAD-PASS] Handheld BLE gamepad and LE Audio transceiver verified\r\n");
     true
 }
