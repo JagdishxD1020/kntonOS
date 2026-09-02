@@ -3,8 +3,10 @@ pub mod loader;
 pub mod image;
 pub mod user_stack;
 pub mod spawn;
+pub mod ntdll;
 
 pub use header::*;
+pub use ntdll::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;

@@ -5,10 +5,12 @@ pub const USER_SPACE_START: usize = 0x0000_0000_0001_0000; // 64 KiB guard page
 pub const USER_SPACE_END: usize = 0x0000_7FFF_FFFF_FFFF;   // 128 TiB canonical userland boundary
 
 pub const STATUS_SUCCESS: u32 = 0x0000_0000;
+pub const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
 pub const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+pub const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 pub const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
 /// Validates whether a given virtual address falls within userland boundaries.
