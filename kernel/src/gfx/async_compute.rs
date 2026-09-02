@@ -564,7 +564,172 @@ impl MultiQueueScheduler {
     }
 }
 
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Async Compute & High-Priority Graphics Queue Scheduler.
 pub fn test_d3d12_async_compute_subsystem() -> bool {
+    // 1. Verify priority preemption scheduling
+    let mut scheduler = MultiQueueScheduler::new(1024);
+
+    scheduler.set_queue_priority(
+        D3D12_COMMAND_LIST_TYPE::Direct,
+        D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+    );
+    scheduler.set_queue_priority(
+        D3D12_COMMAND_LIST_TYPE::Compute,
+        D3D12_COMMAND_QUEUE_PRIORITY::High,
+    );
+
+    // Direct batch submitted first
+    scheduler.submit_batch(CommandBatch::new(
+        1,
+        D3D12_COMMAND_LIST_TYPE::Direct,
+        D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+        100,
+        256,
+        false,
+    ));
+
+    // High priority compute batch submitted second
+    scheduler.submit_batch(CommandBatch::new(
+        2,
+        D3D12_COMMAND_LIST_TYPE::Compute,
+        D3D12_COMMAND_QUEUE_PRIORITY::High,
+        50,
+        256,
+        false,
+    ));
+
+    // High priority compute batch must preempt normal priority direct batch
+    let scheduled_first = scheduler.schedule_next();
+    match scheduled_first {
+        Some((q_type, batch, _)) => {
+            if q_type != D3D12_COMMAND_LIST_TYPE::Compute || batch.batch_id != 2 {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    // Complete the compute batch
+    if !scheduler.complete_batch(D3D12_COMMAND_LIST_TYPE::Compute, 2, None) {
+        return false;
+    }
+
+    // Now Direct batch can be scheduled
+    let scheduled_second = scheduler.schedule_next();
+    match scheduled_second {
+        Some((q_type, batch, _)) => {
+            if q_type != D3D12_COMMAND_LIST_TYPE::Direct || batch.batch_id != 1 {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    if !scheduler.complete_batch(D3D12_COMMAND_LIST_TYPE::Direct, 1, None) {
+        return false;
+    }
+
+    // 2. Verify cross-queue timeline semaphore synchronization
+    let sem_id = 42;
+    scheduler.sync_hub.register_semaphore(sem_id, 0);
+
+    // Direct queue waits on semaphore 42 reaching value 1
+    scheduler.sync_hub.queue_wait(D3D12_COMMAND_LIST_TYPE::Direct, sem_id, 1);
+
+    scheduler.submit_batch(CommandBatch::new(
+        10,
+        D3D12_COMMAND_LIST_TYPE::Direct,
+        D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+        100,
+        256,
+        false,
+    ));
+
+    // Direct queue is stalled by unsatisfied timeline wait
+    if scheduler.sync_hub.can_queue_proceed(D3D12_COMMAND_LIST_TYPE::Direct) {
+        return false;
+    }
+
+    // Submit compute batch 11 that produces data and signals semaphore 42
+    scheduler.submit_batch(CommandBatch::new(
+        11,
+        D3D12_COMMAND_LIST_TYPE::Compute,
+        D3D12_COMMAND_QUEUE_PRIORITY::Normal,
+        80,
+        256,
+        false,
+    ));
+
+    // Direct cannot proceed, so Compute batch 11 must be scheduled
+    let scheduled_compute = scheduler.schedule_next();
+    match scheduled_compute {
+        Some((q_type, batch, _)) => {
+            if q_type != D3D12_COMMAND_LIST_TYPE::Compute || batch.batch_id != 11 {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    // Complete compute batch 11 and signal semaphore 42 with value 1
+    if !scheduler.complete_batch(D3D12_COMMAND_LIST_TYPE::Compute, 11, Some((sem_id, 1))) {
+        return false;
+    }
+
+    // Now Direct queue dependency is satisfied
+    if !scheduler.sync_hub.can_queue_proceed(D3D12_COMMAND_LIST_TYPE::Direct) {
+        return false;
+    }
+
+    let scheduled_direct = scheduler.schedule_next();
+    match scheduled_direct {
+        Some((q_type, batch, _)) => {
+            if q_type != D3D12_COMMAND_LIST_TYPE::Direct || batch.batch_id != 10 {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    if !scheduler.complete_batch(D3D12_COMMAND_LIST_TYPE::Direct, 10, None) {
+        return false;
+    }
+
+    // 3. Verify compute overlap pacing & saturation optimization
+    let mut tracker = ComputeWaveSaturationTracker::new(1024);
+    let mut optimizer = AsyncComputeOverlapOptimizer::new();
+
+    // Heavy rasterization pass (700 waves, raster-heavy flag = true)
+    tracker.update_graphics_load(700, true);
+    if tracker.l2_bandwidth_pressure_pct < 80 {
+        return false;
+    }
+
+    // High L2 pressure during raster-heavy pass triggers YieldUntilRasterDone
+    let yield_decision = optimizer.evaluate_dispatch(&tracker, 512);
+    if yield_decision != OverlapDecision::YieldUntilRasterDone {
+        return false;
+    }
+
+    // Moderate non-raster graphics pass (200 waves, raster-heavy flag = false)
+    tracker.update_graphics_load(200, false);
+    let immediate_decision = optimizer.evaluate_dispatch(&tracker, 512);
+    if immediate_decision != OverlapDecision::ExecuteImmediate {
+        return false;
+    }
+
+    // Saturated condition (600 graphics waves + 400 compute waves = 1000/1024 > 85%)
+    tracker.update_graphics_load(600, false);
+    let throttle_decision = optimizer.evaluate_dispatch(&tracker, 400);
+    match throttle_decision {
+        OverlapDecision::ThrottleWaves { max_waves } => {
+            if max_waves > 400 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    crate::serial_write_str("[KNT-D3D12-ASYNC-COMPUTE-PASS] Direct3D 12 async compute and high-priority graphics queue scheduler verified\r\n");
     true
 }
