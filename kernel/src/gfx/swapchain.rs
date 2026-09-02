@@ -4,6 +4,9 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::display::color::Color;
+use crate::compositor::dirty::Rect;
+use crate::gfx::cmdbuf::{CommandBufferRecorder, DrawIndexedPayload, GpuCommandBuffer, PipelineStageFlags, PrimitiveTopology, ResourceState, SetPipelineStatePayload};
+use crate::gfx::gpu_fence::GpuTimelineFence;
 
 /// Standard DXGI surface pixel formats used by Direct3D 12 applications.
 #[repr(u32)]
@@ -298,5 +301,141 @@ impl DXGISwapChain {
         self.current_backbuffer_index = 0;
         self.last_presented_index = 0;
         Ok(())
+    }
+}
+
+/// Direct blit transferring swapchain backbuffer contents into a destination framebuffer/plane.
+pub fn present_blit(
+    source: &BackbufferSurface,
+    target: &mut [Color],
+    target_width: usize,
+    target_height: usize,
+    dst_x: usize,
+    dst_y: usize,
+    clip: Option<&Rect>,
+) {
+    if target_width == 0 || target_height == 0 || source.width == 0 || source.height == 0 {
+        return;
+    }
+    let copy_w = (source.width as usize).min(target_width.saturating_sub(dst_x));
+    let copy_h = (source.height as usize).min(target_height.saturating_sub(dst_y));
+
+    for row in 0..copy_h {
+        let ty = dst_y + row;
+        if ty >= target_height {
+            break;
+        }
+        let src_row_start = row * source.pitch_pixels;
+        let dst_row_start = ty * target_width;
+
+        for col in 0..copy_w {
+            let tx = dst_x + col;
+            if tx >= target_width {
+                break;
+            }
+            if let Some(cl) = clip {
+                if !cl.contains_point(tx, ty) {
+                    continue;
+                }
+            }
+            target[dst_row_start + tx] = source.pixels[src_row_start + col];
+        }
+    }
+}
+
+/// User-Mode Driver (UMD) graphics command streamer and hardware queue bridge.
+#[derive(Debug)]
+pub struct UmdCommandStreamer {
+    pub stream_id: u16,
+    pub recorder: CommandBufferRecorder,
+    pub fence: GpuTimelineFence,
+    pub next_fence_value: u64,
+    pub last_submitted_fence_val: u64,
+}
+
+impl UmdCommandStreamer {
+    /// Creates a new user-mode command streamer with dedicated fence synchronization.
+    pub fn new(stream_id: u16, fence_id: u32, initial_capacity: usize) -> Self {
+        Self {
+            stream_id,
+            recorder: CommandBufferRecorder::new(initial_capacity, stream_id),
+            fence: GpuTimelineFence::new(fence_id, 0),
+            next_fence_value: 1,
+            last_submitted_fence_val: 0,
+        }
+    }
+
+    /// Records a solid color clear directly to the backbuffer surface.
+    pub fn record_clear_backbuffer(&self, backbuffer: &mut BackbufferSurface, color: Color) {
+        backbuffer.clear(color);
+    }
+
+    /// Records an indexed draw command (`DrawIndexed`) into the GPU stream.
+    pub fn record_draw_indexed(
+        &mut self,
+        index_count: u32,
+        start_index_location: u32,
+        base_vertex_location: i32,
+    ) -> Result<(), &'static str> {
+        let payload = DrawIndexedPayload::new(
+            index_count,
+            1,
+            start_index_location,
+            base_vertex_location,
+            0,
+        );
+        self.recorder.record_draw_indexed(&payload)
+    }
+
+    /// Records a pipeline state change (`SetPipelineState`) into the GPU stream.
+    pub fn record_set_pipeline_state(&mut self, pso_id: u64) -> Result<(), &'static str> {
+        let payload = SetPipelineStatePayload::new(
+            pso_id,
+            PrimitiveTopology::TriangleList,
+            true,
+            true,
+            true,
+            2,
+        );
+        self.recorder.record_set_pipeline_state(&payload)
+    }
+
+    /// Records a resource barrier transition between rendering states.
+    pub fn record_resource_barrier(
+        &mut self,
+        resource_gpu_address: u64,
+        before: ResourceState,
+        after: ResourceState,
+    ) -> Result<(), &'static str> {
+        self.recorder.record_transition_barrier(
+            resource_gpu_address,
+            0,
+            before,
+            after,
+            PipelineStageFlags::ALL_COMMANDS,
+            PipelineStageFlags::ALL_COMMANDS,
+        )
+    }
+
+    /// Closes the recorded command stream and advances the synchronization timeline fence.
+    pub fn submit(&mut self) -> Result<(GpuCommandBuffer, u64), &'static str> {
+        let cmdbuf = self.recorder.close()?;
+        let fence_val = self.next_fence_value;
+        self.next_fence_value = self.next_fence_value.wrapping_add(1);
+
+        self.fence.signal(fence_val)?;
+        self.last_submitted_fence_val = fence_val;
+        Ok((cmdbuf, fence_val))
+    }
+
+    /// Completes execution of the submitted fence value and resets the recorder for the next frame.
+    pub fn complete_frame(&mut self, fence_val: u64) {
+        self.fence.complete(fence_val);
+        self.recorder.reset();
+    }
+
+    /// Returns whether the specified timeline fence value has finished execution.
+    pub fn is_fence_completed(&self, fence_val: u64) -> bool {
+        self.fence.is_completed(fence_val)
     }
 }
