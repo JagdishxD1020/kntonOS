@@ -449,3 +449,214 @@ pub fn verify_xaudio2_source_voice() -> bool {
 
     true
 }
+
+use super::client_ring::AudioFrame;
+
+/// Channel matrix routing and upmix/downmix coefficient multiplier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelMatrix {
+    pub src_channels: usize,
+    pub dst_channels: usize,
+    pub matrix: Vec<f32>,
+}
+
+impl ChannelMatrix {
+    // Creates standard stereo-to-stereo passthrough matrix.
+    pub fn stereo_passthrough() -> Self {
+        Self {
+            src_channels: 2,
+            dst_channels: 2,
+            matrix: alloc::vec![1.0, 0.0, 0.0, 1.0],
+        }
+    }
+
+    // Creates standard stereo-to-5.1 surround upmix matrix.
+    pub fn stereo_to_5point1() -> Self {
+        Self {
+            src_channels: 2,
+            dst_channels: 6,
+            // FL, FR, C, LFE, BL, BR
+            matrix: alloc::vec![
+                1.0, 0.0,   // Front Left
+                0.0, 1.0,   // Front Right
+                0.707, 0.707, // Center
+                0.5, 0.5,   // LFE Subwoofer
+                0.707, 0.0, // Back Left
+                0.0, 0.707  // Back Right
+            ],
+        }
+    }
+
+    // Creates standard 5.1 surround-to-stereo downmix matrix.
+    pub fn five_point_one_to_stereo() -> Self {
+        Self {
+            src_channels: 6,
+            dst_channels: 2,
+            // Left: FL + 0.707*C + 0.707*BL + 0.5*LFE
+            // Right: FR + 0.707*C + 0.707*BR + 0.5*LFE
+            matrix: alloc::vec![
+                0.707, 0.0,   // FL -> L, R
+                0.0, 0.707,   // FR -> L, R
+                0.5, 0.5,     // C -> L, R
+                0.353, 0.353, // LFE -> L, R
+                0.5, 0.0,     // BL -> L, R
+                0.0, 0.5      // BR -> L, R
+            ],
+        }
+    }
+
+    // Transforms an input multi-channel frame into the destination channel configuration.
+    pub fn transform_frame(&self, src: &[f32], dst: &mut [f32]) {
+        for d in 0..self.dst_channels {
+            let mut acc = 0.0f32;
+            let row_offset = d * self.src_channels;
+            for s in 0..self.src_channels {
+                if s < src.len() && row_offset + s < self.matrix.len() {
+                    acc += src[s] * self.matrix[row_offset + s];
+                }
+            }
+            if d < dst.len() {
+                dst[d] = acc;
+            }
+        }
+    }
+}
+
+/// XAudio2 Mastering Voice representing the destination audio endpoint and mix bus.
+#[derive(Debug, Clone)]
+pub struct XAudio2MasteringVoice {
+    pub input_channels: u16,
+    pub output_channels: u16,
+    pub sample_rate: u32,
+    pub master_volume: f32,
+    pub matrix: ChannelMatrix,
+    pub source_voices: Vec<XAudio2SourceVoice>,
+}
+
+impl Default for XAudio2MasteringVoice {
+    fn default() -> Self {
+        Self::new(2, 2, 48000)
+    }
+}
+
+impl XAudio2MasteringVoice {
+    // Creates a new mastering voice for the audio engine endpoint.
+    pub fn new(input_channels: u16, output_channels: u16, sample_rate: u32) -> Self {
+        let matrix = if input_channels == 2 && output_channels == 6 {
+            ChannelMatrix::stereo_to_5point1()
+        } else if input_channels == 6 && output_channels == 2 {
+            ChannelMatrix::five_point_one_to_stereo()
+        } else {
+            ChannelMatrix::stereo_passthrough()
+        };
+
+        Self {
+            input_channels,
+            output_channels,
+            sample_rate,
+            master_volume: 1.0,
+            matrix,
+            source_voices: Vec::new(),
+        }
+    }
+
+    // Registers a new source voice with this mastering voice graph.
+    pub fn create_source_voice(&mut self, format: WaveFormatEx) -> usize {
+        let id = self.source_voices.len();
+        self.source_voices.push(XAudio2SourceVoice::new(format));
+        id
+    }
+
+    // Obtains a mutable reference to an existing source voice.
+    pub fn get_source_voice_mut(&mut self, id: usize) -> Option<&mut XAudio2SourceVoice> {
+        self.source_voices.get_mut(id)
+    }
+
+    // Adjusts master bus linear gain.
+    pub fn set_master_volume(&mut self, volume: f32) {
+        self.master_volume = volume.clamp(0.0, XAUDIO2_MAX_VOLUME_LEVEL);
+    }
+
+    // Renders one audio quantum across all active source voices into standard stereo AudioFrames.
+    pub fn render_quantum(&mut self, frames: usize) -> Vec<AudioFrame> {
+        let mut mix_left = alloc::vec![0.0f32; frames];
+        let mut mix_right = alloc::vec![0.0f32; frames];
+
+        let mut voice_l = alloc::vec![0.0f32; frames];
+        let mut voice_r = alloc::vec![0.0f32; frames];
+
+        for voice in &mut self.source_voices {
+            if voice.state != VoiceState::Playing {
+                continue;
+            }
+            voice_l.fill(0.0);
+            voice_r.fill(0.0);
+            voice.process_frames(&mut voice_l, &mut voice_r);
+
+            for i in 0..frames {
+                mix_left[i] += voice_l[i];
+                mix_right[i] += voice_r[i];
+            }
+        }
+
+        let mut output_frames = Vec::with_capacity(frames);
+        for i in 0..frames {
+            let left_clamped = (mix_left[i] * self.master_volume).clamp(-1.0, 1.0);
+            let right_clamped = (mix_right[i] * self.master_volume).clamp(-1.0, 1.0);
+            output_frames.push(AudioFrame {
+                left: left_clamped,
+                right: right_clamped,
+            });
+        }
+
+        output_frames
+    }
+}
+
+/// Verifies channel matrix upmixing/downmixing and master voice multi-voice rendering.
+pub fn verify_xaudio2_mastering_voice_and_matrix() -> bool {
+    let matrix_up = ChannelMatrix::stereo_to_5point1();
+    let src = [1.0f32, 0.0f32]; // pure Left
+    let mut dst = [0.0f32; 6];
+    matrix_up.transform_frame(&src, &mut dst);
+
+    // Verify Front Left is 1.0 and Front Right is 0.0
+    if (dst[0] - 1.0).abs() > 0.01 || dst[1].abs() > 0.01 {
+        return false;
+    }
+    // Verify Center channel has energy
+    if (dst[2] - 0.707).abs() > 0.01 {
+        return false;
+    }
+
+    // Test mastering voice mixdown with 2 voices
+    let mut master = XAudio2MasteringVoice::new(2, 2, 48000);
+    master.set_master_volume(0.8);
+
+    let v1 = master.create_source_voice(WaveFormatEx::pcm_stereo(48000, 16));
+    let v2 = master.create_source_voice(WaveFormatEx::pcm_stereo(48000, 16));
+
+    // Submit 50 frames to each voice
+    let mut raw_bytes = Vec::new();
+    for _ in 0..50 {
+        let sample: i16 = 16384; // 0.5
+        raw_bytes.extend_from_slice(&sample.to_le_bytes());
+        raw_bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    master.get_source_voice_mut(v1).unwrap().submit_source_buffer(XAudio2Buffer::new(&raw_bytes, true));
+    master.get_source_voice_mut(v1).unwrap().start();
+
+    master.get_source_voice_mut(v2).unwrap().submit_source_buffer(XAudio2Buffer::new(&raw_bytes, true));
+    master.get_source_voice_mut(v2).unwrap().start();
+
+    let rendered = master.render_quantum(50);
+    if rendered.len() != 50 {
+        return false;
+    }
+    // Expected mix: (0.5 + 0.5) * 0.8 = 0.8
+    if (rendered[0].left - 0.8).abs() > 0.01 || (rendered[0].right - 0.8).abs() > 0.01 {
+        return false;
+    }
+
+    true
+}
