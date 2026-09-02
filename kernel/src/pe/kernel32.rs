@@ -144,7 +144,8 @@ pub fn win32_get_proc_address(h_module: HMODULE, proc_name: &str) -> FARPROC {
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use super::ntdll::{
-    nt_allocate_virtual_memory, nt_free_virtual_memory, nt_success,
+    nt_allocate_virtual_memory, nt_close, nt_create_file, nt_free_virtual_memory, nt_read_file,
+    nt_success, nt_write_file, IoStatusBlock,
 };
 use crate::syscall::NT_CURRENT_PROCESS;
 
@@ -276,4 +277,187 @@ pub unsafe fn win32_virtual_protect(
 
     win32_set_last_error(ERROR_SUCCESS);
     true
+}
+
+pub const INVALID_HANDLE_VALUE: u64 = !0u64;
+
+pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const GENERIC_EXECUTE: u32 = 0x2000_0000;
+pub const GENERIC_ALL: u32 = 0x1000_0000;
+
+pub const FILE_SHARE_READ: u32 = 0x0000_0001;
+pub const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+pub const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+pub const CREATE_NEW: u32 = 1;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const OPEN_EXISTING: u32 = 3;
+pub const OPEN_ALWAYS: u32 = 4;
+pub const TRUNCATE_EXISTING: u32 = 5;
+
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+
+/// Emulates Win32 CreateFile creating or opening a file or device.
+pub unsafe fn win32_create_file(
+    lp_file_name: &str,
+    dw_desired_access: u32,
+    dw_share_mode: u32,
+    dw_creation_disposition: u32,
+    dw_flags_and_attributes: u32,
+) -> u64 {
+    if lp_file_name.is_empty() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    let mut handle: u64 = 0;
+    let mut iosb = IoStatusBlock::default();
+
+    let status = nt_create_file(
+        &mut handle as *mut u64,
+        dw_desired_access,
+        core::ptr::null(),
+        &mut iosb as *mut IoStatusBlock,
+        core::ptr::null(),
+        dw_flags_and_attributes,
+        dw_share_mode,
+        dw_creation_disposition,
+        0,
+        core::ptr::null(),
+        0,
+    );
+
+    if nt_success(status) {
+        win32_set_last_error(ERROR_SUCCESS);
+        handle
+    } else {
+        win32_set_last_error(ERROR_FILE_NOT_FOUND);
+        INVALID_HANDLE_VALUE
+    }
+}
+
+/// Emulates Win32 ReadFile reading bytes from an open file or device.
+pub unsafe fn win32_read_file(
+    h_file: u64,
+    lp_buffer: *mut u8,
+    n_number_of_bytes_to_read: u32,
+    lp_number_of_bytes_read: *mut u32,
+) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 || lp_buffer.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let mut iosb = IoStatusBlock::default();
+    let status = nt_read_file(
+        h_file,
+        0,
+        0,
+        0,
+        &mut iosb as *mut IoStatusBlock,
+        lp_buffer,
+        n_number_of_bytes_to_read,
+        core::ptr::null(),
+        core::ptr::null(),
+    );
+
+    if !lp_number_of_bytes_read.is_null() {
+        *lp_number_of_bytes_read = iosb.information as u32;
+    }
+
+    if nt_success(status) {
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Emulates Win32 WriteFile writing bytes to an open file or device.
+pub unsafe fn win32_write_file(
+    h_file: u64,
+    lp_buffer: *const u8,
+    n_number_of_bytes_to_write: u32,
+    lp_number_of_bytes_written: *mut u32,
+) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 || lp_buffer.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let mut iosb = IoStatusBlock::default();
+    let status = nt_write_file(
+        h_file,
+        0,
+        0,
+        0,
+        &mut iosb as *mut IoStatusBlock,
+        lp_buffer,
+        n_number_of_bytes_to_write,
+        core::ptr::null(),
+        core::ptr::null(),
+    );
+
+    if !lp_number_of_bytes_written.is_null() {
+        *lp_number_of_bytes_written = iosb.information as u32;
+    }
+
+    if nt_success(status) {
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Emulates Win32 CloseHandle closing an open object handle.
+pub unsafe fn win32_close_handle(h_object: u64) -> bool {
+    if h_object == INVALID_HANDLE_VALUE || h_object == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let status = nt_close(h_object);
+    if nt_success(status) {
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Emulates Win32 GetModuleHandle retrieving a module handle for the specified module.
+pub fn win32_get_module_handle(module_name: Option<&str>) -> HMODULE {
+    match module_name {
+        None => HMODULE_KERNEL32,
+        Some(name) => {
+            let h = win32_load_library(name);
+            if h == HMODULE_INVALID {
+                win32_set_last_error(ERROR_MOD_NOT_FOUND);
+            } else {
+                win32_set_last_error(ERROR_SUCCESS);
+            }
+            h
+        }
+    }
+}
+
+/// Emulates Win32 GetCommandLine retrieving the command-line string for current process.
+pub fn win32_get_command_line() -> &'static str {
+    "init.exe\0"
+}
+
+/// Emulates Win32 ExitProcess terminating the calling process and all its threads.
+pub fn win32_exit_process(exit_code: u32) {
+    crate::syscall::table::dispatch(
+        crate::syscall::table::NT_TERMINATE_PROCESS,
+        NT_CURRENT_PROCESS,
+        exit_code as u64,
+        0,
+        0,
+    );
 }
