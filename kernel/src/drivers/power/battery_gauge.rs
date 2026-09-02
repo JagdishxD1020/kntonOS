@@ -275,3 +275,28 @@ pub fn verify_battery_thermal_tripwire() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld Battery Gauge Fuel Coulomb Counter & Dynamic Charge Limiter Service.
+pub fn test_battery_gauge_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld Battery Gauge Fuel Coulomb Counter & Dynamic Charge Limiter...\r\n");
+
+    if !verify_battery_gauge_registers() {
+        crate::serial_write_str("[KNT-PANIC] Battery gauge registers verification failed!\r\n");
+        return false;
+    }
+    if !verify_precision_coulomb_counter() {
+        crate::serial_write_str("[KNT-PANIC] Precision Coulomb counter verification failed!\r\n");
+        return false;
+    }
+    if !verify_docked_charge_limiter() {
+        crate::serial_write_str("[KNT-PANIC] Docked bypass charge limiter verification failed!\r\n");
+        return false;
+    }
+    if !verify_battery_thermal_tripwire() {
+        crate::serial_write_str("[KNT-PANIC] Battery thermal tripwire verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-BATTERY-GAUGE-PASS] Handheld battery fuel gauge and dynamic charge limiter verified\r\n");
+    true
+}
