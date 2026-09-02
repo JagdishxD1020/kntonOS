@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod hud;
 pub mod capture;
 pub mod stream;
+pub mod game_shell;
 
 use crate::display::color::Color;
 use crate::display::framebuffer::{FramebufferInfo, LinearFramebuffer};
@@ -36,6 +37,7 @@ pub use launcher::{
 };
 pub use capture::*;
 pub use stream::*;
+pub use game_shell::*;
 
 /// Global compositor manager instance.
 pub static COMPOSITOR: Spinlock<Option<SceneCompositor>> = Spinlock::new(None);

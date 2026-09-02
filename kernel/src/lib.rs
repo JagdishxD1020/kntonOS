@@ -483,6 +483,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Frame capture and video streamer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Gaming Shell, Game Launcher & Performance HUD Overlay (TASK-KNT-136)
+    if !compositor::test_game_shell_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld gaming shell self-test failed!\r\n");
+    }
+
     // Initialize Interactive Virtual Terminal (VT) Shell & Key-Event Engine
     shell::init(34, 9);
     if !shell::test_shell_subsystem() {
