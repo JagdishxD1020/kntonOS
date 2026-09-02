@@ -13,6 +13,7 @@ pub mod drc;
 pub mod occlusion;
 pub mod vad;
 pub mod xaudio2;
+pub mod dsound;
 
 pub use occlusion::test_audio_occlusion_subsystem;
 pub use vad::test_audio_vad_subsystem;
@@ -28,6 +29,7 @@ pub use client_ring::*;
 pub use simd_mix::*;
 pub use voice_dsp::*;
 pub use xaudio2::*;
+pub use dsound::*;
 
 /// Verification self-test suite for Real-Time 3D Audio Spatializer & Binaural HRTF DSP Pipeline.
 pub fn test_audio_spatializer_subsystem() -> bool {
