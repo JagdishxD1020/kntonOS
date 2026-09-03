@@ -56,6 +56,17 @@ pub const SW_HIDE: i32 = 0;
 pub const SW_SHOWNORMAL: i32 = 1;
 pub const SW_SHOW: i32 = 5;
 
+pub const PM_NOREMOVE: u32 = 0x0000;
+pub const PM_REMOVE: u32 = 0x0001;
+pub const PM_NOYIELD: u32 = 0x0002;
+
+pub const SRCCOPY: u32 = 0x00CC_0020;
+pub const SRCPAINT: u32 = 0x00EE_0086;
+pub const SRCAND: u32 = 0x0088_00C6;
+pub const SRCINVERT: u32 = 0x0066_0046;
+pub const BLACKNESS: u32 = 0x0000_0042;
+pub const WHITENESS: u32 = 0x00FF_0062;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Point {
@@ -130,6 +141,8 @@ pub struct WindowState {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    pub surface_width: i32,
+    pub surface_height: i32,
     pub wnd_proc: WNDPROC,
     pub h_instance: HINSTANCE,
     pub is_visible: bool,
@@ -137,9 +150,46 @@ pub struct WindowState {
     pub surface_buffer: Vec<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DcKind {
+    Window(HWND),
+    Memory {
+        selected_bitmap: HBITMAP,
+    },
+}
+
+pub struct DeviceContext {
+    pub hdc: HDC,
+    pub kind: DcKind,
+}
+
+pub struct BitmapObject {
+    pub hbitmap: HBITMAP,
+    pub width: i32,
+    pub height: i32,
+    pub buffer: Vec<u32>,
+}
+
+pub struct MessageQueue {
+    pub messages: Vec<Msg>,
+    pub quit_posted: bool,
+    pub exit_code: i32,
+}
+
 static NEXT_HWND: Spinlock<HWND> = Spinlock::new(0x0002_0001);
+static NEXT_HDC: Spinlock<HDC> = Spinlock::new(0x0003_0001);
+static NEXT_HBITMAP: Spinlock<HBITMAP> = Spinlock::new(0x0004_0001);
+
 static CLASS_TABLE: Spinlock<Vec<RegisteredClass>> = Spinlock::new(Vec::new());
 static WINDOW_TABLE: Spinlock<Vec<WindowState>> = Spinlock::new(Vec::new());
+static DC_TABLE: Spinlock<Vec<DeviceContext>> = Spinlock::new(Vec::new());
+static BITMAP_TABLE: Spinlock<Vec<BitmapObject>> = Spinlock::new(Vec::new());
+
+static MESSAGE_QUEUE: Spinlock<MessageQueue> = Spinlock::new(MessageQueue {
+    messages: Vec::new(),
+    quit_posted: false,
+    exit_code: 0,
+});
 
 /// Registers a window class for subsequent use in CreateWindowEx calls.
 pub unsafe fn win32_register_class_ex(lp_wcex: *const WndClassEx) -> u16 {
@@ -206,9 +256,11 @@ pub fn win32_create_window_ex(
     *hwnd_gen = hwnd.saturating_add(1);
     drop(hwnd_gen);
 
-    let w = if width > 0 { width } else { 640 };
-    let h = if height > 0 { height } else { 480 };
-    let buffer_size = (w as usize) * (h as usize);
+    let w = if width > 0 { width } else { 64 };
+    let h = if height > 0 { height } else { 48 };
+    let surf_w = w.min(64);
+    let surf_h = h.min(64);
+    let buffer_size = (surf_w as usize) * (surf_h as usize);
     let mut surface = Vec::with_capacity(buffer_size);
     surface.resize(buffer_size, 0x0020_2020);
 
@@ -228,6 +280,8 @@ pub fn win32_create_window_ex(
         y,
         width: w,
         height: h,
+        surface_width: surf_w,
+        surface_height: surf_h,
         wnd_proc: class_info.0,
         h_instance: if h_instance != 0 { h_instance } else { class_info.1 },
         is_visible: (style & WS_VISIBLE) != 0,
@@ -307,22 +361,6 @@ pub fn win32_show_window(hwnd: HWND, cmd_show: i32) -> bool {
         false
     }
 }
-
-pub const PM_NOREMOVE: u32 = 0x0000;
-pub const PM_REMOVE: u32 = 0x0001;
-pub const PM_NOYIELD: u32 = 0x0002;
-
-pub struct MessageQueue {
-    pub messages: Vec<Msg>,
-    pub quit_posted: bool,
-    pub exit_code: i32,
-}
-
-static MESSAGE_QUEUE: Spinlock<MessageQueue> = Spinlock::new(MessageQueue {
-    messages: Vec::new(),
-    quit_posted: false,
-    exit_code: 0,
-});
 
 /// Places a message in the message queue associated with the thread that created the window.
 pub fn win32_post_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -515,39 +553,6 @@ pub fn win32_send_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
     }
 }
 
-pub const SRCCOPY: u32 = 0x00CC_0020;
-pub const SRCPAINT: u32 = 0x00EE_0086;
-pub const SRCAND: u32 = 0x0088_00C6;
-pub const SRCINVERT: u32 = 0x0066_0046;
-pub const BLACKNESS: u32 = 0x0000_0042;
-pub const WHITENESS: u32 = 0x00FF_0062;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DcKind {
-    Window(HWND),
-    Memory {
-        selected_bitmap: HBITMAP,
-    },
-}
-
-pub struct DeviceContext {
-    pub hdc: HDC,
-    pub kind: DcKind,
-}
-
-pub struct BitmapObject {
-    pub hbitmap: HBITMAP,
-    pub width: i32,
-    pub height: i32,
-    pub buffer: Vec<u32>,
-}
-
-static NEXT_HDC: Spinlock<HDC> = Spinlock::new(0x0003_0001);
-static NEXT_HBITMAP: Spinlock<HBITMAP> = Spinlock::new(0x0004_0001);
-
-static DC_TABLE: Spinlock<Vec<DeviceContext>> = Spinlock::new(Vec::new());
-static BITMAP_TABLE: Spinlock<Vec<BitmapObject>> = Spinlock::new(Vec::new());
-
 /// Retrieves a handle to a device context (DC) for the client area of a specified window.
 pub fn win32_get_dc(hwnd: HWND) -> HDC {
     let mut hdc_gen = NEXT_HDC.lock();
@@ -688,8 +693,8 @@ pub fn win32_set_pixel(hdc: HDC, x: i32, y: i32, color: u32) -> u32 {
         DcKind::Window(hwnd) => {
             let mut windows = WINDOW_TABLE.lock();
             if let Some(win) = windows.iter_mut().find(|w| w.hwnd == hwnd) {
-                if x >= 0 && x < win.width && y >= 0 && y < win.height {
-                    let idx = (y as usize) * (win.width as usize) + (x as usize);
+                if x >= 0 && x < win.surface_width && y >= 0 && y < win.surface_height {
+                    let idx = (y as usize) * (win.surface_width as usize) + (x as usize);
                     let prev = win.surface_buffer[idx];
                     win.surface_buffer[idx] = color;
                     prev
@@ -730,8 +735,8 @@ pub fn win32_get_pixel(hdc: HDC, x: i32, y: i32) -> u32 {
         DcKind::Window(hwnd) => {
             let windows = WINDOW_TABLE.lock();
             if let Some(win) = windows.iter().find(|w| w.hwnd == hwnd) {
-                if x >= 0 && x < win.width && y >= 0 && y < win.height {
-                    let idx = (y as usize) * (win.width as usize) + (x as usize);
+                if x >= 0 && x < win.surface_width && y >= 0 && y < win.surface_height {
+                    let idx = (y as usize) * (win.surface_width as usize) + (x as usize);
                     win.surface_buffer[idx]
                 } else {
                     0xFFFF_FFFF
@@ -775,7 +780,6 @@ pub fn win32_bit_blt(
         }
     };
 
-    // Extract source pixel rectangle into buffer
     let mut src_pixels = Vec::with_capacity((width * height) as usize);
     match src_kind {
         DcKind::Memory { selected_bitmap } => {
@@ -808,8 +812,8 @@ pub fn win32_bit_blt(
                 let sy = y_src + row;
                 for col in 0..width {
                     let sx = x_src + col;
-                    let p = if sx >= 0 && sx < win.width && sy >= 0 && sy < win.height {
-                        let idx = (sy as usize) * (win.width as usize) + (sx as usize);
+                    let p = if sx >= 0 && sx < win.surface_width && sy >= 0 && sy < win.surface_height {
+                        let idx = (sy as usize) * (win.surface_width as usize) + (sx as usize);
                         win.surface_buffer[idx]
                     } else {
                         0
@@ -820,7 +824,6 @@ pub fn win32_bit_blt(
         }
     }
 
-    // Apply extracted pixels to destination device context according to ROP code
     match dest_kind {
         DcKind::Memory { selected_bitmap } => {
             let mut bmps = BITMAP_TABLE.lock();
@@ -864,17 +867,17 @@ pub fn win32_bit_blt(
             };
             for row in 0..height {
                 let dy = y_dest + row;
-                if dy < 0 || dy >= win.height {
+                if dy < 0 || dy >= win.surface_height {
                     continue;
                 }
                 for col in 0..width {
                     let dx = x_dest + col;
-                    if dx < 0 || dx >= win.width {
+                    if dx < 0 || dx >= win.surface_width {
                         continue;
                     }
                     let s_idx = (row as usize) * (width as usize) + (col as usize);
                     let src_px = src_pixels[s_idx];
-                    let d_idx = (dy as usize) * (win.width as usize) + (dx as usize);
+                    let d_idx = (dy as usize) * (win.surface_width as usize) + (dx as usize);
                     let dst_px = win.surface_buffer[d_idx];
 
                     win.surface_buffer[d_idx] = match rop {
@@ -891,4 +894,136 @@ pub fn win32_bit_blt(
             true
         }
     }
+}
+
+/// Comprehensive self-test suite verifying the Win32 User32 & GDI32 emulation layer.
+pub fn test_user32_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-USER32-TEST] Executing Win32 User32 & GDI32 emulation verification...\r\n");
+
+    // 1. Verify window class registration and window creation
+    let class_name_str = "KntonSampleWindowClass\0";
+    let wcex = WndClassEx {
+        cb_size: core::mem::size_of::<WndClassEx>() as u32,
+        style: 0,
+        lpfn_wnd_proc: Some(win32_def_window_proc),
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        h_instance: 0x0040_0000,
+        h_icon: 0,
+        h_cursor: 0,
+        hbr_background: 0,
+        lpsz_menu_name: core::ptr::null(),
+        lpsz_class_name: class_name_str.as_ptr(),
+        h_icon_sm: 0,
+    };
+
+    let atom = unsafe { win32_register_class_ex(&wcex) };
+    if atom == 0 {
+        return false;
+    }
+
+    let hwnd = win32_create_window_ex(
+        0,
+        "KntonSampleWindowClass",
+        "KntonOS Test Window",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        10,
+        10,
+        64,
+        48,
+        HWND_DESKTOP,
+        0,
+        0x0040_0000,
+        0,
+    );
+    if hwnd == HWND_INVALID || !win32_is_window(hwnd) {
+        return false;
+    }
+
+    let mut rect = Rect::default();
+    if !win32_get_window_rect(hwnd, &mut rect as *mut Rect) {
+        return false;
+    }
+    if rect.right - rect.left != 64 || rect.bottom - rect.top != 48 {
+        return false;
+    }
+
+    // 2. Verify posting, peeking, and dispatching message loop queue events
+    let post_ok = win32_post_message(hwnd, WM_KEYDOWN, b'A' as usize, 0);
+    if !post_ok {
+        return false;
+    }
+
+    let mut msg = Msg::default();
+    let peek_ok = win32_peek_message(&mut msg as *mut Msg, hwnd, 0, 0, PM_REMOVE);
+    if !peek_ok || msg.message != WM_KEYDOWN || msg.wparam != b'A' as usize {
+        return false;
+    }
+
+    let trans_ok = win32_translate_message(&msg as *const Msg);
+    if !trans_ok {
+        return false;
+    }
+
+    let mut char_msg = Msg::default();
+    let peek_char_ok = win32_peek_message(&mut char_msg as *mut Msg, hwnd, WM_CHAR, WM_CHAR, PM_REMOVE);
+    if !peek_char_ok || char_msg.message != WM_CHAR || char_msg.wparam != b'A' as usize {
+        return false;
+    }
+
+    win32_post_quit_message(42);
+    let mut quit_msg = Msg::default();
+    let get_res = win32_get_message(&mut quit_msg as *mut Msg, HWND_INVALID, 0, 0);
+    if get_res != 0 || quit_msg.message != WM_QUIT || quit_msg.wparam != 42 {
+        return false;
+    }
+
+    // 3. Verify GDI32 device context allocation and memory DC BitBlt raster blitting
+    let hdc_window = win32_get_dc(hwnd);
+    if hdc_window == 0 {
+        return false;
+    }
+
+    let hdc_mem = win32_create_compatible_dc(hdc_window);
+    if hdc_mem == 0 {
+        return false;
+    }
+
+    let hbmp = win32_create_compatible_bitmap(hdc_window, 16, 16);
+    if hbmp == 0 {
+        return false;
+    }
+
+    let _old_bmp = win32_select_object(hdc_mem, hbmp);
+
+    for y in 0..16 {
+        for x in 0..16 {
+            let color = 0x00FF_AA55;
+            win32_set_pixel(hdc_mem, x, y, color);
+        }
+    }
+    if win32_get_pixel(hdc_mem, 8, 8) != 0x00FF_AA55 {
+        return false;
+    }
+
+    let blt_ok = win32_bit_blt(hdc_window, 4, 4, 16, 16, hdc_mem, 0, 0, SRCCOPY);
+    if !blt_ok {
+        return false;
+    }
+
+    if win32_get_pixel(hdc_window, 4 + 8, 4 + 8) != 0x00FF_AA55 {
+        return false;
+    }
+
+    win32_delete_object(hbmp);
+    win32_delete_dc(hdc_mem);
+    win32_release_dc(hwnd, hdc_window);
+    win32_destroy_window(hwnd);
+
+    if win32_is_window(hwnd) {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-USER32-PASS] Win32 User32 message loop and GDI32 graphics emulation verified\r\n");
+    true
 }
