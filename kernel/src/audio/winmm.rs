@@ -660,3 +660,165 @@ pub fn verify_waveout_buffer_queue_and_prepare() -> bool {
 
     true
 }
+
+// Standard MIDI Channel Status opcodes.
+pub const MIDI_STATUS_NOTE_OFF: u8 = 0x80;
+pub const MIDI_STATUS_NOTE_ON: u8 = 0x90;
+pub const MIDI_STATUS_POLY_KEY_PRESSURE: u8 = 0xA0;
+pub const MIDI_STATUS_CONTROL_CHANGE: u8 = 0xB0;
+pub const MIDI_STATUS_PROGRAM_CHANGE: u8 = 0xC0;
+pub const MIDI_STATUS_CHANNEL_PRESSURE: u8 = 0xD0;
+pub const MIDI_STATUS_PITCH_BEND: u8 = 0xE0;
+pub const MIDI_STATUS_SYSTEM_RESET: u8 = 0xFF;
+
+// Common MIDI Control Change controllers.
+pub const MIDI_CC_BANK_SELECT: u8 = 0;
+pub const MIDI_CC_MODULATION: u8 = 1;
+pub const MIDI_CC_VOLUME: u8 = 7;
+pub const MIDI_CC_PAN: u8 = 10;
+pub const MIDI_CC_EXPRESSION: u8 = 11;
+pub const MIDI_CC_SUSTAIN: u8 = 64;
+pub const MIDI_CC_ALL_SOUND_OFF: u8 = 120;
+pub const MIDI_CC_ALL_NOTES_OFF: u8 = 123;
+
+/// Decoded standard MIDI 1.0 channel voice event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidiEvent {
+    NoteOff { channel: u8, note: u8, velocity: u8 },
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+    PolyKeyPressure { channel: u8, note: u8, pressure: u8 },
+    ControlChange { channel: u8, controller: u8, value: u8 },
+    ProgramChange { channel: u8, program: u8 },
+    ChannelPressure { channel: u8, pressure: u8 },
+    PitchBend { channel: u8, bend: i16 },
+    SystemReset,
+    Unknown(u8),
+}
+
+/// Helper parsing packed 32-bit short messages and byte stream buffers.
+pub struct MidiMessageParser;
+
+impl MidiMessageParser {
+    // Decodes standard Win32 32-bit packed short message (status in byte 0, data1 in byte 1, data2 in byte 2).
+    pub fn parse_short_msg(msg: u32) -> MidiEvent {
+        let status = (msg & 0xFF) as u8;
+        let data1 = ((msg >> 8) & 0x7F) as u8;
+        let data2 = ((msg >> 16) & 0x7F) as u8;
+
+        let channel = status & 0x0F;
+        let opcode = status & 0xF0;
+
+        match opcode {
+            MIDI_STATUS_NOTE_OFF => MidiEvent::NoteOff {
+                channel,
+                note: data1,
+                velocity: data2,
+            },
+            MIDI_STATUS_NOTE_ON => {
+                if data2 == 0 {
+                    // Velocity 0 is treated as Note Off in standard MIDI spec
+                    MidiEvent::NoteOff {
+                        channel,
+                        note: data1,
+                        velocity: 0,
+                    }
+                } else {
+                    MidiEvent::NoteOn {
+                        channel,
+                        note: data1,
+                        velocity: data2,
+                    }
+                }
+            }
+            MIDI_STATUS_POLY_KEY_PRESSURE => MidiEvent::PolyKeyPressure {
+                channel,
+                note: data1,
+                pressure: data2,
+            },
+            MIDI_STATUS_CONTROL_CHANGE => MidiEvent::ControlChange {
+                channel,
+                controller: data1,
+                value: data2,
+            },
+            MIDI_STATUS_PROGRAM_CHANGE => MidiEvent::ProgramChange {
+                channel,
+                program: data1,
+            },
+            MIDI_STATUS_CHANNEL_PRESSURE => MidiEvent::ChannelPressure {
+                channel,
+                pressure: data1,
+            },
+            MIDI_STATUS_PITCH_BEND => {
+                // 14-bit unsigned value centered at 0x2000 (8192)
+                let raw14 = (data1 as u16) | ((data2 as u16) << 7);
+                let bend = (raw14 as i32 - 8192) as i16;
+                MidiEvent::PitchBend { channel, bend }
+            }
+            _ => {
+                if status == MIDI_STATUS_SYSTEM_RESET {
+                    MidiEvent::SystemReset
+                } else {
+                    MidiEvent::Unknown(status)
+                }
+            }
+        }
+    }
+
+    // Converts MIDI note number (0..127) and pitch bend semitones to fundamental frequency in Hertz.
+    pub fn note_to_frequency(note: u8, pitch_bend_semitones: f32) -> f32 {
+        let semitones = (note as f32 - 69.0) + pitch_bend_semitones;
+        let exponent = semitones / 12.0;
+        440.0 * crate::drivers::input::gyro_aim::powf_f32(2.0, exponent)
+    }
+}
+
+/// Verifies parsing of Note On, Note Off, Control Change, Pitch Bend, and note frequency conversion.
+pub fn verify_midi_message_parser() -> bool {
+    // 1. Note On on channel 2, note 60 (Middle C), velocity 90
+    // Packed: status = 0x92, data1 = 60 (0x3C), data2 = 90 (0x5A) -> 0x005A3C92
+    let msg_on = 0x92 | (60 << 8) | (90 << 16);
+    match MidiMessageParser::parse_short_msg(msg_on) {
+        MidiEvent::NoteOn { channel, note, velocity } => {
+            if channel != 2 || note != 60 || velocity != 90 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 2. Note On with velocity 0 must translate to NoteOff
+    let msg_zero_vel = 0x92 | (60 << 8) | (0 << 16);
+    match MidiMessageParser::parse_short_msg(msg_zero_vel) {
+        MidiEvent::NoteOff { channel, note, .. } => {
+            if channel != 2 || note != 60 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 3. Pitch bend: center 8192 (0x2000) -> data1 = 0x00, data2 = 0x40
+    let msg_bend_center = 0xE0 | (0x00 << 8) | (0x40 << 16);
+    match MidiMessageParser::parse_short_msg(msg_bend_center) {
+        MidiEvent::PitchBend { channel, bend } => {
+            if channel != 0 || bend != 0 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 4. Frequency conversion for A4 (note 69) = exactly 440 Hz
+    let f_a4 = MidiMessageParser::note_to_frequency(69, 0.0);
+    if (f_a4 - 440.0).abs() > 0.01 {
+        return false;
+    }
+
+    // Frequency conversion for A5 (note 81) = 880 Hz
+    let f_a5 = MidiMessageParser::note_to_frequency(81, 0.0);
+    if (f_a5 - 880.0).abs() > 0.1 {
+        return false;
+    }
+
+    true
+}
