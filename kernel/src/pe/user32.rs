@@ -307,3 +307,210 @@ pub fn win32_show_window(hwnd: HWND, cmd_show: i32) -> bool {
         false
     }
 }
+
+pub const PM_NOREMOVE: u32 = 0x0000;
+pub const PM_REMOVE: u32 = 0x0001;
+pub const PM_NOYIELD: u32 = 0x0002;
+
+pub struct MessageQueue {
+    pub messages: Vec<Msg>,
+    pub quit_posted: bool,
+    pub exit_code: i32,
+}
+
+static MESSAGE_QUEUE: Spinlock<MessageQueue> = Spinlock::new(MessageQueue {
+    messages: Vec::new(),
+    quit_posted: false,
+    exit_code: 0,
+});
+
+/// Places a message in the message queue associated with the thread that created the window.
+pub fn win32_post_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    let msg = Msg {
+        hwnd,
+        message,
+        wparam,
+        lparam,
+        time: 0,
+        pt: Point::default(),
+    };
+
+    let mut q = MESSAGE_QUEUE.lock();
+    if message == WM_QUIT {
+        q.quit_posted = true;
+        q.exit_code = wparam as i32;
+    }
+    q.messages.push(msg);
+    true
+}
+
+/// Indicates to the system that a thread has made a request to terminate.
+pub fn win32_post_quit_message(exit_code: i32) {
+    let mut q = MESSAGE_QUEUE.lock();
+    q.quit_posted = true;
+    q.exit_code = exit_code;
+    q.messages.push(Msg {
+        hwnd: HWND_INVALID,
+        message: WM_QUIT,
+        wparam: exit_code as usize,
+        lparam: 0,
+        time: 0,
+        pt: Point::default(),
+    });
+}
+
+/// Dispatches incoming sent messages and checks the thread message queue for a posted message.
+pub fn win32_peek_message(
+    lp_msg: *mut Msg,
+    hwnd: HWND,
+    msg_filter_min: u32,
+    msg_filter_max: u32,
+    remove_msg: u32,
+) -> bool {
+    if lp_msg.is_null() {
+        return false;
+    }
+
+    let mut q = MESSAGE_QUEUE.lock();
+    let mut found_idx = None;
+
+    for (idx, m) in q.messages.iter().enumerate() {
+        if hwnd != HWND_INVALID && m.hwnd != hwnd {
+            continue;
+        }
+        if msg_filter_min != 0 || msg_filter_max != 0 {
+            if m.message < msg_filter_min || m.message > msg_filter_max {
+                continue;
+            }
+        }
+        found_idx = Some(idx);
+        break;
+    }
+
+    if let Some(idx) = found_idx {
+        let msg = if (remove_msg & PM_REMOVE) != 0 {
+            q.messages.remove(idx)
+        } else {
+            q.messages[idx]
+        };
+        unsafe {
+            *lp_msg = msg;
+        }
+        true
+    } else if q.quit_posted {
+        let quit_msg = Msg {
+            hwnd: HWND_INVALID,
+            message: WM_QUIT,
+            wparam: q.exit_code as usize,
+            lparam: 0,
+            time: 0,
+            pt: Point::default(),
+        };
+        if (remove_msg & PM_REMOVE) != 0 {
+            q.quit_posted = false;
+        }
+        unsafe {
+            *lp_msg = quit_msg;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Retrieves a message from the calling thread's message queue.
+pub fn win32_get_message(
+    lp_msg: *mut Msg,
+    hwnd: HWND,
+    msg_filter_min: u32,
+    msg_filter_max: u32,
+) -> i32 {
+    if lp_msg.is_null() {
+        return -1;
+    }
+
+    if win32_peek_message(lp_msg, hwnd, msg_filter_min, msg_filter_max, PM_REMOVE) {
+        let msg = unsafe { &*lp_msg };
+        if msg.message == WM_QUIT {
+            0
+        } else {
+            1
+        }
+    } else {
+        -1
+    }
+}
+
+/// Translates virtual-key messages into character messages.
+pub fn win32_translate_message(lp_msg: *const Msg) -> bool {
+    if lp_msg.is_null() {
+        return false;
+    }
+
+    let msg = unsafe { &*lp_msg };
+    if msg.message == WM_KEYDOWN {
+        let vk = msg.wparam as u8;
+        if vk.is_ascii_graphic() || vk == b' ' {
+            win32_post_message(msg.hwnd, WM_CHAR, vk as usize, msg.lparam);
+            return true;
+        }
+    }
+    false
+}
+
+/// Dispatches a message to a window procedure.
+pub fn win32_dispatch_message(lp_msg: *const Msg) -> LRESULT {
+    if lp_msg.is_null() {
+        return 0;
+    }
+
+    let msg = unsafe { *lp_msg };
+    if msg.hwnd != HWND_INVALID {
+        let wnd_proc = {
+            let windows = WINDOW_TABLE.lock();
+            windows.iter().find(|w| w.hwnd == msg.hwnd).and_then(|w| w.wnd_proc)
+        };
+
+        if let Some(proc) = wnd_proc {
+            unsafe { proc(msg.hwnd, msg.message, msg.wparam, msg.lparam) }
+        } else {
+            win32_def_window_proc(msg.hwnd, msg.message, msg.wparam, msg.lparam)
+        }
+    } else {
+        win32_def_window_proc(msg.hwnd, msg.message, msg.wparam, msg.lparam)
+    }
+}
+
+/// Provides default processing for any window messages that an application does not process.
+pub extern "C" fn win32_def_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    _wparam: WPARAM,
+    _lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CLOSE => {
+            win32_destroy_window(hwnd);
+            0
+        }
+        WM_DESTROY => {
+            win32_post_quit_message(0);
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// Sends the specified message to a window or windows synchronously.
+pub fn win32_send_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let wnd_proc = {
+        let windows = WINDOW_TABLE.lock();
+        windows.iter().find(|w| w.hwnd == hwnd).and_then(|w| w.wnd_proc)
+    };
+
+    if let Some(proc) = wnd_proc {
+        unsafe { proc(hwnd, msg, wparam, lparam) }
+    } else {
+        win32_def_window_proc(hwnd, msg, wparam, lparam)
+    }
+}
