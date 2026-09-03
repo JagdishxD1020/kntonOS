@@ -544,3 +544,129 @@ impl DescriptorHeap {
         self.num_descriptors.saturating_sub(self.allocated_count)
     }
 }
+
+// Dynamic Root Parameter Binding Table
+
+/// Bound state value for an individual root parameter slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundRootParameter {
+    /// Descriptor table bound to a base GPU descriptor handle.
+    DescriptorTable { gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE },
+    /// Inline 32-bit constants buffer.
+    Constants32Bit { values: Vec<u32> },
+    /// Direct 64-bit GPU virtual address descriptor.
+    RootDescriptor { gpu_virtual_address: u64 },
+}
+
+/// Dynamic runtime binding table managing active shader parameters for a root signature layout.
+#[derive(Debug, Clone)]
+pub struct RootBindingTable {
+    pub layout: RootSignatureLayout,
+    pub bindings: Vec<Option<BoundRootParameter>>,
+}
+
+impl RootBindingTable {
+    /// Creates a new binding table configured for the given root signature layout.
+    pub fn new(layout: RootSignatureLayout) -> Self {
+        let num_params = layout.num_parameters();
+        Self {
+            layout,
+            bindings: alloc::vec![None; num_params],
+        }
+    }
+
+    /// Binds a GPU descriptor handle to a descriptor table root parameter slot.
+    pub fn bind_descriptor_table(
+        &mut self,
+        slot: usize,
+        handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    ) -> Result<(), &'static str> {
+        if slot >= self.bindings.len() {
+            return Err("Root parameter slot out of bounds");
+        }
+        if self.layout.parameters[slot].parameter_type != D3D12_ROOT_PARAMETER_TYPE::DescriptorTable {
+            return Err("Target slot is not a descriptor table parameter");
+        }
+        if !handle.is_valid() {
+            return Err("Descriptor table GPU handle must be non-null and valid");
+        }
+
+        self.bindings[slot] = Some(BoundRootParameter::DescriptorTable { gpu_handle: handle });
+        Ok(())
+    }
+
+    /// Binds inline 32-bit constants into a root constants parameter slot.
+    pub fn bind_32bit_constants(
+        &mut self,
+        slot: usize,
+        values: &[u32],
+        offset_dwords: usize,
+    ) -> Result<(), &'static str> {
+        if slot >= self.bindings.len() {
+            return Err("Root parameter slot out of bounds");
+        }
+        let expected_count = match &self.layout.parameters[slot].payload {
+            RootParameterPayload::Constants32Bit(c) => c.num_32bit_values as usize,
+            _ => return Err("Target slot is not a 32-bit constants parameter"),
+        };
+
+        if offset_dwords.saturating_add(values.len()) > expected_count {
+            return Err("Constant values exceed root parameter allocated DWORD budget");
+        }
+
+        let mut current_vals = if let Some(BoundRootParameter::Constants32Bit { values: cur }) = &self.bindings[slot] {
+            cur.clone()
+        } else {
+            alloc::vec![0u32; expected_count]
+        };
+
+        for (i, &val) in values.iter().enumerate() {
+            current_vals[offset_dwords + i] = val;
+        }
+
+        self.bindings[slot] = Some(BoundRootParameter::Constants32Bit { values: current_vals });
+        Ok(())
+    }
+
+    /// Binds a direct 64-bit GPU virtual address to a CBV, SRV, or UAV root descriptor slot.
+    pub fn bind_root_descriptor(
+        &mut self,
+        slot: usize,
+        gpu_virtual_address: u64,
+    ) -> Result<(), &'static str> {
+        if slot >= self.bindings.len() {
+            return Err("Root parameter slot out of bounds");
+        }
+        match self.layout.parameters[slot].parameter_type {
+            D3D12_ROOT_PARAMETER_TYPE::Cbv
+            | D3D12_ROOT_PARAMETER_TYPE::Srv
+            | D3D12_ROOT_PARAMETER_TYPE::Uav => {}
+            _ => return Err("Target slot is not a direct root descriptor parameter"),
+        }
+
+        if gpu_virtual_address == 0 {
+            return Err("Root descriptor GPU virtual address cannot be zero");
+        }
+        if (gpu_virtual_address % 8) != 0 {
+            return Err("Root descriptor GPU virtual address must be 8-byte aligned");
+        }
+
+        self.bindings[slot] = Some(BoundRootParameter::RootDescriptor { gpu_virtual_address });
+        Ok(())
+    }
+
+    /// Computes the hardware byte offset in the root argument ring for the given parameter slot.
+    pub fn compute_hardware_offset(&self, slot: usize) -> Option<u32> {
+        self.layout.get_parameter_offset(slot).map(|dw| dw * 4)
+    }
+
+    /// Returns a reference to the bound parameter value at the given slot.
+    pub fn get_binding(&self, slot: usize) -> Option<&BoundRootParameter> {
+        self.bindings.get(slot).and_then(|opt| opt.as_ref())
+    }
+
+    /// Checks if all parameters required by the root signature layout are bound.
+    pub fn all_parameters_bound(&self) -> bool {
+        self.bindings.iter().all(|b| b.is_some())
+    }
+}
