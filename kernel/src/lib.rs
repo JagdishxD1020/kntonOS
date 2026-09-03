@@ -666,6 +666,10 @@ pub extern "C" fn kmain() -> ! {
     if !audio::test_xaudio2_service_subsystem() {
         serial_write_str("[KNT-PANIC] Userland XAudio2 game audio service self-test failed!\r\n");
     }
+    // Initialize and verify DirectSound & DirectSound3D Legacy Game Audio API Emulation (TASK-KNT-140)
+    if !audio::test_dsound_service_subsystem() {
+        serial_write_str("[KNT-PANIC] DirectSound and DirectSound3D legacy audio service self-test failed!\r\n");
+    }
 
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
