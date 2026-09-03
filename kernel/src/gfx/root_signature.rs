@@ -836,3 +836,192 @@ impl RootSignatureCache {
         self.cache_misses = 0;
     }
 }
+
+/// Comprehensive verification self-test suite for Direct3D 12 Root Signature & Descriptor Heap Binding Table Engine.
+pub fn test_root_signature_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Root Signature & Descriptor Heap Binding Table...\r\n");
+
+    // 1. Verify Root Parameter Construction and 64-DWORD Budget Enforcement
+    let ranges = alloc::vec![
+        D3D12_DESCRIPTOR_RANGE::new(D3D12_DESCRIPTOR_RANGE_TYPE::Srv, 4, 0, 0, 0),
+        D3D12_DESCRIPTOR_RANGE::new(D3D12_DESCRIPTOR_RANGE_TYPE::Uav, 2, 0, 0, 4),
+    ];
+    let params = alloc::vec![
+        D3D12_ROOT_PARAMETER::descriptor_table(D3D12_SHADER_VISIBILITY::Pixel, ranges),
+        D3D12_ROOT_PARAMETER::constants(D3D12_SHADER_VISIBILITY::All, 0, 0, 4),
+        D3D12_ROOT_PARAMETER::cbv(D3D12_SHADER_VISIBILITY::Vertex, 0, 0),
+        D3D12_ROOT_PARAMETER::srv(D3D12_SHADER_VISIBILITY::Pixel, 1, 0),
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC::new(
+        params,
+        D3D12_ROOT_SIGNATURE_FLAGS::ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    );
+
+    let layout = match RootSignatureLayout::compile(desc.clone()) {
+        Ok(l) => l,
+        Err(_) => {
+            crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to compile valid root signature\r\n");
+            return false;
+        }
+    };
+
+    // Expected DWORD cost: Table (1) + Constants (4) + CBV (2) + SRV (2) = 9 DWORDs
+    if layout.total_dwords != 9 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Root signature DWORD cost mismatch\r\n");
+        return false;
+    }
+    if layout.parameter_offsets != alloc::vec![0, 1, 5, 7] {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Root signature parameter offsets mismatch\r\n");
+        return false;
+    }
+
+    // Budget overflow test (> 64 DWORDs)
+    let overflow_params = alloc::vec![
+        D3D12_ROOT_PARAMETER::constants(D3D12_SHADER_VISIBILITY::All, 0, 0, 60),
+        D3D12_ROOT_PARAMETER::constants(D3D12_SHADER_VISIBILITY::All, 1, 0, 10),
+    ];
+    let overflow_desc = D3D12_ROOT_SIGNATURE_DESC::new(overflow_params, D3D12_ROOT_SIGNATURE_FLAGS::NONE);
+    if RootSignatureLayout::compile(overflow_desc).is_ok() {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Budget overflow must be rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Root parameter descriptors and 64-DWORD budget validation verified\r\n");
+
+    // 2. Verify DescriptorHeap Allocation and Handle Arithmetic
+    let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC::new(
+        D3D12_DESCRIPTOR_HEAP_TYPE::CbvSrvUav,
+        128,
+        D3D12_DESCRIPTOR_HEAP_FLAGS::SHADER_VISIBLE,
+    );
+    let mut heap = match DescriptorHeap::new(heap_desc, 0x1000_0000, 0x2000_0000) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to create descriptor heap\r\n");
+            return false;
+        }
+    };
+
+    if heap.descriptor_increment_size != 32 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Descriptor increment size mismatch\r\n");
+        return false;
+    }
+
+    let (cpu_h0, gpu_h0) = match heap.allocate_range(16) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-ROOT-SIG-FAIL] First range allocation failed\r\n");
+            return false;
+        }
+    };
+    if cpu_h0.ptr != 0x1000_0000 || gpu_h0.ptr != 0x2000_0000 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Base handle allocation mismatch\r\n");
+        return false;
+    }
+
+    let (cpu_h1, gpu_h1) = match heap.allocate_range(8) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Second range allocation failed\r\n");
+            return false;
+        }
+    };
+    // 16 descriptors * 32 bytes = 512 bytes = 0x200
+    if cpu_h1.ptr != 0x1000_0200 || gpu_h1.ptr != 0x2000_0200 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Second range offset handle mismatch\r\n");
+        return false;
+    }
+    if heap.remaining_capacity() != 104 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Heap remaining capacity mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Descriptor heap allocation and handle offset arithmetic verified\r\n");
+
+    // 3. Verify Dynamic Root Binding Table and Hardware Offsets
+    let mut binding_table = RootBindingTable::new(layout);
+
+    if binding_table.all_parameters_bound() {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Initial binding table must not report all bound\r\n");
+        return false;
+    }
+
+    // Bind slot 0: Descriptor Table
+    if let Err(_) = binding_table.bind_descriptor_table(0, gpu_h0) {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to bind descriptor table\r\n");
+        return false;
+    }
+
+    // Bind slot 1: 32-bit Constants
+    let const_vals = [0xCAFEBABE, 0xDEADBEEF, 0x12345678, 0x9ABCDEF0];
+    if let Err(_) = binding_table.bind_32bit_constants(1, &const_vals, 0) {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to bind 32-bit constants\r\n");
+        return false;
+    }
+
+    // Bind slot 2: CBV
+    if let Err(_) = binding_table.bind_root_descriptor(2, 0x3000_0000) {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to bind CBV root descriptor\r\n");
+        return false;
+    }
+
+    // Bind slot 3: SRV
+    if let Err(_) = binding_table.bind_root_descriptor(3, 0x4000_0000) {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Failed to bind SRV root descriptor\r\n");
+        return false;
+    }
+
+    if !binding_table.all_parameters_bound() {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] All parameters must be bound\r\n");
+        return false;
+    }
+    if binding_table.compute_hardware_offset(0) != Some(0)
+        || binding_table.compute_hardware_offset(1) != Some(4)
+        || binding_table.compute_hardware_offset(2) != Some(20)
+        || binding_table.compute_hardware_offset(3) != Some(28)
+    {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Hardware byte offsets calculation mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Dynamic root parameter binding and hardware offset mapping verified\r\n");
+
+    // 4. Verify Dirty Slot Bitmask and Incremental Update Pipeline
+    if binding_table.dirty_slots != 0x0F {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Dirty slot bitmask mismatch\r\n");
+        return false;
+    }
+
+    let mut flushed_count = 0;
+    binding_table.flush_dirty_parameters(|_slot, _param, _hw_offset| {
+        flushed_count += 1;
+    });
+
+    if flushed_count != 4 || binding_table.has_dirty_slots() {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Incremental dirty parameter flush failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Incremental dirty slot tracking and hardware flush pipeline verified\r\n");
+
+    // 5. Verify Centralized Root Signature Cache Deduplication
+    let mut cache = RootSignatureCache::new();
+    let l1 = match cache.get_or_compile(desc.clone()) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    let l2 = match cache.get_or_compile(desc) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+
+    if l1 != l2 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Cached layout mismatch\r\n");
+        return false;
+    }
+    let (hits, misses) = cache.stats();
+    if hits != 1 || misses != 1 {
+        crate::serial_write_str("[KNT-ROOT-SIG-FAIL] Cache hits/misses telemetry mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Centralized root signature cache deduplication verified\r\n");
+
+    crate::serial_write_str("[KNT-ROOT-SIG-PASS] Direct3D 12 root signature and descriptor heap binding verified\r\n");
+    true
+}
