@@ -68,6 +68,23 @@ pub struct DSoundLockRegion {
     pub len2: usize,
 }
 
+// Control unavailable error.
+pub const DSERR_CONTROLUNAVAIL: u32 = 0x8878001E;
+
+// Volume limits in hundredths of a decibel (mB).
+pub const DSBVOLUME_MIN: i32 = -10000;
+pub const DSBVOLUME_MAX: i32 = 0;
+
+// Pan limits in hundredths of a decibel.
+pub const DSBPAN_LEFT: i32 = -10000;
+pub const DSBPAN_CENTER: i32 = 0;
+pub const DSBPAN_RIGHT: i32 = 10000;
+
+// Frequency range limits in Hertz.
+pub const DSBFREQUENCY_MIN: u32 = 100;
+pub const DSBFREQUENCY_MAX: u32 = 200000;
+pub const DSBFREQUENCY_ORIGINAL: u32 = 0;
+
 /// DirectSound Buffer representing a circular PCM sound buffer with cursor tracking.
 #[derive(Debug, Clone)]
 pub struct DirectSoundBuffer {
@@ -78,12 +95,21 @@ pub struct DirectSoundBuffer {
     pub status: u32,
     pub is_locked: bool,
     pub lock_region: DSoundLockRegion,
+    pub volume: i32,
+    pub pan: i32,
+    pub frequency: u32,
+    pub original_frequency: u32,
 }
 
 impl DirectSoundBuffer {
     // Creates a new secondary or primary DirectSoundBuffer.
     pub fn new(desc: DSBUFFERDESC) -> Self {
         let size = desc.dwBufferBytes as usize;
+        let orig_freq = if desc.lpwfxFormat.nSamplesPerSec > 0 {
+            desc.lpwfxFormat.nSamplesPerSec
+        } else {
+            48000
+        };
         Self {
             desc,
             buffer: alloc::vec![0u8; size],
@@ -97,6 +123,10 @@ impl DirectSoundBuffer {
                 offset2: 0,
                 len2: 0,
             },
+            volume: DSBVOLUME_MAX,
+            pan: DSBPAN_CENTER,
+            frequency: orig_freq,
+            original_frequency: orig_freq,
         }
     }
 
@@ -221,6 +251,151 @@ pub fn verify_dsound_buffer_descriptors() -> bool {
         return false;
     }
     if buf.buffer[850] != 0xBB || buf.buffer[999] != 0xBB || buf.buffer[0] != 0xCC || buf.buffer[149] != 0xCC {
+        return false;
+    }
+
+    true
+}
+
+impl DirectSoundBuffer {
+    // Sets buffer volume attenuation in hundredths of a decibel (-10000 to 0).
+    pub fn set_volume(&mut self, volume: i32) -> u32 {
+        if (self.desc.dwFlags & DSBCAPS_CTRLVOLUME) == 0 {
+            return DSERR_CONTROLUNAVAIL;
+        }
+        self.volume = volume.clamp(DSBVOLUME_MIN, DSBVOLUME_MAX);
+        DS_OK
+    }
+
+    // Returns current buffer volume in mB.
+    pub fn get_volume(&self) -> i32 {
+        self.volume
+    }
+
+    // Sets pan balance between left and right channels (-10000 to +10000).
+    pub fn set_pan(&mut self, pan: i32) -> u32 {
+        if (self.desc.dwFlags & DSBCAPS_CTRLPAN) == 0 {
+            return DSERR_CONTROLUNAVAIL;
+        }
+        self.pan = pan.clamp(DSBPAN_LEFT, DSBPAN_RIGHT);
+        DS_OK
+    }
+
+    // Returns current buffer pan balance.
+    pub fn get_pan(&self) -> i32 {
+        self.pan
+    }
+
+    // Adjusts playback sampling frequency in Hertz (100 to 200000 Hz).
+    pub fn set_frequency(&mut self, frequency: u32) -> u32 {
+        if (self.desc.dwFlags & DSBCAPS_CTRLFREQUENCY) == 0 {
+            return DSERR_CONTROLUNAVAIL;
+        }
+        if frequency == DSBFREQUENCY_ORIGINAL {
+            self.frequency = self.original_frequency;
+        } else {
+            self.frequency = frequency.clamp(DSBFREQUENCY_MIN, DSBFREQUENCY_MAX);
+        }
+        DS_OK
+    }
+
+    // Returns current playback sampling frequency.
+    pub fn get_frequency(&self) -> u32 {
+        self.frequency
+    }
+
+    // Starts buffer playback with optional looping flag.
+    pub fn play(&mut self, flags: u32) -> u32 {
+        self.status |= DSBSTATUS_PLAYING;
+        if (flags & DSBPLAY_LOOPING) != 0 {
+            self.status |= DSBSTATUS_LOOPING;
+        } else {
+            self.status &= !DSBSTATUS_LOOPING;
+        }
+        DS_OK
+    }
+
+    // Stops buffer playback.
+    pub fn stop(&mut self) -> u32 {
+        self.status &= !(DSBSTATUS_PLAYING | DSBSTATUS_LOOPING);
+        DS_OK
+    }
+
+    // Returns current playback status bitmask.
+    pub fn get_status(&self) -> u32 {
+        self.status
+    }
+
+    // Computes left and right linear multipliers from current volume and pan settings.
+    pub fn compute_channel_gains(&self) -> (f32, f32) {
+        let vol_db = (self.volume as f32) / 100.0;
+        let base_gain = super::xaudio2::decibels_to_linear(vol_db);
+
+        let (pan_l, pan_r) = if self.pan == 0 {
+            (1.0, 1.0)
+        } else if self.pan < 0 {
+            let right_atten_db = (self.pan as f32) / 100.0;
+            (1.0, super::xaudio2::decibels_to_linear(right_atten_db))
+        } else {
+            let left_atten_db = -(self.pan as f32) / 100.0;
+            (super::xaudio2::decibels_to_linear(left_atten_db), 1.0)
+        };
+
+        (base_gain * pan_l, base_gain * pan_r)
+    }
+
+    // Computes resampling speed ratio relative to original buffer frequency.
+    pub fn get_resample_ratio(&self) -> f32 {
+        if self.original_frequency == 0 {
+            1.0
+        } else {
+            (self.frequency as f32) / (self.original_frequency as f32)
+        }
+    }
+}
+
+/// Verifies volume gain attenuation, pan channel balance, and frequency ratio scaling.
+pub fn verify_dsound_volume_pan_and_frequency() -> bool {
+    let mut desc = DSBUFFERDESC::default();
+    desc.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_CTRLFREQUENCY;
+    desc.dwBufferBytes = 4096;
+    desc.lpwfxFormat = WaveFormatEx::pcm_stereo(44100, 16);
+
+    let mut buf = DirectSoundBuffer::new(desc);
+
+    // Test volume attenuation (-600 mB = -6 dB = ~0.501)
+    if buf.set_volume(-600) != DS_OK {
+        return false;
+    }
+    let (gl, gr) = buf.compute_channel_gains();
+    if (gl - 0.501).abs() > 0.05 || (gr - 0.501).abs() > 0.05 {
+        return false;
+    }
+
+    // Test full right pan (+10000 mB): left attenuated to 0, right retains base gain
+    if buf.set_pan(DSBPAN_RIGHT) != DS_OK {
+        return false;
+    }
+    let (gl_panned, gr_panned) = buf.compute_channel_gains();
+    if gl_panned > 0.01 || (gr_panned - 0.501).abs() > 0.05 {
+        return false;
+    }
+
+    // Test frequency scaling: double frequency (88200 Hz) -> 2.0x ratio
+    if buf.set_frequency(88200) != DS_OK {
+        return false;
+    }
+    if (buf.get_resample_ratio() - 2.0).abs() > 0.01 {
+        return false;
+    }
+
+    // Test play/stop status
+    buf.play(DSBPLAY_LOOPING);
+    if (buf.get_status() & (DSBSTATUS_PLAYING | DSBSTATUS_LOOPING)) == 0 {
+        return false;
+    }
+    buf.stop();
+    if (buf.get_status() & DSBSTATUS_PLAYING) != 0 {
         return false;
     }
 
