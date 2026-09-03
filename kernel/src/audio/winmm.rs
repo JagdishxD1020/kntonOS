@@ -255,6 +255,8 @@ pub const WOM_DONE: u32 = 0x3BD;
 pub const WINMM_FIXED_POINT_UNITY: u32 = 0x00010000;
 
 /// State representation of an active WaveOut device instance.
+use alloc::collections::VecDeque;
+
 #[derive(Debug, Clone)]
 pub struct WaveOutInstance {
     pub handle: HWAVEOUT,
@@ -267,6 +269,10 @@ pub struct WaveOutInstance {
     pub pitch: u32,
     pub playback_rate: u32,
     pub is_paused: bool,
+    pub buffer_queue: VecDeque<WAVEHDR>,
+    pub playback_byte_offset: usize,
+    pub current_loops_remaining: u32,
+    pub completed_headers: Vec<WAVEHDR>,
 }
 
 impl WaveOutInstance {
@@ -283,6 +289,10 @@ impl WaveOutInstance {
             pitch: WINMM_FIXED_POINT_UNITY,
             playback_rate: WINMM_FIXED_POINT_UNITY,
             is_paused: false,
+            buffer_queue: VecDeque::new(),
+            playback_byte_offset: 0,
+            current_loops_remaining: 0,
+            completed_headers: Vec::new(),
         }
     }
 
@@ -460,6 +470,191 @@ pub fn verify_waveout_device_lifecycle() -> bool {
         return false;
     }
     if reg.wave_out_close(handle) != MMSYSERR_INVALHANDLE {
+        return false;
+    }
+
+    true
+}
+
+impl WaveOutInstance {
+    // Processes audio frames from active queue into destination buffers, applying volume attenuation.
+    pub fn render_frames(&mut self, frames: usize, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        if self.is_paused {
+            return 0;
+        }
+
+        let (gl, gr) = self.get_linear_gains();
+        let block_align = self.format.nBlockAlign as usize;
+        if block_align == 0 {
+            return 0;
+        }
+
+        let channels = self.format.nChannels as usize;
+        let mut frames_written = 0;
+
+        while frames_written < frames {
+            let hdr = match self.buffer_queue.front_mut() {
+                Some(h) => h,
+                None => break,
+            };
+
+            let data_len = hdr.data.len();
+            if self.playback_byte_offset + block_align > data_len {
+                if hdr.loops > 1 && self.current_loops_remaining + 1 < hdr.loops {
+                    self.current_loops_remaining += 1;
+                    self.playback_byte_offset = 0;
+                    continue;
+                } else {
+                    let mut done_hdr = self.buffer_queue.pop_front().unwrap();
+                    done_hdr.flags &= !WHDR_INQUEUE;
+                    done_hdr.flags |= WHDR_DONE;
+                    self.completed_headers.push(done_hdr);
+                    self.playback_byte_offset = 0;
+                    self.current_loops_remaining = 0;
+                    continue;
+                }
+            }
+
+            let off = self.playback_byte_offset;
+            let sample_l = if self.format.wBitsPerSample == 16 {
+                let s_i16 = i16::from_le_bytes([hdr.data[off], hdr.data[off + 1]]);
+                (s_i16 as f32) / 32768.0
+            } else {
+                let s_u8 = hdr.data[off] as f32;
+                (s_u8 - 128.0) / 128.0
+            };
+
+            let sample_r = if channels > 1 {
+                if self.format.wBitsPerSample == 16 {
+                    let s_i16 = i16::from_le_bytes([hdr.data[off + 2], hdr.data[off + 3]]);
+                    (s_i16 as f32) / 32768.0
+                } else {
+                    let s_u8 = hdr.data[off + 1] as f32;
+                    (s_u8 - 128.0) / 128.0
+                }
+            } else {
+                sample_l
+            };
+
+            out_l[frames_written] += sample_l * gl;
+            out_r[frames_written] += sample_r * gr;
+
+            frames_written += 1;
+            self.playback_byte_offset += block_align;
+        }
+
+        frames_written
+    }
+}
+
+impl WaveOutDeviceRegistry {
+    // Win32 waveOutPrepareHeader implementation.
+    pub fn wave_out_prepare_header(&mut self, handle: HWAVEOUT, hdr: &mut WAVEHDR) -> u32 {
+        if !self.instances.contains_key(&handle) {
+            return MMSYSERR_INVALHANDLE;
+        }
+        hdr.flags |= WHDR_PREPARED;
+        hdr.flags &= !WHDR_DONE;
+        MMSYSERR_NOERROR
+    }
+
+    // Win32 waveOutUnprepareHeader implementation.
+    pub fn wave_out_unprepare_header(&mut self, handle: HWAVEOUT, hdr: &mut WAVEHDR) -> u32 {
+        if !self.instances.contains_key(&handle) {
+            return MMSYSERR_INVALHANDLE;
+        }
+        if (hdr.flags & WHDR_INQUEUE) != 0 {
+            return WAVERR_STILLPLAYING;
+        }
+        hdr.flags &= !WHDR_PREPARED;
+        MMSYSERR_NOERROR
+    }
+
+    // Win32 waveOutWrite implementation.
+    pub fn wave_out_write(&mut self, handle: HWAVEOUT, mut hdr: WAVEHDR) -> u32 {
+        if (hdr.flags & WHDR_PREPARED) == 0 {
+            return WAVERR_UNPREPARED;
+        }
+        let inst = match self.instances.get_mut(&handle) {
+            Some(i) => i,
+            None => return MMSYSERR_INVALHANDLE,
+        };
+
+        hdr.flags |= WHDR_INQUEUE;
+        hdr.flags &= !WHDR_DONE;
+        inst.buffer_queue.push_back(hdr);
+        MMSYSERR_NOERROR
+    }
+
+    // Win32 waveOutReset implementation.
+    pub fn wave_out_reset(&mut self, handle: HWAVEOUT) -> u32 {
+        let inst = match self.instances.get_mut(&handle) {
+            Some(i) => i,
+            None => return MMSYSERR_INVALHANDLE,
+        };
+
+        while let Some(mut hdr) = inst.buffer_queue.pop_front() {
+            hdr.flags &= !WHDR_INQUEUE;
+            hdr.flags |= WHDR_DONE;
+            inst.completed_headers.push(hdr);
+        }
+        inst.playback_byte_offset = 0;
+        MMSYSERR_NOERROR
+    }
+}
+
+/// Verifies WaveOut header preparation, queueing semantics, and stream consumption.
+pub fn verify_waveout_buffer_queue_and_prepare() -> bool {
+    let mut reg = WaveOutDeviceRegistry::new();
+    let fmt = WaveFormatEx::pcm_stereo(48000, 16);
+    let handle = reg.wave_out_open(WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL).unwrap();
+
+    let mut raw_pcm = Vec::new();
+    for _ in 0..64 {
+        let sample: i16 = 16384; // 0.5
+        raw_pcm.extend_from_slice(&sample.to_le_bytes());
+        raw_pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    let mut hdr = WAVEHDR::new(&raw_pcm, 1);
+
+    // Write before prepare must fail
+    if reg.wave_out_write(handle, hdr.clone()) != WAVERR_UNPREPARED {
+        return false;
+    }
+
+    // Prepare header
+    if reg.wave_out_prepare_header(handle, &mut hdr) != MMSYSERR_NOERROR {
+        return false;
+    }
+    if (hdr.flags & WHDR_PREPARED) == 0 {
+        return false;
+    }
+
+    // Unprepare while not in queue succeeds
+    if reg.wave_out_unprepare_header(handle, &mut hdr) != MMSYSERR_NOERROR {
+        return false;
+    }
+    if (hdr.flags & WHDR_PREPARED) != 0 {
+        return false;
+    }
+
+    // Re-prepare and write
+    reg.wave_out_prepare_header(handle, &mut hdr);
+    if reg.wave_out_write(handle, hdr.clone()) != MMSYSERR_NOERROR {
+        return false;
+    }
+
+    // Render 64 frames
+    let mut out_l = alloc::vec![0.0f32; 64];
+    let mut out_r = alloc::vec![0.0f32; 64];
+    let written = reg.instances.get_mut(&handle).unwrap().render_frames(64, &mut out_l, &mut out_r);
+    if written != 64 || (out_l[0] - 0.5).abs() > 0.01 {
+        return false;
+    }
+
+    // Header should now be in completed_headers marked DONE
+    let inst = reg.instances.get(&handle).unwrap();
+    if inst.completed_headers.is_empty() || (inst.completed_headers[0].flags & WHDR_DONE) == 0 {
         return false;
     }
 
