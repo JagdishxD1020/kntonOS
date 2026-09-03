@@ -401,3 +401,156 @@ pub fn verify_dsound_volume_pan_and_frequency() -> bool {
 
     true
 }
+
+use crate::drivers::input::imu::sqrt_f32;
+
+// DirectSound3D processing modes.
+pub const DS3DMODE_NORMAL: u32 = 0x00000000;
+pub const DS3DMODE_HEADRELATIVE: u32 = 0x00000001;
+pub const DS3DMODE_DISABLE: u32 = 0x00000002;
+
+// Standard 3D vector for DirectSound3D coordinates and velocities.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct D3DVECTOR {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl D3DVECTOR {
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    // Computes vector magnitude length.
+    pub fn length(&self) -> f32 {
+        sqrt_f32(self.x * self.x + self.y * self.y + self.z * self.z)
+    }
+}
+
+/// DirectSound3D Listener parameters representing user position and orientation in world space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DS3DListener {
+    pub position: D3DVECTOR,
+    pub velocity: D3DVECTOR,
+    pub orient_front: D3DVECTOR,
+    pub orient_top: D3DVECTOR,
+    pub distance_factor: f32,
+    pub rolloff_factor: f32,
+    pub doppler_factor: f32,
+}
+
+impl Default for DS3DListener {
+    fn default() -> Self {
+        Self {
+            position: D3DVECTOR::new(0.0, 0.0, 0.0),
+            velocity: D3DVECTOR::new(0.0, 0.0, 0.0),
+            orient_front: D3DVECTOR::new(0.0, 0.0, 1.0),
+            orient_top: D3DVECTOR::new(0.0, 1.0, 0.0),
+            distance_factor: 1.0,
+            rolloff_factor: 1.0,
+            doppler_factor: 1.0,
+        }
+    }
+}
+
+/// DirectSound3D Buffer parameters for sound sources positioned in 3D audio space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectSound3DBuffer {
+    pub position: D3DVECTOR,
+    pub velocity: D3DVECTOR,
+    pub inside_cone_angle: u32,
+    pub outside_cone_angle: u32,
+    pub cone_orientation: D3DVECTOR,
+    pub cone_outside_volume: i32,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub mode: u32,
+}
+
+impl Default for DirectSound3DBuffer {
+    fn default() -> Self {
+        Self {
+            position: D3DVECTOR::new(0.0, 0.0, 1.0),
+            velocity: D3DVECTOR::new(0.0, 0.0, 0.0),
+            inside_cone_angle: 360,
+            outside_cone_angle: 360,
+            cone_orientation: D3DVECTOR::new(0.0, 0.0, 1.0),
+            cone_outside_volume: 0,
+            min_distance: 1.0,
+            max_distance: 100.0,
+            mode: DS3DMODE_NORMAL,
+        }
+    }
+}
+
+impl DirectSound3DBuffer {
+    // Computes distance attenuation and constant-power stereo panning relative to a listener.
+    pub fn compute_spatial_gains(&self, listener: &DS3DListener) -> (f32, f32) {
+        if self.mode == DS3DMODE_DISABLE {
+            return (1.0, 1.0);
+        }
+
+        let rel_x = if self.mode == DS3DMODE_HEADRELATIVE {
+            self.position.x
+        } else {
+            self.position.x - listener.position.x
+        };
+        let rel_y = if self.mode == DS3DMODE_HEADRELATIVE {
+            self.position.y
+        } else {
+            self.position.y - listener.position.y
+        };
+        let rel_z = if self.mode == DS3DMODE_HEADRELATIVE {
+            self.position.z
+        } else {
+            self.position.z - listener.position.z
+        };
+
+        let dist = sqrt_f32(rel_x * rel_x + rel_y * rel_y + rel_z * rel_z).max(0.001);
+        let clamped_dist = dist.clamp(self.min_distance, self.max_distance);
+
+        // Standard inverse distance attenuation formula
+        let denom = self.min_distance + listener.rolloff_factor * (clamped_dist - self.min_distance);
+        let dist_gain = (self.min_distance / denom.max(0.001)).clamp(0.0, 1.0);
+
+        // Constant-power horizontal azimuth panning (-1.0 left to +1.0 right)
+        let pan = (rel_x / dist).clamp(-1.0, 1.0);
+        let pan_l = sqrt_f32(0.5 * (1.0 - pan));
+        let pan_r = sqrt_f32(0.5 * (1.0 + pan));
+
+        (dist_gain * pan_l, dist_gain * pan_r)
+    }
+}
+
+/// Verifies DirectSound3D distance rolloff attenuation and spatial azimuth panning.
+pub fn verify_dsound3d_spatial_attenuation() -> bool {
+    let listener = DS3DListener::default();
+    let mut source = DirectSound3DBuffer::default();
+    source.min_distance = 1.0;
+    source.max_distance = 100.0;
+
+    // 1. Source at min_distance ahead (0, 0, 1): center panned, gain = 1.0 * ~0.707
+    source.position = D3DVECTOR::new(0.0, 0.0, 1.0);
+    let (l1, r1) = source.compute_spatial_gains(&listener);
+    if (l1 - r1).abs() > 0.01 || (l1 - 0.707).abs() > 0.05 {
+        return false;
+    }
+
+    // 2. Source at 10.0m ahead: distance attenuation = 1.0 / (1.0 + 1.0 * (10 - 1)) = 0.1
+    source.position = D3DVECTOR::new(0.0, 0.0, 10.0);
+    let (l10, r10) = source.compute_spatial_gains(&listener);
+    if (l10 - r10).abs() > 0.01 || (l10 - (0.1 * 0.707)).abs() > 0.02 {
+        return false;
+    }
+
+    // 3. Source to the right (10, 0, 0): pan_r >> pan_l
+    source.position = D3DVECTOR::new(10.0, 0.0, 0.0);
+    let (l_right, r_right) = source.compute_spatial_gains(&listener);
+    if r_right <= l_right || l_right > 0.01 {
+        return false;
+    }
+
+    true
+}
