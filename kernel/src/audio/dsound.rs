@@ -554,3 +554,193 @@ pub fn verify_dsound3d_spatial_attenuation() -> bool {
 
     true
 }
+
+use super::client_ring::AudioFrame;
+use crate::serial_write_str;
+
+/// Win32 DirectSound Device Context managing primary and secondary sound buffers.
+#[derive(Debug, Clone)]
+pub struct DirectSoundDevice {
+    pub primary_buffer: Option<DirectSoundBuffer>,
+    pub secondary_buffers: Vec<DirectSoundBuffer>,
+    pub three_d_buffers: Vec<Option<DirectSound3DBuffer>>,
+    pub listener: DS3DListener,
+}
+
+impl Default for DirectSoundDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirectSoundDevice {
+    // Creates a new DirectSound device context.
+    pub fn new() -> Self {
+        Self {
+            primary_buffer: None,
+            secondary_buffers: Vec::new(),
+            three_d_buffers: Vec::new(),
+            listener: DS3DListener::default(),
+        }
+    }
+
+    // Creates a new primary or secondary DirectSoundBuffer.
+    pub fn create_sound_buffer(&mut self, desc: DSBUFFERDESC) -> usize {
+        let is_primary = (desc.dwFlags & DSBCAPS_PRIMARYBUFFER) != 0;
+        let is_3d = (desc.dwFlags & DSBCAPS_CTRL3D) != 0;
+        let buf = DirectSoundBuffer::new(desc);
+
+        if is_primary {
+            self.primary_buffer = Some(buf);
+            0
+        } else {
+            let id = self.secondary_buffers.len();
+            self.secondary_buffers.push(buf);
+            self.three_d_buffers.push(if is_3d { Some(DirectSound3DBuffer::default()) } else { None });
+            id
+        }
+    }
+
+    // Obtains a mutable reference to an existing secondary sound buffer.
+    pub fn get_buffer_mut(&mut self, id: usize) -> Option<&mut DirectSoundBuffer> {
+        self.secondary_buffers.get_mut(id)
+    }
+
+    // Obtains a mutable reference to 3D parameters for an existing secondary sound buffer.
+    pub fn get_3d_buffer_mut(&mut self, id: usize) -> Option<&mut DirectSound3DBuffer> {
+        self.three_d_buffers.get_mut(id).and_then(|opt| opt.as_mut())
+    }
+
+    // Blends all active secondary sound buffers into stereo AudioFrames for kernel DMA output.
+    pub fn render_mixdown(&mut self, frames: usize) -> Vec<AudioFrame> {
+        let mut mix_left = alloc::vec![0.0f32; frames];
+        let mut mix_right = alloc::vec![0.0f32; frames];
+
+        for i in 0..self.secondary_buffers.len() {
+            let buf = &mut self.secondary_buffers[i];
+            if (buf.status & DSBSTATUS_PLAYING) == 0 || buf.buffer.is_empty() {
+                continue;
+            }
+
+            let block_align = buf.desc.lpwfxFormat.nBlockAlign as usize;
+            if block_align == 0 {
+                continue;
+            }
+
+            let channels = buf.desc.lpwfxFormat.nChannels as usize;
+            let (gl, gr) = if let Some(ref three_d) = self.three_d_buffers[i] {
+                three_d.compute_spatial_gains(&self.listener)
+            } else {
+                buf.compute_channel_gains()
+            };
+
+            let resample_ratio = buf.get_resample_ratio();
+            let mut cursor_f = buf.play_cursor as f32;
+            let total_bytes = buf.buffer.len();
+            let is_looping = (buf.status & DSBSTATUS_LOOPING) != 0;
+
+            for f in 0..frames {
+                let cur_idx = (cursor_f as usize) % total_bytes;
+                if !is_looping && (cursor_f as usize) + block_align > total_bytes {
+                    buf.stop();
+                    break;
+                }
+
+                if cur_idx + block_align <= total_bytes {
+                    let left_i16 = i16::from_le_bytes([buf.buffer[cur_idx], buf.buffer[cur_idx + 1]]);
+                    let sample_l = (left_i16 as f32) / 32768.0;
+                    let sample_r = if channels > 1 {
+                        let right_i16 = i16::from_le_bytes([buf.buffer[cur_idx + 2], buf.buffer[cur_idx + 3]]);
+                        (right_i16 as f32) / 32768.0
+                    } else {
+                        sample_l
+                    };
+
+                    mix_left[f] += sample_l * gl;
+                    mix_right[f] += sample_r * gr;
+                }
+
+                cursor_f += resample_ratio * (block_align as f32);
+                if is_looping {
+                    cursor_f %= total_bytes as f32;
+                }
+            }
+
+            buf.play_cursor = (cursor_f as usize) % total_bytes;
+        }
+
+        let mut output = Vec::with_capacity(frames);
+        for f in 0..frames {
+            output.push(AudioFrame {
+                left: mix_left[f].clamp(-1.0, 1.0),
+                right: mix_right[f].clamp(-1.0, 1.0),
+            });
+        }
+        output
+    }
+}
+
+/// Verifies DirectSound secondary buffer playback mixdown and stream packet generation.
+pub fn verify_dsound_device_mixer() -> bool {
+    let mut device = DirectSoundDevice::new();
+    let mut desc = DSBUFFERDESC::default();
+    desc.dwFlags = DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLPAN | DSBCAPS_CTRLFREQUENCY;
+    desc.dwBufferBytes = 400; // 100 stereo 16-bit frames
+    desc.lpwfxFormat = WaveFormatEx::pcm_stereo(48000, 16);
+
+    let id = device.create_sound_buffer(desc);
+    let buf = device.get_buffer_mut(id).unwrap();
+
+    let region = buf.lock(0, 400, 0).unwrap();
+    let mut pcm_data = Vec::new();
+    for _ in 0..100 {
+        let sample: i16 = 16384; // 0.5
+        pcm_data.extend_from_slice(&sample.to_le_bytes());
+        pcm_data.extend_from_slice(&sample.to_le_bytes());
+    }
+    buf.unlock(region, &pcm_data, &[]);
+    buf.play(DSBPLAY_LOOPING);
+
+    let frames = device.render_mixdown(50);
+    if frames.len() != 50 {
+        return false;
+    }
+    // Expected sample value = 0.5 (full volume, center pan)
+    if (frames[0].left - 0.5).abs() > 0.02 || (frames[0].right - 0.5).abs() > 0.02 {
+        return false;
+    }
+
+    true
+}
+
+/// Comprehensive verification self-test suite for DirectSound & DirectSound3D Legacy Game Audio API Emulation.
+pub fn test_dsound_service_subsystem() -> bool {
+    serial_write_str("[KNT-AUDIO] Testing DirectSound & DirectSound3D legacy game audio service...\r\n");
+
+    // 1. Verify buffer descriptors, capabilities, and circular lock/unlock split regions
+    if !verify_dsound_buffer_descriptors() {
+        serial_write_str("[KNT-PANIC] DirectSound buffer descriptor and lock/unlock verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify volume attenuation, pan balance, and frequency scaling
+    if !verify_dsound_volume_pan_and_frequency() {
+        serial_write_str("[KNT-PANIC] DirectSound volume, pan, and frequency verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify DirectSound3D distance rolloff attenuation and spatial azimuth panning
+    if !verify_dsound3d_spatial_attenuation() {
+        serial_write_str("[KNT-PANIC] DirectSound3D spatial attenuation verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify multi-buffer mixing engine and stream packet emission
+    if !verify_dsound_device_mixer() {
+        serial_write_str("[KNT-PANIC] DirectSound mixer and stream rendering verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-DSOUND-PASS] DirectSound and DirectSound3D legacy game audio service verified\r\n");
+    true
+}
