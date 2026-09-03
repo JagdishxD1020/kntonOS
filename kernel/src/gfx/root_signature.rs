@@ -238,3 +238,101 @@ impl D3D12_ROOT_PARAMETER {
         }
     }
 }
+
+/// Maximum allowed root signature size in 32-bit DWORDs (256 bytes).
+pub const D3D12_MAX_ROOT_COST_DWORDS: u32 = 64;
+
+/// Specification descriptor used to construct and compile a root signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_ROOT_SIGNATURE_DESC {
+    pub parameters: Vec<D3D12_ROOT_PARAMETER>,
+    pub flags: D3D12_ROOT_SIGNATURE_FLAGS,
+}
+
+impl D3D12_ROOT_SIGNATURE_DESC {
+    /// Creates a new root signature descriptor.
+    pub fn new(parameters: Vec<D3D12_ROOT_PARAMETER>, flags: D3D12_ROOT_SIGNATURE_FLAGS) -> Self {
+        Self { parameters, flags }
+    }
+}
+
+/// Compiled hardware layout of a Direct3D 12 root signature.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootSignatureLayout {
+    pub total_dwords: u32,
+    pub parameter_offsets: Vec<u32>,
+    pub parameter_dwords: Vec<u32>,
+    pub table_descriptor_counts: Vec<u32>,
+    pub flags: D3D12_ROOT_SIGNATURE_FLAGS,
+    pub parameters: Vec<D3D12_ROOT_PARAMETER>,
+}
+
+impl RootSignatureLayout {
+    /// Compiles and validates a root signature descriptor against D3D12 hardware budget limits.
+    pub fn compile(desc: D3D12_ROOT_SIGNATURE_DESC) -> Result<Self, &'static str> {
+        let mut total_dwords: u32 = 0;
+        let mut parameter_offsets = Vec::with_capacity(desc.parameters.len());
+        let mut parameter_dwords = Vec::with_capacity(desc.parameters.len());
+        let mut table_descriptor_counts = Vec::new();
+
+        for param in &desc.parameters {
+            parameter_offsets.push(total_dwords);
+
+            let dwords = match &param.payload {
+                RootParameterPayload::DescriptorTable(table) => {
+                    let mut desc_count: u32 = 0;
+                    for range in &table.descriptor_ranges {
+                        if range.num_descriptors == 0 {
+                            return Err("Descriptor range cannot contain 0 descriptors");
+                        }
+                        desc_count = desc_count.saturating_add(range.num_descriptors);
+                    }
+                    table_descriptor_counts.push(desc_count);
+                    // A descriptor table pointer in root memory occupies 1 DWORD (32-bit handle/offset)
+                    1
+                }
+                RootParameterPayload::Constants32Bit(c) => {
+                    if c.num_32bit_values == 0 {
+                        return Err("Root constants count must be greater than 0");
+                    }
+                    c.num_32bit_values
+                }
+                RootParameterPayload::Cbv(_) | RootParameterPayload::Srv(_) | RootParameterPayload::Uav(_) => {
+                    // A direct 64-bit GPU virtual address occupies 2 DWORDs
+                    2
+                }
+            };
+
+            parameter_dwords.push(dwords);
+            total_dwords = total_dwords.saturating_add(dwords);
+
+            if total_dwords > D3D12_MAX_ROOT_COST_DWORDS {
+                return Err("Root signature exceeds maximum 64 DWORD hardware budget");
+            }
+        }
+
+        Ok(Self {
+            total_dwords,
+            parameter_offsets,
+            parameter_dwords,
+            table_descriptor_counts,
+            flags: desc.flags,
+            parameters: desc.parameters,
+        })
+    }
+
+    /// Returns the number of parameter slots in the compiled root signature.
+    pub fn num_parameters(&self) -> usize {
+        self.parameters.len()
+    }
+
+    /// Returns the DWORD offset of the specified parameter slot in root memory.
+    pub fn get_parameter_offset(&self, slot: usize) -> Option<u32> {
+        self.parameter_offsets.get(slot).copied()
+    }
+
+    /// Returns the size in DWORDs of the specified parameter slot.
+    pub fn get_parameter_dwords(&self, slot: usize) -> Option<u32> {
+        self.parameter_dwords.get(slot).copied()
+    }
+}
