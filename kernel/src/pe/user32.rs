@@ -514,3 +514,381 @@ pub fn win32_send_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) 
         win32_def_window_proc(hwnd, msg, wparam, lparam)
     }
 }
+
+pub const SRCCOPY: u32 = 0x00CC_0020;
+pub const SRCPAINT: u32 = 0x00EE_0086;
+pub const SRCAND: u32 = 0x0088_00C6;
+pub const SRCINVERT: u32 = 0x0066_0046;
+pub const BLACKNESS: u32 = 0x0000_0042;
+pub const WHITENESS: u32 = 0x00FF_0062;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DcKind {
+    Window(HWND),
+    Memory {
+        selected_bitmap: HBITMAP,
+    },
+}
+
+pub struct DeviceContext {
+    pub hdc: HDC,
+    pub kind: DcKind,
+}
+
+pub struct BitmapObject {
+    pub hbitmap: HBITMAP,
+    pub width: i32,
+    pub height: i32,
+    pub buffer: Vec<u32>,
+}
+
+static NEXT_HDC: Spinlock<HDC> = Spinlock::new(0x0003_0001);
+static NEXT_HBITMAP: Spinlock<HBITMAP> = Spinlock::new(0x0004_0001);
+
+static DC_TABLE: Spinlock<Vec<DeviceContext>> = Spinlock::new(Vec::new());
+static BITMAP_TABLE: Spinlock<Vec<BitmapObject>> = Spinlock::new(Vec::new());
+
+/// Retrieves a handle to a device context (DC) for the client area of a specified window.
+pub fn win32_get_dc(hwnd: HWND) -> HDC {
+    let mut hdc_gen = NEXT_HDC.lock();
+    let hdc = *hdc_gen;
+    *hdc_gen = hdc.saturating_add(1);
+    drop(hdc_gen);
+
+    let dc = DeviceContext {
+        hdc,
+        kind: DcKind::Window(hwnd),
+    };
+
+    let mut dcs = DC_TABLE.lock();
+    dcs.push(dc);
+    hdc
+}
+
+/// Releases a device context (DC), freeing it for use by other applications.
+pub fn win32_release_dc(_hwnd: HWND, hdc: HDC) -> i32 {
+    let mut dcs = DC_TABLE.lock();
+    if let Some(pos) = dcs.iter().position(|d| d.hdc == hdc) {
+        dcs.remove(pos);
+        1
+    } else {
+        0
+    }
+}
+
+/// Creates a memory device context compatible with the specified device.
+pub fn win32_create_compatible_dc(_hdc: HDC) -> HDC {
+    let mut hdc_gen = NEXT_HDC.lock();
+    let hdc = *hdc_gen;
+    *hdc_gen = hdc.saturating_add(1);
+    drop(hdc_gen);
+
+    let dc = DeviceContext {
+        hdc,
+        kind: DcKind::Memory { selected_bitmap: 0 },
+    };
+
+    let mut dcs = DC_TABLE.lock();
+    dcs.push(dc);
+    hdc
+}
+
+/// Deletes the specified device context.
+pub fn win32_delete_dc(hdc: HDC) -> bool {
+    let mut dcs = DC_TABLE.lock();
+    if let Some(pos) = dcs.iter().position(|d| d.hdc == hdc) {
+        dcs.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Creates a bitmap compatible with the device that is associated with the specified device context.
+pub fn win32_create_compatible_bitmap(_hdc: HDC, width: i32, height: i32) -> HBITMAP {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+
+    let mut hbmp_gen = NEXT_HBITMAP.lock();
+    let hbitmap = *hbmp_gen;
+    *hbmp_gen = hbitmap.saturating_add(1);
+    drop(hbmp_gen);
+
+    let pixel_count = (width as usize) * (height as usize);
+    let mut buffer = Vec::with_capacity(pixel_count);
+    buffer.resize(pixel_count, 0x0000_0000);
+
+    let bmp = BitmapObject {
+        hbitmap,
+        width,
+        height,
+        buffer,
+    };
+
+    let mut bmps = BITMAP_TABLE.lock();
+    bmps.push(bmp);
+    hbitmap
+}
+
+/// Selects an object into the specified device context.
+pub fn win32_select_object(hdc: HDC, h_obj: usize) -> usize {
+    let mut dcs = DC_TABLE.lock();
+    if let Some(dc) = dcs.iter_mut().find(|d| d.hdc == hdc) {
+        match &mut dc.kind {
+            DcKind::Memory { selected_bitmap } => {
+                let prev = *selected_bitmap;
+                *selected_bitmap = h_obj;
+                prev
+            }
+            DcKind::Window(_) => 0,
+        }
+    } else {
+        0
+    }
+}
+
+/// Deletes a logical pen, brush, font, bitmap, region, or palette.
+pub fn win32_delete_object(h_obj: usize) -> bool {
+    let mut bmps = BITMAP_TABLE.lock();
+    if let Some(pos) = bmps.iter().position(|b| b.hbitmap == h_obj) {
+        bmps.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Sets the pixel at the specified coordinates to the specified color.
+pub fn win32_set_pixel(hdc: HDC, x: i32, y: i32, color: u32) -> u32 {
+    let dc_kind = {
+        let dcs = DC_TABLE.lock();
+        match dcs.iter().find(|d| d.hdc == hdc) {
+            Some(dc) => dc.kind,
+            None => return 0xFFFF_FFFF,
+        }
+    };
+
+    match dc_kind {
+        DcKind::Memory { selected_bitmap } => {
+            let mut bmps = BITMAP_TABLE.lock();
+            if let Some(bmp) = bmps.iter_mut().find(|b| b.hbitmap == selected_bitmap) {
+                if x >= 0 && x < bmp.width && y >= 0 && y < bmp.height {
+                    let idx = (y as usize) * (bmp.width as usize) + (x as usize);
+                    let prev = bmp.buffer[idx];
+                    bmp.buffer[idx] = color;
+                    prev
+                } else {
+                    0xFFFF_FFFF
+                }
+            } else {
+                0xFFFF_FFFF
+            }
+        }
+        DcKind::Window(hwnd) => {
+            let mut windows = WINDOW_TABLE.lock();
+            if let Some(win) = windows.iter_mut().find(|w| w.hwnd == hwnd) {
+                if x >= 0 && x < win.width && y >= 0 && y < win.height {
+                    let idx = (y as usize) * (win.width as usize) + (x as usize);
+                    let prev = win.surface_buffer[idx];
+                    win.surface_buffer[idx] = color;
+                    prev
+                } else {
+                    0xFFFF_FFFF
+                }
+            } else {
+                0xFFFF_FFFF
+            }
+        }
+    }
+}
+
+/// Retrieves the red, green, blue (RGB) color value of the pixel at the specified coordinates.
+pub fn win32_get_pixel(hdc: HDC, x: i32, y: i32) -> u32 {
+    let dc_kind = {
+        let dcs = DC_TABLE.lock();
+        match dcs.iter().find(|d| d.hdc == hdc) {
+            Some(dc) => dc.kind,
+            None => return 0xFFFF_FFFF,
+        }
+    };
+
+    match dc_kind {
+        DcKind::Memory { selected_bitmap } => {
+            let bmps = BITMAP_TABLE.lock();
+            if let Some(bmp) = bmps.iter().find(|b| b.hbitmap == selected_bitmap) {
+                if x >= 0 && x < bmp.width && y >= 0 && y < bmp.height {
+                    let idx = (y as usize) * (bmp.width as usize) + (x as usize);
+                    bmp.buffer[idx]
+                } else {
+                    0xFFFF_FFFF
+                }
+            } else {
+                0xFFFF_FFFF
+            }
+        }
+        DcKind::Window(hwnd) => {
+            let windows = WINDOW_TABLE.lock();
+            if let Some(win) = windows.iter().find(|w| w.hwnd == hwnd) {
+                if x >= 0 && x < win.width && y >= 0 && y < win.height {
+                    let idx = (y as usize) * (win.width as usize) + (x as usize);
+                    win.surface_buffer[idx]
+                } else {
+                    0xFFFF_FFFF
+                }
+            } else {
+                0xFFFF_FFFF
+            }
+        }
+    }
+}
+
+/// Performs a bit-block transfer of color data from source device context to destination device context.
+pub fn win32_bit_blt(
+    hdc_dest: HDC,
+    x_dest: i32,
+    y_dest: i32,
+    width: i32,
+    height: i32,
+    hdc_src: HDC,
+    x_src: i32,
+    y_src: i32,
+    rop: u32,
+) -> bool {
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+
+    let src_kind = {
+        let dcs = DC_TABLE.lock();
+        match dcs.iter().find(|d| d.hdc == hdc_src) {
+            Some(dc) => dc.kind,
+            None => return false,
+        }
+    };
+
+    let dest_kind = {
+        let dcs = DC_TABLE.lock();
+        match dcs.iter().find(|d| d.hdc == hdc_dest) {
+            Some(dc) => dc.kind,
+            None => return false,
+        }
+    };
+
+    // Extract source pixel rectangle into buffer
+    let mut src_pixels = Vec::with_capacity((width * height) as usize);
+    match src_kind {
+        DcKind::Memory { selected_bitmap } => {
+            let bmps = BITMAP_TABLE.lock();
+            let bmp = match bmps.iter().find(|b| b.hbitmap == selected_bitmap) {
+                Some(b) => b,
+                None => return false,
+            };
+            for row in 0..height {
+                let sy = y_src + row;
+                for col in 0..width {
+                    let sx = x_src + col;
+                    let p = if sx >= 0 && sx < bmp.width && sy >= 0 && sy < bmp.height {
+                        let idx = (sy as usize) * (bmp.width as usize) + (sx as usize);
+                        bmp.buffer[idx]
+                    } else {
+                        0
+                    };
+                    src_pixels.push(p);
+                }
+            }
+        }
+        DcKind::Window(hwnd) => {
+            let windows = WINDOW_TABLE.lock();
+            let win = match windows.iter().find(|w| w.hwnd == hwnd) {
+                Some(w) => w,
+                None => return false,
+            };
+            for row in 0..height {
+                let sy = y_src + row;
+                for col in 0..width {
+                    let sx = x_src + col;
+                    let p = if sx >= 0 && sx < win.width && sy >= 0 && sy < win.height {
+                        let idx = (sy as usize) * (win.width as usize) + (sx as usize);
+                        win.surface_buffer[idx]
+                    } else {
+                        0
+                    };
+                    src_pixels.push(p);
+                }
+            }
+        }
+    }
+
+    // Apply extracted pixels to destination device context according to ROP code
+    match dest_kind {
+        DcKind::Memory { selected_bitmap } => {
+            let mut bmps = BITMAP_TABLE.lock();
+            let bmp = match bmps.iter_mut().find(|b| b.hbitmap == selected_bitmap) {
+                Some(b) => b,
+                None => return false,
+            };
+            for row in 0..height {
+                let dy = y_dest + row;
+                if dy < 0 || dy >= bmp.height {
+                    continue;
+                }
+                for col in 0..width {
+                    let dx = x_dest + col;
+                    if dx < 0 || dx >= bmp.width {
+                        continue;
+                    }
+                    let s_idx = (row as usize) * (width as usize) + (col as usize);
+                    let src_px = src_pixels[s_idx];
+                    let d_idx = (dy as usize) * (bmp.width as usize) + (dx as usize);
+                    let dst_px = bmp.buffer[d_idx];
+
+                    bmp.buffer[d_idx] = match rop {
+                        SRCCOPY => src_px,
+                        SRCPAINT => dst_px | src_px,
+                        SRCAND => dst_px & src_px,
+                        SRCINVERT => dst_px ^ src_px,
+                        BLACKNESS => 0x0000_0000,
+                        WHITENESS => 0x00FF_FFFF,
+                        _ => src_px,
+                    };
+                }
+            }
+            true
+        }
+        DcKind::Window(hwnd) => {
+            let mut windows = WINDOW_TABLE.lock();
+            let win = match windows.iter_mut().find(|w| w.hwnd == hwnd) {
+                Some(w) => w,
+                None => return false,
+            };
+            for row in 0..height {
+                let dy = y_dest + row;
+                if dy < 0 || dy >= win.height {
+                    continue;
+                }
+                for col in 0..width {
+                    let dx = x_dest + col;
+                    if dx < 0 || dx >= win.width {
+                        continue;
+                    }
+                    let s_idx = (row as usize) * (width as usize) + (col as usize);
+                    let src_px = src_pixels[s_idx];
+                    let d_idx = (dy as usize) * (win.width as usize) + (dx as usize);
+                    let dst_px = win.surface_buffer[d_idx];
+
+                    win.surface_buffer[d_idx] = match rop {
+                        SRCCOPY => src_px,
+                        SRCPAINT => dst_px | src_px,
+                        SRCAND => dst_px & src_px,
+                        SRCINVERT => dst_px ^ src_px,
+                        BLACKNESS => 0x0000_0000,
+                        WHITENESS => 0x00FF_FFFF,
+                        _ => src_px,
+                    };
+                }
+            }
+            true
+        }
+    }
+}
