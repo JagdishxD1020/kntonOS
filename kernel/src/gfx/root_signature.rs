@@ -336,3 +336,211 @@ impl RootSignatureLayout {
         self.parameter_dwords.get(slot).copied()
     }
 }
+
+// Descriptor Heaps & Handle Arithmetic
+
+/// Direct3D 12 descriptor heap categories.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D3D12_DESCRIPTOR_HEAP_TYPE {
+    CbvSrvUav = 0,
+    Sampler = 1,
+    Rtv = 2,
+    Dsv = 3,
+}
+
+/// Descriptor heap execution visibility flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12_DESCRIPTOR_HEAP_FLAGS(pub u32);
+
+impl D3D12_DESCRIPTOR_HEAP_FLAGS {
+    pub const NONE: Self = Self(0);
+    pub const SHADER_VISIBLE: Self = Self(1 << 0);
+
+    #[inline(always)]
+    pub const fn contains(&self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+/// Descriptor heap creation parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12_DESCRIPTOR_HEAP_DESC {
+    pub heap_type: D3D12_DESCRIPTOR_HEAP_TYPE,
+    pub num_descriptors: u32,
+    pub flags: D3D12_DESCRIPTOR_HEAP_FLAGS,
+    pub node_mask: u32,
+}
+
+impl D3D12_DESCRIPTOR_HEAP_DESC {
+    pub const fn new(
+        heap_type: D3D12_DESCRIPTOR_HEAP_TYPE,
+        num_descriptors: u32,
+        flags: D3D12_DESCRIPTOR_HEAP_FLAGS,
+    ) -> Self {
+        Self {
+            heap_type,
+            num_descriptors,
+            flags,
+            node_mask: 0,
+        }
+    }
+}
+
+/// CPU-visible memory handle to an individual descriptor inside a heap.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub ptr: usize,
+}
+
+impl D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub const NULL: Self = Self { ptr: 0 };
+
+    #[inline(always)]
+    pub const fn new(ptr: usize) -> Self {
+        Self { ptr }
+    }
+
+    #[inline(always)]
+    pub const fn is_valid(&self) -> bool {
+        self.ptr != 0
+    }
+
+    /// Advances the handle forward by `index * increment_size` bytes.
+    #[inline(always)]
+    pub const fn offset(&self, index: usize, increment_size: usize) -> Self {
+        Self {
+            ptr: self.ptr.saturating_add(index.saturating_mul(increment_size)),
+        }
+    }
+}
+
+/// GPU-visible memory handle to an individual descriptor inside a shader-visible heap.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D12_GPU_DESCRIPTOR_HANDLE {
+    pub ptr: u64,
+}
+
+impl D3D12_GPU_DESCRIPTOR_HANDLE {
+    pub const NULL: Self = Self { ptr: 0 };
+
+    #[inline(always)]
+    pub const fn new(ptr: u64) -> Self {
+        Self { ptr }
+    }
+
+    #[inline(always)]
+    pub const fn is_valid(&self) -> bool {
+        self.ptr != 0
+    }
+
+    /// Advances the GPU handle forward by `index * increment_size` bytes.
+    #[inline(always)]
+    pub const fn offset(&self, index: usize, increment_size: usize) -> Self {
+        Self {
+            ptr: self.ptr.saturating_add((index as u64).saturating_mul(increment_size as u64)),
+        }
+    }
+}
+
+/// GPU Descriptor Heap managing contiguous descriptor pools and handle allocation.
+#[derive(Debug)]
+pub struct DescriptorHeap {
+    pub heap_type: D3D12_DESCRIPTOR_HEAP_TYPE,
+    pub flags: D3D12_DESCRIPTOR_HEAP_FLAGS,
+    pub num_descriptors: u32,
+    pub descriptor_increment_size: usize,
+    pub cpu_start: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pub gpu_start: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub allocated_count: u32,
+}
+
+impl DescriptorHeap {
+    /// Returns the hardware byte stride between consecutive descriptors for a given heap type.
+    pub const fn get_descriptor_increment_size(heap_type: D3D12_DESCRIPTOR_HEAP_TYPE) -> usize {
+        match heap_type {
+            D3D12_DESCRIPTOR_HEAP_TYPE::CbvSrvUav => 32,
+            D3D12_DESCRIPTOR_HEAP_TYPE::Sampler => 16,
+            D3D12_DESCRIPTOR_HEAP_TYPE::Rtv => 32,
+            D3D12_DESCRIPTOR_HEAP_TYPE::Dsv => 32,
+        }
+    }
+
+    /// Creates a new descriptor heap mapped at the specified base addresses.
+    pub fn new(
+        desc: D3D12_DESCRIPTOR_HEAP_DESC,
+        cpu_base: usize,
+        gpu_base: u64,
+    ) -> Result<Self, &'static str> {
+        if desc.num_descriptors == 0 {
+            return Err("Descriptor heap descriptor count must be greater than zero");
+        }
+        let descriptor_increment_size = Self::get_descriptor_increment_size(desc.heap_type);
+        let gpu_start = if desc.flags.contains(D3D12_DESCRIPTOR_HEAP_FLAGS::SHADER_VISIBLE) {
+            D3D12_GPU_DESCRIPTOR_HANDLE::new(gpu_base)
+        } else {
+            D3D12_GPU_DESCRIPTOR_HANDLE::NULL
+        };
+
+        Ok(Self {
+            heap_type: desc.heap_type,
+            flags: desc.flags,
+            num_descriptors: desc.num_descriptors,
+            descriptor_increment_size,
+            cpu_start: D3D12_CPU_DESCRIPTOR_HANDLE::new(cpu_base),
+            gpu_start,
+            allocated_count: 0,
+        })
+    }
+
+    /// Sub-allocates a contiguous slice of descriptors from the heap.
+    pub fn allocate_range(
+        &mut self,
+        count: u32,
+    ) -> Result<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_GPU_DESCRIPTOR_HANDLE), &'static str> {
+        if count == 0 {
+            return Err("Cannot allocate range of zero descriptors");
+        }
+        let available = self.num_descriptors.saturating_sub(self.allocated_count);
+        if count > available {
+            return Err("Out of descriptor heap memory");
+        }
+
+        let base_idx = self.allocated_count as usize;
+        self.allocated_count = self.allocated_count.saturating_add(count);
+
+        let cpu_handle = self.cpu_start.offset(base_idx, self.descriptor_increment_size);
+        let gpu_handle = if self.gpu_start.is_valid() {
+            self.gpu_start.offset(base_idx, self.descriptor_increment_size)
+        } else {
+            D3D12_GPU_DESCRIPTOR_HANDLE::NULL
+        };
+
+        Ok((cpu_handle, gpu_handle))
+    }
+
+    /// Returns the CPU descriptor handle at the specified zero-based index.
+    pub fn get_cpu_handle_at(&self, index: usize) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        if index < self.num_descriptors as usize {
+            Some(self.cpu_start.offset(index, self.descriptor_increment_size))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the GPU descriptor handle at the specified zero-based index.
+    pub fn get_gpu_handle_at(&self, index: usize) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        if index < self.num_descriptors as usize && self.gpu_start.is_valid() {
+            Some(self.gpu_start.offset(index, self.descriptor_increment_size))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the remaining available descriptor capacity.
+    pub fn remaining_capacity(&self) -> u32 {
+        self.num_descriptors.saturating_sub(self.allocated_count)
+    }
+}
