@@ -708,6 +708,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 Kernel32 emulation layer self-test failed!\r\n");
     }
 
+    // Verify Win32 User32 & GDI32 Window Message Loop and Graphics Emulation (TASK-KNT-141)
+    if !pe::test_user32_emulation_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 User32 & GDI32 emulation layer self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
