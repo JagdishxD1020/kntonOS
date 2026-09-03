@@ -563,6 +563,7 @@ pub enum BoundRootParameter {
 pub struct RootBindingTable {
     pub layout: RootSignatureLayout,
     pub bindings: Vec<Option<BoundRootParameter>>,
+    pub dirty_slots: u64,
 }
 
 impl RootBindingTable {
@@ -572,6 +573,7 @@ impl RootBindingTable {
         Self {
             layout,
             bindings: alloc::vec![None; num_params],
+            dirty_slots: 0,
         }
     }
 
@@ -592,6 +594,7 @@ impl RootBindingTable {
         }
 
         self.bindings[slot] = Some(BoundRootParameter::DescriptorTable { gpu_handle: handle });
+        self.mark_dirty(slot);
         Ok(())
     }
 
@@ -625,6 +628,7 @@ impl RootBindingTable {
         }
 
         self.bindings[slot] = Some(BoundRootParameter::Constants32Bit { values: current_vals });
+        self.mark_dirty(slot);
         Ok(())
     }
 
@@ -652,6 +656,7 @@ impl RootBindingTable {
         }
 
         self.bindings[slot] = Some(BoundRootParameter::RootDescriptor { gpu_virtual_address });
+        self.mark_dirty(slot);
         Ok(())
     }
 
@@ -668,5 +673,166 @@ impl RootBindingTable {
     /// Checks if all parameters required by the root signature layout are bound.
     pub fn all_parameters_bound(&self) -> bool {
         self.bindings.iter().all(|b| b.is_some())
+    }
+
+    /// Marks the specified parameter slot as dirty, requiring hardware flush.
+    #[inline(always)]
+    pub fn mark_dirty(&mut self, slot: usize) {
+        if slot < 64 {
+            self.dirty_slots |= 1 << slot;
+        }
+    }
+
+    /// Checks if the specified parameter slot has unflushed modifications.
+    #[inline(always)]
+    pub fn is_dirty(&self, slot: usize) -> bool {
+        if slot < 64 {
+            (self.dirty_slots & (1 << slot)) != 0
+        } else {
+            false
+        }
+    }
+
+    /// Returns true if any parameter slot is currently marked dirty.
+    #[inline(always)]
+    pub fn has_dirty_slots(&self) -> bool {
+        self.dirty_slots != 0
+    }
+
+    /// Clears the dirty flag on a single parameter slot after hardware synchronization.
+    #[inline(always)]
+    pub fn clear_dirty_slot(&mut self, slot: usize) {
+        if slot < 64 {
+            self.dirty_slots &= !(1 << slot);
+        }
+    }
+
+    /// Resets all dirty bits across the binding table.
+    #[inline(always)]
+    pub fn reset_dirty(&mut self) {
+        self.dirty_slots = 0;
+    }
+
+    /// Flushes all dirty parameters through a callback and clears the dirty bitmask.
+    pub fn flush_dirty_parameters<F>(&mut self, mut flush_fn: F) -> usize
+    where
+        F: FnMut(usize, &BoundRootParameter, u32),
+    {
+        let mut flushed_count = 0;
+        let mut mask = self.dirty_slots;
+        while mask != 0 {
+            let slot = mask.trailing_zeros() as usize;
+            if let Some(param) = self.get_binding(slot) {
+                let hw_offset = self.compute_hardware_offset(slot).unwrap_or(0);
+                flush_fn(slot, param, hw_offset);
+                flushed_count += 1;
+            }
+            mask &= mask - 1;
+        }
+        self.dirty_slots = 0;
+        flushed_count
+    }
+
+}
+
+// Root Signature Cache & Deduplication
+
+/// Computes an FNV-1a 64-bit hash over a root signature descriptor for cache lookup.
+pub fn hash_root_signature_desc(desc: &D3D12_ROOT_SIGNATURE_DESC) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    hash = (hash ^ (desc.flags.0 as u64)).wrapping_mul(FNV_PRIME);
+    hash = (hash ^ (desc.parameters.len() as u64)).wrapping_mul(FNV_PRIME);
+
+    for (i, p) in desc.parameters.iter().enumerate() {
+        hash = (hash ^ (i as u64)).wrapping_mul(FNV_PRIME);
+        hash = (hash ^ (p.parameter_type as u64)).wrapping_mul(FNV_PRIME);
+        hash = (hash ^ (p.shader_visibility as u64)).wrapping_mul(FNV_PRIME);
+
+        match &p.payload {
+            RootParameterPayload::DescriptorTable(t) => {
+                hash = (hash ^ (t.descriptor_ranges.len() as u64)).wrapping_mul(FNV_PRIME);
+                for r in &t.descriptor_ranges {
+                    hash = (hash ^ (r.range_type as u64)).wrapping_mul(FNV_PRIME);
+                    hash = (hash ^ (r.num_descriptors as u64)).wrapping_mul(FNV_PRIME);
+                    hash = (hash ^ (r.base_shader_register as u64)).wrapping_mul(FNV_PRIME);
+                    hash = (hash ^ (r.register_space as u64)).wrapping_mul(FNV_PRIME);
+                }
+            }
+            RootParameterPayload::Constants32Bit(c) => {
+                hash = (hash ^ (c.shader_register as u64)).wrapping_mul(FNV_PRIME);
+                hash = (hash ^ (c.register_space as u64)).wrapping_mul(FNV_PRIME);
+                hash = (hash ^ (c.num_32bit_values as u64)).wrapping_mul(FNV_PRIME);
+            }
+            RootParameterPayload::Cbv(d) | RootParameterPayload::Srv(d) | RootParameterPayload::Uav(d) => {
+                hash = (hash ^ (d.shader_register as u64)).wrapping_mul(FNV_PRIME);
+                hash = (hash ^ (d.register_space as u64)).wrapping_mul(FNV_PRIME);
+            }
+        }
+    }
+    hash
+}
+
+/// Cached compiled root signature entry with unique 64-bit signature ID.
+#[derive(Debug, Clone)]
+pub struct CachedRootSignature {
+    pub hash_id: u64,
+    pub layout: RootSignatureLayout,
+}
+
+/// Centralized root signature cache eliminating redundant compilation overhead.
+#[derive(Debug, Default)]
+pub struct RootSignatureCache {
+    pub entries: Vec<CachedRootSignature>,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
+impl RootSignatureCache {
+    /// Creates an empty root signature cache.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// Fetches an existing compiled root signature layout or compiles and caches a new one.
+    pub fn get_or_compile(
+        &mut self,
+        desc: D3D12_ROOT_SIGNATURE_DESC,
+    ) -> Result<RootSignatureLayout, &'static str> {
+        let hash = hash_root_signature_desc(&desc);
+
+        for entry in &self.entries {
+            if entry.hash_id == hash {
+                self.cache_hits = self.cache_hits.saturating_add(1);
+                return Ok(entry.layout.clone());
+            }
+        }
+
+        self.cache_misses = self.cache_misses.saturating_add(1);
+        let layout = RootSignatureLayout::compile(desc)?;
+        self.entries.push(CachedRootSignature {
+            hash_id: hash,
+            layout: layout.clone(),
+        });
+
+        Ok(layout)
+    }
+
+    /// Returns cache telemetry performance statistics: (hits, misses).
+    pub fn stats(&self) -> (u64, u64) {
+        (self.cache_hits, self.cache_misses)
+    }
+
+    /// Clears all entries from the root signature cache.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.cache_hits = 0;
+        self.cache_misses = 0;
     }
 }
