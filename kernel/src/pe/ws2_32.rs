@@ -212,3 +212,341 @@ pub fn win32_inet_addr(cp: &str) -> u32 {
 
     u32::from_ne_bytes(octets)
 }
+
+use alloc::vec::Vec;
+use crate::net::socket::{
+    GLOBAL_SOCKET_TABLE, SocketDomain, SocketError, SocketProtocol, SocketType,
+};
+
+pub struct Win32SocketEntry {
+    pub socket: SOCKET,
+    pub af: i32,
+    pub sock_type: i32,
+    pub protocol: i32,
+    pub nonblocking: bool,
+    pub local_addr: Option<SockAddrIn>,
+    pub peer_addr: Option<SockAddrIn>,
+}
+
+static WIN32_SOCKET_TABLE: Spinlock<Vec<Win32SocketEntry>> = Spinlock::new(Vec::new());
+
+fn map_socket_error(err: SocketError) -> i32 {
+    match err {
+        SocketError::InvalidHandle => WSAENOTSOCK,
+        SocketError::TableFull => WSASYSNOTREADY,
+        SocketError::AlreadyBound => WSAEINVAL,
+        SocketError::NotBound => WSAEINVAL,
+        SocketError::AlreadyConnected => WSAEINVAL,
+        SocketError::NotConnected => WSAENOTCONN,
+        SocketError::ConnectionRefused => WSAECONNREFUSED,
+        SocketError::WouldBlock => WSAEWOULDBLOCK,
+        SocketError::UnsupportedDomain => WSAEINVAL,
+        SocketError::UnsupportedType => WSAEINVAL,
+        SocketError::AddressInUse => WSAEADDRINUSE,
+        SocketError::InvalidAddress => WSAEFAULT,
+        SocketError::BrokenPipe => 10053,
+    }
+}
+
+/// Creates a socket that is bound to a specific transport-service provider.
+pub fn win32_socket(af: i32, sock_type: i32, protocol: i32) -> SOCKET {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return INVALID_SOCKET;
+    }
+
+    let domain = match af {
+        AF_INET => SocketDomain::AfInet,
+        AF_UNIX => SocketDomain::AfUnix,
+        AF_UNSPEC => SocketDomain::AfUnspec,
+        _ => {
+            win32_wsa_set_last_error(WSAEINVAL);
+            return INVALID_SOCKET;
+        }
+    };
+
+    let stype = match sock_type {
+        SOCK_STREAM => SocketType::SockStream,
+        SOCK_DGRAM => SocketType::SockDgram,
+        SOCK_RAW => SocketType::SockRaw,
+        _ => {
+            win32_wsa_set_last_error(WSAEINVAL);
+            return INVALID_SOCKET;
+        }
+    };
+
+    let proto = match protocol {
+        IPPROTO_TCP => SocketProtocol::Tcp,
+        IPPROTO_UDP => SocketProtocol::Udp,
+        _ => SocketProtocol::Default,
+    };
+
+    match GLOBAL_SOCKET_TABLE.create_socket(domain, stype, proto) {
+        Ok(handle) => {
+            let mut table = WIN32_SOCKET_TABLE.lock();
+            table.push(Win32SocketEntry {
+                socket: handle,
+                af,
+                sock_type,
+                protocol,
+                nonblocking: false,
+                local_addr: None,
+                peer_addr: None,
+            });
+            win32_wsa_set_last_error(0);
+            handle
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            INVALID_SOCKET
+        }
+    }
+}
+
+/// Creates a socket descriptor with extended WSA attributes and flags.
+pub fn win32_wsa_socket(
+    af: i32,
+    sock_type: i32,
+    protocol: i32,
+    _lp_protocol_info: usize,
+    _g: u32,
+    _dw_flags: u32,
+) -> SOCKET {
+    win32_socket(af, sock_type, protocol)
+}
+
+/// Associates a local address with a socket.
+pub unsafe fn win32_bind(s: SOCKET, name: *const SockAddr, namelen: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if name.is_null() || namelen < core::mem::size_of::<SockAddrIn>() as i32 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    let sa_in = &*(name as *const SockAddrIn);
+    let port = u16::from_be(sa_in.sin_port);
+    let ip_bytes = sa_in.sin_addr.s_addr.to_ne_bytes();
+
+    match GLOBAL_SOCKET_TABLE.bind(s, ip_bytes, port) {
+        Ok(()) => {
+            let mut table = WIN32_SOCKET_TABLE.lock();
+            if let Some(entry) = table.iter_mut().find(|e| e.socket == s) {
+                entry.local_addr = Some(*sa_in);
+            }
+            win32_wsa_set_last_error(0);
+            0
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Places a socket in a state in which it is listening for an incoming connection.
+pub fn win32_listen(s: SOCKET, backlog: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+
+    let bl = if backlog > 0 { backlog as usize } else { 5 };
+    match GLOBAL_SOCKET_TABLE.listen(s, bl) {
+        Ok(()) => {
+            win32_wsa_set_last_error(0);
+            0
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Permits an incoming connection attempt on a socket.
+pub unsafe fn win32_accept(s: SOCKET, addr: *mut SockAddr, addrlen: *mut i32) -> SOCKET {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return INVALID_SOCKET;
+    }
+
+    match GLOBAL_SOCKET_TABLE.accept(s) {
+        Ok((client_handle, (ip, port))) => {
+            let client_sa = SockAddrIn {
+                sin_family: AF_INET as u16,
+                sin_port: port.to_be(),
+                sin_addr: InAddr {
+                    s_addr: u32::from_ne_bytes(ip),
+                },
+                sin_zero: [0; 8],
+            };
+
+            if !addr.is_null() && !addrlen.is_null() {
+                if *addrlen >= core::mem::size_of::<SockAddrIn>() as i32 {
+                    core::ptr::copy_nonoverlapping(
+                        &client_sa as *const _ as *const u8,
+                        addr as *mut u8,
+                        core::mem::size_of::<SockAddrIn>(),
+                    );
+                    *addrlen = core::mem::size_of::<SockAddrIn>() as i32;
+                }
+            }
+
+            let mut table = WIN32_SOCKET_TABLE.lock();
+            table.push(Win32SocketEntry {
+                socket: client_handle,
+                af: AF_INET,
+                sock_type: SOCK_STREAM,
+                protocol: IPPROTO_TCP,
+                nonblocking: false,
+                local_addr: None,
+                peer_addr: Some(client_sa),
+            });
+
+            win32_wsa_set_last_error(0);
+            client_handle
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            INVALID_SOCKET
+        }
+    }
+}
+
+/// Establishes a connection to a specified socket.
+pub unsafe fn win32_connect(s: SOCKET, name: *const SockAddr, namelen: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if name.is_null() || namelen < core::mem::size_of::<SockAddrIn>() as i32 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    let sa_in = &*(name as *const SockAddrIn);
+    let port = u16::from_be(sa_in.sin_port);
+    let ip_bytes = sa_in.sin_addr.s_addr.to_ne_bytes();
+
+    match GLOBAL_SOCKET_TABLE.connect(s, ip_bytes, port) {
+        Ok(()) => {
+            let mut table = WIN32_SOCKET_TABLE.lock();
+            if let Some(entry) = table.iter_mut().find(|e| e.socket == s) {
+                entry.peer_addr = Some(*sa_in);
+            }
+            win32_wsa_set_last_error(0);
+            0
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Closes an existing socket descriptor.
+pub fn win32_closesocket(s: SOCKET) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+
+    let mut table = WIN32_SOCKET_TABLE.lock();
+    if let Some(pos) = table.iter().position(|e| e.socket == s) {
+        table.remove(pos);
+    }
+    drop(table);
+
+    match GLOBAL_SOCKET_TABLE.close(s) {
+        Ok(()) => {
+            win32_wsa_set_last_error(0);
+            0
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Retrieves the local name for a socket.
+pub unsafe fn win32_get_sock_name(s: SOCKET, name: *mut SockAddr, namelen: *mut i32) -> i32 {
+    if name.is_null() || namelen.is_null() {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    let table = WIN32_SOCKET_TABLE.lock();
+    let entry = match table.iter().find(|e| e.socket == s) {
+        Some(e) => e,
+        None => {
+            win32_wsa_set_last_error(WSAENOTSOCK);
+            return SOCKET_ERROR;
+        }
+    };
+
+    let local_sa = match entry.local_addr {
+        Some(sa) => sa,
+        None => SockAddrIn::default(),
+    };
+
+    if *namelen >= core::mem::size_of::<SockAddrIn>() as i32 {
+        core::ptr::copy_nonoverlapping(
+            &local_sa as *const _ as *const u8,
+            name as *mut u8,
+            core::mem::size_of::<SockAddrIn>(),
+        );
+        *namelen = core::mem::size_of::<SockAddrIn>() as i32;
+        0
+    } else {
+        win32_wsa_set_last_error(WSAEFAULT);
+        SOCKET_ERROR
+    }
+}
+
+/// Retrieves the address of the peer to which a socket is connected.
+pub unsafe fn win32_get_peer_name(s: SOCKET, name: *mut SockAddr, namelen: *mut i32) -> i32 {
+    if name.is_null() || namelen.is_null() {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    let table = WIN32_SOCKET_TABLE.lock();
+    let entry = match table.iter().find(|e| e.socket == s) {
+        Some(e) => e,
+        None => {
+            win32_wsa_set_last_error(WSAENOTSOCK);
+            return SOCKET_ERROR;
+        }
+    };
+
+    let peer_sa = match entry.peer_addr {
+        Some(sa) => sa,
+        None => {
+            win32_wsa_set_last_error(WSAENOTCONN);
+            return SOCKET_ERROR;
+        }
+    };
+
+    if *namelen >= core::mem::size_of::<SockAddrIn>() as i32 {
+        core::ptr::copy_nonoverlapping(
+            &peer_sa as *const _ as *const u8,
+            name as *mut u8,
+            core::mem::size_of::<SockAddrIn>(),
+        );
+        *namelen = core::mem::size_of::<SockAddrIn>() as i32;
+        0
+    } else {
+        win32_wsa_set_last_error(WSAEFAULT);
+        SOCKET_ERROR
+    }
+}
