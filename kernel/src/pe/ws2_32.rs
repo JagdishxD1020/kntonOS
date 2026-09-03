@@ -550,3 +550,254 @@ pub unsafe fn win32_get_peer_name(s: SOCKET, name: *mut SockAddr, namelen: *mut 
         SOCKET_ERROR
     }
 }
+
+pub const FIONBIO: i32 = -2147195266; // 0x8004667E as i32
+pub const FIONREAD: i32 = 0x4004_667F;
+
+pub const POLLRDNORM: i16 = 0x0100;
+pub const POLLRDBAND: i16 = 0x0200;
+pub const POLLIN: i16 = 0x0300;
+pub const POLLPRI: i16 = 0x0400;
+pub const POLLWRNORM: i16 = 0x0010;
+pub const POLLOUT: i16 = 0x0010;
+pub const POLLERR: i16 = 0x0001;
+pub const POLLHUP: i16 = 0x0002;
+pub const POLLNVAL: i16 = 0x0004;
+
+pub const FD_SETSIZE: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FdSet {
+    pub fd_count: u32,
+    pub fd_array: [SOCKET; FD_SETSIZE],
+}
+
+impl Default for FdSet {
+    fn default() -> Self {
+        Self {
+            fd_count: 0,
+            fd_array: [INVALID_SOCKET; FD_SETSIZE],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeVal {
+    pub tv_sec: i32,
+    pub tv_usec: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WsaPollFd {
+    pub fd: SOCKET,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Clears an fd_set structure.
+pub unsafe fn win32_fd_zero(set: *mut FdSet) {
+    if !set.is_null() {
+        (*set).fd_count = 0;
+        for i in 0..FD_SETSIZE {
+            (*set).fd_array[i] = INVALID_SOCKET;
+        }
+    }
+}
+
+/// Adds a socket descriptor to an fd_set structure.
+pub unsafe fn win32_fd_set(s: SOCKET, set: *mut FdSet) {
+    if set.is_null() {
+        return;
+    }
+    let count = (*set).fd_count as usize;
+    if count >= FD_SETSIZE {
+        return;
+    }
+    for i in 0..count {
+        if (*set).fd_array[i] == s {
+            return;
+        }
+    }
+    (*set).fd_array[count] = s;
+    (*set).fd_count += 1;
+}
+
+/// Removes a socket descriptor from an fd_set structure.
+pub unsafe fn win32_fd_clr(s: SOCKET, set: *mut FdSet) {
+    if set.is_null() {
+        return;
+    }
+    let count = (*set).fd_count as usize;
+    for i in 0..count {
+        if (*set).fd_array[i] == s {
+            for j in i..(count - 1) {
+                (*set).fd_array[j] = (*set).fd_array[j + 1];
+            }
+            (*set).fd_array[count - 1] = INVALID_SOCKET;
+            (*set).fd_count -= 1;
+            break;
+        }
+    }
+}
+
+/// Determines whether a socket descriptor is contained in an fd_set structure.
+pub unsafe fn win32_fd_isset(s: SOCKET, set: *const FdSet) -> bool {
+    if set.is_null() {
+        return false;
+    }
+    let count = (*set).fd_count as usize;
+    for i in 0..count {
+        if (*set).fd_array[i] == s {
+            return true;
+        }
+    }
+    false
+}
+
+/// Controls the I/O mode of a socket descriptor.
+pub unsafe fn win32_ioctlsocket(s: SOCKET, cmd: i32, argp: *mut u32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if argp.is_null() {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    match cmd {
+        FIONBIO => {
+            let nonblocking = *argp != 0;
+            match GLOBAL_SOCKET_TABLE.set_nonblocking(s, nonblocking) {
+                Ok(()) => {
+                    let mut table = WIN32_SOCKET_TABLE.lock();
+                    if let Some(entry) = table.iter_mut().find(|e| e.socket == s) {
+                        entry.nonblocking = nonblocking;
+                    }
+                    win32_wsa_set_last_error(0);
+                    0
+                }
+                Err(err) => {
+                    let wsa_err = map_socket_error(err);
+                    win32_wsa_set_last_error(wsa_err);
+                    SOCKET_ERROR
+                }
+            }
+        }
+        FIONREAD => {
+            let readable = GLOBAL_SOCKET_TABLE.is_readable(s);
+            *argp = if readable { 1 } else { 0 };
+            win32_wsa_set_last_error(0);
+            0
+        }
+        _ => {
+            win32_wsa_set_last_error(WSAEINVAL);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Determines the status of one or more sockets, waiting if necessary.
+pub unsafe fn win32_select(
+    _nfds: i32,
+    readfds: *mut FdSet,
+    writefds: *mut FdSet,
+    exceptfds: *mut FdSet,
+    _timeout: *const TimeVal,
+) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+
+    let mut ready_count = 0;
+
+    if !readfds.is_null() {
+        let count = (*readfds).fd_count as usize;
+        let mut ready_fds = [INVALID_SOCKET; FD_SETSIZE];
+        let mut r_count = 0;
+
+        for i in 0..count {
+            let fd = (*readfds).fd_array[i];
+            if GLOBAL_SOCKET_TABLE.is_readable(fd) {
+                ready_fds[r_count] = fd;
+                r_count += 1;
+                ready_count += 1;
+            }
+        }
+
+        (*readfds).fd_count = r_count as u32;
+        (*readfds).fd_array = ready_fds;
+    }
+
+    if !writefds.is_null() {
+        let count = (*writefds).fd_count as usize;
+        let mut ready_fds = [INVALID_SOCKET; FD_SETSIZE];
+        let mut w_count = 0;
+
+        for i in 0..count {
+            let fd = (*writefds).fd_array[i];
+            if GLOBAL_SOCKET_TABLE.is_writable(fd) {
+                ready_fds[w_count] = fd;
+                w_count += 1;
+                ready_count += 1;
+            }
+        }
+
+        (*writefds).fd_count = w_count as u32;
+        (*writefds).fd_array = ready_fds;
+    }
+
+    if !exceptfds.is_null() {
+        (*exceptfds).fd_count = 0;
+        for i in 0..FD_SETSIZE {
+            (*exceptfds).fd_array[i] = INVALID_SOCKET;
+        }
+    }
+
+    win32_wsa_set_last_error(0);
+    ready_count
+}
+
+/// Polls the status of one or more sockets with timeout support.
+pub unsafe fn win32_wsa_poll(fdarray: *mut WsaPollFd, nfds: u32, _timeout_ms: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if fdarray.is_null() {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    let mut ready_count = 0;
+    for i in 0..(nfds as usize) {
+        let pfd = &mut *fdarray.add(i);
+        pfd.revents = 0;
+
+        if !GLOBAL_SOCKET_TABLE.exists(pfd.fd) {
+            pfd.revents = POLLNVAL;
+            ready_count += 1;
+            continue;
+        }
+
+        let mut rev = 0;
+        if (pfd.events & (POLLIN | POLLRDNORM)) != 0 && GLOBAL_SOCKET_TABLE.is_readable(pfd.fd) {
+            rev |= pfd.events & (POLLIN | POLLRDNORM);
+        }
+        if (pfd.events & (POLLOUT | POLLWRNORM)) != 0 && GLOBAL_SOCKET_TABLE.is_writable(pfd.fd) {
+            rev |= pfd.events & (POLLOUT | POLLWRNORM);
+        }
+
+        pfd.revents = rev;
+        if rev != 0 {
+            ready_count += 1;
+        }
+    }
+
+    win32_wsa_set_last_error(0);
+    ready_count
+}
