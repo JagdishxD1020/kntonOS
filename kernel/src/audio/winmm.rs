@@ -233,3 +233,235 @@ pub fn verify_winmm_types_and_descriptors() -> bool {
 
     true
 }
+
+use alloc::collections::BTreeMap;
+
+// WaveOut device handle identifier.
+pub type HWAVEOUT = u32;
+
+// Callback mechanism flags.
+pub const CALLBACK_NULL: u32 = 0x00000000;
+pub const CALLBACK_WINDOW: u32 = 0x00010000;
+pub const CALLBACK_TASK: u32 = 0x00020000;
+pub const CALLBACK_FUNCTION: u32 = 0x00030000;
+pub const CALLBACK_TYPEMASK: u32 = 0x00070000;
+
+// WaveOut callback notification messages.
+pub const WOM_OPEN: u32 = 0x3BB;
+pub const WOM_CLOSE: u32 = 0x3BC;
+pub const WOM_DONE: u32 = 0x3BD;
+
+// Fixed-point 16.16 scalar for unity pitch / playback rate.
+pub const WINMM_FIXED_POINT_UNITY: u32 = 0x00010000;
+
+/// State representation of an active WaveOut device instance.
+#[derive(Debug, Clone)]
+pub struct WaveOutInstance {
+    pub handle: HWAVEOUT,
+    pub device_id: u32,
+    pub format: WaveFormatEx,
+    pub callback: usize,
+    pub instance_data: usize,
+    pub flags: u32,
+    pub volume: u32,
+    pub pitch: u32,
+    pub playback_rate: u32,
+    pub is_paused: bool,
+}
+
+impl WaveOutInstance {
+    // Creates a new WaveOut instance initialized to full stereo volume.
+    pub fn new(handle: HWAVEOUT, device_id: u32, format: WaveFormatEx, callback: usize, instance_data: usize, flags: u32) -> Self {
+        Self {
+            handle,
+            device_id,
+            format,
+            callback,
+            instance_data,
+            flags,
+            volume: 0xFFFFFFFF,
+            pitch: WINMM_FIXED_POINT_UNITY,
+            playback_rate: WINMM_FIXED_POINT_UNITY,
+            is_paused: false,
+        }
+    }
+
+    // Extracts left and right normalized linear gains (0.0 .. 1.0) from packed 32-bit volume.
+    pub fn get_linear_gains(&self) -> (f32, f32) {
+        let left_u16 = (self.volume & 0xFFFF) as u16;
+        let right_u16 = ((self.volume >> 16) & 0xFFFF) as u16;
+        ((left_u16 as f32) / 65535.0, (right_u16 as f32) / 65535.0)
+    }
+}
+
+/// Registry and lifecycle supervisor managing physical and virtual WinMM WaveOut devices.
+#[derive(Debug, Clone, Default)]
+pub struct WaveOutDeviceRegistry {
+    pub default_caps: WAVEOUTCAPS,
+    pub instances: BTreeMap<HWAVEOUT, WaveOutInstance>,
+    pub next_handle: HWAVEOUT,
+}
+
+impl WaveOutDeviceRegistry {
+    // Creates a new device registry with next handle starting at 1.
+    pub fn new() -> Self {
+        Self {
+            default_caps: WAVEOUTCAPS::default(),
+            instances: BTreeMap::new(),
+            next_handle: 1,
+        }
+    }
+
+    // Win32 waveOutGetNumDevs implementation.
+    pub fn wave_out_get_num_devs(&self) -> u32 {
+        1
+    }
+
+    // Win32 waveOutGetDevCaps implementation.
+    pub fn wave_out_get_dev_caps(&self, device_id: u32, caps: &mut WAVEOUTCAPS) -> u32 {
+        if device_id != 0 && device_id != WAVE_MAPPER {
+            return MMSYSERR_BADDEVICEID;
+        }
+        *caps = self.default_caps;
+        MMSYSERR_NOERROR
+    }
+
+    // Win32 waveOutOpen implementation.
+    pub fn wave_out_open(
+        &mut self,
+        device_id: u32,
+        format: &WaveFormatEx,
+        callback: usize,
+        instance_data: usize,
+        flags: u32,
+    ) -> Result<HWAVEOUT, u32> {
+        if device_id != 0 && device_id != WAVE_MAPPER {
+            return Err(MMSYSERR_BADDEVICEID);
+        }
+        if !format.is_valid() {
+            return Err(WAVERR_BADFORMAT);
+        }
+
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(1).max(1);
+
+        let instance = WaveOutInstance::new(handle, device_id, *format, callback, instance_data, flags);
+        self.instances.insert(handle, instance);
+        Ok(handle)
+    }
+
+    // Win32 waveOutClose implementation.
+    pub fn wave_out_close(&mut self, handle: HWAVEOUT) -> u32 {
+        if self.instances.remove(&handle).is_some() {
+            MMSYSERR_NOERROR
+        } else {
+            MMSYSERR_INVALHANDLE
+        }
+    }
+
+    // Win32 waveOutGetVolume implementation.
+    pub fn wave_out_get_volume(&self, handle: HWAVEOUT, out_vol: &mut u32) -> u32 {
+        if let Some(inst) = self.instances.get(&handle) {
+            *out_vol = inst.volume;
+            MMSYSERR_NOERROR
+        } else {
+            MMSYSERR_INVALHANDLE
+        }
+    }
+
+    // Win32 waveOutSetVolume implementation.
+    pub fn wave_out_set_volume(&mut self, handle: HWAVEOUT, volume: u32) -> u32 {
+        if let Some(inst) = self.instances.get_mut(&handle) {
+            inst.volume = volume;
+            MMSYSERR_NOERROR
+        } else {
+            MMSYSERR_INVALHANDLE
+        }
+    }
+
+    // Win32 waveOutPause implementation.
+    pub fn wave_out_pause(&mut self, handle: HWAVEOUT) -> u32 {
+        if let Some(inst) = self.instances.get_mut(&handle) {
+            inst.is_paused = true;
+            MMSYSERR_NOERROR
+        } else {
+            MMSYSERR_INVALHANDLE
+        }
+    }
+
+    // Win32 waveOutRestart implementation.
+    pub fn wave_out_restart(&mut self, handle: HWAVEOUT) -> u32 {
+        if let Some(inst) = self.instances.get_mut(&handle) {
+            inst.is_paused = false;
+            MMSYSERR_NOERROR
+        } else {
+            MMSYSERR_INVALHANDLE
+        }
+    }
+}
+
+/// Verifies WaveOut device enumeration, capabilities query, instance opening, and volume manipulation.
+pub fn verify_waveout_device_lifecycle() -> bool {
+    let mut reg = WaveOutDeviceRegistry::new();
+    if reg.wave_out_get_num_devs() != 1 {
+        return false;
+    }
+
+    let mut caps = WAVEOUTCAPS::default();
+    if reg.wave_out_get_dev_caps(0, &mut caps) != MMSYSERR_NOERROR {
+        return false;
+    }
+
+    // Test open with invalid format
+    let mut bad_fmt = WaveFormatEx::default();
+    bad_fmt.nChannels = 0;
+    if reg.wave_out_open(0, &bad_fmt, 0, 0, CALLBACK_NULL).is_ok() {
+        return false;
+    }
+
+    // Test open with supported format
+    let valid_fmt = WaveFormatEx::pcm_stereo(48000, 16);
+    let handle = match reg.wave_out_open(WAVE_MAPPER, &valid_fmt, 0, 0, CALLBACK_NULL) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+
+    // Test volume controls (0x80008000 = ~50% each)
+    if reg.wave_out_set_volume(handle, 0x80008000) != MMSYSERR_NOERROR {
+        return false;
+    }
+    let mut vol = 0;
+    if reg.wave_out_get_volume(handle, &mut vol) != MMSYSERR_NOERROR || vol != 0x80008000 {
+        return false;
+    }
+
+    let inst = reg.instances.get(&handle).unwrap();
+    let (gl, gr) = inst.get_linear_gains();
+    if (gl - 0.5).abs() > 0.01 || (gr - 0.5).abs() > 0.01 {
+        return false;
+    }
+
+    // Test pause and restart
+    if reg.wave_out_pause(handle) != MMSYSERR_NOERROR {
+        return false;
+    }
+    if !reg.instances.get(&handle).unwrap().is_paused {
+        return false;
+    }
+    if reg.wave_out_restart(handle) != MMSYSERR_NOERROR {
+        return false;
+    }
+    if reg.instances.get(&handle).unwrap().is_paused {
+        return false;
+    }
+
+    // Test close and duplicate close
+    if reg.wave_out_close(handle) != MMSYSERR_NOERROR {
+        return false;
+    }
+    if reg.wave_out_close(handle) != MMSYSERR_INVALHANDLE {
+        return false;
+    }
+
+    true
+}
