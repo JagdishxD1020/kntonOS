@@ -675,6 +675,10 @@ pub extern "C" fn kmain() -> ! {
     if !audio::test_dsound_service_subsystem() {
         serial_write_str("[KNT-PANIC] DirectSound and DirectSound3D legacy audio service self-test failed!\r\n");
     }
+    // Initialize and verify Win32 WinMM Legacy WaveOut & MIDI Synthesizer Engine (TASK-KNT-144)
+    if !audio::test_winmm_service_subsystem() {
+        serial_write_str("[KNT-PANIC] WinMM legacy WaveOut audio and MIDI synthesizer self-test failed!\r\n");
+    }
 
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
