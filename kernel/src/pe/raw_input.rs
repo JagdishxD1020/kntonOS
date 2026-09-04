@@ -142,3 +142,183 @@ impl Default for RawInput {
         }
     }
 }
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use crate::memory::spinlock::Spinlock;
+
+static RAW_INPUT_REGISTRY: Spinlock<Vec<RawInputDevice>> = Spinlock::new(Vec::new());
+static RAW_INPUT_BUFFER: Spinlock<BTreeMap<usize, RawInput>> = Spinlock::new(BTreeMap::new());
+static NEXT_RAW_INPUT_HANDLE: Spinlock<usize> = Spinlock::new(0x0005_0001);
+
+/// Registers the devices that supply the Raw Input data.
+pub unsafe fn win32_register_raw_input_devices(
+    p_raw_input_devices: *const RawInputDevice,
+    ui_num_devices: u32,
+    cb_size: u32,
+) -> bool {
+    if p_raw_input_devices.is_null() || cb_size != core::mem::size_of::<RawInputDevice>() as u32 {
+        return false;
+    }
+
+    let mut registry = RAW_INPUT_REGISTRY.lock();
+    for i in 0..(ui_num_devices as usize) {
+        let dev = &*p_raw_input_devices.add(i);
+
+        if (dev.dw_flags & RIDEV_REMOVE) != 0 {
+            if let Some(pos) = registry.iter().position(|d| {
+                d.us_usage_page == dev.us_usage_page && d.us_usage == dev.us_usage
+            }) {
+                registry.remove(pos);
+            }
+        } else {
+            if let Some(existing) = registry.iter_mut().find(|d| {
+                d.us_usage_page == dev.us_usage_page && d.us_usage == dev.us_usage
+            }) {
+                *existing = *dev;
+            } else {
+                registry.push(*dev);
+            }
+        }
+    }
+
+    true
+}
+
+/// Retrieves the information about the Raw Input devices for the current process.
+pub unsafe fn win32_get_registered_raw_input_devices(
+    p_raw_input_devices: *mut RawInputDevice,
+    pui_num_devices: *mut u32,
+    cb_size: u32,
+) -> u32 {
+    if pui_num_devices.is_null() || cb_size != core::mem::size_of::<RawInputDevice>() as u32 {
+        return 0xFFFF_FFFF;
+    }
+
+    let registry = RAW_INPUT_REGISTRY.lock();
+    let total = registry.len() as u32;
+
+    if p_raw_input_devices.is_null() {
+        *pui_num_devices = total;
+        return 0;
+    }
+
+    let capacity = *pui_num_devices;
+    if capacity < total {
+        *pui_num_devices = total;
+        return 0xFFFF_FFFF;
+    }
+
+    let copy_count = capacity.min(total) as usize;
+    for i in 0..copy_count {
+        *p_raw_input_devices.add(i) = registry[i];
+    }
+    *pui_num_devices = copy_count as u32;
+
+    copy_count as u32
+}
+
+/// Retrieves the raw input from the specified device.
+pub unsafe fn win32_get_raw_input_data(
+    h_raw_input: usize,
+    ui_command: u32,
+    p_data: *mut u8,
+    pcb_size: *mut u32,
+    cb_size_header: u32,
+) -> u32 {
+    if pcb_size.is_null() || cb_size_header != core::mem::size_of::<RawInputHeader>() as u32 {
+        return 0xFFFF_FFFF;
+    }
+
+    let header_size = core::mem::size_of::<RawInputHeader>() as u32;
+    let full_size = core::mem::size_of::<RawInput>() as u32;
+
+    if p_data.is_null() {
+        match ui_command {
+            RID_HEADER => {
+                *pcb_size = header_size;
+                0
+            }
+            RID_INPUT => {
+                *pcb_size = full_size;
+                0
+            }
+            _ => 0xFFFF_FFFF,
+        }
+    } else {
+        let buffer = RAW_INPUT_BUFFER.lock();
+        let packet = match buffer.get(&h_raw_input) {
+            Some(p) => *p,
+            None => return 0xFFFF_FFFF,
+        };
+
+        match ui_command {
+            RID_HEADER => {
+                if *pcb_size < header_size {
+                    *pcb_size = header_size;
+                    return 0xFFFF_FFFF;
+                }
+                core::ptr::copy_nonoverlapping(
+                    &packet.header as *const _ as *const u8,
+                    p_data,
+                    header_size as usize,
+                );
+                header_size
+            }
+            RID_INPUT => {
+                if *pcb_size < full_size {
+                    *pcb_size = full_size;
+                    return 0xFFFF_FFFF;
+                }
+                core::ptr::copy_nonoverlapping(
+                    &packet as *const _ as *const u8,
+                    p_data,
+                    full_size as usize,
+                );
+                full_size
+            }
+            _ => 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// Dispatches a raw input packet to registered target windows via WM_INPUT.
+pub fn win32_dispatch_raw_input(raw: &RawInput) -> bool {
+    let (usage_page, usage) = match raw.header.dw_type {
+        RIM_TYPEMOUSE => (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_MOUSE),
+        RIM_TYPEKEYBOARD => (HID_USAGE_PAGE_GENERIC, HID_USAGE_GENERIC_KEYBOARD),
+        _ => return false,
+    };
+
+    let target_hwnd = {
+        let registry = RAW_INPUT_REGISTRY.lock();
+        registry.iter().find(|d| d.us_usage_page == usage_page && d.us_usage == usage).map(|d| d.hwnd_target)
+    };
+
+    let hwnd = match target_hwnd {
+        Some(h) if h != 0 => h,
+        _ => return false,
+    };
+
+    let handle = {
+        let mut gen = NEXT_RAW_INPUT_HANDLE.lock();
+        let h = *gen;
+        *gen = h.saturating_add(1);
+        h
+    };
+
+    let mut packet = *raw;
+    packet.header.h_device = handle;
+
+    {
+        let mut buffer = RAW_INPUT_BUFFER.lock();
+        buffer.insert(handle, packet);
+    }
+
+    crate::pe::user32::win32_post_message(
+        hwnd,
+        WM_INPUT,
+        raw.header.w_param,
+        handle as isize,
+    )
+}
