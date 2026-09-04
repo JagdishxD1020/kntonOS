@@ -6,11 +6,13 @@ pub mod spawn;
 pub mod ntdll;
 pub mod kernel32;
 pub mod user32;
+pub mod ws2_32;
 
 pub use header::*;
 pub use ntdll::*;
 pub use kernel32::*;
 pub use user32::*;
+pub use ws2_32::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
