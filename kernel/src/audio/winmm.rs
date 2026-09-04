@@ -822,3 +822,273 @@ pub fn verify_midi_message_parser() -> bool {
 
     true
 }
+
+use crate::graphics::types::sin_f32;
+
+// Standard number of polyphonic hardware voices.
+pub const MIDI_SYNTH_VOICES: usize = 16;
+pub const TWO_PI: f32 = 6.2831853;
+
+/// Individual polyphonic synthesizer voice utilizing dual-oscillator wavetable synthesis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SynthVoice {
+    pub is_active: bool,
+    pub channel: u8,
+    pub note: u8,
+    pub velocity: u8,
+    pub frequency: f32,
+    pub phase_osc1: f32,
+    pub phase_osc2: f32,
+    pub detune_factor: f32,
+    pub envelope_level: f32,
+    pub decay_rate: f32,
+    pub sample_rate: f32,
+}
+
+impl Default for SynthVoice {
+    fn default() -> Self {
+        Self {
+            is_active: false,
+            channel: 0,
+            note: 0,
+            velocity: 0,
+            frequency: 440.0,
+            phase_osc1: 0.0,
+            phase_osc2: 0.0,
+            detune_factor: 1.006,
+            envelope_level: 0.0,
+            decay_rate: 0.99985,
+            sample_rate: 48000.0,
+        }
+    }
+}
+
+impl SynthVoice {
+    // Triggers key press note event, resetting phase and envelope.
+    pub fn trigger_note_on(&mut self, channel: u8, note: u8, velocity: u8, bend_semitones: f32, sample_rate: f32) {
+        self.is_active = true;
+        self.channel = channel;
+        self.note = note;
+        self.velocity = velocity;
+        self.sample_rate = sample_rate;
+        self.frequency = MidiMessageParser::note_to_frequency(note, bend_semitones);
+        self.phase_osc1 = 0.0;
+        self.phase_osc2 = 0.0;
+        self.envelope_level = (velocity as f32) / 127.0;
+    }
+
+    // Releases key press note event.
+    pub fn trigger_note_off(&mut self) {
+        self.is_active = false;
+        self.envelope_level = 0.0;
+    }
+
+    // Recalculates fundamental frequency when channel pitch bend changes.
+    pub fn update_pitch_bend(&mut self, bend_semitones: f32) {
+        if self.is_active {
+            self.frequency = MidiMessageParser::note_to_frequency(self.note, bend_semitones);
+        }
+    }
+
+    // Synthesizes next mono sample using dual-oscillator wavetable synthesis.
+    pub fn render_sample(&mut self) -> f32 {
+        if !self.is_active || self.envelope_level <= 0.001 {
+            self.is_active = false;
+            return 0.0;
+        }
+
+        // Primary fundamental oscillator (sine wave)
+        let s1 = sin_f32(self.phase_osc1 * TWO_PI);
+        // Secondary harmonic detuned oscillator (octave/chorus overtone)
+        let s2 = sin_f32(self.phase_osc2 * TWO_PI) * 0.4;
+
+        let sample = (s1 + s2) * 0.5 * self.envelope_level;
+
+        // Exponential decay envelope
+        self.envelope_level *= self.decay_rate;
+
+        // Advance oscillator phases
+        let step1 = self.frequency / self.sample_rate;
+        let step2 = (self.frequency * self.detune_factor) / self.sample_rate;
+
+        self.phase_osc1 = (self.phase_osc1 + step1) % 1.0;
+        self.phase_osc2 = (self.phase_osc2 + step2) % 1.0;
+
+        sample
+    }
+}
+
+/// Polyphonic 16-voice wavetable synthesizer generating dual-oscillator PCM output from MIDI commands.
+#[derive(Debug, Clone)]
+pub struct MidiWavetableSynth {
+    pub voices: [SynthVoice; MIDI_SYNTH_VOICES],
+    pub channel_pitch_bend: [i16; 16],
+    pub channel_volume: [u8; 16],
+    pub channel_pan: [u8; 16],
+    pub master_volume: f32,
+    pub sample_rate: f32,
+}
+
+impl Default for MidiWavetableSynth {
+    fn default() -> Self {
+        Self::new(48000.0)
+    }
+}
+
+impl MidiWavetableSynth {
+    // Creates a new 16-voice synthesizer instance initialized for standard 48kHz audio.
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            voices: [SynthVoice::default(); MIDI_SYNTH_VOICES],
+            channel_pitch_bend: [0; 16],
+            channel_volume: [100; 16],
+            channel_pan: [64; 16],
+            master_volume: 1.0,
+            sample_rate,
+        }
+    }
+
+    // Converts 14-bit pitch bend offset (-8192..8191) to semitones with +/- 2 semitone range.
+    fn bend_to_semitones(bend: i16) -> f32 {
+        ((bend as f32) / 8192.0) * 2.0
+    }
+
+    // Handles incoming decoded MIDI event.
+    pub fn handle_event(&mut self, event: MidiEvent) {
+        match event {
+            MidiEvent::NoteOn { channel, note, velocity } => {
+                let ch_idx = (channel as usize) % 16;
+                let semitones = Self::bend_to_semitones(self.channel_pitch_bend[ch_idx]);
+
+                // Find free voice or allocate voice
+                let mut target_idx = None;
+                for i in 0..MIDI_SYNTH_VOICES {
+                    if !self.voices[i].is_active {
+                        target_idx = Some(i);
+                        break;
+                    }
+                }
+                let idx = target_idx.unwrap_or(0); // Fallback: voice stealing
+                self.voices[idx].trigger_note_on(channel, note, velocity, semitones, self.sample_rate);
+            }
+            MidiEvent::NoteOff { channel, note, .. } => {
+                for voice in &mut self.voices {
+                    if voice.is_active && voice.channel == channel && voice.note == note {
+                        voice.trigger_note_off();
+                    }
+                }
+            }
+            MidiEvent::PitchBend { channel, bend } => {
+                let ch_idx = (channel as usize) % 16;
+                self.channel_pitch_bend[ch_idx] = bend;
+                let semitones = Self::bend_to_semitones(bend);
+                for voice in &mut self.voices {
+                    if voice.is_active && voice.channel == channel {
+                        voice.update_pitch_bend(semitones);
+                    }
+                }
+            }
+            MidiEvent::ControlChange { channel, controller, value } => {
+                let ch_idx = (channel as usize) % 16;
+                match controller {
+                    MIDI_CC_VOLUME => self.channel_volume[ch_idx] = value,
+                    MIDI_CC_PAN => self.channel_pan[ch_idx] = value,
+                    MIDI_CC_ALL_NOTES_OFF | MIDI_CC_ALL_SOUND_OFF => {
+                        for voice in &mut self.voices {
+                            if voice.channel == channel {
+                                voice.trigger_note_off();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            MidiEvent::SystemReset => {
+                for voice in &mut self.voices {
+                    voice.trigger_note_off();
+                }
+                self.channel_pitch_bend.fill(0);
+                self.channel_volume.fill(100);
+                self.channel_pan.fill(64);
+            }
+            _ => {}
+        }
+    }
+
+    // Synthesizes polyphonic multi-channel PCM audio frames into destination stereo buffers.
+    pub fn render_frames(&mut self, frames: usize, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        let count = frames.min(out_l.len()).min(out_r.len());
+
+        for f in 0..count {
+            for voice in &mut self.voices {
+                if !voice.is_active {
+                    continue;
+                }
+                let sample = voice.render_sample();
+                let ch = (voice.channel as usize) % 16;
+                let ch_vol = (self.channel_volume[ch] as f32) / 127.0;
+                let pan = ((self.channel_pan[ch] as f32) - 64.0) / 64.0; // -1.0 to 1.0
+
+                let pan_l = ((1.0 - pan) * 0.5).clamp(0.0, 1.0);
+                let pan_r = ((1.0 + pan) * 0.5).clamp(0.0, 1.0);
+
+                let mixed = sample * ch_vol * self.master_volume;
+                out_l[f] += mixed * pan_l;
+                out_r[f] += mixed * pan_r;
+            }
+        }
+
+        count
+    }
+}
+
+/// Verifies polyphonic 16-voice synthesizer allocation, dual-oscillator rendering, and note release.
+pub fn verify_polyphonic_midi_synth() -> bool {
+    let mut synth = MidiWavetableSynth::new(48000.0);
+
+    // 1. Play Note C4 (60) and E4 (64) simultaneously on channel 0
+    synth.handle_event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 });
+    synth.handle_event(MidiEvent::NoteOn { channel: 0, note: 64, velocity: 100 });
+
+    let mut active_count = 0;
+    for v in &synth.voices {
+        if v.is_active {
+            active_count += 1;
+        }
+    }
+    if active_count != 2 {
+        return false;
+    }
+
+    // Render 64 frames and check non-zero output
+    let mut out_l = alloc::vec![0.0f32; 64];
+    let mut out_r = alloc::vec![0.0f32; 64];
+    let rendered = synth.render_frames(64, &mut out_l, &mut out_r);
+    if rendered != 64 {
+        return false;
+    }
+    let mut has_sound = false;
+    for &sample in &out_l {
+        if sample.abs() > 0.05 {
+            has_sound = true;
+            break;
+        }
+    }
+    if !has_sound {
+        return false;
+    }
+
+    // 2. NoteOff on C4 (60): only 1 voice should remain active
+    synth.handle_event(MidiEvent::NoteOff { channel: 0, note: 60, velocity: 0 });
+    let mut remaining_count = 0;
+    for v in &synth.voices {
+        if v.is_active {
+            remaining_count += 1;
+        }
+    }
+    if remaining_count != 1 {
+        return false;
+    }
+
+    true
+}
