@@ -906,3 +906,166 @@ impl PsoCache {
         self.cache_misses = 0;
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 PSO & Shader Bytecode Cache Engine
+pub fn test_pso_cache_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Graphics PSO & Shader Bytecode Cache Engine...\r\n");
+
+    // 1. Verify descriptor defaults and validation rules
+    let invalid_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+    if invalid_desc.validate().is_ok() {
+        crate::serial_write_str("[KNT-PSO-FAIL] Default graphics PSO without VS must be rejected\r\n");
+        return false;
+    }
+
+    let invalid_compute = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    if invalid_compute.validate().is_ok() {
+        crate::serial_write_str("[KNT-PSO-FAIL] Default compute PSO without CS must be rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Pipeline state descriptor validation and constraint checks verified\r\n");
+
+    // 2. Verify DXBC and DXIL container parsing and validation
+    let dummy_bytecode = [0x55, 0x89, 0xE5, 0xC3];
+    let valid_dxbc = create_test_dxbc_container(b"SHDR", &dummy_bytecode);
+    let valid_dxil = create_test_dxbc_container(b"DXIL", &dummy_bytecode);
+
+    let dxbc_header = match parse_and_validate_shader_bytecode(&valid_dxbc) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to parse valid DXBC container\r\n");
+            return false;
+        }
+    };
+    if dxbc_header.container_type != ShaderContainerType::Dxbc || dxbc_header.chunk_count != 1 {
+        crate::serial_write_str("[KNT-PSO-FAIL] DXBC header metadata mismatch\r\n");
+        return false;
+    }
+
+    let dxil_header = match parse_and_validate_shader_bytecode(&valid_dxil) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to parse valid DXIL container\r\n");
+            return false;
+        }
+    };
+    if dxil_header.container_type != ShaderContainerType::Dxil {
+        crate::serial_write_str("[KNT-PSO-FAIL] DXIL container type mismatch\r\n");
+        return false;
+    }
+
+    // Invalid container magic check
+    let corrupt_container = [
+        0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    if parse_and_validate_shader_bytecode(&corrupt_container).is_ok() {
+        crate::serial_write_str("[KNT-PSO-FAIL] Corrupted container magic must be rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DXBC/DXIL container layout and FourCC chunk parsing verified\r\n");
+
+    // 3. Verify SHA-256 state hashing and sensitivity to state changes
+    let mut gfx_desc1 = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+    gfx_desc1.vs = D3D12_SHADER_BYTECODE::new(&valid_dxbc);
+    gfx_desc1.ps = D3D12_SHADER_BYTECODE::new(&valid_dxil);
+    gfx_desc1.input_layout.elements.push(D3D12_INPUT_ELEMENT_DESC::new(
+        b"POSITION",
+        0,
+        DXGI_FORMAT::R32G32B32_FLOAT,
+        0,
+        0,
+        D3D12_INPUT_CLASSIFICATION::PerVertexData,
+        0,
+    ));
+
+    let hash1 = compute_graphics_pso_hash(&gfx_desc1);
+    let hash1_repeat = compute_graphics_pso_hash(&gfx_desc1);
+    if hash1 != hash1_repeat {
+        crate::serial_write_str("[KNT-PSO-FAIL] SHA-256 state hashing must be deterministic\r\n");
+        return false;
+    }
+
+    let mut gfx_desc2 = gfx_desc1.clone();
+    gfx_desc2.rasterizer_state.fill_mode = D3D12_FILL_MODE::Wireframe;
+    let hash2 = compute_graphics_pso_hash(&gfx_desc2);
+    if hash1 == hash2 {
+        crate::serial_write_str("[KNT-PSO-FAIL] Rasterizer modification must alter PSO hash\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Deterministic SHA-256 state hashing and differential sensitivity verified\r\n");
+
+    // 4. Verify PsoCache store compilation, deduplication, and cache hits
+    let mut cache = PsoCache::new();
+
+    let pso1 = match cache.get_or_compile_graphics(gfx_desc1.clone()) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to compile graphics PSO 1\r\n");
+            return false;
+        }
+    };
+    if pso1.hw_pipeline_id != 1 {
+        crate::serial_write_str("[KNT-PSO-FAIL] First compiled PSO should receive pipeline ID 1\r\n");
+        return false;
+    }
+
+    // Re-compilation of identical descriptor should trigger cache hit
+    let pso1_cached = match cache.get_or_compile_graphics(gfx_desc1) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to retrieve cached graphics PSO 1\r\n");
+            return false;
+        }
+    };
+    if pso1.hw_pipeline_id != pso1_cached.hw_pipeline_id {
+        crate::serial_write_str("[KNT-PSO-FAIL] Cache hit must return identical compiled PSO\r\n");
+        return false;
+    }
+
+    // Modified descriptor should produce a distinct compiled PSO
+    let pso2 = match cache.get_or_compile_graphics(gfx_desc2) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to compile modified graphics PSO 2\r\n");
+            return false;
+        }
+    };
+    if pso2.hw_pipeline_id != 2 {
+        crate::serial_write_str("[KNT-PSO-FAIL] Second compiled PSO should receive pipeline ID 2\r\n");
+        return false;
+    }
+
+    // Compute PSO compilation
+    let mut comp_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    comp_desc.cs = D3D12_SHADER_BYTECODE::new(&valid_dxbc);
+    let comp_pso = match cache.get_or_compile_compute(comp_desc) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-PSO-FAIL] Failed to compile compute PSO\r\n");
+            return false;
+        }
+    };
+    if comp_pso.hw_pipeline_id != 3 {
+        crate::serial_write_str("[KNT-PSO-FAIL] Compute PSO should receive pipeline ID 3\r\n");
+        return false;
+    }
+
+    let (hits, misses, total) = cache.stats();
+    if hits != 1 || misses != 3 || total != 3 {
+        crate::serial_write_str("[KNT-PSO-FAIL] PSO cache telemetry stats mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * PsoCache compilation, deduplication, and telemetry verified\r\n");
+
+    // 5. Verify PSO cache serialization blob export
+    let blob = cache.export_blob();
+    if blob.len() < 8 || u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) != PSO_CACHE_MAGIC {
+        crate::serial_write_str("[KNT-PSO-FAIL] PSO cache export blob format mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Fast PSO cache binary export serialization verified\r\n");
+
+    crate::serial_write_str("[KNT-PSO-CACHE-PASS] Direct3D 12 graphics PSO and shader bytecode cache engine verified\r\n");
+    true
+}
