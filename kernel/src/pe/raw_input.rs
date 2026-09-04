@@ -322,3 +322,175 @@ pub fn win32_dispatch_raw_input(raw: &RawInput) -> bool {
         handle as isize,
     )
 }
+
+pub const VK_LBUTTON: u16 = 0x01;
+pub const VK_RBUTTON: u16 = 0x02;
+pub const VK_CANCEL: u16 = 0x03;
+pub const VK_BACK: u16 = 0x08;
+pub const VK_TAB: u16 = 0x09;
+pub const VK_RETURN: u16 = 0x0D;
+pub const VK_SHIFT: u16 = 0x10;
+pub const VK_CONTROL: u16 = 0x11;
+pub const VK_MENU: u16 = 0x12;
+pub const VK_ESCAPE: u16 = 0x1B;
+pub const VK_SPACE: u16 = 0x20;
+pub const VK_LEFT: u16 = 0x25;
+pub const VK_UP: u16 = 0x26;
+pub const VK_RIGHT: u16 = 0x27;
+pub const VK_DOWN: u16 = 0x28;
+pub const VK_A: u16 = 0x41;
+pub const VK_D: u16 = 0x44;
+pub const VK_S: u16 = 0x53;
+pub const VK_W: u16 = 0x57;
+
+/// 16.16 fixed-point sub-pixel delta accumulator for high-DPI gaming mice.
+#[derive(Debug, Clone, Copy)]
+pub struct HighDpiMouseAccumulator {
+    pub subpixel_x: i32,
+    pub subpixel_y: i32,
+    pub scale_factor_q16: i32,
+    pub accumulated_x: i64,
+    pub accumulated_y: i64,
+}
+
+impl HighDpiMouseAccumulator {
+    pub const fn new(scale_factor_q16: i32) -> Self {
+        Self {
+            subpixel_x: 0,
+            subpixel_y: 0,
+            scale_factor_q16,
+            accumulated_x: 0,
+            accumulated_y: 0,
+        }
+    }
+
+    /// Sets the DPI sensitivity scaling factor in 16.16 fixed-point format.
+    pub fn set_sensitivity(&mut self, scale_factor_q16: i32) {
+        self.scale_factor_q16 = scale_factor_q16;
+    }
+
+    /// Accumulates raw micro-steps and extracts integer relative delta coordinates.
+    pub fn accumulate_delta(&mut self, raw_dx: i32, raw_dy: i32) -> (i32, i32) {
+        let scaled_x = ((raw_dx as i64 * self.scale_factor_q16 as i64) >> 16) as i32;
+        let scaled_y = ((raw_dy as i64 * self.scale_factor_q16 as i64) >> 16) as i32;
+
+        self.subpixel_x = self.subpixel_x.saturating_add(scaled_x);
+        self.subpixel_y = self.subpixel_y.saturating_add(scaled_y);
+
+        let int_dx = self.subpixel_x;
+        let int_dy = self.subpixel_y;
+
+        self.subpixel_x = 0;
+        self.subpixel_y = 0;
+
+        self.accumulated_x = self.accumulated_x.saturating_add(int_dx as i64);
+        self.accumulated_y = self.accumulated_y.saturating_add(int_dy as i64);
+
+        (int_dx, int_dy)
+    }
+}
+
+static MOUSE_ACCUMULATOR: Spinlock<HighDpiMouseAccumulator> =
+    Spinlock::new(HighDpiMouseAccumulator::new(65536));
+
+/// Translates a PS/2 keyboard make code into a Win32 Virtual Key code.
+pub fn win32_scancode_to_vk(make_code: u16, is_e0: bool) -> u16 {
+    if is_e0 {
+        match make_code {
+            0x48 => VK_UP,
+            0x50 => VK_DOWN,
+            0x4B => VK_LEFT,
+            0x4D => VK_RIGHT,
+            0x1D => VK_CONTROL,
+            0x38 => VK_MENU,
+            _ => 0,
+        }
+    } else {
+        match make_code {
+            0x01 => VK_ESCAPE,
+            0x11 => VK_W,
+            0x1E => VK_A,
+            0x1F => VK_S,
+            0x20 => VK_D,
+            0x39 => VK_SPACE,
+            0x1C => VK_RETURN,
+            0x2A | 0x36 => VK_SHIFT,
+            0x1D => VK_CONTROL,
+            0x38 => VK_MENU,
+            0x0E => VK_BACK,
+            0x0F => VK_TAB,
+            _ => 0,
+        }
+    }
+}
+
+/// Injects high-DPI mouse input into the Raw Input engine and dispatches WM_INPUT.
+pub fn win32_inject_raw_mouse_input(
+    raw_dx: i32,
+    raw_dy: i32,
+    button_flags: u16,
+    wheel_delta: i16,
+) -> bool {
+    let (int_dx, int_dy) = {
+        let mut acc = MOUSE_ACCUMULATOR.lock();
+        acc.accumulate_delta(raw_dx, raw_dy)
+    };
+
+    let raw_packet = RawInput {
+        header: RawInputHeader {
+            dw_type: RIM_TYPEMOUSE,
+            dw_size: core::mem::size_of::<RawInput>() as u32,
+            h_device: 0,
+            w_param: RIM_INPUT,
+        },
+        data: RawInputData {
+            mouse: RawMouse {
+                us_flags: MOUSE_MOVE_RELATIVE,
+                us_button_flags: button_flags,
+                us_button_data: wheel_delta as u16,
+                ul_raw_buttons: 0,
+                l_last_x: int_dx,
+                l_last_y: int_dy,
+                ul_extra_information: 0,
+            },
+        },
+    };
+
+    win32_dispatch_raw_input(&raw_packet)
+}
+
+/// Injects raw keyboard scancode input and dispatches WM_INPUT.
+pub fn win32_inject_raw_keyboard_input(make_code: u16, is_break: bool, is_e0: bool) -> bool {
+    let v_key = win32_scancode_to_vk(make_code, is_e0);
+    let mut flags = if is_break { RI_KEY_BREAK } else { RI_KEY_MAKE };
+    if is_e0 {
+        flags |= RI_KEY_E0;
+    }
+
+    let message = if is_break {
+        crate::pe::user32::WM_KEYUP
+    } else {
+        crate::pe::user32::WM_KEYDOWN
+    };
+
+    let raw_packet = RawInput {
+        header: RawInputHeader {
+            dw_type: RIM_TYPEKEYBOARD,
+            dw_size: core::mem::size_of::<RawInput>() as u32,
+            h_device: 0,
+            w_param: RIM_INPUT,
+        },
+        data: RawInputData {
+            keyboard: RawKeyboard {
+                make_code,
+                flags,
+                reserved: 0,
+                v_key,
+                message,
+                extra_information: 0,
+            },
+        },
+    };
+
+    win32_dispatch_raw_input(&raw_packet)
+}
