@@ -1092,3 +1092,121 @@ pub fn verify_polyphonic_midi_synth() -> bool {
 
     true
 }
+
+use super::client_ring::AudioFrame;
+
+/// Central WinMM Multimedia Mixer combining WaveOut PCM streams and MIDI synthesizer into unified audio stream.
+#[derive(Debug, Clone, Default)]
+pub struct WinMMServiceMixer {
+    pub wave_registry: WaveOutDeviceRegistry,
+    pub midi_synth: MidiWavetableSynth,
+    pub master_volume: f32,
+}
+
+impl WinMMServiceMixer {
+    // Creates a new multimedia mixer instance with default registry and 48kHz MIDI synth.
+    pub fn new() -> Self {
+        Self {
+            wave_registry: WaveOutDeviceRegistry::new(),
+            midi_synth: MidiWavetableSynth::new(48000.0),
+            master_volume: 1.0,
+        }
+    }
+
+    // Sets master output volume level.
+    pub fn set_master_volume(&mut self, volume: f32) {
+        self.master_volume = volume.clamp(0.0, 2.0);
+    }
+
+    // Obtains a mutable reference to the WaveOut device registry.
+    pub fn wave_registry_mut(&mut self) -> &mut WaveOutDeviceRegistry {
+        &mut self.wave_registry
+    }
+
+    // Obtains a mutable reference to the MIDI synthesizer.
+    pub fn midi_synth_mut(&mut self) -> &mut MidiWavetableSynth {
+        &mut self.midi_synth
+    }
+
+    // Blends all active WaveOut PCM streams and polyphonic MIDI voices into stereo AudioFrames.
+    pub fn render_mixdown(&mut self, frames: usize) -> Vec<AudioFrame> {
+        let mut mix_left = alloc::vec![0.0f32; frames];
+        let mut mix_right = alloc::vec![0.0f32; frames];
+
+        // 1. Accumulate all active WaveOut instances
+        let mut voice_l = alloc::vec![0.0f32; frames];
+        let mut voice_r = alloc::vec![0.0f32; frames];
+
+        for inst in self.wave_registry.instances.values_mut() {
+            voice_l.fill(0.0);
+            voice_r.fill(0.0);
+            inst.render_frames(frames, &mut voice_l, &mut voice_r);
+
+            for i in 0..frames {
+                mix_left[i] += voice_l[i];
+                mix_right[i] += voice_r[i];
+            }
+        }
+
+        // 2. Accumulate polyphonic MIDI synthesizer output
+        let mut midi_l = alloc::vec![0.0f32; frames];
+        let mut midi_r = alloc::vec![0.0f32; frames];
+        self.midi_synth.render_frames(frames, &mut midi_l, &mut midi_r);
+
+        for i in 0..frames {
+            mix_left[i] += midi_l[i];
+            mix_right[i] += midi_r[i];
+        }
+
+        // 3. Final master volume scaling and saturation clamping
+        let mut output = Vec::with_capacity(frames);
+        for i in 0..frames {
+            output.push(AudioFrame {
+                left: (mix_left[i] * self.master_volume).clamp(-1.0, 1.0),
+                right: (mix_right[i] * self.master_volume).clamp(-1.0, 1.0),
+            });
+        }
+
+        output
+    }
+}
+
+/// Verifies simultaneous rendering and mixdown of WaveOut PCM audio and MIDI synthesis.
+pub fn verify_winmm_service_mixer() -> bool {
+    let mut mixer = WinMMServiceMixer::new();
+    let fmt = WaveFormatEx::pcm_stereo(48000, 16);
+    let handle = mixer.wave_registry_mut().wave_out_open(WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL).unwrap();
+
+    // Prepare and write a 64-frame WaveOut buffer with amplitude 0.4
+    let mut pcm_bytes = Vec::new();
+    for _ in 0..64 {
+        let s: i16 = 13107; // ~0.4
+        pcm_bytes.extend_from_slice(&s.to_le_bytes());
+        pcm_bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let mut hdr = WAVEHDR::new(&pcm_bytes, 1);
+    mixer.wave_registry_mut().wave_out_prepare_header(handle, &mut hdr);
+    mixer.wave_registry_mut().wave_out_write(handle, hdr);
+
+    // Trigger a MIDI note on channel 0, note 69 (A4, 440Hz), velocity 100
+    mixer.midi_synth_mut().handle_event(MidiEvent::NoteOn { channel: 0, note: 69, velocity: 100 });
+
+    let rendered = mixer.render_mixdown(64);
+    if rendered.len() != 64 {
+        return false;
+    }
+
+    // Output must combine WaveOut (0.4) and MIDI (>0)
+    let mut has_combined_energy = false;
+    for frame in &rendered {
+        if frame.left > 0.4 {
+            has_combined_energy = true;
+            break;
+        }
+    }
+    if !has_combined_energy {
+        return false;
+    }
+
+    true
+}
