@@ -3,7 +3,9 @@
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use crate::crypto::Sha256;
 
 // Append aligned element constant for automatic stride offset calculation
 pub const D3D12_APPEND_ALIGNED_ELEMENT: u32 = 0xFFFF_FFFF;
@@ -14,6 +16,11 @@ pub const D3D12_COLOR_WRITE_ENABLE_GREEN: u8 = 2;
 pub const D3D12_COLOR_WRITE_ENABLE_BLUE: u8 = 4;
 pub const D3D12_COLOR_WRITE_ENABLE_ALPHA: u8 = 8;
 pub const D3D12_COLOR_WRITE_ENABLE_ALL: u8 = 0x0F;
+
+// FourCC magic identifiers for shader bytecode containers
+pub const DXBC_MAGIC: u32 = 0x4342_5844;
+pub const LLVM_BC_MAGIC: u32 = 0xDEC0_4342;
+pub const PSO_CACHE_MAGIC: u32 = 0x4F53_504B;
 
 // Direct3D 12 primitive topology types for pipeline state classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -505,5 +512,397 @@ impl D3D12_COMPUTE_PIPELINE_STATE_DESC {
             return Err(PsoError::MissingComputeShader);
         }
         Ok(())
+    }
+}
+
+// Shader container format classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderContainerType {
+    Dxbc,
+    Dxil,
+}
+
+// Metadata for an individual chunk within a DXBC container
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderChunkInfo {
+    pub fourcc: [u8; 4],
+    pub offset: u32,
+    pub size: u32,
+}
+
+// Parsed and validated DXBC/DXIL container header
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxbcContainerHeader {
+    pub checksum: [u8; 16],
+    pub version: u32,
+    pub total_size: u32,
+    pub chunk_count: u32,
+    pub chunks: Vec<ShaderChunkInfo>,
+    pub container_type: ShaderContainerType,
+}
+
+// Validates DXBC or DXIL bytecode container structure and chunk offsets
+pub fn parse_and_validate_shader_bytecode(bytecode: &[u8]) -> Result<DxbcContainerHeader, PsoError> {
+    if bytecode.len() < 32 {
+        return Err(PsoError::BytecodeTooSmall);
+    }
+
+    let magic = u32::from_le_bytes([bytecode[0], bytecode[1], bytecode[2], bytecode[3]]);
+    if magic == LLVM_BC_MAGIC {
+        return Ok(DxbcContainerHeader {
+            checksum: [0u8; 16],
+            version: 1,
+            total_size: bytecode.len() as u32,
+            chunk_count: 1,
+            chunks: alloc::vec![ShaderChunkInfo {
+                fourcc: *b"DXIL",
+                offset: 0,
+                size: bytecode.len() as u32,
+            }],
+            container_type: ShaderContainerType::Dxil,
+        });
+    }
+
+    if magic != DXBC_MAGIC {
+        return Err(PsoError::InvalidContainerMagic);
+    }
+
+    let mut checksum = [0u8; 16];
+    checksum.copy_from_slice(&bytecode[4..20]);
+
+    let version = u32::from_le_bytes([bytecode[20], bytecode[21], bytecode[22], bytecode[23]]);
+    let total_size = u32::from_le_bytes([bytecode[24], bytecode[25], bytecode[26], bytecode[27]]);
+    let chunk_count = u32::from_le_bytes([bytecode[28], bytecode[29], bytecode[30], bytecode[31]]);
+
+    if total_size as usize != bytecode.len() {
+        return Err(PsoError::InvalidShaderBytecode);
+    }
+
+    let offset_table_end = 32 + (chunk_count as usize * 4);
+    if offset_table_end > bytecode.len() {
+        return Err(PsoError::BytecodeTooSmall);
+    }
+
+    let mut chunks = Vec::with_capacity(chunk_count as usize);
+    let mut container_type = ShaderContainerType::Dxbc;
+
+    for i in 0..chunk_count as usize {
+        let entry_pos = 32 + (i * 4);
+        let chunk_offset = u32::from_le_bytes([
+            bytecode[entry_pos],
+            bytecode[entry_pos + 1],
+            bytecode[entry_pos + 2],
+            bytecode[entry_pos + 3],
+        ]) as usize;
+
+        if chunk_offset + 8 > bytecode.len() {
+            return Err(PsoError::BytecodeTooSmall);
+        }
+
+        let mut fourcc = [0u8; 4];
+        fourcc.copy_from_slice(&bytecode[chunk_offset..chunk_offset + 4]);
+
+        let chunk_size = u32::from_le_bytes([
+            bytecode[chunk_offset + 4],
+            bytecode[chunk_offset + 5],
+            bytecode[chunk_offset + 6],
+            bytecode[chunk_offset + 7],
+        ]);
+
+        if chunk_offset + 8 + (chunk_size as usize) > bytecode.len() {
+            return Err(PsoError::InvalidShaderBytecode);
+        }
+
+        if &fourcc == b"DXIL" || &fourcc == b"ILDB" {
+            container_type = ShaderContainerType::Dxil;
+        }
+
+        chunks.push(ShaderChunkInfo {
+            fourcc,
+            offset: chunk_offset as u32,
+            size: chunk_size,
+        });
+    }
+
+    Ok(DxbcContainerHeader {
+        checksum,
+        version,
+        total_size,
+        chunk_count,
+        chunks,
+        container_type,
+    })
+}
+
+// Builds a synthetic DXBC container with an arbitrary chunk payload
+pub fn create_test_dxbc_container(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let chunk_size = payload.len() as u32;
+    let total_size = 32 + 4 + 8 + chunk_size;
+    let mut out = Vec::with_capacity(total_size as usize);
+
+    out.extend_from_slice(b"DXBC");
+    out.extend_from_slice(&[0x11; 16]);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&total_size.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&36u32.to_le_bytes());
+    out.extend_from_slice(fourcc);
+    out.extend_from_slice(&chunk_size.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+// 256-bit cryptographic pipeline state fingerprint
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PsoHash(pub [u8; 32]);
+
+// Computes deterministic SHA-256 fingerprint for graphics pipeline state
+pub fn compute_graphics_pso_hash(desc: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> PsoHash {
+    let mut hasher = Sha256::new();
+    hasher.update(&desc.root_signature_id.to_le_bytes());
+    hasher.update(&(desc.vs.len() as u32).to_le_bytes());
+    hasher.update(&desc.vs.bytecode);
+    hasher.update(&(desc.ps.len() as u32).to_le_bytes());
+    hasher.update(&desc.ps.bytecode);
+    hasher.update(&(desc.ds.len() as u32).to_le_bytes());
+    hasher.update(&desc.ds.bytecode);
+    hasher.update(&(desc.hs.len() as u32).to_le_bytes());
+    hasher.update(&desc.hs.bytecode);
+    hasher.update(&(desc.gs.len() as u32).to_le_bytes());
+    hasher.update(&desc.gs.bytecode);
+
+    hasher.update(&[
+        desc.blend_state.alpha_to_coverage_enable as u8,
+        desc.blend_state.independent_blend_enable as u8,
+    ]);
+    for rt in &desc.blend_state.render_target {
+        hasher.update(&[rt.blend_enable as u8, rt.logic_op_enable as u8, rt.render_target_write_mask]);
+        hasher.update(&(rt.src_blend as u32).to_le_bytes());
+        hasher.update(&(rt.dest_blend as u32).to_le_bytes());
+        hasher.update(&(rt.blend_op as u32).to_le_bytes());
+        hasher.update(&(rt.src_blend_alpha as u32).to_le_bytes());
+        hasher.update(&(rt.dest_blend_alpha as u32).to_le_bytes());
+        hasher.update(&(rt.blend_op_alpha as u32).to_le_bytes());
+        hasher.update(&(rt.logic_op as u32).to_le_bytes());
+    }
+
+    hasher.update(&desc.sample_mask.to_le_bytes());
+    hasher.update(&(desc.rasterizer_state.fill_mode as u32).to_le_bytes());
+    hasher.update(&(desc.rasterizer_state.cull_mode as u32).to_le_bytes());
+    hasher.update(&[
+        desc.rasterizer_state.front_counter_clockwise as u8,
+        desc.rasterizer_state.depth_clip_enable as u8,
+        desc.rasterizer_state.multisample_enable as u8,
+        desc.rasterizer_state.antialiased_line_enable as u8,
+        desc.rasterizer_state.conservative_rasterization as u8,
+    ]);
+    hasher.update(&desc.rasterizer_state.depth_bias.to_le_bytes());
+    hasher.update(&desc.rasterizer_state.depth_bias_clamp.to_bits().to_le_bytes());
+    hasher.update(&desc.rasterizer_state.slope_scaled_depth_bias.to_bits().to_le_bytes());
+    hasher.update(&desc.rasterizer_state.forced_sample_count.to_le_bytes());
+
+    hasher.update(&[
+        desc.depth_stencil_state.depth_enable as u8,
+        desc.depth_stencil_state.stencil_enable as u8,
+        desc.depth_stencil_state.stencil_read_mask,
+        desc.depth_stencil_state.stencil_write_mask,
+    ]);
+    hasher.update(&(desc.depth_stencil_state.depth_write_mask as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.depth_func as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.front_face.stencil_fail_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.front_face.stencil_depth_fail_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.front_face.stencil_pass_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.front_face.stencil_func as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.back_face.stencil_fail_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.back_face.stencil_depth_fail_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.back_face.stencil_pass_op as u32).to_le_bytes());
+    hasher.update(&(desc.depth_stencil_state.back_face.stencil_func as u32).to_le_bytes());
+
+    hasher.update(&(desc.input_layout.elements.len() as u32).to_le_bytes());
+    for elem in &desc.input_layout.elements {
+        hasher.update(&elem.semantic_name);
+        hasher.update(&elem.semantic_index.to_le_bytes());
+        hasher.update(&(elem.format as u32).to_le_bytes());
+        hasher.update(&elem.input_slot.to_le_bytes());
+        hasher.update(&elem.aligned_byte_offset.to_le_bytes());
+        hasher.update(&(elem.input_slot_class as u32).to_le_bytes());
+        hasher.update(&elem.instance_data_step_rate.to_le_bytes());
+    }
+
+    hasher.update(&desc.ib_strip_cut_value.to_le_bytes());
+    hasher.update(&(desc.primitive_topology_type as u32).to_le_bytes());
+    hasher.update(&desc.num_render_targets.to_le_bytes());
+    for fmt in &desc.rtv_formats {
+        hasher.update(&(*fmt as u32).to_le_bytes());
+    }
+    hasher.update(&(desc.dsv_format as u32).to_le_bytes());
+    hasher.update(&desc.sample_desc.count.to_le_bytes());
+    hasher.update(&desc.sample_desc.quality.to_le_bytes());
+    hasher.update(&desc.node_mask.to_le_bytes());
+    hasher.update(&desc.flags.0.to_le_bytes());
+
+    PsoHash(hasher.finalize())
+}
+
+// Computes deterministic SHA-256 fingerprint for compute pipeline state
+pub fn compute_compute_pso_hash(desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC) -> PsoHash {
+    let mut hasher = Sha256::new();
+    hasher.update(&desc.root_signature_id.to_le_bytes());
+    hasher.update(&(desc.cs.len() as u32).to_le_bytes());
+    hasher.update(&desc.cs.bytecode);
+    hasher.update(&desc.node_mask.to_le_bytes());
+    hasher.update(&desc.flags.0.to_le_bytes());
+    PsoHash(hasher.finalize())
+}
+
+// Compiled hardware graphics pipeline state object
+#[derive(Debug, Clone)]
+pub struct CompiledGraphicsPipelineState {
+    pub hash: PsoHash,
+    pub desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    pub vs_header: DxbcContainerHeader,
+    pub ps_header: Option<DxbcContainerHeader>,
+    pub hw_pipeline_id: u64,
+}
+
+// Compiled hardware compute pipeline state object
+#[derive(Debug, Clone)]
+pub struct CompiledComputePipelineState {
+    pub hash: PsoHash,
+    pub desc: D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    pub cs_header: DxbcContainerHeader,
+    pub hw_pipeline_id: u64,
+}
+
+// Centralized PSO memory cache and deduplication store
+pub struct PsoCache {
+    graphics_psos: Vec<Arc<CompiledGraphicsPipelineState>>,
+    compute_psos: Vec<Arc<CompiledComputePipelineState>>,
+    cache_hits: u64,
+    cache_misses: u64,
+    next_pipeline_id: u64,
+}
+
+impl PsoCache {
+    // Construct empty pipeline state object cache
+    pub fn new() -> Self {
+        Self {
+            graphics_psos: Vec::new(),
+            compute_psos: Vec::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+            next_pipeline_id: 1,
+        }
+    }
+
+    // Lookup existing compiled graphics pipeline by hash
+    pub fn find_graphics(&self, hash: &PsoHash) -> Option<Arc<CompiledGraphicsPipelineState>> {
+        self.graphics_psos.iter().find(|pso| pso.hash == *hash).cloned()
+    }
+
+    // Lookup existing compiled compute pipeline by hash
+    pub fn find_compute(&self, hash: &PsoHash) -> Option<Arc<CompiledComputePipelineState>> {
+        self.compute_psos.iter().find(|pso| pso.hash == *hash).cloned()
+    }
+
+    // Retrieve or compile graphics pipeline state object with deduplication
+    pub fn get_or_compile_graphics(
+        &mut self,
+        desc: D3D12_GRAPHICS_PIPELINE_STATE_DESC,
+    ) -> Result<Arc<CompiledGraphicsPipelineState>, PsoError> {
+        desc.validate()?;
+        let hash = compute_graphics_pso_hash(&desc);
+
+        if let Some(existing) = self.find_graphics(&hash) {
+            self.cache_hits += 1;
+            return Ok(existing);
+        }
+
+        self.cache_misses += 1;
+        let vs_header = parse_and_validate_shader_bytecode(&desc.vs.bytecode)?;
+        let ps_header = if !desc.ps.is_empty() {
+            Some(parse_and_validate_shader_bytecode(&desc.ps.bytecode)?)
+        } else {
+            None
+        };
+
+        let hw_pipeline_id = self.next_pipeline_id;
+        self.next_pipeline_id += 1;
+
+        let compiled = Arc::new(CompiledGraphicsPipelineState {
+            hash,
+            desc,
+            vs_header,
+            ps_header,
+            hw_pipeline_id,
+        });
+
+        self.graphics_psos.push(Arc::clone(&compiled));
+        Ok(compiled)
+    }
+
+    // Retrieve or compile compute pipeline state object with deduplication
+    pub fn get_or_compile_compute(
+        &mut self,
+        desc: D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    ) -> Result<Arc<CompiledComputePipelineState>, PsoError> {
+        desc.validate()?;
+        let hash = compute_compute_pso_hash(&desc);
+
+        if let Some(existing) = self.find_compute(&hash) {
+            self.cache_hits += 1;
+            return Ok(existing);
+        }
+
+        self.cache_misses += 1;
+        let cs_header = parse_and_validate_shader_bytecode(&desc.cs.bytecode)?;
+
+        let hw_pipeline_id = self.next_pipeline_id;
+        self.next_pipeline_id += 1;
+
+        let compiled = Arc::new(CompiledComputePipelineState {
+            hash,
+            desc,
+            cs_header,
+            hw_pipeline_id,
+        });
+
+        self.compute_psos.push(Arc::clone(&compiled));
+        Ok(compiled)
+    }
+
+    // Telemetry query for cache performance
+    pub fn stats(&self) -> (u64, u64, usize) {
+        (
+            self.cache_hits,
+            self.cache_misses,
+            self.graphics_psos.len() + self.compute_psos.len(),
+        )
+    }
+
+    // Export cache index binary blob for quick serialization
+    pub fn export_blob(&self) -> Vec<u8> {
+        let total_count = (self.graphics_psos.len() + self.compute_psos.len()) as u32;
+        let mut blob = Vec::with_capacity(8 + (total_count as usize * 40));
+        blob.extend_from_slice(&PSO_CACHE_MAGIC.to_le_bytes());
+        blob.extend_from_slice(&(self.graphics_psos.len() as u32).to_le_bytes());
+        for pso in &self.graphics_psos {
+            blob.extend_from_slice(&pso.hash.0);
+            blob.extend_from_slice(&pso.hw_pipeline_id.to_le_bytes());
+        }
+        blob.extend_from_slice(&(self.compute_psos.len() as u32).to_le_bytes());
+        for pso in &self.compute_psos {
+            blob.extend_from_slice(&pso.hash.0);
+            blob.extend_from_slice(&pso.hw_pipeline_id.to_le_bytes());
+        }
+        blob
+    }
+
+    // Purge all compiled pipelines from memory store
+    pub fn clear(&mut self) {
+        self.graphics_psos.clear();
+        self.compute_psos.clear();
+        self.cache_hits = 0;
+        self.cache_misses = 0;
     }
 }
