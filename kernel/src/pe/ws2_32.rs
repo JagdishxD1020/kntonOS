@@ -1072,3 +1072,148 @@ pub unsafe fn win32_getsockopt(
         }
     }
 }
+
+/// Comprehensive self-test suite verifying the Win32 WinSock2 emulation layer.
+pub fn test_winsock_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WINSOCK-TEST] Executing Win32 WinSock2 emulation verification...\r\n");
+
+    // 1. Verify WSAStartup and WSACleanup lifecycle
+    let mut wsa_data = WsaData::default();
+    let startup_res = unsafe { win32_wsa_startup(0x0202, &mut wsa_data as *mut WsaData) };
+    if startup_res != 0 || wsa_data.w_version != 0x0202 || !win32_wsa_is_initialized() {
+        return false;
+    }
+
+    // 2. Verify socket descriptor allocation and binding
+    let s_server = win32_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if s_server == INVALID_SOCKET {
+        return false;
+    }
+
+    let mut sa_srv = SockAddrIn::default();
+    sa_srv.sin_family = AF_INET as u16;
+    sa_srv.sin_port = win32_htons(4444);
+    sa_srv.sin_addr.s_addr = win32_inet_addr("127.0.0.1");
+
+    let bind_res = unsafe {
+        win32_bind(
+            s_server,
+            &sa_srv as *const _ as *const SockAddr,
+            core::mem::size_of::<SockAddrIn>() as i32,
+        )
+    };
+    if bind_res != 0 {
+        return false;
+    }
+
+    let mut sa_check = SockAddrIn::default();
+    let mut namelen = core::mem::size_of::<SockAddrIn>() as i32;
+    let name_res = unsafe {
+        win32_get_sock_name(
+            s_server,
+            &mut sa_check as *mut _ as *mut SockAddr,
+            &mut namelen,
+        )
+    };
+    if name_res != 0 || sa_check.sin_port != win32_htons(4444) {
+        return false;
+    }
+
+    // 3. Verify non-blocking mode configuration, select, and WSAPoll
+    let mut nonblocking = 1u32;
+    let ioctl_res = unsafe { win32_ioctlsocket(s_server, FIONBIO, &mut nonblocking as *mut u32) };
+    if ioctl_res != 0 {
+        return false;
+    }
+
+    let mut read_set = FdSet::default();
+    unsafe { win32_fd_set(s_server, &mut read_set as *mut FdSet) };
+    let timeout = TimeVal { tv_sec: 0, tv_usec: 0 };
+    let sel_res = unsafe {
+        win32_select(
+            0,
+            &mut read_set as *mut FdSet,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &timeout as *const TimeVal,
+        )
+    };
+    if sel_res < 0 {
+        return false;
+    }
+
+    let mut poll_fd = WsaPollFd {
+        fd: s_server,
+        events: POLLIN | POLLOUT,
+        revents: 0,
+    };
+    let poll_res = unsafe { win32_wsa_poll(&mut poll_fd as *mut WsaPollFd, 1, 0) };
+    if poll_res < 0 || (poll_fd.revents & POLLOUT) == 0 {
+        return false;
+    }
+
+    // 4. Verify packet transmission and loopback reception
+    let s_client = win32_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if s_client == INVALID_SOCKET {
+        return false;
+    }
+
+    let mut sa_cli = SockAddrIn::default();
+    sa_cli.sin_family = AF_INET as u16;
+    sa_cli.sin_port = win32_htons(5555);
+    sa_cli.sin_addr.s_addr = win32_inet_addr("127.0.0.1");
+
+    let bind_cli_res = unsafe {
+        win32_bind(
+            s_client,
+            &sa_cli as *const _ as *const SockAddr,
+            core::mem::size_of::<SockAddrIn>() as i32,
+        )
+    };
+    if bind_cli_res != 0 {
+        return false;
+    }
+
+    let msg = b"KNT_GAME_NET_PACKET";
+    let send_res = unsafe {
+        win32_sendto(
+            s_client,
+            msg.as_ptr(),
+            msg.len() as i32,
+            0,
+            &sa_srv as *const _ as *const SockAddr,
+            core::mem::size_of::<SockAddrIn>() as i32,
+        )
+    };
+    if send_res != msg.len() as i32 {
+        return false;
+    }
+
+    let mut rx_buf = [0u8; 64];
+    let mut from_sa = SockAddrIn::default();
+    let mut from_len = core::mem::size_of::<SockAddrIn>() as i32;
+    let recv_res = unsafe {
+        win32_recvfrom(
+            s_server,
+            rx_buf.as_mut_ptr(),
+            rx_buf.len() as i32,
+            0,
+            &mut from_sa as *mut _ as *mut SockAddr,
+            &mut from_len as *mut i32,
+        )
+    };
+    if recv_res != msg.len() as i32 || &rx_buf[..msg.len()] != msg {
+        return false;
+    }
+
+    // 5. Cleanup sockets and shutdown Winsock
+    win32_closesocket(s_client);
+    win32_closesocket(s_server);
+    let cleanup_res = win32_wsa_cleanup();
+    if cleanup_res != 0 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WINSOCK-PASS] Win32 WinSock2 game multiplayer socket emulation verified\r\n");
+    true
+}
