@@ -417,6 +417,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 root signature subsystem self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Graphics PSO & Shader Bytecode Cache Engine (TASK-KNT-145)
+    if !gfx::test_pso_cache_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 graphics PSO cache subsystem self-test failed!\r\n");
+    }
+
     // Initialize and verify AHCI SATA Persistent Storage Subsystem
     if !drivers::storage::test_ahci_sata_subsystem() {
         serial_write_str("[KNT-PANIC] AHCI SATA storage subsystem self-test failed!\r\n");
