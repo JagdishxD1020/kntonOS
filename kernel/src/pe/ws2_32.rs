@@ -801,3 +801,274 @@ pub unsafe fn win32_wsa_poll(fdarray: *mut WsaPollFd, nfds: u32, _timeout_ms: i3
     win32_wsa_set_last_error(0);
     ready_count
 }
+
+pub const SD_RECEIVE: i32 = 0;
+pub const SD_SEND: i32 = 1;
+pub const SD_BOTH: i32 = 2;
+
+pub const SOL_SOCKET: i32 = 0xFFFF;
+pub const SO_DEBUG: i32 = 0x0001;
+pub const SO_REUSEADDR: i32 = 0x0004;
+pub const SO_KEEPALIVE: i32 = 0x0008;
+pub const SO_DONTROUTE: i32 = 0x0010;
+pub const SO_BROADCAST: i32 = 0x0020;
+pub const SO_LINGER: i32 = 0x0080;
+pub const SO_OOBINLINE: i32 = 0x0100;
+pub const SO_SNDBUF: i32 = 0x1001;
+pub const SO_RCVBUF: i32 = 0x1002;
+pub const SO_ERROR: i32 = 0x1007;
+pub const SO_TYPE: i32 = 0x1008;
+
+/// Sends data on a connected socket.
+pub unsafe fn win32_send(s: SOCKET, buf: *const u8, len: i32, _flags: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if buf.is_null() || len < 0 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let slice = core::slice::from_raw_parts(buf, len as usize);
+    match GLOBAL_SOCKET_TABLE.send(s, slice) {
+        Ok(n) => {
+            win32_wsa_set_last_error(0);
+            n as i32
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Receives data from a connected socket or a bound connection-oriented socket.
+pub unsafe fn win32_recv(s: SOCKET, buf: *mut u8, len: i32, _flags: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if buf.is_null() || len < 0 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let slice = core::slice::from_raw_parts_mut(buf, len as usize);
+    match GLOBAL_SOCKET_TABLE.recv(s, slice) {
+        Ok(n) => {
+            win32_wsa_set_last_error(0);
+            n as i32
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Sends data to a specific destination.
+pub unsafe fn win32_sendto(
+    s: SOCKET,
+    buf: *const u8,
+    len: i32,
+    _flags: i32,
+    to: *const SockAddr,
+    tolen: i32,
+) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if buf.is_null() || len < 0 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let slice = core::slice::from_raw_parts(buf, len as usize);
+    if !to.is_null() && tolen >= core::mem::size_of::<SockAddrIn>() as i32 {
+        let sa_in = &*(to as *const SockAddrIn);
+        let port = u16::from_be(sa_in.sin_port);
+        let ip_bytes = sa_in.sin_addr.s_addr.to_ne_bytes();
+
+        match GLOBAL_SOCKET_TABLE.sendto(s, slice, ip_bytes, port) {
+            Ok(n) => {
+                win32_wsa_set_last_error(0);
+                n as i32
+            }
+            Err(err) => {
+                let wsa_err = map_socket_error(err);
+                win32_wsa_set_last_error(wsa_err);
+                SOCKET_ERROR
+            }
+        }
+    } else {
+        match GLOBAL_SOCKET_TABLE.send(s, slice) {
+            Ok(n) => {
+                win32_wsa_set_last_error(0);
+                n as i32
+            }
+            Err(err) => {
+                let wsa_err = map_socket_error(err);
+                win32_wsa_set_last_error(wsa_err);
+                SOCKET_ERROR
+            }
+        }
+    }
+}
+
+/// Receives a datagram and stores the source address.
+pub unsafe fn win32_recvfrom(
+    s: SOCKET,
+    buf: *mut u8,
+    len: i32,
+    _flags: i32,
+    from: *mut SockAddr,
+    fromlen: *mut i32,
+) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if buf.is_null() || len < 0 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let slice = core::slice::from_raw_parts_mut(buf, len as usize);
+    match GLOBAL_SOCKET_TABLE.recvfrom(s, slice) {
+        Ok((n, (ip, port))) => {
+            if !from.is_null() && !fromlen.is_null() {
+                if *fromlen >= core::mem::size_of::<SockAddrIn>() as i32 {
+                    let sa_in = SockAddrIn {
+                        sin_family: AF_INET as u16,
+                        sin_port: port.to_be(),
+                        sin_addr: InAddr {
+                            s_addr: u32::from_ne_bytes(ip),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    core::ptr::copy_nonoverlapping(
+                        &sa_in as *const _ as *const u8,
+                        from as *mut u8,
+                        core::mem::size_of::<SockAddrIn>(),
+                    );
+                    *fromlen = core::mem::size_of::<SockAddrIn>() as i32;
+                }
+            }
+            win32_wsa_set_last_error(0);
+            n as i32
+        }
+        Err(err) => {
+            let wsa_err = map_socket_error(err);
+            win32_wsa_set_last_error(wsa_err);
+            SOCKET_ERROR
+        }
+    }
+}
+
+/// Disables sends or receives on a socket descriptor.
+pub fn win32_shutdown(s: SOCKET, how: i32) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if how < SD_RECEIVE || how > SD_BOTH {
+        win32_wsa_set_last_error(WSAEINVAL);
+        return SOCKET_ERROR;
+    }
+
+    if GLOBAL_SOCKET_TABLE.exists(s) {
+        win32_wsa_set_last_error(0);
+        0
+    } else {
+        win32_wsa_set_last_error(WSAENOTSOCK);
+        SOCKET_ERROR
+    }
+}
+
+/// Sets a socket option descriptor value.
+pub unsafe fn win32_setsockopt(
+    s: SOCKET,
+    _level: i32,
+    _optname: i32,
+    optval: *const u8,
+    optlen: i32,
+) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if optval.is_null() || optlen < 0 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    if GLOBAL_SOCKET_TABLE.exists(s) {
+        win32_wsa_set_last_error(0);
+        0
+    } else {
+        win32_wsa_set_last_error(WSAENOTSOCK);
+        SOCKET_ERROR
+    }
+}
+
+/// Retrieves a socket option descriptor value.
+pub unsafe fn win32_getsockopt(
+    s: SOCKET,
+    _level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut i32,
+) -> i32 {
+    if !win32_wsa_is_initialized() {
+        win32_wsa_set_last_error(WSASYSNOTREADY);
+        return SOCKET_ERROR;
+    }
+    if optval.is_null() || optlen.is_null() || *optlen < 4 {
+        win32_wsa_set_last_error(WSAEFAULT);
+        return SOCKET_ERROR;
+    }
+
+    if !GLOBAL_SOCKET_TABLE.exists(s) {
+        win32_wsa_set_last_error(WSAENOTSOCK);
+        return SOCKET_ERROR;
+    }
+
+    match optname {
+        SO_ERROR => {
+            *(optval as *mut i32) = 0;
+            *optlen = 4;
+            win32_wsa_set_last_error(0);
+            0
+        }
+        SO_TYPE => {
+            let table = WIN32_SOCKET_TABLE.lock();
+            let st = table.iter().find(|e| e.socket == s).map(|e| e.sock_type).unwrap_or(SOCK_STREAM);
+            *(optval as *mut i32) = st;
+            *optlen = 4;
+            win32_wsa_set_last_error(0);
+            0
+        }
+        _ => {
+            *(optval as *mut i32) = 0;
+            *optlen = 4;
+            win32_wsa_set_last_error(0);
+            0
+        }
+    }
+}
