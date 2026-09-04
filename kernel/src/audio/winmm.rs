@@ -493,17 +493,54 @@ impl WaveOutInstance {
         let mut frames_written = 0;
 
         while frames_written < frames {
-            let hdr = match self.buffer_queue.front_mut() {
-                Some(h) => h,
-                None => break,
+            if self.buffer_queue.is_empty() {
+                break;
+            }
+
+            let (sample_l, sample_r, has_sample, buffer_finished) = {
+                let hdr = self.buffer_queue.front().unwrap();
+                let data_len = hdr.data.len();
+                if self.playback_byte_offset + block_align > data_len {
+                    (0.0f32, 0.0f32, false, true)
+                } else {
+                    let off = self.playback_byte_offset;
+                    let s_l = if self.format.wBitsPerSample == 16 {
+                        let s_i16 = i16::from_le_bytes([hdr.data[off], hdr.data[off + 1]]);
+                        (s_i16 as f32) / 32768.0
+                    } else {
+                        let s_u8 = hdr.data[off] as f32;
+                        (s_u8 - 128.0) / 128.0
+                    };
+
+                    let s_r = if channels > 1 {
+                        if self.format.wBitsPerSample == 16 {
+                            let s_i16 = i16::from_le_bytes([hdr.data[off + 2], hdr.data[off + 3]]);
+                            (s_i16 as f32) / 32768.0
+                        } else {
+                            let s_u8 = hdr.data[off + 1] as f32;
+                            (s_u8 - 128.0) / 128.0
+                        }
+                    } else {
+                        s_l
+                    };
+
+                    let finished = off + block_align >= data_len;
+                    (s_l, s_r, true, finished)
+                }
             };
 
-            let data_len = hdr.data.len();
-            if self.playback_byte_offset + block_align > data_len {
-                if hdr.loops > 1 && self.current_loops_remaining + 1 < hdr.loops {
+            if has_sample {
+                out_l[frames_written] += sample_l * gl;
+                out_r[frames_written] += sample_r * gr;
+                frames_written += 1;
+                self.playback_byte_offset += block_align;
+            }
+
+            if buffer_finished {
+                let loops = self.buffer_queue.front().unwrap().loops;
+                if loops > 1 && self.current_loops_remaining + 1 < loops {
                     self.current_loops_remaining += 1;
                     self.playback_byte_offset = 0;
-                    continue;
                 } else {
                     let mut done_hdr = self.buffer_queue.pop_front().unwrap();
                     done_hdr.flags &= !WHDR_INQUEUE;
@@ -511,36 +548,8 @@ impl WaveOutInstance {
                     self.completed_headers.push(done_hdr);
                     self.playback_byte_offset = 0;
                     self.current_loops_remaining = 0;
-                    continue;
                 }
             }
-
-            let off = self.playback_byte_offset;
-            let sample_l = if self.format.wBitsPerSample == 16 {
-                let s_i16 = i16::from_le_bytes([hdr.data[off], hdr.data[off + 1]]);
-                (s_i16 as f32) / 32768.0
-            } else {
-                let s_u8 = hdr.data[off] as f32;
-                (s_u8 - 128.0) / 128.0
-            };
-
-            let sample_r = if channels > 1 {
-                if self.format.wBitsPerSample == 16 {
-                    let s_i16 = i16::from_le_bytes([hdr.data[off + 2], hdr.data[off + 3]]);
-                    (s_i16 as f32) / 32768.0
-                } else {
-                    let s_u8 = hdr.data[off + 1] as f32;
-                    (s_u8 - 128.0) / 128.0
-                }
-            } else {
-                sample_l
-            };
-
-            out_l[frames_written] += sample_l * gl;
-            out_r[frames_written] += sample_r * gr;
-
-            frames_written += 1;
-            self.playback_byte_offset += block_align;
         }
 
         frames_written
@@ -1208,5 +1217,51 @@ pub fn verify_winmm_service_mixer() -> bool {
         return false;
     }
 
+    true
+}
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Win32 WinMM WaveOut & MIDI Synthesizer Engine.
+pub fn test_winmm_service_subsystem() -> bool {
+    serial_write_str("[KNT-AUDIO] Testing WinMM legacy WaveOut & MIDI synthesizer service...\r\n");
+
+    // 1. Verify capability descriptors, status codes, and audio buffer headers
+    if !verify_winmm_types_and_descriptors() {
+        serial_write_str("[KNT-PANIC] WinMM capability structures and header verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify waveOut device registry, capabilities queries, and lifecycle
+    if !verify_waveout_device_lifecycle() {
+        serial_write_str("[KNT-PANIC] WaveOut device registry and lifecycle verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify waveOut buffer queueing, header preparation, and PCM consumption
+    if !verify_waveout_buffer_queue_and_prepare() {
+        serial_write_str("[KNT-PANIC] WaveOut buffer queueing and header preparation failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify MIDI message parser, channel event decoding, and frequency calculations
+    if !verify_midi_message_parser() {
+        serial_write_str("[KNT-PANIC] MIDI message parser and frequency conversion failed!\r\n");
+        return false;
+    }
+
+    // 5. Verify polyphonic 16-voice wavetable synthesizer and dual-oscillator voice engine
+    if !verify_polyphonic_midi_synth() {
+        serial_write_str("[KNT-PANIC] Polyphonic MIDI synthesizer verification failed!\r\n");
+        return false;
+    }
+
+    // 6. Verify WinMM multimedia mixer blending WaveOut streams and MIDI synth output
+    if !verify_winmm_service_mixer() {
+        serial_write_str("[KNT-PANIC] WinMM multimedia mixer stream rendering verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-WINMM-PASS] WinMM legacy WaveOut audio and MIDI synthesizer service verified\r\n");
     true
 }

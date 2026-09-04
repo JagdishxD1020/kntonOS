@@ -20,6 +20,7 @@ pub use occlusion::test_audio_occlusion_subsystem;
 pub use vad::test_audio_vad_subsystem;
 pub use xaudio2::test_xaudio2_service_subsystem;
 pub use dsound::test_dsound_service_subsystem;
+pub use winmm::test_winmm_service_subsystem;
 
 pub use hrtf::*;
 pub use drc::*;
