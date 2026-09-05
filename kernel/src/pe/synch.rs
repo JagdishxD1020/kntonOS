@@ -361,3 +361,127 @@ pub unsafe fn win32_delete_critical_section(lp_cs: LPCRITICAL_SECTION) {
         *lp_cs = CriticalSection::default();
     }
 }
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const SRW_EXCLUSIVE: usize = 0x0001;
+const SRW_READER_SHIFT: usize = 4;
+const SRW_READER_MASK: usize = 0x0FFF_FFF0;
+const SRW_READER_INC: usize = 1 << SRW_READER_SHIFT;
+const SRW_OWNER_SHIFT: usize = 32;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct SrwLock {
+    pub state: AtomicUsize,
+}
+
+#[allow(non_camel_case_types)]
+pub type SRWLOCK = SrwLock;
+#[allow(non_camel_case_types)]
+pub type PSRWLOCK = *mut SrwLock;
+
+/// Initializes a slim reader/writer (SRW) lock.
+pub unsafe fn win32_initialize_srw_lock(srw_lock: PSRWLOCK) {
+    if !srw_lock.is_null() {
+        (*srw_lock).state.store(0, Ordering::Release);
+    }
+}
+
+/// Acquires a slim reader/writer (SRW) lock in exclusive mode.
+pub unsafe fn win32_acquire_srw_lock_exclusive(srw_lock: PSRWLOCK) {
+    if srw_lock.is_null() {
+        return;
+    }
+
+    let tid = get_current_tid() as usize;
+    let new_val = (tid << SRW_OWNER_SHIFT) | SRW_EXCLUSIVE;
+
+    loop {
+        let val = (*srw_lock).state.load(Ordering::Acquire);
+        if (val & (SRW_EXCLUSIVE | SRW_READER_MASK)) == 0 {
+            if (*srw_lock).state.compare_exchange_weak(val, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        }
+        core::hint::spin_loop();
+        crate::process::yield_now();
+    }
+}
+
+/// Attempts to acquire a slim reader/writer (SRW) lock in exclusive mode without blocking.
+pub unsafe fn win32_try_acquire_srw_lock_exclusive(srw_lock: PSRWLOCK) -> bool {
+    if srw_lock.is_null() {
+        return false;
+    }
+
+    let val = (*srw_lock).state.load(Ordering::Acquire);
+    if (val & (SRW_EXCLUSIVE | SRW_READER_MASK)) == 0 {
+        let tid = get_current_tid() as usize;
+        let new_val = (tid << SRW_OWNER_SHIFT) | SRW_EXCLUSIVE;
+        (*srw_lock).state.compare_exchange(val, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Releases a slim reader/writer (SRW) lock that was acquired in exclusive mode.
+pub unsafe fn win32_release_srw_lock_exclusive(srw_lock: PSRWLOCK) {
+    if !srw_lock.is_null() {
+        (*srw_lock).state.store(0, Ordering::Release);
+    }
+}
+
+/// Acquires a slim reader/writer (SRW) lock in shared mode.
+pub unsafe fn win32_acquire_srw_lock_shared(srw_lock: PSRWLOCK) {
+    if srw_lock.is_null() {
+        return;
+    }
+
+    loop {
+        let val = (*srw_lock).state.load(Ordering::Acquire);
+        if (val & SRW_EXCLUSIVE) == 0 {
+            let new_val = val + SRW_READER_INC;
+            if (*srw_lock).state.compare_exchange_weak(val, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        }
+        core::hint::spin_loop();
+        crate::process::yield_now();
+    }
+}
+
+/// Attempts to acquire a slim reader/writer (SRW) lock in shared mode without blocking.
+pub unsafe fn win32_try_acquire_srw_lock_shared(srw_lock: PSRWLOCK) -> bool {
+    if srw_lock.is_null() {
+        return false;
+    }
+
+    let val = (*srw_lock).state.load(Ordering::Acquire);
+    if (val & SRW_EXCLUSIVE) == 0 {
+        let new_val = val + SRW_READER_INC;
+        (*srw_lock).state.compare_exchange(val, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    } else {
+        false
+    }
+}
+
+/// Releases a slim reader/writer (SRW) lock that was acquired in shared mode.
+pub unsafe fn win32_release_srw_lock_shared(srw_lock: PSRWLOCK) {
+    if srw_lock.is_null() {
+        return;
+    }
+
+    loop {
+        let val = (*srw_lock).state.load(Ordering::Acquire);
+        let readers = (val & SRW_READER_MASK) >> SRW_READER_SHIFT;
+        if readers > 0 {
+            let new_val = val - SRW_READER_INC;
+            if (*srw_lock).state.compare_exchange_weak(val, new_val, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+}
