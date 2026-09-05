@@ -3,6 +3,7 @@
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
+use alloc::vec::Vec;
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, Not};
 
 // Direct3D 12 standard subresource index sentinel for all subresources
@@ -422,4 +423,199 @@ pub const fn decompose_subresource(
     let array_slice = remainder / mip_levels;
     let mip_slice = remainder % mip_levels;
     (mip_slice, array_slice, plane_slice)
+}
+
+// Per-resource subresource state and queue affinity tracking metadata
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceStateTracking {
+    pub resource_id: u64,
+    pub is_buffer: bool,
+    pub mip_levels: u32,
+    pub array_size: u32,
+    pub plane_count: u32,
+    pub subresource_states: Vec<D3D12_RESOURCE_STATES>,
+    pub current_queue: D3D12_COMMAND_LIST_TYPE,
+    pub is_promoted: bool,
+}
+
+impl ResourceStateTracking {
+    // Construct new tracking descriptor initialized with uniform state
+    pub fn new(
+        resource_id: u64,
+        is_buffer: bool,
+        mip_levels: u32,
+        array_size: u32,
+        plane_count: u32,
+        initial_state: D3D12_RESOURCE_STATES,
+        initial_queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Self {
+        let total_subresources = if is_buffer {
+            1
+        } else {
+            (mip_levels.max(1) * array_size.max(1) * plane_count.max(1)) as usize
+        };
+        let mut subresource_states = Vec::with_capacity(total_subresources);
+        for _ in 0..total_subresources {
+            subresource_states.push(initial_state);
+        }
+        Self {
+            resource_id,
+            is_buffer,
+            mip_levels: mip_levels.max(1),
+            array_size: array_size.max(1),
+            plane_count: plane_count.max(1),
+            subresource_states,
+            current_queue: initial_queue,
+            is_promoted: false,
+        }
+    }
+
+    // Number of trackable subresources for this resource
+    pub fn subresource_count(&self) -> usize {
+        self.subresource_states.len()
+    }
+}
+
+// Global resource barrier state registry tracking GPU resource states
+pub struct ResourceStateRegistry {
+    resources: Vec<ResourceStateTracking>,
+}
+
+impl ResourceStateRegistry {
+    // Construct empty resource state registry
+    pub fn new() -> Self {
+        Self {
+            resources: Vec::new(),
+        }
+    }
+
+    // Register a new GPU resource into the barrier tracking registry
+    pub fn register_resource(
+        &mut self,
+        id: u64,
+        is_buffer: bool,
+        mip_levels: u32,
+        array_size: u32,
+        plane_count: u32,
+        initial_state: D3D12_RESOURCE_STATES,
+        initial_queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<(), ResourceBarrierError> {
+        if self.resources.iter().any(|r| r.resource_id == id) {
+            return Err(ResourceBarrierError::IncompatibleStates);
+        }
+        self.resources.push(ResourceStateTracking::new(
+            id,
+            is_buffer,
+            mip_levels,
+            array_size,
+            plane_count,
+            initial_state,
+            initial_queue,
+        ));
+        Ok(())
+    }
+
+    // Unregister GPU resource from barrier tracker on destruction
+    pub fn unregister_resource(&mut self, id: u64) {
+        self.resources.retain(|r| r.resource_id != id);
+    }
+
+    // Query state of an individual subresource
+    pub fn get_subresource_state(
+        &self,
+        id: u64,
+        subresource: u32,
+    ) -> Result<D3D12_RESOURCE_STATES, ResourceBarrierError> {
+        let res = self
+            .resources
+            .iter()
+            .find(|r| r.resource_id == id)
+            .ok_or(ResourceBarrierError::ResourceNotFound)?;
+
+        if subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES {
+            if let Some(first) = res.subresource_states.first() {
+                if res.subresource_states.iter().all(|s| s == first) {
+                    return Ok(*first);
+                }
+            }
+            return Err(ResourceBarrierError::MissingSubresource);
+        }
+
+        let idx = subresource as usize;
+        if idx >= res.subresource_states.len() {
+            return Err(ResourceBarrierError::MissingSubresource);
+        }
+        Ok(res.subresource_states[idx])
+    }
+
+    // Transition an individual subresource or all subresources
+    pub fn transition(
+        &mut self,
+        id: u64,
+        subresource: u32,
+        expected_before: D3D12_RESOURCE_STATES,
+        state_after: D3D12_RESOURCE_STATES,
+        queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<(), ResourceBarrierError> {
+        if !is_state_supported_on_queue(state_after, queue) {
+            return Err(ResourceBarrierError::InvalidQueueOperation);
+        }
+        if expected_before == state_after {
+            return Err(ResourceBarrierError::RedundantTransition);
+        }
+
+        let res = self
+            .resources
+            .iter_mut()
+            .find(|r| r.resource_id == id)
+            .ok_or(ResourceBarrierError::ResourceNotFound)?;
+
+        res.current_queue = queue;
+
+        if subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES {
+            for state in &mut res.subresource_states {
+                if *state != expected_before {
+                    return Err(ResourceBarrierError::IncompatibleStates);
+                }
+                *state = state_after;
+            }
+        } else {
+            let idx = subresource as usize;
+            if idx >= res.subresource_states.len() {
+                return Err(ResourceBarrierError::MissingSubresource);
+            }
+            if res.subresource_states[idx] != expected_before {
+                return Err(ResourceBarrierError::IncompatibleStates);
+            }
+            res.subresource_states[idx] = state_after;
+        }
+
+        res.is_promoted = false;
+        Ok(())
+    }
+
+    // Apply explicit barrier directly to tracked state
+    pub fn apply_barrier(
+        &mut self,
+        barrier: &D3D12_RESOURCE_BARRIER,
+        queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<(), ResourceBarrierError> {
+        barrier.validate()?;
+
+        if let Some(t) = &barrier.transition {
+            self.transition(
+                t.resource_id,
+                t.subresource,
+                t.state_before,
+                t.state_after,
+                queue,
+            )?;
+        }
+        Ok(())
+    }
+
+    // Total count of registered resources in tracker
+    pub fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
 }
