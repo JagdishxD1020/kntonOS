@@ -4,6 +4,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::vec::Vec;
 use crate::graphics::types::Vec3;
 
 // OpenAL 1.1 core primitive types.
@@ -38,6 +39,12 @@ pub const AL_FORMAT_MONO8: ALenum = 0x1100;
 pub const AL_FORMAT_MONO16: ALenum = 0x1101;
 pub const AL_FORMAT_STEREO8: ALenum = 0x1102;
 pub const AL_FORMAT_STEREO16: ALenum = 0x1103;
+
+// OpenAL buffer query tokens.
+pub const AL_FREQUENCY: ALenum = 0x2001;
+pub const AL_BITS: ALenum = 0x2002;
+pub const AL_CHANNELS: ALenum = 0x2003;
+pub const AL_SIZE: ALenum = 0x2004;
 
 // OpenAL source attributes.
 pub const AL_SOURCE_RELATIVE: ALenum = 0x202;
@@ -90,6 +97,108 @@ pub const ALC_STEREO_SOURCES: ALenum = 0x1011;
 pub const ALC_DEFAULT_DEVICE_SPECIFIER: ALenum = 0x1004;
 pub const ALC_DEVICE_SPECIFIER: ALenum = 0x1005;
 pub const ALC_EXTENSIONS: ALenum = 0x1006;
+
+/// OpenAL audio buffer holding raw PCM data and decoded floating-point frames.
+#[derive(Debug, Clone, Default)]
+pub struct ALBuffer {
+    pub id: ALuint,
+    pub format: ALenum,
+    pub frequency: ALsizei,
+    pub bits: ALsizei,
+    pub channels: ALsizei,
+    pub raw_bytes: Vec<u8>,
+    pub pcm_left: Vec<f32>,
+    pub pcm_right: Vec<f32>,
+}
+
+impl ALBuffer {
+    // Creates an empty uninitialized OpenAL buffer.
+    pub fn new(id: ALuint) -> Self {
+        Self {
+            id,
+            format: AL_NONE,
+            frequency: 0,
+            bits: 0,
+            channels: 0,
+            raw_bytes: Vec::new(),
+            pcm_left: Vec::new(),
+            pcm_right: Vec::new(),
+        }
+    }
+
+    // Number of decoded audio frames in buffer.
+    pub fn num_frames(&self) -> usize {
+        self.pcm_left.len()
+    }
+
+    // Loads and decodes raw PCM audio data into normalized floating-point samples.
+    pub fn load_pcm_data(&mut self, format: ALenum, data: &[u8], size: usize, freq: ALsizei) -> bool {
+        self.format = format;
+        self.frequency = freq;
+        self.raw_bytes = data[..size].to_vec();
+        self.pcm_left.clear();
+        self.pcm_right.clear();
+
+        match format {
+            AL_FORMAT_MONO8 => {
+                self.bits = 8;
+                self.channels = 1;
+                let frames = size;
+                self.pcm_left.reserve(frames);
+                self.pcm_right.reserve(frames);
+                for &b in &data[..frames] {
+                    let s = (b as f32 - 128.0) / 128.0;
+                    self.pcm_left.push(s);
+                    self.pcm_right.push(s);
+                }
+            }
+            AL_FORMAT_MONO16 => {
+                self.bits = 16;
+                self.channels = 1;
+                let frames = size / 2;
+                self.pcm_left.reserve(frames);
+                self.pcm_right.reserve(frames);
+                for i in 0..frames {
+                    let b0 = data[i * 2];
+                    let b1 = data[i * 2 + 1];
+                    let raw = i16::from_le_bytes([b0, b1]);
+                    let s = (raw as f32) / 32768.0;
+                    self.pcm_left.push(s);
+                    self.pcm_right.push(s);
+                }
+            }
+            AL_FORMAT_STEREO8 => {
+                self.bits = 8;
+                self.channels = 2;
+                let frames = size / 2;
+                self.pcm_left.reserve(frames);
+                self.pcm_right.reserve(frames);
+                for i in 0..frames {
+                    let l = (data[i * 2] as f32 - 128.0) / 128.0;
+                    let r = (data[i * 2 + 1] as f32 - 128.0) / 128.0;
+                    self.pcm_left.push(l);
+                    self.pcm_right.push(r);
+                }
+            }
+            AL_FORMAT_STEREO16 => {
+                self.bits = 16;
+                self.channels = 2;
+                let frames = size / 4;
+                self.pcm_left.reserve(frames);
+                self.pcm_right.reserve(frames);
+                for i in 0..frames {
+                    let l_raw = i16::from_le_bytes([data[i * 4], data[i * 4 + 1]]);
+                    let r_raw = i16::from_le_bytes([data[i * 4 + 2], data[i * 4 + 3]]);
+                    self.pcm_left.push((l_raw as f32) / 32768.0);
+                    self.pcm_right.push((r_raw as f32) / 32768.0);
+                }
+            }
+            _ => return false,
+        }
+
+        true
+    }
+}
 
 /// OpenAL 3D listener state representing the virtual listener in world space.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -164,9 +273,11 @@ impl ALCContext {
 pub struct OpenALEngine {
     pub devices: BTreeMap<ALuint, ALCDevice>,
     pub contexts: BTreeMap<ALuint, ALCContext>,
+    pub buffers: BTreeMap<ALuint, ALBuffer>,
     pub current_context: ALuint,
     pub next_device_handle: ALuint,
     pub next_context_handle: ALuint,
+    pub next_buffer_id: ALuint,
 }
 
 impl OpenALEngine {
@@ -175,9 +286,11 @@ impl OpenALEngine {
         Self {
             devices: BTreeMap::new(),
             contexts: BTreeMap::new(),
+            buffers: BTreeMap::new(),
             current_context: 0,
             next_device_handle: 1,
             next_context_handle: 1,
+            next_buffer_id: 1,
         }
     }
 
@@ -269,6 +382,101 @@ impl OpenALEngine {
             AL_NO_ERROR
         }
     }
+
+    // Allocates n buffer object names.
+    pub fn al_gen_buffers(&mut self, n: ALsizei, out_buffers: &mut [ALuint]) -> ALenum {
+        if n < 0 || out_buffers.len() < n as usize {
+            return AL_INVALID_VALUE;
+        }
+        for i in 0..n as usize {
+            let id = self.next_buffer_id;
+            self.next_buffer_id = self.next_buffer_id.wrapping_add(1).max(1);
+            self.buffers.insert(id, ALBuffer::new(id));
+            out_buffers[i] = id;
+        }
+        AL_NO_ERROR
+    }
+
+    // Deletes n buffer objects.
+    pub fn al_delete_buffers(&mut self, n: ALsizei, buffers: &[ALuint]) -> ALenum {
+        if n < 0 || buffers.len() < n as usize {
+            return AL_INVALID_VALUE;
+        }
+        for &id in &buffers[..n as usize] {
+            if id != 0 {
+                self.buffers.remove(&id);
+            }
+        }
+        AL_NO_ERROR
+    }
+
+    // Checks if identifier is a valid OpenAL buffer.
+    pub fn al_is_buffer(&self, buffer: ALuint) -> ALboolean {
+        if self.buffers.contains_key(&buffer) {
+            AL_TRUE
+        } else {
+            AL_FALSE
+        }
+    }
+
+    // Uploads PCM audio data into specified OpenAL buffer with bounds and alignment verification.
+    pub fn al_buffer_data(&mut self, buffer: ALuint, format: ALenum, data: &[u8], size: ALsizei, freq: ALsizei) -> ALenum {
+        if size < 0 || freq <= 0 || (size as usize) > data.len() {
+            return AL_INVALID_VALUE;
+        }
+
+        let sz = size as usize;
+        let align = match format {
+            AL_FORMAT_MONO8 => 1,
+            AL_FORMAT_MONO16 => 2,
+            AL_FORMAT_STEREO8 => 2,
+            AL_FORMAT_STEREO16 => 4,
+            _ => return AL_INVALID_ENUM,
+        };
+
+        if sz % align != 0 {
+            return AL_INVALID_VALUE;
+        }
+
+        let buf = match self.buffers.get_mut(&buffer) {
+            Some(b) => b,
+            None => return AL_INVALID_NAME,
+        };
+
+        if buf.load_pcm_data(format, data, sz, freq) {
+            AL_NO_ERROR
+        } else {
+            AL_INVALID_VALUE
+        }
+    }
+
+    // Queries integer parameters from an OpenAL buffer.
+    pub fn al_get_bufferi(&self, buffer: ALuint, param: ALenum, out_val: &mut ALint) -> ALenum {
+        let buf = match self.buffers.get(&buffer) {
+            Some(b) => b,
+            None => return AL_INVALID_NAME,
+        };
+
+        match param {
+            AL_FREQUENCY => {
+                *out_val = buf.frequency;
+                AL_NO_ERROR
+            }
+            AL_BITS => {
+                *out_val = buf.bits;
+                AL_NO_ERROR
+            }
+            AL_CHANNELS => {
+                *out_val = buf.channels;
+                AL_NO_ERROR
+            }
+            AL_SIZE => {
+                *out_val = buf.raw_bytes.len() as ALint;
+                AL_NO_ERROR
+            }
+            _ => AL_INVALID_ENUM,
+        }
+    }
 }
 
 /// Verifies ALC device opening, context creation, binding, and error tracking.
@@ -314,6 +522,77 @@ pub fn verify_alc_device_and_context_lifecycle() -> bool {
         return false;
     }
     if engine.alc_close_device(dev) != ALC_TRUE {
+        return false;
+    }
+
+    true
+}
+
+/// Verifies OpenAL buffer generation, format bounds checking, PCM uploading, and querying.
+pub fn verify_openal_buffer_management() -> bool {
+    let mut engine = OpenALEngine::new();
+
+    // 1. Generate buffers
+    let mut buf_ids = [0u32; 2];
+    if engine.al_gen_buffers(2, &mut buf_ids) != AL_NO_ERROR {
+        return false;
+    }
+    if engine.al_is_buffer(buf_ids[0]) != AL_TRUE || engine.al_is_buffer(buf_ids[1]) != AL_TRUE {
+        return false;
+    }
+
+    // 2. Test invalid buffer format
+    let dummy_data = [0u8; 16];
+    if engine.al_buffer_data(buf_ids[0], 0x9999, &dummy_data, 16, 44100) != AL_INVALID_ENUM {
+        return false;
+    }
+
+    // 3. Test misaligned size (e.g. 16-bit mono requires size % 2 == 0)
+    if engine.al_buffer_data(buf_ids[0], AL_FORMAT_MONO16, &dummy_data, 15, 44100) != AL_INVALID_VALUE {
+        return false;
+    }
+
+    // 4. Upload valid stereo 16-bit PCM (4 frames = 16 bytes)
+    let mut pcm_bytes = Vec::new();
+    for _ in 0..4 {
+        let l: i16 = 16384;
+        let r: i16 = -16384;
+        pcm_bytes.extend_from_slice(&l.to_le_bytes());
+        pcm_bytes.extend_from_slice(&r.to_le_bytes());
+    }
+
+    if engine.al_buffer_data(buf_ids[0], AL_FORMAT_STEREO16, &pcm_bytes, pcm_bytes.len() as ALsizei, 48000) != AL_NO_ERROR {
+        return false;
+    }
+
+    // 5. Query buffer attributes
+    let mut freq = 0;
+    let mut bits = 0;
+    let mut channels = 0;
+    let mut size = 0;
+    if engine.al_get_bufferi(buf_ids[0], AL_FREQUENCY, &mut freq) != AL_NO_ERROR || freq != 48000 {
+        return false;
+    }
+    if engine.al_get_bufferi(buf_ids[0], AL_BITS, &mut bits) != AL_NO_ERROR || bits != 16 {
+        return false;
+    }
+    if engine.al_get_bufferi(buf_ids[0], AL_CHANNELS, &mut channels) != AL_NO_ERROR || channels != 2 {
+        return false;
+    }
+    if engine.al_get_bufferi(buf_ids[0], AL_SIZE, &mut size) != AL_NO_ERROR || size != 16 {
+        return false;
+    }
+
+    let buf = engine.buffers.get(&buf_ids[0]).unwrap();
+    if buf.num_frames() != 4 || (buf.pcm_left[0] - 0.5).abs() > 0.01 || (buf.pcm_right[0] + 0.5).abs() > 0.01 {
+        return false;
+    }
+
+    // 6. Delete buffers
+    if engine.al_delete_buffers(2, &buf_ids) != AL_NO_ERROR {
+        return false;
+    }
+    if engine.al_is_buffer(buf_ids[0]) == AL_TRUE {
         return false;
     }
 
