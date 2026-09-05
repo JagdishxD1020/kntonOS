@@ -430,6 +430,7 @@ pub const fn decompose_subresource(
 pub struct ResourceStateTracking {
     pub resource_id: u64,
     pub is_buffer: bool,
+    pub has_simultaneous_access: bool,
     pub mip_levels: u32,
     pub array_size: u32,
     pub plane_count: u32,
@@ -461,6 +462,7 @@ impl ResourceStateTracking {
         Self {
             resource_id,
             is_buffer,
+            has_simultaneous_access: false,
             mip_levels: mip_levels.max(1),
             array_size: array_size.max(1),
             plane_count: plane_count.max(1),
@@ -617,5 +619,139 @@ impl ResourceStateRegistry {
     // Total count of registered resources in tracker
     pub fn resource_count(&self) -> usize {
         self.resources.len()
+    }
+
+    // Set simultaneous access flag on texture resource
+    pub fn set_simultaneous_access(&mut self, id: u64, enabled: bool) -> Result<(), ResourceBarrierError> {
+        let res = self
+            .resources
+            .iter_mut()
+            .find(|r| r.resource_id == id)
+            .ok_or(ResourceBarrierError::ResourceNotFound)?;
+        res.has_simultaneous_access = enabled;
+        Ok(())
+    }
+
+    // Check if implicit state promotion is permitted from COMMON state
+    pub fn can_implicitly_promote(
+        is_buffer: bool,
+        has_simultaneous_access: bool,
+        target_state: D3D12_RESOURCE_STATES,
+        queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> bool {
+        if !is_state_supported_on_queue(target_state, queue) {
+            return false;
+        }
+        if is_buffer {
+            return true;
+        }
+
+        let standard_promo = D3D12_RESOURCE_STATES::COPY_DEST
+            | D3D12_RESOURCE_STATES::COPY_SOURCE
+            | D3D12_RESOURCE_STATES::RESOLVE_DEST
+            | D3D12_RESOURCE_STATES::RESOLVE_SOURCE;
+
+        if (target_state & !standard_promo) == D3D12_RESOURCE_STATES::COMMON {
+            return true;
+        }
+
+        if has_simultaneous_access && target_state.is_read_only() {
+            return true;
+        }
+
+        false
+    }
+
+    // Attempt implicit state promotion on resource first access
+    pub fn try_implicit_promotion(
+        &mut self,
+        id: u64,
+        subresource: u32,
+        target_state: D3D12_RESOURCE_STATES,
+        queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<bool, ResourceBarrierError> {
+        let res = self
+            .resources
+            .iter_mut()
+            .find(|r| r.resource_id == id)
+            .ok_or(ResourceBarrierError::ResourceNotFound)?;
+
+        let current_state = if subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES {
+            if let Some(first) = res.subresource_states.first() {
+                if res.subresource_states.iter().all(|s| s == first) {
+                    *first
+                } else {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            }
+        } else {
+            let idx = subresource as usize;
+            if idx >= res.subresource_states.len() {
+                return Err(ResourceBarrierError::MissingSubresource);
+            }
+            res.subresource_states[idx]
+        };
+
+        if current_state != D3D12_RESOURCE_STATES::COMMON {
+            return Ok(false);
+        }
+
+        if !Self::can_implicitly_promote(res.is_buffer, res.has_simultaneous_access, target_state, queue) {
+            return Ok(false);
+        }
+
+        res.current_queue = queue;
+        res.is_promoted = true;
+
+        if subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES {
+            for state in &mut res.subresource_states {
+                *state = target_state;
+            }
+        } else {
+            res.subresource_states[subresource as usize] = target_state;
+        }
+
+        Ok(true)
+    }
+
+    // Executes D3D12 command list completion state decay back to COMMON
+    pub fn execute_command_list_decay(&mut self, queue: D3D12_COMMAND_LIST_TYPE) {
+        for res in &mut self.resources {
+            if res.current_queue != queue {
+                continue;
+            }
+            if res.is_buffer || res.is_promoted || res.has_simultaneous_access {
+                for state in &mut res.subresource_states {
+                    *state = D3D12_RESOURCE_STATES::COMMON;
+                }
+                res.is_promoted = false;
+            }
+        }
+    }
+
+    // Ensures resource is in required state, promoting implicitly or returning barrier
+    pub fn ensure_state(
+        &mut self,
+        id: u64,
+        subresource: u32,
+        required_state: D3D12_RESOURCE_STATES,
+        queue: D3D12_COMMAND_LIST_TYPE,
+    ) -> Result<Option<D3D12_RESOURCE_BARRIER>, ResourceBarrierError> {
+        let current_state = self.get_subresource_state(id, subresource)?;
+        if current_state == required_state {
+            return Ok(None);
+        }
+
+        if current_state == D3D12_RESOURCE_STATES::COMMON {
+            if self.try_implicit_promotion(id, subresource, required_state, queue)? {
+                return Ok(None);
+            }
+        }
+
+        let barrier = D3D12_RESOURCE_BARRIER::transition(id, subresource, current_state, required_state);
+        self.transition(id, subresource, current_state, required_state, queue)?;
+        Ok(Some(barrier))
     }
 }
