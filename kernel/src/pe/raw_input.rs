@@ -494,3 +494,211 @@ pub fn win32_inject_raw_keyboard_input(make_code: u16, is_break: bool, is_e0: bo
 
     win32_dispatch_raw_input(&raw_packet)
 }
+
+/// Comprehensive self-test suite verifying the Win32 Raw Input high-DPI gaming engine.
+pub fn test_raw_input_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-RAW-INPUT-TEST] Executing Win32 Raw Input gaming engine verification...\r\n");
+
+    // 1. Initialize target test window
+    let class_name_str = "KntonRawInputTestClass\0";
+    let wcex = crate::pe::user32::WndClassEx {
+        cb_size: core::mem::size_of::<crate::pe::user32::WndClassEx>() as u32,
+        style: 0,
+        lpfn_wnd_proc: Some(crate::pe::user32::win32_def_window_proc),
+        cb_cls_extra: 0,
+        cb_wnd_extra: 0,
+        h_instance: 0x0040_0000,
+        h_icon: 0,
+        h_cursor: 0,
+        hbr_background: 0,
+        lpsz_menu_name: core::ptr::null(),
+        lpsz_class_name: class_name_str.as_ptr(),
+        h_icon_sm: 0,
+    };
+    let _ = unsafe { crate::pe::user32::win32_register_class_ex(&wcex) };
+    let hwnd = crate::pe::user32::win32_create_window_ex(
+        0,
+        "KntonRawInputTestClass",
+        "RawInput Window",
+        crate::pe::user32::WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        16,
+        16,
+        crate::pe::user32::HWND_DESKTOP,
+        0,
+        0x0040_0000,
+        0,
+    );
+    if hwnd == crate::pe::user32::HWND_INVALID {
+        return false;
+    }
+
+    // 2. Register Raw Input devices
+    let devices = [
+        RawInputDevice {
+            us_usage_page: HID_USAGE_PAGE_GENERIC,
+            us_usage: HID_USAGE_GENERIC_MOUSE,
+            dw_flags: RIDEV_INPUTSINK,
+            hwnd_target: hwnd,
+        },
+        RawInputDevice {
+            us_usage_page: HID_USAGE_PAGE_GENERIC,
+            us_usage: HID_USAGE_GENERIC_KEYBOARD,
+            dw_flags: RIDEV_INPUTSINK,
+            hwnd_target: hwnd,
+        },
+    ];
+    let reg_ok = unsafe {
+        win32_register_raw_input_devices(
+            devices.as_ptr(),
+            2,
+            core::mem::size_of::<RawInputDevice>() as u32,
+        )
+    };
+    if !reg_ok {
+        return false;
+    }
+
+    // 3. Query registered devices
+    let mut num_devs = 0u32;
+    let q_res = unsafe {
+        win32_get_registered_raw_input_devices(
+            core::ptr::null_mut(),
+            &mut num_devs as *mut u32,
+            core::mem::size_of::<RawInputDevice>() as u32,
+        )
+    };
+    if q_res != 0 || num_devs < 2 {
+        return false;
+    }
+
+    let mut registered = [RawInputDevice::default(); 4];
+    let q_res2 = unsafe {
+        win32_get_registered_raw_input_devices(
+            registered.as_mut_ptr(),
+            &mut num_devs as *mut u32,
+            core::mem::size_of::<RawInputDevice>() as u32,
+        )
+    };
+    if q_res2 != 2 {
+        return false;
+    }
+
+    // 4. Inject high-DPI mouse input and verify WM_INPUT packet
+    let mouse_ok = win32_inject_raw_mouse_input(12, -8, RI_MOUSE_LEFT_BUTTON_DOWN, 120);
+    if !mouse_ok {
+        return false;
+    }
+
+    let mut msg = crate::pe::user32::Msg::default();
+    let peek_ok = crate::pe::user32::win32_peek_message(
+        &mut msg as *mut _,
+        hwnd,
+        WM_INPUT,
+        WM_INPUT,
+        crate::pe::user32::PM_REMOVE,
+    );
+    if !peek_ok || msg.message != WM_INPUT {
+        return false;
+    }
+
+    let h_raw = msg.lparam as usize;
+    let mut raw_buf = [0u8; 128];
+    let mut pcb_size = raw_buf.len() as u32;
+    let read_size = unsafe {
+        win32_get_raw_input_data(
+            h_raw,
+            RID_INPUT,
+            raw_buf.as_mut_ptr(),
+            &mut pcb_size as *mut u32,
+            core::mem::size_of::<RawInputHeader>() as u32,
+        )
+    };
+    if read_size != core::mem::size_of::<RawInput>() as u32 {
+        return false;
+    }
+
+    let raw_packet = unsafe { &*(raw_buf.as_ptr() as *const RawInput) };
+    if raw_packet.header.dw_type != RIM_TYPEMOUSE {
+        return false;
+    }
+    let mouse_data = unsafe { raw_packet.data.mouse };
+    if mouse_data.l_last_x != 12 || mouse_data.l_last_y != -8 || mouse_data.us_button_flags != RI_MOUSE_LEFT_BUTTON_DOWN {
+        return false;
+    }
+
+    // 5. Inject keyboard input and verify scancode translation
+    let kbd_ok = win32_inject_raw_keyboard_input(0x11, false, false);
+    if !kbd_ok {
+        return false;
+    }
+
+    let mut kbd_msg = crate::pe::user32::Msg::default();
+    let peek_kbd_ok = crate::pe::user32::win32_peek_message(
+        &mut kbd_msg as *mut _,
+        hwnd,
+        WM_INPUT,
+        WM_INPUT,
+        crate::pe::user32::PM_REMOVE,
+    );
+    if !peek_kbd_ok || kbd_msg.message != WM_INPUT {
+        return false;
+    }
+
+    let h_raw_kbd = kbd_msg.lparam as usize;
+    let mut kbd_raw_buf = [0u8; 128];
+    let mut kbd_pcb_size = kbd_raw_buf.len() as u32;
+    let kbd_read_size = unsafe {
+        win32_get_raw_input_data(
+            h_raw_kbd,
+            RID_INPUT,
+            kbd_raw_buf.as_mut_ptr(),
+            &mut kbd_pcb_size as *mut u32,
+            core::mem::size_of::<RawInputHeader>() as u32,
+        )
+    };
+    if kbd_read_size != core::mem::size_of::<RawInput>() as u32 {
+        return false;
+    }
+
+    let kbd_packet = unsafe { &*(kbd_raw_buf.as_ptr() as *const RawInput) };
+    if kbd_packet.header.dw_type != RIM_TYPEKEYBOARD {
+        return false;
+    }
+    let kbd_data = unsafe { kbd_packet.data.keyboard };
+    if kbd_data.v_key != VK_W || kbd_data.make_code != 0x11 || (kbd_data.flags & RI_KEY_BREAK) != 0 {
+        return false;
+    }
+
+    // 6. Unregister devices and cleanup
+    let remove_devs = [
+        RawInputDevice {
+            us_usage_page: HID_USAGE_PAGE_GENERIC,
+            us_usage: HID_USAGE_GENERIC_MOUSE,
+            dw_flags: RIDEV_REMOVE,
+            hwnd_target: 0,
+        },
+        RawInputDevice {
+            us_usage_page: HID_USAGE_PAGE_GENERIC,
+            us_usage: HID_USAGE_GENERIC_KEYBOARD,
+            dw_flags: RIDEV_REMOVE,
+            hwnd_target: 0,
+        },
+    ];
+    let unreg_ok = unsafe {
+        win32_register_raw_input_devices(
+            remove_devs.as_ptr(),
+            2,
+            core::mem::size_of::<RawInputDevice>() as u32,
+        )
+    };
+    if !unreg_ok {
+        return false;
+    }
+
+    crate::pe::user32::win32_destroy_window(hwnd);
+
+    crate::serial_write_str("[KNT-RAW-INPUT-PASS] Win32 Raw Input high-DPI gaming engine verified\r\n");
+    true
+}

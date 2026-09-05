@@ -723,6 +723,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 WinSock2 emulation layer self-test failed!\r\n");
     }
 
+    // Verify Win32 Raw Input High-DPI Mouse & Keyboard Gaming Input Engine (TASK-KNT-146)
+    if !pe::test_raw_input_emulation_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Raw Input emulation layer self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
