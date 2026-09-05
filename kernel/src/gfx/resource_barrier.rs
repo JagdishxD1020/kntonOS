@@ -242,3 +242,184 @@ pub fn get_pipeline_stages_for_state(state: D3D12_RESOURCE_STATES) -> D3D12_PIPE
 
     stages
 }
+
+// Barrier classification category
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_RESOURCE_BARRIER_TYPE {
+    Transition = 0,
+    Aliasing = 1,
+    Uav = 2,
+}
+
+// Split barrier synchronization execution flags
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct D3D12_RESOURCE_BARRIER_FLAGS(pub u32);
+
+impl D3D12_RESOURCE_BARRIER_FLAGS {
+    pub const NONE: Self = Self(0);
+    pub const BEGIN_ONLY: Self = Self(1);
+    pub const END_ONLY: Self = Self(2);
+
+    // Check if barrier is starting an asynchronous split transition
+    pub const fn is_begin_only(&self) -> bool {
+        (self.0 & Self::BEGIN_ONLY.0) != 0
+    }
+
+    // Check if barrier is concluding an asynchronous split transition
+    pub const fn is_end_only(&self) -> bool {
+        (self.0 & Self::END_ONLY.0) != 0
+    }
+}
+
+// Transition barrier payload between GPU resource states
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct D3D12_RESOURCE_TRANSITION_BARRIER {
+    pub resource_id: u64,
+    pub subresource: u32,
+    pub state_before: D3D12_RESOURCE_STATES,
+    pub state_after: D3D12_RESOURCE_STATES,
+}
+
+// Aliasing barrier payload for overlapping placed resources in a heap
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct D3D12_RESOURCE_ALIASING_BARRIER {
+    pub resource_before_id: u64,
+    pub resource_after_id: u64,
+}
+
+// UAV barrier payload ensuring all unordered access operations have finished
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct D3D12_RESOURCE_UAV_BARRIER {
+    pub resource_id: u64,
+}
+
+// Complete Direct3D 12 resource barrier descriptor
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct D3D12_RESOURCE_BARRIER {
+    pub barrier_type: D3D12_RESOURCE_BARRIER_TYPE,
+    pub flags: D3D12_RESOURCE_BARRIER_FLAGS,
+    pub transition: Option<D3D12_RESOURCE_TRANSITION_BARRIER>,
+    pub aliasing: Option<D3D12_RESOURCE_ALIASING_BARRIER>,
+    pub uav: Option<D3D12_RESOURCE_UAV_BARRIER>,
+}
+
+impl D3D12_RESOURCE_BARRIER {
+    // Construct transition barrier between two resource states
+    pub fn transition(
+        resource_id: u64,
+        subresource: u32,
+        state_before: D3D12_RESOURCE_STATES,
+        state_after: D3D12_RESOURCE_STATES,
+    ) -> Self {
+        Self {
+            barrier_type: D3D12_RESOURCE_BARRIER_TYPE::Transition,
+            flags: D3D12_RESOURCE_BARRIER_FLAGS::NONE,
+            transition: Some(D3D12_RESOURCE_TRANSITION_BARRIER {
+                resource_id,
+                subresource,
+                state_before,
+                state_after,
+            }),
+            aliasing: None,
+            uav: None,
+        }
+    }
+
+    // Construct aliasing barrier between two placed resources
+    pub fn aliasing(resource_before_id: u64, resource_after_id: u64) -> Self {
+        Self {
+            barrier_type: D3D12_RESOURCE_BARRIER_TYPE::Aliasing,
+            flags: D3D12_RESOURCE_BARRIER_FLAGS::NONE,
+            transition: None,
+            aliasing: Some(D3D12_RESOURCE_ALIASING_BARRIER {
+                resource_before_id,
+                resource_after_id,
+            }),
+            uav: None,
+        }
+    }
+
+    // Construct UAV barrier for unordered access synchronization
+    pub fn uav(resource_id: u64) -> Self {
+        Self {
+            barrier_type: D3D12_RESOURCE_BARRIER_TYPE::Uav,
+            flags: D3D12_RESOURCE_BARRIER_FLAGS::NONE,
+            transition: None,
+            aliasing: None,
+            uav: Some(D3D12_RESOURCE_UAV_BARRIER { resource_id }),
+        }
+    }
+
+    // Apply split barrier synchronization execution flag
+    pub fn with_flags(mut self, flags: D3D12_RESOURCE_BARRIER_FLAGS) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    // Validate structural consistency of barrier configuration
+    pub fn validate(&self) -> Result<(), ResourceBarrierError> {
+        match self.barrier_type {
+            D3D12_RESOURCE_BARRIER_TYPE::Transition => {
+                let t = self.transition.as_ref().ok_or(ResourceBarrierError::InvalidBarrierType)?;
+                if !t.state_before.is_valid_combination() || !t.state_after.is_valid_combination() {
+                    return Err(ResourceBarrierError::IncompatibleStates);
+                }
+                if t.state_before == t.state_after {
+                    return Err(ResourceBarrierError::RedundantTransition);
+                }
+            }
+            D3D12_RESOURCE_BARRIER_TYPE::Aliasing => {
+                if self.aliasing.is_none() {
+                    return Err(ResourceBarrierError::InvalidBarrierType);
+                }
+            }
+            D3D12_RESOURCE_BARRIER_TYPE::Uav => {
+                if self.uav.is_none() {
+                    return Err(ResourceBarrierError::InvalidBarrierType);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// Errors occurring during barrier validation and state tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceBarrierError {
+    InvalidBarrierType,
+    IncompatibleStates,
+    MissingSubresource,
+    InvalidQueueOperation,
+    InvalidSplitBarrierPair,
+    RedundantTransition,
+    ResourceNotFound,
+}
+
+// Computes flat subresource index according to standard D3D12 slice arithmetic
+pub const fn calc_subresource(
+    mip_slice: u32,
+    array_slice: u32,
+    plane_slice: u32,
+    mip_levels: u32,
+    array_size: u32,
+) -> u32 {
+    mip_slice + (array_slice * mip_levels) + (plane_slice * mip_levels * array_size)
+}
+
+// Decomposes flat subresource index into mip, array, and plane coordinates
+pub const fn decompose_subresource(
+    subresource: u32,
+    mip_levels: u32,
+    array_size: u32,
+) -> (u32, u32, u32) {
+    if mip_levels == 0 {
+        return (0, 0, 0);
+    }
+    let plane_stride = mip_levels * array_size;
+    let plane_slice = if plane_stride > 0 { subresource / plane_stride } else { 0 };
+    let remainder = if plane_stride > 0 { subresource % plane_stride } else { subresource };
+    let array_slice = remainder / mip_levels;
+    let mip_slice = remainder % mip_levels;
+    (mip_slice, array_slice, plane_slice)
+}
