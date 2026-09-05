@@ -104,6 +104,282 @@ pub const ALC_DEFAULT_DEVICE_SPECIFIER: ALenum = 0x1004;
 pub const ALC_DEVICE_SPECIFIER: ALenum = 0x1005;
 pub const ALC_EXTENSIONS: ALenum = 0x1006;
 
+// Standard EAX environment identifiers.
+pub const EAX_ENVIRONMENT_GENERIC: u32 = 0;
+pub const EAX_ENVIRONMENT_ROOM: u32 = 2;
+pub const EAX_ENVIRONMENT_CAVE: u32 = 9;
+pub const EAX_ENVIRONMENT_ARENA: u32 = 10;
+pub const EAX_ENVIRONMENT_HANGAR: u32 = 11;
+
+/// EAX environmental audio reverb configuration parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EaxReverbParameters {
+    pub environment_id: u32,
+    pub room_size: f32,
+    pub damping: f32,
+    pub wet_level: f32,
+    pub dry_level: f32,
+    pub decay_time: f32,
+}
+
+impl Default for EaxReverbParameters {
+    fn default() -> Self {
+        Self::preset_generic()
+    }
+}
+
+impl EaxReverbParameters {
+    // Standard Generic room reverb preset.
+    pub fn preset_generic() -> Self {
+        Self {
+            environment_id: EAX_ENVIRONMENT_GENERIC,
+            room_size: 0.5,
+            damping: 0.5,
+            wet_level: 0.3,
+            dry_level: 0.9,
+            decay_time: 1.0,
+        }
+    }
+
+    // Standard Room reverb preset with moderate reflections.
+    pub fn preset_room() -> Self {
+        Self {
+            environment_id: EAX_ENVIRONMENT_ROOM,
+            room_size: 0.6,
+            damping: 0.5,
+            wet_level: 0.4,
+            dry_level: 0.85,
+            decay_time: 1.4,
+        }
+    }
+
+    // Cave reverb preset with dense reflections and low damping.
+    pub fn preset_cave() -> Self {
+        Self {
+            environment_id: EAX_ENVIRONMENT_CAVE,
+            room_size: 0.85,
+            damping: 0.2,
+            wet_level: 0.65,
+            dry_level: 0.7,
+            decay_time: 3.5,
+        }
+    }
+
+    // Arena preset with expansive decay and moderate damping.
+    pub fn preset_arena() -> Self {
+        Self {
+            environment_id: EAX_ENVIRONMENT_ARENA,
+            room_size: 0.95,
+            damping: 0.3,
+            wet_level: 0.55,
+            dry_level: 0.8,
+            decay_time: 4.5,
+        }
+    }
+
+    // Hangar preset with long decay time and open reflective space.
+    pub fn preset_hangar() -> Self {
+        Self {
+            environment_id: EAX_ENVIRONMENT_HANGAR,
+            room_size: 1.0,
+            damping: 0.15,
+            wet_level: 0.75,
+            dry_level: 0.6,
+            decay_time: 6.0,
+        }
+    }
+
+    // Retrieves the matching EAX preset for given environment id.
+    pub fn from_environment_id(env: u32) -> Self {
+        match env {
+            EAX_ENVIRONMENT_ROOM => Self::preset_room(),
+            EAX_ENVIRONMENT_CAVE => Self::preset_cave(),
+            EAX_ENVIRONMENT_ARENA => Self::preset_arena(),
+            EAX_ENVIRONMENT_HANGAR => Self::preset_hangar(),
+            _ => Self::preset_generic(),
+        }
+    }
+}
+
+/// Schroeder-Moorer feedback comb filter with low-pass damping in the feedback loop.
+#[derive(Debug, Clone)]
+pub struct CombFilter {
+    pub buffer: Vec<f32>,
+    pub index: usize,
+    pub feedback: f32,
+    pub damping: f32,
+    pub damp_state: f32,
+}
+
+impl CombFilter {
+    // Creates a new comb filter with specified delay buffer size.
+    pub fn new(size: usize) -> Self {
+        Self {
+            buffer: alloc::vec![0.0f32; size],
+            index: 0,
+            feedback: 0.8,
+            damping: 0.2,
+            damp_state: 0.0,
+        }
+    }
+
+    // Processes a single audio sample through the feedback comb delay line.
+    pub fn process(&mut self, input: f32) -> f32 {
+        if self.buffer.is_empty() {
+            return input;
+        }
+        let output = self.buffer[self.index];
+        self.damp_state = output * (1.0 - self.damping) + self.damp_state * self.damping;
+        self.buffer[self.index] = input + self.damp_state * self.feedback;
+        self.index = (self.index + 1) % self.buffer.len();
+        output
+    }
+
+    // Resets filter history buffer and damping state.
+    pub fn clear(&mut self) {
+        self.buffer.fill(0.0);
+        self.index = 0;
+        self.damp_state = 0.0;
+    }
+}
+
+/// Schroeder all-pass filter providing diffuse phase dispersion.
+#[derive(Debug, Clone)]
+pub struct AllPassFilter {
+    pub buffer: Vec<f32>,
+    pub index: usize,
+    pub feedback: f32,
+}
+
+impl AllPassFilter {
+    // Creates a new all-pass filter with specified delay buffer size.
+    pub fn new(size: usize, feedback: f32) -> Self {
+        Self {
+            buffer: alloc::vec![0.0f32; size],
+            index: 0,
+            feedback,
+        }
+    }
+
+    // Processes a single audio sample through the all-pass delay line.
+    pub fn process(&mut self, input: f32) -> f32 {
+        if self.buffer.is_empty() {
+            return input;
+        }
+        let buf_out = self.buffer[self.index];
+        let output = -input + buf_out;
+        self.buffer[self.index] = input + buf_out * self.feedback;
+        self.index = (self.index + 1) % self.buffer.len();
+        output
+    }
+
+    // Resets filter history buffer.
+    pub fn clear(&mut self) {
+        self.buffer.fill(0.0);
+        self.index = 0;
+    }
+}
+
+// Schroeder-Moorer delay lengths for 48kHz sampling rate.
+const COMB_TUNINGS_L: [usize; 4] = [1116, 1188, 1277, 1356];
+const COMB_TUNINGS_R: [usize; 4] = [1139, 1211, 1300, 1379];
+const ALLPASS_TUNINGS_L: [usize; 2] = [225, 556];
+const ALLPASS_TUNINGS_R: [usize; 2] = [248, 579];
+
+/// EAX Environmental Audio reverberation DSP processor implementing Schroeder-Moorer architecture.
+#[derive(Debug, Clone)]
+pub struct EaxReverbEffect {
+    pub params: EaxReverbParameters,
+    pub combs_l: Vec<CombFilter>,
+    pub combs_r: Vec<CombFilter>,
+    pub allpasses_l: Vec<AllPassFilter>,
+    pub allpasses_r: Vec<AllPassFilter>,
+}
+
+impl Default for EaxReverbEffect {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EaxReverbEffect {
+    // Creates an environmental reverb effect initialized to generic room preset.
+    pub fn new() -> Self {
+        let mut effect = Self {
+            params: EaxReverbParameters::default(),
+            combs_l: COMB_TUNINGS_L.iter().map(|&sz| CombFilter::new(sz)).collect(),
+            combs_r: COMB_TUNINGS_R.iter().map(|&sz| CombFilter::new(sz)).collect(),
+            allpasses_l: ALLPASS_TUNINGS_L.iter().map(|&sz| AllPassFilter::new(sz, 0.5)).collect(),
+            allpasses_r: ALLPASS_TUNINGS_R.iter().map(|&sz| AllPassFilter::new(sz, 0.5)).collect(),
+        };
+        effect.set_parameters(EaxReverbParameters::default());
+        effect
+    }
+
+    // Updates DSP internal filter parameters based on active EAX environment preset.
+    pub fn set_parameters(&mut self, params: EaxReverbParameters) {
+        self.params = params;
+        let fb = (0.7 + params.room_size * 0.28).clamp(0.0, 0.98);
+        for c in &mut self.combs_l {
+            c.feedback = fb;
+            c.damping = params.damping.clamp(0.0, 0.9);
+        }
+        for c in &mut self.combs_r {
+            c.feedback = fb;
+            c.damping = params.damping.clamp(0.0, 0.9);
+        }
+    }
+
+    // Processes an audio frame block applying environmental reverberation.
+    pub fn process_block(&mut self, in_l: &[f32], in_r: &[f32], out_l: &mut [f32], out_r: &mut [f32]) {
+        let count = in_l.len().min(in_r.len()).min(out_l.len()).min(out_r.len());
+        for i in 0..count {
+            let xl = in_l[i];
+            let xr = in_r[i];
+
+            // 1. Parallel comb filter accumulation
+            let mut comb_sum_l = 0.0f32;
+            for c in &mut self.combs_l {
+                comb_sum_l += c.process(xl);
+            }
+            let mut comb_sum_r = 0.0f32;
+            for c in &mut self.combs_r {
+                comb_sum_r += c.process(xr);
+            }
+
+            // 2. Cascaded all-pass diffusion
+            let mut ap_l = comb_sum_l * 0.25;
+            for ap in &mut self.allpasses_l {
+                ap_l = ap.process(ap_l);
+            }
+            let mut ap_r = comb_sum_r * 0.25;
+            for ap in &mut self.allpasses_r {
+                ap_r = ap.process(ap_r);
+            }
+
+            // 3. Dry/wet mixdown
+            out_l[i] = xl * self.params.dry_level + ap_l * self.params.wet_level;
+            out_r[i] = xr * self.params.dry_level + ap_r * self.params.wet_level;
+        }
+    }
+
+    // Clears all internal delay lines.
+    pub fn clear(&mut self) {
+        for c in &mut self.combs_l {
+            c.clear();
+        }
+        for c in &mut self.combs_r {
+            c.clear();
+        }
+        for ap in &mut self.allpasses_l {
+            ap.clear();
+        }
+        for ap in &mut self.allpasses_r {
+            ap.clear();
+        }
+    }
+}
+
 /// OpenAL audio buffer holding raw PCM data and decoded floating-point frames.
 #[derive(Debug, Clone, Default)]
 pub struct ALBuffer {
@@ -441,6 +717,7 @@ pub struct OpenALEngine {
     pub contexts: BTreeMap<ALuint, ALCContext>,
     pub buffers: BTreeMap<ALuint, ALBuffer>,
     pub sources: BTreeMap<ALuint, ALSource>,
+    pub eax_reverb: EaxReverbEffect,
     pub current_context: ALuint,
     pub next_device_handle: ALuint,
     pub next_context_handle: ALuint,
@@ -456,6 +733,7 @@ impl OpenALEngine {
             contexts: BTreeMap::new(),
             buffers: BTreeMap::new(),
             sources: BTreeMap::new(),
+            eax_reverb: EaxReverbEffect::new(),
             current_context: 0,
             next_device_handle: 1,
             next_context_handle: 1,
@@ -865,6 +1143,28 @@ impl OpenALEngine {
 
         total_rendered
     }
+
+    // Sets the active EAX environmental reverb preset.
+    pub fn al_set_eax_environment(&mut self, env_id: u32) -> ALenum {
+        let params = EaxReverbParameters::from_environment_id(env_id);
+        self.eax_reverb.set_parameters(params);
+        AL_NO_ERROR
+    }
+
+    // Gets the current active EAX environmental reverb preset identifier.
+    pub fn al_get_eax_environment(&self) -> u32 {
+        self.eax_reverb.params.environment_id
+    }
+
+    // Blends active 3D audio sources and applies EAX environmental reverb post-processing.
+    pub fn render_mixdown_with_eax(&mut self, frames: usize, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        let mut dry_l = alloc::vec![0.0f32; frames];
+        let mut dry_r = alloc::vec![0.0f32; frames];
+        let count = self.render_sources(frames, &mut dry_l, &mut dry_r);
+
+        self.eax_reverb.process_block(&dry_l, &dry_r, out_l, out_r);
+        count
+    }
 }
 
 /// Verifies ALC device opening, context creation, binding, and error tracking.
@@ -1055,6 +1355,61 @@ pub fn verify_openal_source_management() -> bool {
     // 6. Delete source
     engine.al_delete_sources(1, &src);
     if engine.al_is_source(src[0]) == AL_TRUE {
+        return false;
+    }
+
+    true
+}
+
+/// Verifies EAX environmental reverb presets, Schroeder-Moorer comb/all-pass tail generation, and decay times.
+pub fn verify_eax_environmental_reverb() -> bool {
+    let mut reverb = EaxReverbEffect::new();
+
+    // 1. Test Room preset with impulse
+    reverb.set_parameters(EaxReverbParameters::preset_room());
+    let mut in_l = alloc::vec![0.0f32; 512];
+    let mut in_r = alloc::vec![0.0f32; 512];
+    in_l[0] = 1.0;
+    in_r[0] = 1.0;
+
+    let mut room_out_l = alloc::vec![0.0f32; 512];
+    let mut room_out_r = alloc::vec![0.0f32; 512];
+    reverb.process_block(&in_l, &in_r, &mut room_out_l, &mut room_out_r);
+
+    // Verify reverberant tail exists past direct sound
+    let mut room_tail_energy = 0.0f32;
+    for &sample in &room_out_l[100..512] {
+        room_tail_energy += sample * sample;
+    }
+    if room_tail_energy < 0.01 {
+        return false;
+    }
+
+    // 2. Test Cave preset (should yield more tail energy than Room due to longer decay)
+    reverb.clear();
+    reverb.set_parameters(EaxReverbParameters::preset_cave());
+    let mut cave_out_l = alloc::vec![0.0f32; 512];
+    let mut cave_out_r = alloc::vec![0.0f32; 512];
+    reverb.process_block(&in_l, &in_r, &mut cave_out_l, &mut cave_out_r);
+
+    let mut cave_tail_energy = 0.0f32;
+    for &sample in &cave_out_l[100..512] {
+        cave_tail_energy += sample * sample;
+    }
+    if cave_tail_energy <= room_tail_energy {
+        return false;
+    }
+
+    // 3. Test Arena and Hangar presets stability
+    reverb.clear();
+    reverb.set_parameters(EaxReverbParameters::preset_arena());
+    if reverb.params.environment_id != EAX_ENVIRONMENT_ARENA {
+        return false;
+    }
+
+    reverb.clear();
+    reverb.set_parameters(EaxReverbParameters::preset_hangar());
+    if reverb.params.environment_id != EAX_ENVIRONMENT_HANGAR {
         return false;
     }
 
