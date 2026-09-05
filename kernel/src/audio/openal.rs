@@ -1365,35 +1365,35 @@ pub fn verify_openal_source_management() -> bool {
 pub fn verify_eax_environmental_reverb() -> bool {
     let mut reverb = EaxReverbEffect::new();
 
-    // 1. Test Room preset with impulse
+    // 1. Test Room preset with impulse over 2400 frames (comb delay lines start at 1116 samples)
     reverb.set_parameters(EaxReverbParameters::preset_room());
-    let mut in_l = alloc::vec![0.0f32; 512];
-    let mut in_r = alloc::vec![0.0f32; 512];
+    let mut in_l = alloc::vec![0.0f32; 2400];
+    let mut in_r = alloc::vec![0.0f32; 2400];
     in_l[0] = 1.0;
     in_r[0] = 1.0;
 
-    let mut room_out_l = alloc::vec![0.0f32; 512];
-    let mut room_out_r = alloc::vec![0.0f32; 512];
+    let mut room_out_l = alloc::vec![0.0f32; 2400];
+    let mut room_out_r = alloc::vec![0.0f32; 2400];
     reverb.process_block(&in_l, &in_r, &mut room_out_l, &mut room_out_r);
 
-    // Verify reverberant tail exists past direct sound
+    // Verify reverberant tail exists after first reflections arrive at sample 1116
     let mut room_tail_energy = 0.0f32;
-    for &sample in &room_out_l[100..512] {
+    for &sample in &room_out_l[1116..2400] {
         room_tail_energy += sample * sample;
     }
     if room_tail_energy < 0.01 {
         return false;
     }
 
-    // 2. Test Cave preset (should yield more tail energy than Room due to longer decay)
+    // 2. Test Cave preset (yields higher tail energy than Room due to larger room size and longer decay)
     reverb.clear();
     reverb.set_parameters(EaxReverbParameters::preset_cave());
-    let mut cave_out_l = alloc::vec![0.0f32; 512];
-    let mut cave_out_r = alloc::vec![0.0f32; 512];
+    let mut cave_out_l = alloc::vec![0.0f32; 2400];
+    let mut cave_out_r = alloc::vec![0.0f32; 2400];
     reverb.process_block(&in_l, &in_r, &mut cave_out_l, &mut cave_out_r);
 
     let mut cave_tail_energy = 0.0f32;
-    for &sample in &cave_out_l[100..512] {
+    for &sample in &cave_out_l[1116..2400] {
         cave_tail_energy += sample * sample;
     }
     if cave_tail_energy <= room_tail_energy {
@@ -1413,5 +1413,39 @@ pub fn verify_eax_environmental_reverb() -> bool {
         return false;
     }
 
+    true
+}
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Win32 OpenAL 1.1 3D Spatial Audio & EAX Engine.
+pub fn test_openal_service_subsystem() -> bool {
+    serial_write_str("[KNT-AUDIO] Testing OpenAL 1.1 3D spatial audio & EAX reverb service...\r\n");
+
+    // 1. Verify ALC device opening, context management, and error tracking
+    if !verify_alc_device_and_context_lifecycle() {
+        serial_write_str("[KNT-PANIC] OpenAL ALC device and context lifecycle verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify OpenAL buffer allocation, bounds checking, and PCM uploading
+    if !verify_openal_buffer_management() {
+        serial_write_str("[KNT-PANIC] OpenAL audio buffer management and PCM loading failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify OpenAL 3D sound sources, spatial panning, and playback controls
+    if !verify_openal_source_management() {
+        serial_write_str("[KNT-PANIC] OpenAL 3D sound source spatialization verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify EAX environmental audio reverb presets and Schroeder-Moorer DSP engine
+    if !verify_eax_environmental_reverb() {
+        serial_write_str("[KNT-PANIC] OpenAL EAX environmental reverb DSP verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-OPENAL-PASS] OpenAL 1.1 3D spatial audio and EAX environmental reverb verified\r\n");
     true
 }
