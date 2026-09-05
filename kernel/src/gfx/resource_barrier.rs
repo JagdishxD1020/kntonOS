@@ -755,3 +755,141 @@ impl ResourceStateRegistry {
         Ok(Some(barrier))
     }
 }
+
+// Active pending split barrier record
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingSplitBarrier {
+    pub resource_id: u64,
+    pub subresource: u32,
+    pub state_before: D3D12_RESOURCE_STATES,
+    pub state_after: D3D12_RESOURCE_STATES,
+}
+
+// Split barrier pairing validator tracking BeginBarrier and EndBarrier cycles
+pub struct SplitBarrierTracker {
+    pending_splits: Vec<PendingSplitBarrier>,
+}
+
+impl SplitBarrierTracker {
+    // Construct new empty split barrier tracker
+    pub fn new() -> Self {
+        Self {
+            pending_splits: Vec::new(),
+        }
+    }
+
+    // Register a BeginBarrier transition
+    pub fn begin_split_barrier(&mut self, barrier: &D3D12_RESOURCE_BARRIER) -> Result<(), ResourceBarrierError> {
+        let t = barrier.transition.as_ref().ok_or(ResourceBarrierError::InvalidBarrierType)?;
+        if !barrier.flags.is_begin_only() {
+            return Err(ResourceBarrierError::InvalidSplitBarrierPair);
+        }
+
+        if self.pending_splits.iter().any(|p| p.resource_id == t.resource_id && p.subresource == t.subresource) {
+            return Err(ResourceBarrierError::InvalidSplitBarrierPair);
+        }
+
+        self.pending_splits.push(PendingSplitBarrier {
+            resource_id: t.resource_id,
+            subresource: t.subresource,
+            state_before: t.state_before,
+            state_after: t.state_after,
+        });
+        Ok(())
+    }
+
+    // Match and complete an EndBarrier transition
+    pub fn end_split_barrier(&mut self, barrier: &D3D12_RESOURCE_BARRIER) -> Result<(), ResourceBarrierError> {
+        let t = barrier.transition.as_ref().ok_or(ResourceBarrierError::InvalidBarrierType)?;
+        if !barrier.flags.is_end_only() {
+            return Err(ResourceBarrierError::InvalidSplitBarrierPair);
+        }
+
+        let idx = self
+            .pending_splits
+            .iter()
+            .position(|p| {
+                p.resource_id == t.resource_id
+                    && p.subresource == t.subresource
+                    && p.state_before == t.state_before
+                    && p.state_after == t.state_after
+            })
+            .ok_or(ResourceBarrierError::InvalidSplitBarrierPair)?;
+
+        self.pending_splits.swap_remove(idx);
+        Ok(())
+    }
+
+    // Check if subresource currently has an active pending split transition
+    pub fn has_pending_split(&self, resource_id: u64, subresource: u32) -> bool {
+        self.pending_splits.iter().any(|p| p.resource_id == resource_id && p.subresource == subresource)
+    }
+
+    // Number of uncompleted split barriers
+    pub fn pending_count(&self) -> usize {
+        self.pending_splits.len()
+    }
+}
+
+// Redundant barrier removal and transition coalescing optimizer
+pub struct BarrierBatchOptimizer;
+
+impl BarrierBatchOptimizer {
+    // Coalesce sequential transitions and strip no-op barriers
+    pub fn coalesce_barriers(barriers: &[D3D12_RESOURCE_BARRIER]) -> Vec<D3D12_RESOURCE_BARRIER> {
+        let mut coalesced: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+
+        for barrier in barriers {
+            if barrier.barrier_type != D3D12_RESOURCE_BARRIER_TYPE::Transition {
+                coalesced.push(barrier.clone());
+                continue;
+            }
+
+            let t = match &barrier.transition {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Eliminate no-op transitions
+            if t.state_before == t.state_after {
+                continue;
+            }
+
+            // Look for existing transition in the current batch on same resource and subresource
+            if let Some(pos) = coalesced.iter().position(|b| {
+                if let Some(prev) = &b.transition {
+                    b.flags == barrier.flags
+                        && prev.resource_id == t.resource_id
+                        && prev.subresource == t.subresource
+                } else {
+                    false
+                }
+            }) {
+                let prev_t = coalesced[pos].transition.as_ref().unwrap();
+                if prev_t.state_after == t.state_before {
+                    let initial_before = prev_t.state_before;
+                    let final_after = t.state_after;
+
+                    if initial_before == final_after {
+                        // Cycles back to initial state -> completely cancel out
+                        coalesced.remove(pos);
+                    } else {
+                        // Coalesce into initial_before -> final_after
+                        coalesced[pos] = D3D12_RESOURCE_BARRIER::transition(
+                            t.resource_id,
+                            t.subresource,
+                            initial_before,
+                            final_after,
+                        ).with_flags(barrier.flags);
+                    }
+                } else {
+                    coalesced.push(barrier.clone());
+                }
+            } else {
+                coalesced.push(barrier.clone());
+            }
+        }
+
+        coalesced
+    }
+}
