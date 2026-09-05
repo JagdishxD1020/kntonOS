@@ -62,6 +62,12 @@ pub const AL_MAX_GAIN: ALenum = 0x100E;
 pub const AL_ORIENTATION: ALenum = 0x100F;
 pub const AL_SOURCE_STATE: ALenum = 0x1010;
 
+// OpenAL 3D distance and source parameters.
+pub const AL_REFERENCE_DISTANCE: ALenum = 0x1020;
+pub const AL_ROLLOFF_FACTOR: ALenum = 0x1021;
+pub const AL_CONE_OUTER_GAIN: ALenum = 0x1022;
+pub const AL_MAX_DISTANCE: ALenum = 0x1023;
+
 // OpenAL source state flags.
 pub const AL_INITIAL: ALenum = 0x1011;
 pub const AL_PLAYING: ALenum = 0x1012;
@@ -222,6 +228,166 @@ impl Default for ALListener {
     }
 }
 
+/// OpenAL 3D audio source emitting sound within virtual 3D space.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ALSource {
+    pub id: ALuint,
+    pub state: ALenum,
+    pub buffer_id: ALuint,
+    pub source_relative: bool,
+    pub looping: bool,
+    pub pitch: f32,
+    pub gain: f32,
+    pub min_gain: f32,
+    pub max_gain: f32,
+    pub reference_distance: f32,
+    pub max_distance: f32,
+    pub rolloff_factor: f32,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub direction: Vec3,
+    pub playback_sample_offset: f32,
+}
+
+impl ALSource {
+    // Creates a new OpenAL sound source initialized to default attributes.
+    pub fn new(id: ALuint) -> Self {
+        Self {
+            id,
+            state: AL_INITIAL,
+            buffer_id: 0,
+            source_relative: false,
+            looping: false,
+            pitch: 1.0,
+            gain: 1.0,
+            min_gain: 0.0,
+            max_gain: 1.0,
+            reference_distance: 1.0,
+            max_distance: 10000.0,
+            rolloff_factor: 1.0,
+            position: Vec3::zero(),
+            velocity: Vec3::zero(),
+            direction: Vec3::zero(),
+            playback_sample_offset: 0.0,
+        }
+    }
+
+    // Calculates left/right spatial gain attenuation and panning based on distance and listener position.
+    pub fn calculate_spatial_gains(&self, listener: &ALListener, distance_model: ALenum) -> (f32, f32) {
+        let (distance, pan) = if self.source_relative {
+            let dist = self.position.length();
+            let p = if dist > 1e-4 {
+                (self.position.x / dist).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            (dist, p)
+        } else {
+            let delta = self.position.sub(listener.position);
+            let dist = delta.length();
+
+            let forward = listener.forward.normalize();
+            let up = listener.up.normalize();
+            let right = forward.cross(up).normalize();
+
+            let x_rel = delta.dot(right);
+            let p = if dist > 1e-4 {
+                (x_rel / dist).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            (dist, p)
+        };
+
+        // Distance attenuation
+        let atten = match distance_model {
+            AL_INVERSE_DISTANCE_CLAMPED => {
+                let d = distance.clamp(self.reference_distance, self.max_distance);
+                self.reference_distance / (self.reference_distance + self.rolloff_factor * (d - self.reference_distance))
+            }
+            AL_LINEAR_DISTANCE_CLAMPED => {
+                let d = distance.clamp(self.reference_distance, self.max_distance);
+                1.0 - self.rolloff_factor * (d - self.reference_distance) / (self.max_distance - self.reference_distance).max(1e-4)
+            }
+            _ => {
+                if distance > 1e-4 {
+                    self.reference_distance / (self.reference_distance + self.rolloff_factor * (distance - self.reference_distance).max(0.0))
+                } else {
+                    1.0
+                }
+            }
+        };
+
+        let effective_gain = (self.gain * listener.gain * atten.clamp(0.0, 1.0)).clamp(self.min_gain, self.max_gain);
+        let pan_l = ((1.0 - pan) * 0.5).clamp(0.0, 1.0);
+        let pan_r = ((1.0 + pan) * 0.5).clamp(0.0, 1.0);
+
+        (effective_gain * pan_l, effective_gain * pan_r)
+    }
+
+    // Renders audio frames from bound buffer into destination left and right mixing buffers.
+    pub fn render_frames(
+        &mut self,
+        frames: usize,
+        buffer: Option<&ALBuffer>,
+        listener: &ALListener,
+        distance_model: ALenum,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) -> usize {
+        if self.state != AL_PLAYING {
+            return 0;
+        }
+
+        let buf = match buffer {
+            Some(b) if b.num_frames() > 0 => b,
+            _ => {
+                self.state = AL_STOPPED;
+                return 0;
+            }
+        };
+
+        let (gain_l, gain_r) = self.calculate_spatial_gains(listener, distance_model);
+        let total_frames = buf.num_frames();
+        let step = self.pitch.clamp(0.1, 4.0);
+        let mut frames_rendered = 0;
+
+        for f in 0..frames {
+            let idx_floor = self.playback_sample_offset as usize;
+            if idx_floor >= total_frames {
+                if self.looping {
+                    self.playback_sample_offset %= total_frames as f32;
+                } else {
+                    self.state = AL_STOPPED;
+                    self.playback_sample_offset = 0.0;
+                    break;
+                }
+            }
+
+            let curr = self.playback_sample_offset as usize;
+            let next = if curr + 1 < total_frames {
+                curr + 1
+            } else if self.looping {
+                0
+            } else {
+                curr
+            };
+
+            let frac = self.playback_sample_offset - (curr as f32);
+            let s_l = buf.pcm_left[curr] + frac * (buf.pcm_left[next] - buf.pcm_left[curr]);
+            let s_r = buf.pcm_right[curr] + frac * (buf.pcm_right[next] - buf.pcm_right[curr]);
+
+            out_l[f] += s_l * gain_l;
+            out_r[f] += s_r * gain_r;
+
+            self.playback_sample_offset += step;
+            frames_rendered += 1;
+        }
+
+        frames_rendered
+    }
+}
+
 /// ALC physical or virtual audio output device descriptor.
 #[derive(Debug, Clone)]
 pub struct ALCDevice {
@@ -274,10 +440,12 @@ pub struct OpenALEngine {
     pub devices: BTreeMap<ALuint, ALCDevice>,
     pub contexts: BTreeMap<ALuint, ALCContext>,
     pub buffers: BTreeMap<ALuint, ALBuffer>,
+    pub sources: BTreeMap<ALuint, ALSource>,
     pub current_context: ALuint,
     pub next_device_handle: ALuint,
     pub next_context_handle: ALuint,
     pub next_buffer_id: ALuint,
+    pub next_source_id: ALuint,
 }
 
 impl OpenALEngine {
@@ -287,10 +455,12 @@ impl OpenALEngine {
             devices: BTreeMap::new(),
             contexts: BTreeMap::new(),
             buffers: BTreeMap::new(),
+            sources: BTreeMap::new(),
             current_context: 0,
             next_device_handle: 1,
             next_context_handle: 1,
             next_buffer_id: 1,
+            next_source_id: 1,
         }
     }
 
@@ -477,6 +647,224 @@ impl OpenALEngine {
             _ => AL_INVALID_ENUM,
         }
     }
+
+    // Allocates n source object names.
+    pub fn al_gen_sources(&mut self, n: ALsizei, out_sources: &mut [ALuint]) -> ALenum {
+        if n < 0 || out_sources.len() < n as usize {
+            return AL_INVALID_VALUE;
+        }
+        for i in 0..n as usize {
+            let id = self.next_source_id;
+            self.next_source_id = self.next_source_id.wrapping_add(1).max(1);
+            self.sources.insert(id, ALSource::new(id));
+            out_sources[i] = id;
+        }
+        AL_NO_ERROR
+    }
+
+    // Deletes n source objects.
+    pub fn al_delete_sources(&mut self, n: ALsizei, sources: &[ALuint]) -> ALenum {
+        if n < 0 || sources.len() < n as usize {
+            return AL_INVALID_VALUE;
+        }
+        for &id in &sources[..n as usize] {
+            if id != 0 {
+                self.sources.remove(&id);
+            }
+        }
+        AL_NO_ERROR
+    }
+
+    // Checks if identifier is a valid OpenAL source.
+    pub fn al_is_source(&self, source: ALuint) -> ALboolean {
+        if self.sources.contains_key(&source) {
+            AL_TRUE
+        } else {
+            AL_FALSE
+        }
+    }
+
+    // Sets integer source parameters.
+    pub fn al_sourcei(&mut self, source: ALuint, param: ALenum, value: ALint) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+
+        match param {
+            AL_BUFFER => {
+                src.buffer_id = value as ALuint;
+                src.playback_sample_offset = 0.0;
+                AL_NO_ERROR
+            }
+            AL_LOOPING => {
+                src.looping = value == (AL_TRUE as ALint);
+                AL_NO_ERROR
+            }
+            AL_SOURCE_RELATIVE => {
+                src.source_relative = value == (AL_TRUE as ALint);
+                AL_NO_ERROR
+            }
+            _ => AL_INVALID_ENUM,
+        }
+    }
+
+    // Sets floating-point source parameters.
+    pub fn al_sourcef(&mut self, source: ALuint, param: ALenum, value: ALfloat) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+
+        match param {
+            AL_PITCH => {
+                src.pitch = value.clamp(0.1, 4.0);
+                AL_NO_ERROR
+            }
+            AL_GAIN => {
+                src.gain = value.max(0.0);
+                AL_NO_ERROR
+            }
+            AL_MIN_GAIN => {
+                src.min_gain = value.clamp(0.0, 1.0);
+                AL_NO_ERROR
+            }
+            AL_MAX_GAIN => {
+                src.max_gain = value.clamp(0.0, 1.0);
+                AL_NO_ERROR
+            }
+            AL_REFERENCE_DISTANCE => {
+                src.reference_distance = value.max(0.0);
+                AL_NO_ERROR
+            }
+            AL_MAX_DISTANCE => {
+                src.max_distance = value.max(0.0);
+                AL_NO_ERROR
+            }
+            AL_ROLLOFF_FACTOR => {
+                src.rolloff_factor = value.max(0.0);
+                AL_NO_ERROR
+            }
+            _ => AL_INVALID_ENUM,
+        }
+    }
+
+    // Sets 3-component floating-point vector source parameters.
+    pub fn al_source3f(&mut self, source: ALuint, param: ALenum, v1: ALfloat, v2: ALfloat, v3: ALfloat) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+
+        match param {
+            AL_POSITION => {
+                src.position = Vec3::new(v1, v2, v3);
+                AL_NO_ERROR
+            }
+            AL_VELOCITY => {
+                src.velocity = Vec3::new(v1, v2, v3);
+                AL_NO_ERROR
+            }
+            AL_DIRECTION => {
+                src.direction = Vec3::new(v1, v2, v3);
+                AL_NO_ERROR
+            }
+            _ => AL_INVALID_ENUM,
+        }
+    }
+
+    // Starts playback on specified source.
+    pub fn al_source_play(&mut self, source: ALuint) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+        src.state = AL_PLAYING;
+        AL_NO_ERROR
+    }
+
+    // Pauses playback on specified source.
+    pub fn al_source_pause(&mut self, source: ALuint) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+        if src.state == AL_PLAYING {
+            src.state = AL_PAUSED;
+        }
+        AL_NO_ERROR
+    }
+
+    // Stops playback on specified source and resets offset.
+    pub fn al_source_stop(&mut self, source: ALuint) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+        src.state = AL_STOPPED;
+        src.playback_sample_offset = 0.0;
+        AL_NO_ERROR
+    }
+
+    // Rewinds source playback to initial state.
+    pub fn al_source_rewind(&mut self, source: ALuint) -> ALenum {
+        let src = match self.sources.get_mut(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+        src.state = AL_INITIAL;
+        src.playback_sample_offset = 0.0;
+        AL_NO_ERROR
+    }
+
+    // Queries integer parameters from an OpenAL source.
+    pub fn al_get_sourcei(&self, source: ALuint, param: ALenum, out_val: &mut ALint) -> ALenum {
+        let src = match self.sources.get(&source) {
+            Some(s) => s,
+            None => return AL_INVALID_NAME,
+        };
+
+        match param {
+            AL_SOURCE_STATE => {
+                *out_val = src.state;
+                AL_NO_ERROR
+            }
+            AL_BUFFER => {
+                *out_val = src.buffer_id as ALint;
+                AL_NO_ERROR
+            }
+            AL_LOOPING => {
+                *out_val = if src.looping { AL_TRUE as ALint } else { AL_FALSE as ALint };
+                AL_NO_ERROR
+            }
+            _ => AL_INVALID_ENUM,
+        }
+    }
+
+    // Blends all active playing sources into output audio frames.
+    pub fn render_sources(&mut self, frames: usize, out_l: &mut [f32], out_r: &mut [f32]) -> usize {
+        let listener = if let Some(ctx) = self.contexts.get(&self.current_context) {
+            ctx.listener
+        } else {
+            ALListener::default()
+        };
+        let distance_model = if let Some(ctx) = self.contexts.get(&self.current_context) {
+            ctx.distance_model
+        } else {
+            AL_INVERSE_DISTANCE_CLAMPED
+        };
+
+        let mut total_rendered = 0;
+        for src in self.sources.values_mut() {
+            if src.state == AL_PLAYING {
+                let buf_opt = self.buffers.get(&src.buffer_id);
+                let count = src.render_frames(frames, buf_opt, &listener, distance_model, out_l, out_r);
+                total_rendered = total_rendered.max(count);
+            }
+        }
+
+        total_rendered
+    }
 }
 
 /// Verifies ALC device opening, context creation, binding, and error tracking.
@@ -593,6 +981,80 @@ pub fn verify_openal_buffer_management() -> bool {
         return false;
     }
     if engine.al_is_buffer(buf_ids[0]) == AL_TRUE {
+        return false;
+    }
+
+    true
+}
+
+/// Verifies OpenAL source generation, 3D spatial panning, pitch/gain controls, and playback states.
+pub fn verify_openal_source_management() -> bool {
+    let mut engine = OpenALEngine::new();
+
+    let dev = engine.alc_open_device(None).unwrap();
+    let ctx = engine.alc_create_context(dev).unwrap();
+    engine.alc_make_context_current(ctx);
+
+    // 1. Generate buffer with mono 16-bit constant PCM
+    let mut buf = [0u32; 1];
+    engine.al_gen_buffers(1, &mut buf);
+    let mut pcm = Vec::new();
+    for _ in 0..16 {
+        let sample: i16 = 16384; // 0.5
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    engine.al_buffer_data(buf[0], AL_FORMAT_MONO16, &pcm, pcm.len() as ALsizei, 48000);
+
+    // 2. Generate source and bind buffer
+    let mut src = [0u32; 1];
+    if engine.al_gen_sources(1, &mut src) != AL_NO_ERROR {
+        return false;
+    }
+    engine.al_sourcei(src[0], AL_BUFFER, buf[0] as ALint);
+    engine.al_sourcei(src[0], AL_LOOPING, AL_TRUE as ALint);
+
+    // Place source to the far right (+10.0, 0, 0)
+    engine.al_source3f(src[0], AL_POSITION, 10.0, 0.0, 0.0);
+    engine.al_sourcef(src[0], AL_GAIN, 1.0);
+    engine.al_sourcef(src[0], AL_PITCH, 1.0);
+
+    // 3. Play source
+    if engine.al_source_play(src[0]) != AL_NO_ERROR {
+        return false;
+    }
+    let mut state = 0;
+    engine.al_get_sourcei(src[0], AL_SOURCE_STATE, &mut state);
+    if state != AL_PLAYING {
+        return false;
+    }
+
+    // 4. Render frames and check right-panning dominance
+    let mut out_l = alloc::vec![0.0f32; 16];
+    let mut out_r = alloc::vec![0.0f32; 16];
+    let count = engine.render_sources(16, &mut out_l, &mut out_r);
+    if count != 16 {
+        return false;
+    }
+    if out_r[0] <= out_l[0] {
+        return false;
+    }
+
+    // 5. Test pause and stop
+    engine.al_source_pause(src[0]);
+    engine.al_get_sourcei(src[0], AL_SOURCE_STATE, &mut state);
+    if state != AL_PAUSED {
+        return false;
+    }
+
+    engine.al_source_stop(src[0]);
+    engine.al_get_sourcei(src[0], AL_SOURCE_STATE, &mut state);
+    if state != AL_STOPPED {
+        return false;
+    }
+
+    // 6. Delete source
+    engine.al_delete_sources(1, &src);
+    if engine.al_is_source(src[0]) == AL_TRUE {
         return false;
     }
 
