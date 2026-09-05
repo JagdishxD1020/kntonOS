@@ -893,3 +893,168 @@ impl BarrierBatchOptimizer {
         coalesced
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Resource Barrier State Tracker
+pub fn test_resource_barrier_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Resource Barrier State Tracker & Implicit Transitions...\r\n");
+
+    // 1. Verify resource state bitmasks, access classifications, and stage mapping
+    let rt_state = D3D12_RESOURCE_STATES::RENDER_TARGET;
+    let srv_state = D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE;
+    let mixed_valid = rt_state | D3D12_RESOURCE_STATES::COPY_SOURCE;
+    let mixed_invalid = rt_state | D3D12_RESOURCE_STATES::DEPTH_WRITE;
+
+    if !rt_state.is_write_state() || rt_state.is_read_only() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Render target must be classified as write state\r\n");
+        return false;
+    }
+    if srv_state.is_write_state() || !srv_state.is_read_only() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Pixel shader resource must be classified as read-only\r\n");
+        return false;
+    }
+    if !mixed_valid.is_valid_combination() || mixed_invalid.is_valid_combination() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] State combination validation logic mismatch\r\n");
+        return false;
+    }
+
+    let stages = get_pipeline_stages_for_state(rt_state);
+    if !stages.contains(D3D12_PIPELINE_STAGE_FLAGS::RENDER_TARGET) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Pipeline stage mapping mismatch\r\n");
+        return false;
+    }
+    if !is_state_supported_on_queue(D3D12_RESOURCE_STATES::COPY_DEST, D3D12_COMMAND_LIST_TYPE::Copy)
+        || is_state_supported_on_queue(D3D12_RESOURCE_STATES::RENDER_TARGET, D3D12_COMMAND_LIST_TYPE::Copy)
+    {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Queue capability check mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Resource state bitmask operations and pipeline stage mapping verified\r\n");
+
+    // 2. Verify subresource slice indexing and reverse decomposition
+    let flat_idx = calc_subresource(2, 3, 0, 4, 6);
+    let (mip, array, plane) = decompose_subresource(flat_idx, 4, 6);
+    if mip != 2 || array != 3 || plane != 0 || flat_idx != (2 + 3 * 4) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Subresource slice arithmetic mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Subresource coordinate arithmetic and slice decomposition verified\r\n");
+
+    // 3. Verify registry tracking and explicit state transitions
+    let mut registry = ResourceStateRegistry::new();
+    let buffer_id = 101;
+    let texture_id = 202;
+
+    if registry.register_resource(buffer_id, true, 1, 1, 1, D3D12_RESOURCE_STATES::COMMON, D3D12_COMMAND_LIST_TYPE::Direct).is_err() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Failed to register buffer resource\r\n");
+        return false;
+    }
+    if registry.register_resource(texture_id, false, 4, 1, 1, D3D12_RESOURCE_STATES::COMMON, D3D12_COMMAND_LIST_TYPE::Direct).is_err() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Failed to register texture resource\r\n");
+        return false;
+    }
+
+    let b_barrier = D3D12_RESOURCE_BARRIER::transition(
+        texture_id,
+        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATES::COMMON,
+        D3D12_RESOURCE_STATES::RENDER_TARGET,
+    );
+    if registry.apply_barrier(&b_barrier, D3D12_COMMAND_LIST_TYPE::Direct).is_err() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Failed to apply ALL_SUBRESOURCES transition\r\n");
+        return false;
+    }
+    if registry.get_subresource_state(texture_id, 2) != Ok(D3D12_RESOURCE_STATES::RENDER_TARGET) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Transition state mismatch on subresource 2\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Per-subresource state registry and explicit transitions verified\r\n");
+
+    // 4. Verify implicit state promotion rules and decay lifecycle
+    let dyn_buffer_id = 303;
+    let _ = registry.register_resource(dyn_buffer_id, true, 1, 1, 1, D3D12_RESOURCE_STATES::COMMON, D3D12_COMMAND_LIST_TYPE::Direct);
+
+    // Buffer in COMMON should implicitly promote to VERTEX_AND_CONSTANT_BUFFER without barrier
+    let promo_result = match registry.ensure_state(dyn_buffer_id, 0, D3D12_RESOURCE_STATES::VERTEX_AND_CONSTANT_BUFFER, D3D12_COMMAND_LIST_TYPE::Direct) {
+        Ok(res) => res,
+        Err(_) => return false,
+    };
+    if promo_result.is_some() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Buffer promotion must not emit explicit barrier\r\n");
+        return false;
+    }
+    if registry.get_subresource_state(dyn_buffer_id, 0) != Ok(D3D12_RESOURCE_STATES::VERTEX_AND_CONSTANT_BUFFER) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Promoted buffer state mismatch\r\n");
+        return false;
+    }
+
+    // ExecuteCommandLists completion should decay promoted buffer back to COMMON
+    registry.execute_command_list_decay(D3D12_COMMAND_LIST_TYPE::Direct);
+    if registry.get_subresource_state(dyn_buffer_id, 0) != Ok(D3D12_RESOURCE_STATES::COMMON) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Buffer must decay to COMMON on command list completion\r\n");
+        return false;
+    }
+    // Explicitly transitioned texture without simultaneous access must retain its state
+    if registry.get_subresource_state(texture_id, 0) != Ok(D3D12_RESOURCE_STATES::RENDER_TARGET) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Explicitly transitioned texture must retain state\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Implicit state promotion and ExecuteCommandLists decay lifecycle verified\r\n");
+
+    // 5. Verify SplitBarrierTracker pairing and BarrierBatchOptimizer coalescing
+    let mut split_tracker = SplitBarrierTracker::new();
+    let split_begin = D3D12_RESOURCE_BARRIER::transition(
+        texture_id,
+        0,
+        D3D12_RESOURCE_STATES::RENDER_TARGET,
+        D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE,
+    ).with_flags(D3D12_RESOURCE_BARRIER_FLAGS::BEGIN_ONLY);
+
+    let split_end = D3D12_RESOURCE_BARRIER::transition(
+        texture_id,
+        0,
+        D3D12_RESOURCE_STATES::RENDER_TARGET,
+        D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE,
+    ).with_flags(D3D12_RESOURCE_BARRIER_FLAGS::END_ONLY);
+
+    if split_tracker.begin_split_barrier(&split_begin).is_err() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Failed to register BeginBarrier\r\n");
+        return false;
+    }
+    if !split_tracker.has_pending_split(texture_id, 0) {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Pending split barrier status mismatch\r\n");
+        return false;
+    }
+    if split_tracker.begin_split_barrier(&split_begin).is_ok() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Duplicate BeginBarrier must be rejected\r\n");
+        return false;
+    }
+    if split_tracker.end_split_barrier(&split_end).is_err() {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Failed to complete matching EndBarrier\r\n");
+        return false;
+    }
+    if split_tracker.pending_count() != 0 {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Split tracker must have zero pending barriers\r\n");
+        return false;
+    }
+
+    // Coalescing test: COMMON -> COPY_DEST then COPY_DEST -> PIXEL_SHADER_RESOURCE should coalesce to COMMON -> PIXEL_SHADER_RESOURCE
+    let unoptimized = [
+        D3D12_RESOURCE_BARRIER::transition(404, 0, D3D12_RESOURCE_STATES::COMMON, D3D12_RESOURCE_STATES::COPY_DEST),
+        D3D12_RESOURCE_BARRIER::transition(404, 0, D3D12_RESOURCE_STATES::COPY_DEST, D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE),
+        D3D12_RESOURCE_BARRIER::transition(505, 0, D3D12_RESOURCE_STATES::RENDER_TARGET, D3D12_RESOURCE_STATES::RENDER_TARGET),
+    ];
+    let optimized = BarrierBatchOptimizer::coalesce_barriers(&unoptimized);
+    if optimized.len() != 1 {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Coalesced barrier count mismatch\r\n");
+        return false;
+    }
+    let opt_t = optimized[0].transition.as_ref().unwrap();
+    if opt_t.state_before != D3D12_RESOURCE_STATES::COMMON || opt_t.state_after != D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE {
+        crate::serial_write_str("[KNT-BARRIER-FAIL] Coalesced state endpoints mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Split barrier pairing and redundant transition coalescing verified\r\n");
+
+    crate::serial_write_str("[KNT-BARRIER-TRACK-PASS] Direct3D 12 resource barrier state tracker and implicit transition engine verified\r\n");
+    true
+}

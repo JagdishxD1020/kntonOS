@@ -422,6 +422,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 graphics PSO cache subsystem self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Resource Barrier State Tracker & Implicit Transitions (TASK-KNT-148)
+    if !gfx::test_resource_barrier_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 resource barrier state tracker self-test failed!\r\n");
+    }
+
     // Initialize and verify AHCI SATA Persistent Storage Subsystem
     if !drivers::storage::test_ahci_sata_subsystem() {
         serial_write_str("[KNT-PANIC] AHCI SATA storage subsystem self-test failed!\r\n");
