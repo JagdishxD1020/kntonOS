@@ -238,3 +238,126 @@ pub unsafe fn win32_release_semaphore(
         false
     }
 }
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CriticalSection {
+    pub debug_info: usize,
+    pub lock_count: i32,
+    pub recursion_count: i32,
+    pub owning_thread: usize,
+    pub lock_semaphore: usize,
+    pub spin_count: usize,
+}
+
+impl Default for CriticalSection {
+    fn default() -> Self {
+        Self {
+            debug_info: 0,
+            lock_count: -1,
+            recursion_count: 0,
+            owning_thread: 0,
+            lock_semaphore: 0,
+            spin_count: 0,
+        }
+    }
+}
+
+#[allow(non_camel_case_types)]
+pub type CRITICAL_SECTION = CriticalSection;
+#[allow(non_camel_case_types)]
+pub type LPCRITICAL_SECTION = *mut CriticalSection;
+
+/// Initializes a critical section object.
+pub unsafe fn win32_initialize_critical_section(lp_cs: LPCRITICAL_SECTION) {
+    if !lp_cs.is_null() {
+        *lp_cs = CriticalSection::default();
+    }
+}
+
+/// Initializes a critical section object and sets its spin count.
+pub unsafe fn win32_initialize_critical_section_and_spin_count(
+    lp_cs: LPCRITICAL_SECTION,
+    dw_spin_count: u32,
+) -> bool {
+    if lp_cs.is_null() {
+        return false;
+    }
+    *lp_cs = CriticalSection {
+        spin_count: dw_spin_count as usize,
+        ..Default::default()
+    };
+    true
+}
+
+/// Waits for ownership of the specified critical section object.
+pub unsafe fn win32_enter_critical_section(lp_cs: LPCRITICAL_SECTION) {
+    if lp_cs.is_null() {
+        return;
+    }
+
+    let cur_tid = get_current_tid() as usize;
+    if (*lp_cs).owning_thread == cur_tid {
+        (*lp_cs).recursion_count += 1;
+        (*lp_cs).lock_count += 1;
+        return;
+    }
+
+    let mut spins = (*lp_cs).spin_count;
+    while (*lp_cs).owning_thread != 0 {
+        if spins > 0 {
+            core::hint::spin_loop();
+            spins -= 1;
+        } else {
+            crate::process::yield_now();
+        }
+    }
+
+    (*lp_cs).owning_thread = cur_tid;
+    (*lp_cs).recursion_count = 1;
+    (*lp_cs).lock_count = 0;
+}
+
+/// Attempts to enter a critical section without blocking.
+pub unsafe fn win32_try_enter_critical_section(lp_cs: LPCRITICAL_SECTION) -> bool {
+    if lp_cs.is_null() {
+        return false;
+    }
+
+    let cur_tid = get_current_tid() as usize;
+    if (*lp_cs).owning_thread == cur_tid {
+        (*lp_cs).recursion_count += 1;
+        (*lp_cs).lock_count += 1;
+        true
+    } else if (*lp_cs).owning_thread == 0 {
+        (*lp_cs).owning_thread = cur_tid;
+        (*lp_cs).recursion_count = 1;
+        (*lp_cs).lock_count = 0;
+        true
+    } else {
+        false
+    }
+}
+
+/// Releases ownership of the specified critical section object.
+pub unsafe fn win32_leave_critical_section(lp_cs: LPCRITICAL_SECTION) {
+    if lp_cs.is_null() {
+        return;
+    }
+
+    let cur_tid = get_current_tid() as usize;
+    if (*lp_cs).owning_thread == cur_tid && (*lp_cs).recursion_count > 0 {
+        (*lp_cs).recursion_count -= 1;
+        (*lp_cs).lock_count -= 1;
+        if (*lp_cs).recursion_count == 0 {
+            (*lp_cs).owning_thread = 0;
+        }
+    }
+}
+
+/// Releases all resources used by an unowned critical section object.
+pub unsafe fn win32_delete_critical_section(lp_cs: LPCRITICAL_SECTION) {
+    if !lp_cs.is_null() {
+        *lp_cs = CriticalSection::default();
+    }
+}
