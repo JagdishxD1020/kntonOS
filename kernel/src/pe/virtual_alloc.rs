@@ -221,3 +221,26 @@ pub unsafe fn win32_virtual_query(
 
     core::mem::size_of::<MemoryBasicInformation>()
 }
+
+/// Retrieves the minimum size of a large page supported by the system.
+pub fn win32_get_large_page_minimum() -> usize {
+    LARGE_PAGE_SIZE
+}
+
+/// Determines whether large page allocations (2MB THP) are supported.
+pub fn win32_is_large_page_supported() -> bool {
+    true
+}
+
+/// Allocates high-throughput 2MB large pages for game asset and texture streaming.
+pub unsafe fn win32_virtual_alloc_large_pages(
+    dw_size: usize,
+    fl_protect: u32,
+) -> *mut u8 {
+    win32_virtual_alloc(
+        core::ptr::null_mut(),
+        dw_size,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        fl_protect,
+    )
+}
