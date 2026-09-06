@@ -590,3 +590,150 @@ pub unsafe fn win32_wait_for_multiple_objects(
 
     WAIT_TIMEOUT
 }
+
+/// Comprehensive self-test suite verifying Win32 synchronization primitives and wait engine.
+pub fn test_synch_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SYNCH-TEST] Executing Win32 synchronization primitives verification...\r\n");
+
+    // 1. Verify Event objects (manual-reset & auto-reset)
+    let h_manual_event = win32_create_event(0, true, false, Some("KntonManualEvent"));
+    let h_auto_event = win32_create_event(0, false, false, Some("KntonAutoEvent"));
+    if h_manual_event == 0 || h_auto_event == 0 {
+        return false;
+    }
+
+    if unsafe { win32_wait_for_single_object(h_manual_event, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_auto_event, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    win32_set_event(h_manual_event);
+    if unsafe { win32_wait_for_single_object(h_manual_event, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_manual_event, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    win32_reset_event(h_manual_event);
+    if unsafe { win32_wait_for_single_object(h_manual_event, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    win32_set_event(h_auto_event);
+    if unsafe { win32_wait_for_single_object(h_auto_event, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_auto_event, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    // 2. Verify Mutex recursive locking and ownership
+    let h_mutex = win32_create_mutex(0, false, Some("KntonMutex"));
+    if h_mutex == 0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_mutex, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_mutex, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if !win32_release_mutex(h_mutex) {
+        return false;
+    }
+    if !win32_release_mutex(h_mutex) {
+        return false;
+    }
+    if win32_release_mutex(h_mutex) {
+        return false;
+    }
+
+    // 3. Verify Semaphore counting
+    let h_sem = win32_create_semaphore(0, 2, 4, Some("KntonSem"));
+    if h_sem == 0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_sem, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_sem, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_single_object(h_sem, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+    let mut prev_count = 0;
+    if !unsafe { win32_release_semaphore(h_sem, 3, &mut prev_count as *mut i32) } || prev_count != 0 {
+        return false;
+    }
+    if unsafe { win32_release_semaphore(h_sem, 2, core::ptr::null_mut()) } {
+        return false;
+    }
+
+    // 4. Verify Critical Section and SRW Lock
+    let mut cs = CriticalSection::default();
+    unsafe {
+        win32_initialize_critical_section_and_spin_count(&mut cs as *mut _, 100);
+        win32_enter_critical_section(&mut cs as *mut _);
+        if !win32_try_enter_critical_section(&mut cs as *mut _) {
+            return false;
+        }
+        win32_leave_critical_section(&mut cs as *mut _);
+        win32_leave_critical_section(&mut cs as *mut _);
+        win32_delete_critical_section(&mut cs as *mut _);
+    }
+
+    let mut srw = SrwLock::default();
+    unsafe {
+        win32_initialize_srw_lock(&mut srw as *mut _);
+        win32_acquire_srw_lock_exclusive(&mut srw as *mut _);
+        if win32_try_acquire_srw_lock_shared(&mut srw as *mut _) {
+            return false;
+        }
+        win32_release_srw_lock_exclusive(&mut srw as *mut _);
+
+        win32_acquire_srw_lock_shared(&mut srw as *mut _);
+        if !win32_try_acquire_srw_lock_shared(&mut srw as *mut _) {
+            return false;
+        }
+        if win32_try_acquire_srw_lock_exclusive(&mut srw as *mut _) {
+            return false;
+        }
+        win32_release_srw_lock_shared(&mut srw as *mut _);
+        win32_release_srw_lock_shared(&mut srw as *mut _);
+    }
+
+    // 5. Verify WaitForMultipleObjects (wait-all & wait-any)
+    let ev1 = win32_create_event(0, true, false, None);
+    let ev2 = win32_create_event(0, false, false, None);
+    let handles = [ev1, ev2];
+
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), false, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), true, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    win32_set_event(ev2);
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), false, 0) } != WAIT_OBJECT_0 + 1 {
+        return false;
+    }
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), false, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    win32_set_event(ev1);
+    win32_set_event(ev2);
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), true, 0) } != WAIT_OBJECT_0 {
+        return false;
+    }
+    if unsafe { win32_wait_for_multiple_objects(2, handles.as_ptr(), true, 0) } != WAIT_TIMEOUT {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-SYNCH-PASS] Win32 synchronization primitives verified\r\n");
+    true
+}
