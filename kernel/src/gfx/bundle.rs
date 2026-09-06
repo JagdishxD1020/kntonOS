@@ -411,3 +411,206 @@ pub fn validate_bundle_operation_legality(op: ForbiddenBundleOperation) -> Resul
     let _ = op;
     Err(BundleError::ForbiddenCommandInBundle)
 }
+
+// Low-overhead pre-compiled GPU DMA hardware packet representation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecompiledGpuPacket {
+    pub opcode: u16,
+    pub payload: Vec<u8>,
+}
+
+// Pre-compiled GPU command packet stream ready for instant multi-draw replay
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecompiledBundle {
+    pub bundle_id: u64,
+    pub packets: Vec<PrecompiledGpuPacket>,
+    pub total_dwords: usize,
+    pub draw_count: usize,
+    pub dispatch_count: usize,
+    pub required_pso: Option<u64>,
+    pub required_root_signature: Option<u64>,
+}
+
+// Pre-compilation engine baking recorded high-level bundle commands into hardware DMA packets
+pub struct BundlePrecompiler;
+
+impl BundlePrecompiler {
+    // Pre-compile closed bundle into hardware-ready packet cache
+    pub fn compile(bundle: &D3D12GraphicsCommandListBundle, bundle_id: u64) -> Result<PrecompiledBundle, BundleError> {
+        if !bundle.is_closed {
+            return Err(BundleError::BundleNotClosed);
+        }
+
+        let mut packets = Vec::with_capacity(bundle.commands.len());
+        let mut total_dwords = 0;
+
+        for cmd in &bundle.commands {
+            match cmd {
+                BundleCommand::DrawIndexedInstanced {
+                    index_count_per_instance,
+                    instance_count,
+                    start_index_location,
+                    base_vertex_location,
+                    start_instance_location,
+                } => {
+                    let mut payload = Vec::with_capacity(20);
+                    payload.extend_from_slice(&index_count_per_instance.to_le_bytes());
+                    payload.extend_from_slice(&instance_count.to_le_bytes());
+                    payload.extend_from_slice(&start_index_location.to_le_bytes());
+                    payload.extend_from_slice(&base_vertex_location.to_le_bytes());
+                    payload.extend_from_slice(&start_instance_location.to_le_bytes());
+                    total_dwords += 5;
+                    packets.push(PrecompiledGpuPacket { opcode: 1, payload });
+                }
+                BundleCommand::Dispatch {
+                    thread_group_count_x,
+                    thread_group_count_y,
+                    thread_group_count_z,
+                } => {
+                    let mut payload = Vec::with_capacity(12);
+                    payload.extend_from_slice(&thread_group_count_x.to_le_bytes());
+                    payload.extend_from_slice(&thread_group_count_y.to_le_bytes());
+                    payload.extend_from_slice(&thread_group_count_z.to_le_bytes());
+                    total_dwords += 3;
+                    packets.push(PrecompiledGpuPacket { opcode: 12, payload });
+                }
+                BundleCommand::SetGraphicsRootDescriptorTable {
+                    root_parameter_index,
+                    base_descriptor_gpu_address,
+                } => {
+                    let mut payload = Vec::with_capacity(12);
+                    payload.extend_from_slice(&root_parameter_index.to_le_bytes());
+                    payload.extend_from_slice(&base_descriptor_gpu_address.to_le_bytes());
+                    total_dwords += 3;
+                    packets.push(PrecompiledGpuPacket { opcode: 11, payload });
+                }
+                BundleCommand::SetGraphicsRoot32BitConstants {
+                    root_parameter_index,
+                    num_32bit_values_to_set,
+                    dest_offset_in_32bit_values,
+                    values,
+                } => {
+                    let mut payload = Vec::with_capacity(12 + values.len() * 4);
+                    payload.extend_from_slice(&root_parameter_index.to_le_bytes());
+                    payload.extend_from_slice(&num_32bit_values_to_set.to_le_bytes());
+                    payload.extend_from_slice(&dest_offset_in_32bit_values.to_le_bytes());
+                    for v in values {
+                        payload.extend_from_slice(&v.to_le_bytes());
+                    }
+                    total_dwords += 3 + values.len();
+                    packets.push(PrecompiledGpuPacket { opcode: 13, payload });
+                }
+                BundleCommand::IASetVertexBuffers { start_slot, views } => {
+                    let mut payload = Vec::with_capacity(8 + views.len() * 16);
+                    payload.extend_from_slice(&start_slot.to_le_bytes());
+                    payload.extend_from_slice(&(views.len() as u32).to_le_bytes());
+                    for v in views {
+                        payload.extend_from_slice(&v.buffer_location.to_le_bytes());
+                        payload.extend_from_slice(&v.size_in_bytes.to_le_bytes());
+                        payload.extend_from_slice(&v.stride_in_bytes.to_le_bytes());
+                    }
+                    total_dwords += 2 + (views.len() * 4);
+                    packets.push(PrecompiledGpuPacket { opcode: 8, payload });
+                }
+                BundleCommand::IASetIndexBuffer { view } => {
+                    let mut payload = Vec::with_capacity(16);
+                    payload.extend_from_slice(&view.buffer_location.to_le_bytes());
+                    payload.extend_from_slice(&view.size_in_bytes.to_le_bytes());
+                    payload.extend_from_slice(&(view.format as u32).to_le_bytes());
+                    total_dwords += 4;
+                    packets.push(PrecompiledGpuPacket { opcode: 7, payload });
+                }
+                BundleCommand::SetPipelineState { pso_id } => {
+                    let mut payload = Vec::with_capacity(8);
+                    payload.extend_from_slice(&pso_id.to_le_bytes());
+                    total_dwords += 2;
+                    packets.push(PrecompiledGpuPacket { opcode: 2, payload });
+                }
+                BundleCommand::SetGraphicsRootSignature { root_signature_id } => {
+                    let mut payload = Vec::with_capacity(8);
+                    payload.extend_from_slice(&root_signature_id.to_le_bytes());
+                    total_dwords += 2;
+                    packets.push(PrecompiledGpuPacket { opcode: 14, payload });
+                }
+            }
+        }
+
+        Ok(PrecompiledBundle {
+            bundle_id,
+            packets,
+            total_dwords,
+            draw_count: bundle.recorded_draw_count,
+            dispatch_count: bundle.recorded_dispatch_count,
+            required_pso: bundle.active_pso_id,
+            required_root_signature: bundle.active_root_signature_id,
+        })
+    }
+}
+
+// Parent direct command list simulator executing bundles via zero-translation stream splice
+pub struct DirectCommandListExecutor {
+    pub active_pso_id: Option<u64>,
+    pub active_root_signature_id: Option<u64>,
+    pub executed_bundles_count: usize,
+    pub total_replayed_draws: usize,
+    pub dispatched_packets: Vec<PrecompiledGpuPacket>,
+}
+
+impl DirectCommandListExecutor {
+    // Construct new direct command list executor
+    pub fn new() -> Self {
+        Self {
+            active_pso_id: None,
+            active_root_signature_id: None,
+            executed_bundles_count: 0,
+            total_replayed_draws: 0,
+            dispatched_packets: Vec::new(),
+        }
+    }
+
+    // Set active pipeline state on direct command list
+    pub fn set_pipeline_state(&mut self, pso_id: u64) {
+        self.active_pso_id = Some(pso_id);
+    }
+
+    // Set active root signature on direct command list
+    pub fn set_graphics_root_signature(&mut self, root_sig_id: u64) {
+        self.active_root_signature_id = Some(root_sig_id);
+    }
+
+    // Execute bundle via ExecuteBundle dispatching pre-compiled packets
+    pub fn execute_bundle(
+        &mut self,
+        bundle: &D3D12GraphicsCommandListBundle,
+        precompiled: &PrecompiledBundle,
+    ) -> Result<BundleInheritanceContext, BundleError> {
+        if !bundle.is_closed {
+            return Err(BundleError::BundleNotClosed);
+        }
+
+        // Validate and resolve state inheritance
+        let inheritance = bundle.validate_and_resolve_inheritance(
+            self.active_pso_id,
+            self.active_root_signature_id,
+        )?;
+
+        // Splice pre-compiled packets into parent execution stream
+        for pkt in &precompiled.packets {
+            self.dispatched_packets.push(pkt.clone());
+        }
+
+        self.executed_bundles_count += 1;
+        self.total_replayed_draws += precompiled.draw_count;
+
+        Ok(inheritance)
+    }
+
+    // Reset direct command list state
+    pub fn reset(&mut self) {
+        self.active_pso_id = None;
+        self.active_root_signature_id = None;
+        self.executed_bundles_count = 0;
+        self.total_replayed_draws = 0;
+        self.dispatched_packets.clear();
+    }
+}
