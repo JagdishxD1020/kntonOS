@@ -137,3 +137,199 @@ pub struct D3D12_BUNDLE_DESC {
     pub node_mask: u32,
     pub initial_pipeline_state: Option<u64>,
 }
+
+// Pre-compiled GPU command list bundle for high-frequency multi-draw execution
+pub struct D3D12GraphicsCommandListBundle {
+    pub allocator: BundleAllocator,
+    pub commands: Vec<BundleCommand>,
+    pub is_closed: bool,
+    pub active_pso_id: Option<u64>,
+    pub active_root_signature_id: Option<u64>,
+    pub vsv_slots: [Option<D3D12_VERTEX_BUFFER_VIEW>; D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT],
+    pub ibv: Option<D3D12_INDEX_BUFFER_VIEW>,
+    pub recorded_draw_count: usize,
+    pub recorded_dispatch_count: usize,
+}
+
+impl D3D12GraphicsCommandListBundle {
+    // Construct empty bundle command list with memory allocation quota
+    pub fn new(allocator_capacity: usize, initial_pso: Option<u64>) -> Self {
+        Self {
+            allocator: BundleAllocator::new(allocator_capacity),
+            commands: Vec::new(),
+            is_closed: false,
+            active_pso_id: initial_pso,
+            active_root_signature_id: None,
+            vsv_slots: [None; D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT],
+            ibv: None,
+            recorded_draw_count: 0,
+            recorded_dispatch_count: 0,
+        }
+    }
+
+    // Reset bundle recorder state and re-open command stream for writing
+    pub fn reset(&mut self, initial_pso: Option<u64>) {
+        self.allocator.reset();
+        self.commands.clear();
+        self.is_closed = false;
+        self.active_pso_id = initial_pso;
+        self.active_root_signature_id = None;
+        self.vsv_slots = [None; D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT];
+        self.ibv = None;
+        self.recorded_draw_count = 0;
+        self.recorded_dispatch_count = 0;
+    }
+
+    // Record DrawIndexedInstanced draw call into the bundle stream
+    pub fn draw_indexed_instanced(
+        &mut self,
+        index_count_per_instance: u32,
+        instance_count: u32,
+        start_index_location: u32,
+        base_vertex_location: i32,
+        start_instance_location: u32,
+    ) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(32)?;
+        self.commands.push(BundleCommand::DrawIndexedInstanced {
+            index_count_per_instance,
+            instance_count,
+            start_index_location,
+            base_vertex_location,
+            start_instance_location,
+        });
+        self.recorded_draw_count += 1;
+        Ok(())
+    }
+
+    // Record compute dispatch call into the bundle stream
+    pub fn dispatch(
+        &mut self,
+        thread_group_count_x: u32,
+        thread_group_count_y: u32,
+        thread_group_count_z: u32,
+    ) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(24)?;
+        self.commands.push(BundleCommand::Dispatch {
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+        });
+        self.recorded_dispatch_count += 1;
+        Ok(())
+    }
+
+    // Bind descriptor table to graphics root signature parameter slot
+    pub fn set_graphics_root_descriptor_table(
+        &mut self,
+        root_parameter_index: u32,
+        base_descriptor_gpu_address: u64,
+    ) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(16)?;
+        self.commands.push(BundleCommand::SetGraphicsRootDescriptorTable {
+            root_parameter_index,
+            base_descriptor_gpu_address,
+        });
+        Ok(())
+    }
+
+    // Push inline 32-bit constants into graphics root signature parameter slot
+    pub fn set_graphics_root_32bit_constants(
+        &mut self,
+        root_parameter_index: u32,
+        num_32bit_values_to_set: u32,
+        dest_offset_in_32bit_values: u32,
+        values: &[u32],
+    ) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        let payload_size = 16 + (values.len() * 4);
+        self.allocator.track_allocation(payload_size)?;
+        self.commands.push(BundleCommand::SetGraphicsRoot32BitConstants {
+            root_parameter_index,
+            num_32bit_values_to_set,
+            dest_offset_in_32bit_values,
+            values: values.to_vec(),
+        });
+        Ok(())
+    }
+
+    // Bind array of vertex buffer views to input assembler slots
+    pub fn ia_set_vertex_buffers(
+        &mut self,
+        start_slot: u32,
+        views: &[D3D12_VERTEX_BUFFER_VIEW],
+    ) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        let end_slot = start_slot as usize + views.len();
+        if end_slot > D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT {
+            return Err(BundleError::InvalidSlotIndex);
+        }
+
+        let alloc_size = 8 + (views.len() * 16);
+        self.allocator.track_allocation(alloc_size)?;
+
+        for (i, view) in views.iter().enumerate() {
+            self.vsv_slots[start_slot as usize + i] = Some(*view);
+        }
+
+        self.commands.push(BundleCommand::IASetVertexBuffers {
+            start_slot,
+            views: views.to_vec(),
+        });
+        Ok(())
+    }
+
+    // Bind index buffer view to input assembler
+    pub fn ia_set_index_buffer(&mut self, view: &D3D12_INDEX_BUFFER_VIEW) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(16)?;
+        self.ibv = Some(*view);
+        self.commands.push(BundleCommand::IASetIndexBuffer { view: *view });
+        Ok(())
+    }
+
+    // Set pipeline state object within the bundle
+    pub fn set_pipeline_state(&mut self, pso_id: u64) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(16)?;
+        self.active_pso_id = Some(pso_id);
+        self.commands.push(BundleCommand::SetPipelineState { pso_id });
+        Ok(())
+    }
+
+    // Set graphics root signature within the bundle
+    pub fn set_graphics_root_signature(&mut self, root_signature_id: u64) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.allocator.track_allocation(16)?;
+        self.active_root_signature_id = Some(root_signature_id);
+        self.commands.push(BundleCommand::SetGraphicsRootSignature { root_signature_id });
+        Ok(())
+    }
+
+    // Finalize bundle recording and lock stream against further command writes
+    pub fn close(&mut self) -> Result<(), BundleError> {
+        if self.is_closed {
+            return Err(BundleError::BundleAlreadyClosed);
+        }
+        self.is_closed = true;
+        Ok(())
+    }
+}
