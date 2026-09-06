@@ -485,3 +485,108 @@ pub unsafe fn win32_release_srw_lock_shared(srw_lock: PSRWLOCK) {
         }
     }
 }
+
+pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
+pub const WAIT_ABANDONED_0: u32 = 0x0000_0080;
+pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
+pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+pub const INFINITE: u32 = 0xFFFF_FFFF;
+pub const MAXIMUM_WAIT_OBJECTS: u32 = 64;
+
+fn is_object_signaled(obj: &SynchObject, cur_tid: u32) -> bool {
+    match obj {
+        SynchObject::Event(ev) => ev.signaled,
+        SynchObject::Mutex(m) => m.owner_tid == 0 || m.owner_tid == cur_tid,
+        SynchObject::Semaphore(sem) => sem.current_count > 0,
+    }
+}
+
+fn satisfy_object_wait(obj: &mut SynchObject, cur_tid: u32) {
+    match obj {
+        SynchObject::Event(ev) => {
+            if !ev.manual_reset {
+                ev.signaled = false;
+            }
+        }
+        SynchObject::Mutex(m) => {
+            m.owner_tid = cur_tid;
+            m.recursion_count = m.recursion_count.saturating_add(1);
+        }
+        SynchObject::Semaphore(sem) => {
+            sem.current_count = sem.current_count.saturating_sub(1);
+        }
+    }
+}
+
+/// Waits until the specified object is in the signaled state or the time-out interval elapses.
+pub unsafe fn win32_wait_for_single_object(h_handle: HANDLE, dw_milliseconds: u32) -> u32 {
+    win32_wait_for_multiple_objects(1, &h_handle, false, dw_milliseconds)
+}
+
+/// Waits until one or all of the specified objects are in the signaled state or time-out occurs.
+pub unsafe fn win32_wait_for_multiple_objects(
+    count: u32,
+    p_handles: *const HANDLE,
+    b_wait_all: bool,
+    dw_milliseconds: u32,
+) -> u32 {
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS || p_handles.is_null() {
+        return WAIT_FAILED;
+    }
+
+    let handles = core::slice::from_raw_parts(p_handles, count as usize);
+    let cur_tid = get_current_tid();
+    let max_spins = if dw_milliseconds == 0 { 1 } else if dw_milliseconds == INFINITE { 1000 } else { dw_milliseconds.min(100) };
+
+    for _ in 0..max_spins {
+        let mut table = SYNCH_TABLE.lock();
+
+        // Validate all handles exist
+        for &h in handles {
+            if !table.contains_key(&h) {
+                return WAIT_FAILED;
+            }
+        }
+
+        if b_wait_all {
+            let mut all_signaled = true;
+            for &h in handles {
+                if let Some(obj) = table.get(&h) {
+                    if !is_object_signaled(obj, cur_tid) {
+                        all_signaled = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_signaled {
+                for &h in handles {
+                    if let Some(obj) = table.get_mut(&h) {
+                        satisfy_object_wait(obj, cur_tid);
+                    }
+                }
+                return WAIT_OBJECT_0;
+            }
+        } else {
+            for (idx, &h) in handles.iter().enumerate() {
+                if let Some(obj) = table.get(&h) {
+                    if is_object_signaled(obj, cur_tid) {
+                        if let Some(mut_obj) = table.get_mut(&h) {
+                            satisfy_object_wait(mut_obj, cur_tid);
+                        }
+                        return WAIT_OBJECT_0 + idx as u32;
+                    }
+                }
+            }
+        }
+
+        drop(table);
+        if dw_milliseconds == 0 {
+            return WAIT_TIMEOUT;
+        }
+        core::hint::spin_loop();
+        crate::process::yield_now();
+    }
+
+    WAIT_TIMEOUT
+}
