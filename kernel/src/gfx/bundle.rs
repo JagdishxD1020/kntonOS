@@ -332,4 +332,82 @@ impl D3D12GraphicsCommandListBundle {
         self.is_closed = true;
         Ok(())
     }
+
+    // Attempting to record ClearRenderTargetView in bundle must be rejected
+    pub fn record_clear_render_target_view(&mut self) -> Result<(), BundleError> {
+        Err(BundleError::ForbiddenCommandInBundle)
+    }
+
+    // Attempting to record ResourceBarrier in bundle must be rejected
+    pub fn record_resource_barrier(&mut self) -> Result<(), BundleError> {
+        Err(BundleError::ForbiddenCommandInBundle)
+    }
+
+    // Attempting to record CopyResource in bundle must be rejected
+    pub fn record_copy_resource(&mut self) -> Result<(), BundleError> {
+        Err(BundleError::ForbiddenCommandInBundle)
+    }
+
+    // Attempting to nest ExecuteBundle within a bundle must be rejected
+    pub fn record_execute_bundle(&mut self) -> Result<(), BundleError> {
+        Err(BundleError::ForbiddenCommandInBundle)
+    }
+
+    // Validate and resolve inherited pipeline state and root signature from parent
+    pub fn validate_and_resolve_inheritance(
+        &self,
+        parent_pso: Option<u64>,
+        parent_root_sig: Option<u64>,
+    ) -> Result<BundleInheritanceContext, BundleError> {
+        let effective_pso_id = match (self.active_pso_id, parent_pso) {
+            (Some(id), _) => id,
+            (None, Some(id)) => id,
+            (None, None) => return Err(BundleError::MissingParentPipelineState),
+        };
+
+        let effective_root_sig_id = match (self.active_root_signature_id, parent_root_sig) {
+            (Some(bundle_sig), Some(parent_sig)) => {
+                if bundle_sig != parent_sig {
+                    return Err(BundleError::IncompatibleRootSignature);
+                }
+                bundle_sig
+            }
+            (Some(bundle_sig), None) => bundle_sig,
+            (None, Some(parent_sig)) => parent_sig,
+            (None, None) => return Err(BundleError::MissingParentRootSignature),
+        };
+
+        Ok(BundleInheritanceContext {
+            effective_pso_id,
+            effective_root_signature_id: effective_root_sig_id,
+            inherited_pso: self.active_pso_id.is_none(),
+            inherited_root_signature: self.active_root_signature_id.is_none(),
+        })
+    }
+}
+
+// Resolved bundle execution state after inheritance validation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleInheritanceContext {
+    pub effective_pso_id: u64,
+    pub effective_root_signature_id: u64,
+    pub inherited_pso: bool,
+    pub inherited_root_signature: bool,
+}
+
+// Forbidden command list operations inside bundles
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForbiddenBundleOperation {
+    ClearRenderTargetView,
+    ClearDepthStencilView,
+    ResourceBarrier,
+    CopyResource,
+    ResolveSubresource,
+    ExecuteBundle,
+}
+
+// Helper validating whether a command is forbidden in D3D12 bundle context
+pub fn validate_bundle_operation_legality(op: ForbiddenBundleOperation) -> Result<(), BundleError> {
+    let _ = op;
+    Err(BundleError::ForbiddenCommandInBundle)
 }
