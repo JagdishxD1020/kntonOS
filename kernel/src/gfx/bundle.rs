@@ -614,3 +614,167 @@ impl DirectCommandListExecutor {
         self.dispatched_packets.clear();
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Bundle Pre-Compilation Engine
+pub fn test_bundle_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Bundle Recording & Pre-Compilation Engine...\r\n");
+
+    // 1. Verify bundle creation, allocation tracking, and legal command recording
+    let mut bundle = D3D12GraphicsCommandListBundle::new(4096, None);
+
+    let vb_views = [
+        D3D12_VERTEX_BUFFER_VIEW {
+            buffer_location: 0x1000_0000,
+            size_in_bytes: 1024,
+            stride_in_bytes: 32,
+        },
+        D3D12_VERTEX_BUFFER_VIEW {
+            buffer_location: 0x1000_1000,
+            size_in_bytes: 512,
+            stride_in_bytes: 16,
+        },
+    ];
+    if bundle.ia_set_vertex_buffers(0, &vb_views).is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to record IASetVertexBuffers\r\n");
+        return false;
+    }
+
+    let ib_view = D3D12_INDEX_BUFFER_VIEW {
+        buffer_location: 0x2000_0000,
+        size_in_bytes: 2048,
+        format: DXGI_FORMAT::R32_FLOAT,
+    };
+    if bundle.ia_set_index_buffer(&ib_view).is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to record IASetIndexBuffer\r\n");
+        return false;
+    }
+
+    let const_values = [0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00];
+    if bundle.set_graphics_root_32bit_constants(0, 4, 0, &const_values).is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to record SetGraphicsRoot32BitConstants\r\n");
+        return false;
+    }
+
+    if bundle.set_graphics_root_descriptor_table(1, 0x3000_0000).is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to record SetGraphicsRootDescriptorTable\r\n");
+        return false;
+    }
+
+    if bundle.draw_indexed_instanced(36, 1, 0, 0, 0).is_err()
+        || bundle.draw_indexed_instanced(36, 1, 36, 0, 0).is_err()
+    {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to record DrawIndexedInstanced\r\n");
+        return false;
+    }
+
+    if bundle.recorded_draw_count != 2 {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Recorded draw call count mismatch\r\n");
+        return false;
+    }
+    let (allocated, capacity, cmd_count) = bundle.allocator.memory_usage();
+    if allocated == 0 || allocated > capacity || cmd_count != 6 {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Allocator memory usage metrics mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Bundle command recording and linear allocation metrics verified\r\n");
+
+    // 2. Verify strict rejection of forbidden operations inside bundles
+    if bundle.record_clear_render_target_view().is_ok()
+        || bundle.record_resource_barrier().is_ok()
+        || bundle.record_copy_resource().is_ok()
+        || bundle.record_execute_bundle().is_ok()
+    {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Forbidden commands must be strictly rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Strict validation and rejection of forbidden bundle commands verified\r\n");
+
+    // 3. Verify pre-compilation lock and packet compilation
+    if BundlePrecompiler::compile(&bundle, 1001).is_ok() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Compiling unclosed bundle must fail\r\n");
+        return false;
+    }
+
+    if bundle.close().is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to close bundle\r\n");
+        return false;
+    }
+
+    if bundle.draw_indexed_instanced(12, 1, 0, 0, 0).is_ok() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Writing commands to closed bundle must fail\r\n");
+        return false;
+    }
+
+    let precompiled = match BundlePrecompiler::compile(&bundle, 1001) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-BUNDLE-FAIL] Failed to pre-compile closed bundle\r\n");
+            return false;
+        }
+    };
+    if precompiled.packets.len() != 6 || precompiled.draw_count != 2 || precompiled.total_dwords == 0 {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Pre-compiled packet count mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Fast pre-compilation and GPU DMA packet baking verified\r\n");
+
+    // 4. Verify state inheritance rules during ExecuteBundle dispatch
+    let mut direct_executor = DirectCommandListExecutor::new();
+
+    // Executing without parent PSO must fail because bundle does not set its own
+    if direct_executor.execute_bundle(&bundle, &precompiled).is_ok() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] ExecuteBundle without PSO must be rejected\r\n");
+        return false;
+    }
+
+    direct_executor.set_pipeline_state(500);
+    // Executing without parent Root Signature must fail
+    if direct_executor.execute_bundle(&bundle, &precompiled).is_ok() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] ExecuteBundle without Root Signature must be rejected\r\n");
+        return false;
+    }
+
+    direct_executor.set_graphics_root_signature(600);
+    let inheritance = match direct_executor.execute_bundle(&bundle, &precompiled) {
+        Ok(inh) => inh,
+        Err(_) => {
+            crate::serial_write_str("[KNT-BUNDLE-FAIL] ExecuteBundle failed with valid inheritance\r\n");
+            return false;
+        }
+    };
+
+    if !inheritance.inherited_pso || !inheritance.inherited_root_signature {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Bundle inheritance resolution flag mismatch\r\n");
+        return false;
+    }
+    if direct_executor.executed_bundles_count != 1 || direct_executor.total_replayed_draws != 2 {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Replayed draw count mismatch after first execution\r\n");
+        return false;
+    }
+
+    // Low-overhead multi-draw replay of the same pre-compiled bundle
+    if direct_executor.execute_bundle(&bundle, &precompiled).is_err() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Second bundle replay execution failed\r\n");
+        return false;
+    }
+    if direct_executor.executed_bundles_count != 2 || direct_executor.total_replayed_draws != 4 {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Multi-draw replay metrics mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * ExecuteBundle dispatch, state inheritance, and multi-draw replay verified\r\n");
+
+    // 5. Verify root signature incompatibility detection
+    let mut incompatible_bundle = D3D12GraphicsCommandListBundle::new(1024, Some(500));
+    let _ = incompatible_bundle.set_graphics_root_signature(777); // Mismatch with parent (600)
+    let _ = incompatible_bundle.close();
+    let incomp_precompiled = BundlePrecompiler::compile(&incompatible_bundle, 1002).unwrap();
+
+    if direct_executor.execute_bundle(&incompatible_bundle, &incomp_precompiled).is_ok() {
+        crate::serial_write_str("[KNT-BUNDLE-FAIL] Incompatible root signature must be rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Root signature compatibility verification across bundle boundary verified\r\n");
+
+    crate::serial_write_str("[KNT-BUNDLE-PASS] Direct3D 12 bundle pre-compilation engine verified\r\n");
+    true
+}
