@@ -689,6 +689,10 @@ pub extern "C" fn kmain() -> ! {
     if !audio::test_winmm_service_subsystem() {
         serial_write_str("[KNT-PANIC] WinMM legacy WaveOut audio and MIDI synthesizer self-test failed!\r\n");
     }
+    // Initialize and verify Win32 OpenAL 1.1 3D Spatial Audio & EAX Reverb Engine (TASK-KNT-147)
+    if !audio::test_openal_service_subsystem() {
+        serial_write_str("[KNT-PANIC] OpenAL 1.1 audio service self-test failed!\r\n");
+    }
 
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
