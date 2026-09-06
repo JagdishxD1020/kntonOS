@@ -9,6 +9,7 @@ pub mod user32;
 pub mod ws2_32;
 pub mod raw_input;
 pub mod synch;
+pub mod virtual_alloc;
 
 pub use header::*;
 pub use ntdll::*;
@@ -17,6 +18,7 @@ pub use user32::*;
 pub use ws2_32::*;
 pub use raw_input::*;
 pub use synch::*;
+pub use virtual_alloc::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
