@@ -26,6 +26,7 @@ pub mod micromesh;
 pub mod swapchain;
 pub mod root_signature;
 pub mod pso;
+pub mod resource_barrier;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -52,6 +53,7 @@ pub use micromesh::*;
 pub use swapchain::*;
 pub use root_signature::*;
 pub use pso::*;
+pub use resource_barrier::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
