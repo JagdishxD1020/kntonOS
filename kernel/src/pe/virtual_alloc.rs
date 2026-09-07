@@ -271,6 +271,7 @@ pub struct Win32Heap {
     pub base_address: usize,
     pub current_offset: usize,
     pub blocks: Vec<HeapBlock>,
+    pub buffer: Vec<u8>,
 }
 
 static NEXT_HEAP_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x0007_0001);
@@ -287,13 +288,9 @@ pub unsafe fn win32_heap_create(
     *gen = handle.saturating_add(1);
     drop(gen);
 
-    let init_size = if dw_initial_size > 0 { dw_initial_size } else { 64 * 1024 };
-    let base = win32_virtual_alloc(
-        core::ptr::null_mut(),
-        init_size,
-        MEM_RESERVE | MEM_COMMIT,
-        PAGE_READWRITE,
-    ) as usize;
+    let init_size = if dw_initial_size > 0 { dw_initial_size.min(16 * 1024) } else { 16 * 1024 };
+    let mut buffer = alloc::vec![0u8; init_size];
+    let base = buffer.as_mut_ptr() as usize;
 
     if base == 0 {
         return 0;
@@ -307,6 +304,7 @@ pub unsafe fn win32_heap_create(
         base_address: base,
         current_offset: 0,
         blocks: Vec::new(),
+        buffer,
     };
 
     let mut table = HEAP_TABLE.lock();
@@ -608,4 +606,111 @@ pub unsafe fn win32_heap_size(h_heap: HANDLE, _dw_flags: u32, lp_mem: *const u8)
     }
 
     usize::MAX
+}
+
+/// Self-test suite verifying Win32 virtual memory and dynamic heap subsystem.
+pub fn test_virtual_alloc_emulation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-VIRT-MEM-TEST] Executing Win32 virtual memory and dynamic heap verification...\r\n");
+
+    // 1. Verify virtual reservation, committing, and protection transitions
+    let res = unsafe { win32_virtual_alloc(core::ptr::null_mut(), 0x10000, MEM_RESERVE, PAGE_READWRITE) };
+    if res.is_null() {
+        return false;
+    }
+
+    let comm = unsafe { win32_virtual_alloc(res, 0x1000, MEM_COMMIT, PAGE_READWRITE) };
+    if comm != res {
+        return false;
+    }
+
+    let mut old_protect = 0u32;
+    if unsafe { !win32_virtual_protect(res, 0x1000, PAGE_EXECUTE_READWRITE, &mut old_protect) } || old_protect != PAGE_READWRITE {
+        return false;
+    }
+
+    // 2. Verify virtual query
+    let mut mbi = MemoryBasicInformation::default();
+    let query_sz = unsafe { win32_virtual_query(res, &mut mbi, core::mem::size_of::<MemoryBasicInformation>()) };
+    if query_sz != core::mem::size_of::<MemoryBasicInformation>() || mbi.protect != PAGE_EXECUTE_READWRITE || (mbi.state & MEM_COMMIT) == 0 {
+        return false;
+    }
+
+    // 3. Verify large page reservation and alignment
+    let large = unsafe { win32_virtual_alloc_large_pages(LARGE_PAGE_SIZE, PAGE_READWRITE) };
+    if large.is_null() || (large as usize % LARGE_PAGE_SIZE != 0) {
+        return false;
+    }
+
+    // 4. Verify decommit and release lifecycle
+    if unsafe { !win32_virtual_free(res, 0x1000, MEM_DECOMMIT) } {
+        return false;
+    }
+    if unsafe { !win32_virtual_free(res, 0, MEM_RELEASE) } {
+        return false;
+    }
+    if unsafe { !win32_virtual_free(large, 0, MEM_RELEASE) } {
+        return false;
+    }
+
+    // 5. Verify dynamic heap creation, allocation, zeroing, reallocation, and destroy
+    let heap = unsafe { win32_heap_create(0, 4096, 0) };
+    if heap == 0 {
+        return false;
+    }
+
+    let p_block = unsafe { win32_heap_alloc(heap, HEAP_ZERO_MEMORY, 64) };
+    if p_block.is_null() {
+        return false;
+    }
+    for i in 0..64 {
+        if unsafe { *p_block.add(i) } != 0 {
+            return false;
+        }
+    }
+    unsafe { core::ptr::write_bytes(p_block, 0xEE, 64); }
+
+    let p_realloc = unsafe { win32_heap_realloc(heap, 0, p_block, 128) };
+    if p_realloc.is_null() {
+        return false;
+    }
+    if unsafe { *p_realloc } != 0xEE {
+        return false;
+    }
+
+    // 6. Verify cache-line aligned gaming sub-allocator
+    let p_aligned64 = unsafe { win32_heap_alloc_aligned(heap, 0, 128, 64) };
+    if p_aligned64.is_null() || (p_aligned64 as usize % 64 != 0) {
+        return false;
+    }
+    if unsafe { !win32_heap_validate(heap, 0, p_aligned64) } {
+        return false;
+    }
+    let sz = unsafe { win32_heap_size(heap, 0, p_aligned64) };
+    if sz != 128 {
+        return false;
+    }
+    if unsafe { !win32_heap_free_aligned(heap, 0, p_aligned64) } {
+        return false;
+    }
+
+    if unsafe { !win32_heap_free(heap, 0, p_realloc) } {
+        return false;
+    }
+    if unsafe { !win32_heap_destroy(heap) } {
+        return false;
+    }
+
+    // 7. Verify default process heap query
+    let proc_heap = unsafe { win32_get_process_heap() };
+    if proc_heap == 0 {
+        return false;
+    }
+    let mut heaps = [0usize; 4];
+    let num_heaps = unsafe { win32_get_process_heaps(4, heaps.as_mut_ptr()) };
+    if num_heaps == 0 || heaps[0] != proc_heap {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-VIRT-MEM-PASS] Win32 virtual memory and heap subsystem verified\r\n");
+    true
 }
