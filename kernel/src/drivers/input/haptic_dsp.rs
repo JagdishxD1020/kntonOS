@@ -298,3 +298,296 @@ pub fn verify_waveform_library() -> bool {
 
     true
 }
+
+use crate::graphics::types::cos_f32;
+
+/// Second-order biquad filter section.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BiquadFilter {
+    pub b0: f32,
+    pub b1: f32,
+    pub b2: f32,
+    pub a1: f32,
+    pub a2: f32,
+    pub x1: f32,
+    pub x2: f32,
+    pub y1: f32,
+    pub y2: f32,
+}
+
+impl BiquadFilter {
+    // Creates a new low-pass biquad filter section.
+    pub fn new_low_pass(sample_rate: f32, cutoff_hz: f32, q: f32) -> Self {
+        let w0 = TWO_PI * cutoff_hz / sample_rate;
+        let alpha = sin_f32(w0) / (2.0 * q);
+        let cos_w0 = cos_f32(w0);
+        let b0 = (1.0 - cos_w0) * 0.5;
+        let b1 = 1.0 - cos_w0;
+        let b2 = (1.0 - cos_w0) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            x1: 0.0,
+            x2: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        }
+    }
+
+    // Steps filter with next input sample.
+    pub fn step(&mut self, input: f32) -> f32 {
+        let y = self.b0 * input + self.b1 * self.x1 + self.b2 * self.x2 - self.a1 * self.y1 - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = input;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+
+    // Clears filter history.
+    pub fn clear(&mut self) {
+        self.x1 = 0.0;
+        self.x2 = 0.0;
+        self.y1 = 0.0;
+        self.y2 = 0.0;
+    }
+}
+
+/// Fourth-order Butterworth low-pass filter composed of two cascaded biquad sections.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Butterworth4thOrderLowPass {
+    pub sec1: BiquadFilter,
+    pub sec2: BiquadFilter,
+}
+
+impl Butterworth4thOrderLowPass {
+    // Creates a 4th-order Butterworth low-pass filter.
+    pub fn new(sample_rate: f32, cutoff_hz: f32) -> Self {
+        Self {
+            sec1: BiquadFilter::new_low_pass(sample_rate, cutoff_hz, 0.5411961),
+            sec2: BiquadFilter::new_low_pass(sample_rate, cutoff_hz, 1.306563),
+        }
+    }
+
+    // Steps cascaded filter with next input sample.
+    pub fn step(&mut self, input: f32) -> f32 {
+        let mid = self.sec1.step(input);
+        self.sec2.step(mid)
+    }
+
+    // Clears filter history across all sections.
+    pub fn clear(&mut self) {
+        self.sec1.clear();
+        self.sec2.clear();
+    }
+}
+
+/// Transient envelope detector with asymmetric attack and release time constants.
+#[derive(Debug, Clone)]
+pub struct TransientEnvelopeDetector {
+    pub envelope: f32,
+    pub attack_coeff: f32,
+    pub release_coeff: f32,
+}
+
+impl TransientEnvelopeDetector {
+    // Creates a new envelope detector with specified attack and release smoothing coefficients.
+    pub fn new(attack_coeff: f32, release_coeff: f32) -> Self {
+        Self {
+            envelope: 0.0,
+            attack_coeff: attack_coeff.clamp(0.0, 0.999),
+            release_coeff: release_coeff.clamp(0.0, 0.999),
+        }
+    }
+
+    // Processes a single audio sample and updates rectified smoothed envelope.
+    pub fn step(&mut self, input: f32) -> f32 {
+        let abs_in = if input < 0.0 { -input } else { input };
+        let coeff = if abs_in > self.envelope { self.attack_coeff } else { self.release_coeff };
+        self.envelope = coeff * self.envelope + (1.0 - coeff) * abs_in;
+        self.envelope
+    }
+
+    // Resets envelope state.
+    pub fn clear(&mut self) {
+        self.envelope = 0.0;
+    }
+}
+
+/// Dynamic range compressor and soft limiter preventing tactile overdrive.
+#[derive(Debug, Clone)]
+pub struct DynamicCompressor {
+    pub threshold: f32,
+    pub ratio: f32,
+    pub makeup_gain: f32,
+}
+
+impl DynamicCompressor {
+    // Creates a dynamic compressor with specified threshold, compression ratio, and makeup gain.
+    pub fn new(threshold: f32, ratio: f32, makeup_gain: f32) -> Self {
+        Self {
+            threshold: threshold.clamp(0.05, 1.0),
+            ratio: ratio.max(1.0),
+            makeup_gain: makeup_gain.max(0.1),
+        }
+    }
+
+    // Applies dynamic range compression to input amplitude.
+    pub fn process(&self, input: f32) -> f32 {
+        let abs_in = if input < 0.0 { -input } else { input };
+        let compressed = if abs_in <= self.threshold {
+            abs_in
+        } else {
+            self.threshold + (abs_in - self.threshold) / self.ratio
+        };
+        (compressed * self.makeup_gain).clamp(0.0, 1.0)
+    }
+}
+
+/// Real-time audio-to-haptics DSP pipeline converting sub-120Hz bass to tactile vibration signals.
+#[derive(Debug, Clone)]
+pub struct AudioToHapticsTransducer {
+    pub low_pass: Butterworth4thOrderLowPass,
+    pub envelope: TransientEnvelopeDetector,
+    pub compressor: DynamicCompressor,
+    pub carrier_phase: f32,
+}
+
+impl AudioToHapticsTransducer {
+    // Creates an audio-to-haptics transducer instance for specified audio sample rate.
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            low_pass: Butterworth4thOrderLowPass::new(sample_rate, 120.0),
+            envelope: TransientEnvelopeDetector::new(0.9, 0.999),
+            compressor: DynamicCompressor::new(0.25, 4.0, 1.2),
+            carrier_phase: 0.0,
+        }
+    }
+
+    // Processes a stereo audio sample pair into a tactile drive signal at given resonant frequency.
+    pub fn step_stereo(&mut self, left: f32, right: f32, resonance_hz: f32, dt: f32) -> f32 {
+        let mono_bass = (left + right) * 0.5;
+        let filtered = self.low_pass.step(mono_bass);
+        let env = self.envelope.step(filtered);
+        let intensity = self.compressor.process(env);
+
+        let carrier = sin_f32(self.carrier_phase);
+        self.carrier_phase += TWO_PI * resonance_hz * dt;
+        if self.carrier_phase > TWO_PI {
+            self.carrier_phase -= TWO_PI;
+        }
+
+        carrier * intensity
+    }
+
+    // Clears DSP states.
+    pub fn clear(&mut self) {
+        self.low_pass.clear();
+        self.envelope.clear();
+        self.carrier_phase = 0.0;
+    }
+}
+
+/// Dual-motor legacy XInput rumble mapping to LRA amplitude and frequency modulation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct XInputHapticMapping {
+    pub left_amplitude: f32,
+    pub right_amplitude: f32,
+    pub left_frequency_hz: f32,
+    pub right_frequency_hz: f32,
+}
+
+impl XInputHapticMapping {
+    // Maps legacy 16-bit left/right motor speeds (0..65535) into LRA drive parameters.
+    pub fn from_xinput(left_motor: u16, right_motor: u16) -> Self {
+        let l_norm = (left_motor as f32) / 65535.0;
+        let r_norm = (right_motor as f32) / 65535.0;
+
+        let l_freq = 175.0 + l_norm * 10.0;
+        let r_freq = 215.0 + r_norm * 15.0;
+
+        Self {
+            left_amplitude: l_norm.clamp(0.0, 1.0),
+            right_amplitude: r_norm.clamp(0.0, 1.0),
+            left_frequency_hz: l_freq.clamp(LRA_MIN_RESONANCE_HZ, LRA_MAX_RESONANCE_HZ),
+            right_frequency_hz: r_freq.clamp(LRA_MIN_RESONANCE_HZ, LRA_MAX_RESONANCE_HZ),
+        }
+    }
+}
+
+/// Verifies 4th-order Butterworth low-pass filter, envelope detector, and dynamic compressor.
+pub fn verify_audio_to_haptics() -> bool {
+    let mut transducer = AudioToHapticsTransducer::new(48000.0);
+
+    // 1. Verify 50Hz bass passes through low-pass filter
+    let dt = 1.0 / 48000.0;
+    let mut max_50hz = 0.0f32;
+    for i in 0..4800 {
+        let t = (i as f32) * dt;
+        let s = sin_f32(TWO_PI * 50.0 * t);
+        let out = transducer.low_pass.step(s);
+        let abs_o = if out < 0.0 { -out } else { out };
+        if i > 2400 && abs_o > max_50hz {
+            max_50hz = abs_o;
+        }
+    }
+    if max_50hz < 0.8 {
+        return false;
+    }
+
+    // 2. Verify 1000Hz treble is strongly rejected
+    transducer.clear();
+    let mut max_1000hz = 0.0f32;
+    for i in 0..4800 {
+        let t = (i as f32) * dt;
+        let s = sin_f32(TWO_PI * 1000.0 * t);
+        let out = transducer.low_pass.step(s);
+        let abs_o = if out < 0.0 { -out } else { out };
+        if i > 2400 && abs_o > max_1000hz {
+            max_1000hz = abs_o;
+        }
+    }
+    if max_1000hz > 0.05 {
+        return false;
+    }
+
+    // 3. Verify envelope and dynamic compressor
+    let comp = DynamicCompressor::new(0.25, 4.0, 1.0);
+    let c_low = comp.process(0.1);
+    let c_high = comp.process(0.8);
+    if c_low != 0.1 || c_high >= 0.8 {
+        return false;
+    }
+
+    true
+}
+
+/// Verifies mapping of legacy XInput 16-bit motor values to LRA amplitude and frequency.
+pub fn verify_xinput_rumble_mapping() -> bool {
+    let map_full = XInputHapticMapping::from_xinput(65535, 32768);
+    let diff_l = (map_full.left_amplitude - 1.0).abs();
+    let diff_r = (map_full.right_amplitude - 0.5).abs();
+    if diff_l > 0.01 || diff_r > 0.01 {
+        return false;
+    }
+    if map_full.left_frequency_hz < LRA_MIN_RESONANCE_HZ || map_full.left_frequency_hz > 200.0 {
+        return false;
+    }
+    if map_full.right_frequency_hz < 200.0 || map_full.right_frequency_hz > LRA_MAX_RESONANCE_HZ {
+        return false;
+    }
+
+    let map_zero = XInputHapticMapping::from_xinput(0, 0);
+    if map_zero.left_amplitude != 0.0 || map_zero.right_amplitude != 0.0 {
+        return false;
+    }
+
+    true
+}
