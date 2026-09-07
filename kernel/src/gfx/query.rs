@@ -363,3 +363,74 @@ impl GpuTimestampProfiler {
         heap.end_query(D3D12_QUERY_TYPE::Timestamp, slot_index, current_gpu_ticks, None)
     }
 }
+
+// Hardware pipeline statistics counter accumulator
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineStatisticsAccumulator {
+    pub current: D3D12_QUERY_DATA_PIPELINE_STATISTICS,
+    pub baseline: D3D12_QUERY_DATA_PIPELINE_STATISTICS,
+}
+
+impl PipelineStatisticsAccumulator {
+    // Construct new empty pipeline statistics accumulator
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Reset accumulated statistics counters to zero
+    pub fn reset(&mut self) {
+        self.current = D3D12_QUERY_DATA_PIPELINE_STATISTICS::default();
+        self.baseline = D3D12_QUERY_DATA_PIPELINE_STATISTICS::default();
+    }
+
+    // Accumulate draw call geometry and rasterizer pipeline metrics
+    pub fn record_draw(&mut self, vertex_count: u64, primitive_count: u64, estimated_pixels: u64) {
+        self.current.ia_vertices += vertex_count;
+        self.current.ia_primitives += primitive_count;
+        self.current.vs_invocations += vertex_count;
+        self.current.c_invocations += primitive_count;
+        self.current.c_primitives += primitive_count;
+        self.current.ps_invocations += estimated_pixels;
+    }
+
+    // Accumulate compute shader dispatch execution metrics
+    pub fn record_dispatch(&mut self, groups_x: u64, groups_y: u64, groups_z: u64, threads_per_group: u64) {
+        let total_groups = groups_x * groups_y * groups_z;
+        self.current.cs_invocations += total_groups * threads_per_group;
+    }
+
+    // Snapshot active pipeline statistics counters
+    pub fn snapshot(&self) -> D3D12_QUERY_DATA_PIPELINE_STATISTICS {
+        self.current
+    }
+
+    // Compute differential statistics relative to query begin baseline
+    pub fn delta_from_baseline(&self) -> D3D12_QUERY_DATA_PIPELINE_STATISTICS {
+        D3D12_QUERY_DATA_PIPELINE_STATISTICS {
+            ia_vertices: self.current.ia_vertices.saturating_sub(self.baseline.ia_vertices),
+            ia_primitives: self.current.ia_primitives.saturating_sub(self.baseline.ia_primitives),
+            vs_invocations: self.current.vs_invocations.saturating_sub(self.baseline.vs_invocations),
+            gs_invocations: self.current.gs_invocations.saturating_sub(self.baseline.gs_invocations),
+            gs_primitives: self.current.gs_primitives.saturating_sub(self.baseline.gs_primitives),
+            c_invocations: self.current.c_invocations.saturating_sub(self.baseline.c_invocations),
+            c_primitives: self.current.c_primitives.saturating_sub(self.baseline.c_primitives),
+            ps_invocations: self.current.ps_invocations.saturating_sub(self.baseline.ps_invocations),
+            hs_invocations: self.current.hs_invocations.saturating_sub(self.baseline.hs_invocations),
+            ds_invocations: self.current.ds_invocations.saturating_sub(self.baseline.ds_invocations),
+            cs_invocations: self.current.cs_invocations.saturating_sub(self.baseline.cs_invocations),
+        }
+    }
+
+    // Begin pipeline statistics measurement recording baseline
+    pub fn begin_query(&mut self, heap: &mut D3D12QueryHeap, slot_index: u32) -> Result<(), QueryError> {
+        heap.begin_query(D3D12_QUERY_TYPE::PipelineStatistics, slot_index)?;
+        self.baseline = self.current;
+        Ok(())
+    }
+
+    // End pipeline statistics measurement recording delta into query slot
+    pub fn end_query(&mut self, heap: &mut D3D12QueryHeap, slot_index: u32) -> Result<(), QueryError> {
+        let delta = self.delta_from_baseline();
+        heap.end_query(D3D12_QUERY_TYPE::PipelineStatistics, slot_index, 0, Some(delta))
+    }
+}
