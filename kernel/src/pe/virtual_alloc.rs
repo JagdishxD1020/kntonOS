@@ -244,3 +244,205 @@ pub unsafe fn win32_virtual_alloc_large_pages(
         fl_protect,
     )
 }
+
+use alloc::collections::BTreeMap;
+
+pub use crate::pe::synch::HANDLE;
+
+pub const HEAP_NO_SERIALIZE: u32 = 0x0000_0001;
+pub const HEAP_GENERATE_EXCEPTIONS: u32 = 0x0000_0004;
+pub const HEAP_ZERO_MEMORY: u32 = 0x0000_0008;
+pub const HEAP_REALLOC_IN_PLACE_ONLY: u32 = 0x0000_0010;
+
+#[derive(Debug, Clone)]
+pub struct HeapBlock {
+    pub ptr: usize,
+    pub size: usize,
+    pub user_size: usize,
+    pub in_use: bool,
+}
+
+#[derive(Debug)]
+pub struct Win32Heap {
+    pub handle: HANDLE,
+    pub flags: u32,
+    pub initial_size: usize,
+    pub maximum_size: usize,
+    pub base_address: usize,
+    pub current_offset: usize,
+    pub blocks: Vec<HeapBlock>,
+}
+
+static NEXT_HEAP_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x0007_0001);
+static HEAP_TABLE: Spinlock<BTreeMap<HANDLE, Win32Heap>> = Spinlock::new(BTreeMap::new());
+
+/// Creates a private heap object that can be used by the calling process.
+pub unsafe fn win32_heap_create(
+    fl_options: u32,
+    dw_initial_size: usize,
+    dw_maximum_size: usize,
+) -> HANDLE {
+    let mut gen = NEXT_HEAP_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let init_size = if dw_initial_size > 0 { dw_initial_size } else { 64 * 1024 };
+    let base = win32_virtual_alloc(
+        core::ptr::null_mut(),
+        init_size,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_READWRITE,
+    ) as usize;
+
+    if base == 0 {
+        return 0;
+    }
+
+    let heap = Win32Heap {
+        handle,
+        flags: fl_options,
+        initial_size: init_size,
+        maximum_size: dw_maximum_size,
+        base_address: base,
+        current_offset: 0,
+        blocks: Vec::new(),
+    };
+
+    let mut table = HEAP_TABLE.lock();
+    table.insert(handle, heap);
+    handle
+}
+
+/// Allocates a block of memory from a heap.
+pub unsafe fn win32_heap_alloc(
+    h_heap: HANDLE,
+    dw_flags: u32,
+    dw_bytes: usize,
+) -> *mut u8 {
+    if dw_bytes == 0 {
+        return core::ptr::null_mut();
+    }
+
+    let mut table = HEAP_TABLE.lock();
+    let heap = match table.get_mut(&h_heap) {
+        Some(h) => h,
+        None => return core::ptr::null_mut(),
+    };
+
+    // 16-byte standard aligned allocation
+    let align = 16;
+    let aligned_size = (dw_bytes + align - 1) & !(align - 1);
+
+    // Look for reusable freed block
+    if let Some(block) = heap.blocks.iter_mut().find(|b| !b.in_use && b.size >= aligned_size) {
+        block.in_use = true;
+        block.user_size = dw_bytes;
+        let ptr = block.ptr as *mut u8;
+        if (dw_flags & HEAP_ZERO_MEMORY) != 0 || (heap.flags & HEAP_ZERO_MEMORY) != 0 {
+            core::ptr::write_bytes(ptr, 0, dw_bytes);
+        }
+        return ptr;
+    }
+
+    if heap.current_offset + aligned_size > heap.initial_size {
+        return core::ptr::null_mut();
+    }
+
+    let block_addr = heap.base_address + heap.current_offset;
+    heap.current_offset += aligned_size;
+
+    let ptr = block_addr as *mut u8;
+    if (dw_flags & HEAP_ZERO_MEMORY) != 0 || (heap.flags & HEAP_ZERO_MEMORY) != 0 {
+        core::ptr::write_bytes(ptr, 0, dw_bytes);
+    }
+
+    heap.blocks.push(HeapBlock {
+        ptr: block_addr,
+        size: aligned_size,
+        user_size: dw_bytes,
+        in_use: true,
+    });
+
+    ptr
+}
+
+/// Reallocates a block of memory from a heap.
+pub unsafe fn win32_heap_realloc(
+    h_heap: HANDLE,
+    dw_flags: u32,
+    lp_mem: *mut u8,
+    dw_bytes: usize,
+) -> *mut u8 {
+    if lp_mem.is_null() {
+        return win32_heap_alloc(h_heap, dw_flags, dw_bytes);
+    }
+    if dw_bytes == 0 {
+        win32_heap_free(h_heap, dw_flags, lp_mem);
+        return core::ptr::null_mut();
+    }
+
+    let mem_addr = lp_mem as usize;
+    let old_user_size = {
+        let table = HEAP_TABLE.lock();
+        let heap = match table.get(&h_heap) {
+            Some(h) => h,
+            None => return core::ptr::null_mut(),
+        };
+        match heap.blocks.iter().find(|b| b.ptr == mem_addr && b.in_use) {
+            Some(b) => b.user_size,
+            None => return core::ptr::null_mut(),
+        }
+    };
+
+    let new_ptr = win32_heap_alloc(h_heap, dw_flags, dw_bytes);
+    if new_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let copy_bytes = old_user_size.min(dw_bytes);
+    core::ptr::copy_nonoverlapping(lp_mem, new_ptr, copy_bytes);
+
+    if dw_bytes > old_user_size && ((dw_flags & HEAP_ZERO_MEMORY) != 0) {
+        core::ptr::write_bytes(new_ptr.add(old_user_size), 0, dw_bytes - old_user_size);
+    }
+
+    win32_heap_free(h_heap, dw_flags, lp_mem);
+    new_ptr
+}
+
+/// Frees a memory block allocated from a heap.
+pub unsafe fn win32_heap_free(
+    h_heap: HANDLE,
+    _dw_flags: u32,
+    lp_mem: *mut u8,
+) -> bool {
+    if lp_mem.is_null() {
+        return false;
+    }
+
+    let mem_addr = lp_mem as usize;
+    let mut table = HEAP_TABLE.lock();
+    let heap = match table.get_mut(&h_heap) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    if let Some(block) = heap.blocks.iter_mut().find(|b| b.ptr == mem_addr && b.in_use) {
+        block.in_use = false;
+        true
+    } else {
+        false
+    }
+}
+
+/// Destroys the specified heap object.
+pub unsafe fn win32_heap_destroy(h_heap: HANDLE) -> bool {
+    let mut table = HEAP_TABLE.lock();
+    if let Some(heap) = table.remove(&h_heap) {
+        win32_virtual_free(heap.base_address as *mut u8, 0, MEM_RELEASE);
+        true
+    } else {
+        false
+    }
+}
