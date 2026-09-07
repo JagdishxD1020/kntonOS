@@ -132,3 +132,167 @@ pub enum QueryError {
     SlotNotResolved,
     ResolveBufferOutOfBounds,
 }
+
+// Recorded query commands for command buffer encoding
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedQueryCommand {
+    BeginQuery {
+        query_type: D3D12_QUERY_TYPE,
+        slot_index: u32,
+    },
+    EndQuery {
+        query_type: D3D12_QUERY_TYPE,
+        slot_index: u32,
+    },
+    ResolveQueryData {
+        query_type: D3D12_QUERY_TYPE,
+        start_index: u32,
+        num_queries: u32,
+        destination_offset: usize,
+    },
+}
+
+impl D3D12QueryHeap {
+    // Begin query measurement on a specific slot (invalid for timestamp queries)
+    pub fn begin_query(&mut self, query_type: D3D12_QUERY_TYPE, slot_index: u32) -> Result<(), QueryError> {
+        self.validate_query_type(query_type)?;
+        if query_type == D3D12_QUERY_TYPE::Timestamp {
+            return Err(QueryError::InvalidQueryType);
+        }
+
+        let slot = self.slots.get_mut(slot_index as usize).ok_or(QueryError::InvalidSlotIndex)?;
+        if slot.is_active {
+            return Err(QueryError::QueryAlreadyActive);
+        }
+
+        slot.is_active = true;
+        slot.is_resolved = false;
+        Ok(())
+    }
+
+    // End query measurement and record raw GPU payload or pipeline statistics
+    pub fn end_query(
+        &mut self,
+        query_type: D3D12_QUERY_TYPE,
+        slot_index: u32,
+        raw_val: u64,
+        stats: Option<D3D12_QUERY_DATA_PIPELINE_STATISTICS>,
+    ) -> Result<(), QueryError> {
+        self.validate_query_type(query_type)?;
+        let slot = self.slots.get_mut(slot_index as usize).ok_or(QueryError::InvalidSlotIndex)?;
+
+        if query_type != D3D12_QUERY_TYPE::Timestamp && !slot.is_active {
+            return Err(QueryError::QueryNotActive);
+        }
+
+        slot.is_active = false;
+        slot.raw_data = raw_val;
+        slot.stats = stats;
+        slot.is_resolved = true;
+        Ok(())
+    }
+
+    // Resolve query results into CPU or GPU memory buffer
+    pub fn resolve_query_data(
+        &self,
+        query_type: D3D12_QUERY_TYPE,
+        start_index: u32,
+        num_queries: u32,
+        destination_buffer: &mut [u8],
+        dest_offset: usize,
+    ) -> Result<usize, QueryError> {
+        self.validate_query_type(query_type)?;
+        let end_index = (start_index + num_queries) as usize;
+        if end_index > self.slots.len() {
+            return Err(QueryError::InvalidSlotIndex);
+        }
+
+        let stride = match query_type {
+            D3D12_QUERY_TYPE::Occlusion | D3D12_QUERY_TYPE::BinaryOcclusion | D3D12_QUERY_TYPE::Timestamp => 8,
+            D3D12_QUERY_TYPE::PipelineStatistics => 88,
+        };
+
+        let total_bytes = stride * num_queries as usize;
+        if dest_offset + total_bytes > destination_buffer.len() {
+            return Err(QueryError::ResolveBufferOutOfBounds);
+        }
+
+        for i in 0..num_queries as usize {
+            let slot = &self.slots[(start_index as usize) + i];
+            let out_pos = dest_offset + (i * stride);
+
+            match query_type {
+                D3D12_QUERY_TYPE::Occlusion | D3D12_QUERY_TYPE::Timestamp => {
+                    destination_buffer[out_pos..out_pos + 8].copy_from_slice(&slot.raw_data.to_le_bytes());
+                }
+                D3D12_QUERY_TYPE::BinaryOcclusion => {
+                    let binary_val: u64 = if slot.raw_data > 0 { 1 } else { 0 };
+                    destination_buffer[out_pos..out_pos + 8].copy_from_slice(&binary_val.to_le_bytes());
+                }
+                D3D12_QUERY_TYPE::PipelineStatistics => {
+                    let default_stats = D3D12_QUERY_DATA_PIPELINE_STATISTICS::default();
+                    let s = slot.stats.as_ref().unwrap_or(&default_stats);
+                    destination_buffer[out_pos..out_pos + 8].copy_from_slice(&s.ia_vertices.to_le_bytes());
+                    destination_buffer[out_pos + 8..out_pos + 16].copy_from_slice(&s.ia_primitives.to_le_bytes());
+                    destination_buffer[out_pos + 16..out_pos + 24].copy_from_slice(&s.vs_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 24..out_pos + 32].copy_from_slice(&s.gs_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 32..out_pos + 40].copy_from_slice(&s.gs_primitives.to_le_bytes());
+                    destination_buffer[out_pos + 40..out_pos + 48].copy_from_slice(&s.c_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 48..out_pos + 56].copy_from_slice(&s.c_primitives.to_le_bytes());
+                    destination_buffer[out_pos + 56..out_pos + 64].copy_from_slice(&s.ps_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 64..out_pos + 72].copy_from_slice(&s.hs_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 72..out_pos + 80].copy_from_slice(&s.ds_invocations.to_le_bytes());
+                    destination_buffer[out_pos + 80..out_pos + 88].copy_from_slice(&s.cs_invocations.to_le_bytes());
+                }
+            }
+        }
+
+        Ok(total_bytes)
+    }
+}
+
+// Command stream query recorder mimicking command list interface
+pub struct QueryCommandRecorder {
+    pub commands: Vec<RecordedQueryCommand>,
+}
+
+impl QueryCommandRecorder {
+    // Construct new empty query command recorder
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+        }
+    }
+
+    // Record BeginQuery command
+    pub fn record_begin_query(&mut self, query_type: D3D12_QUERY_TYPE, slot_index: u32) {
+        self.commands.push(RecordedQueryCommand::BeginQuery {
+            query_type,
+            slot_index,
+        });
+    }
+
+    // Record EndQuery command
+    pub fn record_end_query(&mut self, query_type: D3D12_QUERY_TYPE, slot_index: u32) {
+        self.commands.push(RecordedQueryCommand::EndQuery {
+            query_type,
+            slot_index,
+        });
+    }
+
+    // Record ResolveQueryData command
+    pub fn record_resolve_query_data(
+        &mut self,
+        query_type: D3D12_QUERY_TYPE,
+        start_index: u32,
+        num_queries: u32,
+        destination_offset: usize,
+    ) {
+        self.commands.push(RecordedQueryCommand::ResolveQueryData {
+            query_type,
+            start_index,
+            num_queries,
+            destination_offset,
+        });
+    }
+}
