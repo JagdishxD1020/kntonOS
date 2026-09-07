@@ -922,3 +922,193 @@ pub fn verify_motion_transfer_and_yaw_autocentering() -> bool {
 
     true
 }
+
+// Handheld IMU hardware device profiles.
+
+/// Supported handheld gaming device hardware IMU profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldDeviceType {
+    SteamDeck,
+    RogAlly,
+    LegionGo,
+}
+
+impl HandheldDeviceType {
+    // Gyroscope sensitivity in LSB per degree-per-second (e.g. ±2000 dps full-scale).
+    pub const fn gyro_lsb_per_dps(&self) -> f32 {
+        match self {
+            Self::SteamDeck => 16.4,   // ±2000 dps (16-bit 65536 / 4000)
+            Self::RogAlly => 16.4,     // ±2000 dps
+            Self::LegionGo => 16.384,  // ±2000 dps
+        }
+    }
+
+    // Accelerometer sensitivity in LSB per m/s^2 (e.g. ±8g full-scale).
+    pub const fn accel_lsb_per_g(&self) -> f32 {
+        match self {
+            Self::SteamDeck => 4096.0, // ±8g
+            Self::RogAlly => 4096.0,   // ±8g
+            Self::LegionGo => 4096.0,  // ±8g
+        }
+    }
+}
+
+/// Raw 6-axis inertial measurement unit (IMU) packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Imu6AxisRawSample {
+    pub raw_accel_x: i16,
+    pub raw_accel_y: i16,
+    pub raw_accel_z: i16,
+    pub raw_gyro_x: i16,
+    pub raw_gyro_y: i16,
+    pub raw_gyro_z: i16,
+    pub timestamp_us: u64,
+}
+
+/// Calibrated and physical unit-scaled 6-axis IMU measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImuCalibratedSample {
+    pub accel_g: (f32, f32, f32),
+    pub gyro_dps: (f32, f32, f32),
+    pub timestamp_us: u64,
+}
+
+/// IMU calibration and sensitivity scaling supervisor.
+#[derive(Debug, Clone)]
+pub struct ImuCalibrationManager {
+    pub device: HandheldDeviceType,
+    pub gyro_bias_dps: (f32, f32, f32),
+    pub accel_bias_g: (f32, f32, f32),
+    pub bias_accumulator_gyro: (f32, f32, f32),
+    pub bias_accumulator_accel: (f32, f32, f32),
+    pub sample_count: usize,
+    pub is_calibrated: bool,
+}
+
+impl ImuCalibrationManager {
+    // Creates a new IMU calibration manager for specified handheld device profile.
+    pub fn new(device: HandheldDeviceType) -> Self {
+        Self {
+            device,
+            gyro_bias_dps: (0.0, 0.0, 0.0),
+            accel_bias_g: (0.0, 0.0, 0.0),
+            bias_accumulator_gyro: (0.0, 0.0, 0.0),
+            bias_accumulator_accel: (0.0, 0.0, 0.0),
+            sample_count: 0,
+            is_calibrated: false,
+        }
+    }
+
+    // Accumulates a stationary raw sample into calibration average.
+    pub fn accumulate_sample(&mut self, sample: &Imu6AxisRawSample) {
+        let g_scale = self.device.gyro_lsb_per_dps();
+        let a_scale = self.device.accel_lsb_per_g();
+
+        let gx = (sample.raw_gyro_x as f32) / g_scale;
+        let gy = (sample.raw_gyro_y as f32) / g_scale;
+        let gz = (sample.raw_gyro_z as f32) / g_scale;
+
+        let ax = (sample.raw_accel_x as f32) / a_scale;
+        let ay = (sample.raw_accel_y as f32) / a_scale;
+        let az = (sample.raw_accel_z as f32) / a_scale;
+
+        self.bias_accumulator_gyro.0 += gx;
+        self.bias_accumulator_gyro.1 += gy;
+        self.bias_accumulator_gyro.2 += gz;
+
+        self.bias_accumulator_accel.0 += ax;
+        self.bias_accumulator_accel.1 += ay;
+        // Assume z-axis aligned with gravity (1.0g) during static flat calibration
+        self.bias_accumulator_accel.2 += az - 1.0;
+
+        self.sample_count += 1;
+    }
+
+    // Computes bias offsets from accumulated samples.
+    pub fn finalize_calibration(&mut self) -> bool {
+        if self.sample_count == 0 {
+            return false;
+        }
+        let count_f = self.sample_count as f32;
+        self.gyro_bias_dps = (
+            self.bias_accumulator_gyro.0 / count_f,
+            self.bias_accumulator_gyro.1 / count_f,
+            self.bias_accumulator_gyro.2 / count_f,
+        );
+        self.accel_bias_g = (
+            self.bias_accumulator_accel.0 / count_f,
+            self.bias_accumulator_accel.1 / count_f,
+            self.bias_accumulator_accel.2 / count_f,
+        );
+        self.is_calibrated = true;
+        true
+    }
+
+    // Converts raw sensor readings into calibrated physical units.
+    pub fn process_raw(&self, raw: &Imu6AxisRawSample) -> ImuCalibratedSample {
+        let g_scale = self.device.gyro_lsb_per_dps();
+        let a_scale = self.device.accel_lsb_per_g();
+
+        let gx = (raw.raw_gyro_x as f32) / g_scale - self.gyro_bias_dps.0;
+        let gy = (raw.raw_gyro_y as f32) / g_scale - self.gyro_bias_dps.1;
+        let gz = (raw.raw_gyro_z as f32) / g_scale - self.gyro_bias_dps.2;
+
+        let ax = (raw.raw_accel_x as f32) / a_scale - self.accel_bias_g.0;
+        let ay = (raw.raw_accel_y as f32) / a_scale - self.accel_bias_g.1;
+        let az = (raw.raw_accel_z as f32) / a_scale - self.accel_bias_g.2;
+
+        ImuCalibratedSample {
+            accel_g: (ax, ay, az),
+            gyro_dps: (gx, gy, gz),
+            timestamp_us: raw.timestamp_us,
+        }
+    }
+}
+
+/// Verifies IMU raw data parsing, sensitivity scaling, and stationary bias cancellation.
+pub fn verify_imu_hardware_model() -> bool {
+    let mut cal = ImuCalibrationManager::new(HandheldDeviceType::SteamDeck);
+
+    // Feed 10 stationary samples with 1.0 dps gyro drift and 1g vertical gravity
+    let drift_raw_gyro = (16.4 * 1.0) as i16;
+    let gravity_raw_accel = 4096;
+
+    for i in 0..10 {
+        let raw = Imu6AxisRawSample {
+            raw_accel_x: 0,
+            raw_accel_y: 0,
+            raw_accel_z: gravity_raw_accel,
+            raw_gyro_x: drift_raw_gyro,
+            raw_gyro_y: 0,
+            raw_gyro_z: 0,
+            timestamp_us: (i as u64) * 1000,
+        };
+        cal.accumulate_sample(&raw);
+    }
+
+    if !cal.finalize_calibration() {
+        return false;
+    }
+
+    // Calibrated bias must equal ~1.0 dps on X
+    if (cal.gyro_bias_dps.0 - 1.0).abs() > 0.05 {
+        return false;
+    }
+
+    // Process stationary sample: net gyro X should now be zeroed
+    let test_raw = Imu6AxisRawSample {
+        raw_accel_x: 0,
+        raw_accel_y: 0,
+        raw_accel_z: gravity_raw_accel,
+        raw_gyro_x: drift_raw_gyro,
+        raw_gyro_y: 0,
+        raw_gyro_z: 0,
+        timestamp_us: 10000,
+    };
+    let processed = cal.process_raw(&test_raw);
+    if processed.gyro_dps.0.abs() > 0.05 || (processed.accel_g.2 - 1.0).abs() > 0.05 {
+        return false;
+    }
+
+    true
+}
