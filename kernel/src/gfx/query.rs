@@ -296,3 +296,70 @@ impl QueryCommandRecorder {
         });
     }
 }
+
+// Measured GPU timeline execution span in microsecond units
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuExecutionSpan {
+    pub start_ticks: u64,
+    pub end_ticks: u64,
+    pub duration_us: u64,
+    pub label: [u8; 16],
+}
+
+// GPU hardware timestamp clock frequency profiler and calibrator
+pub struct GpuTimestampProfiler {
+    pub frequency_hz: u64,
+}
+
+impl GpuTimestampProfiler {
+    // Construct new GPU timestamp profiler calibrated with hardware timer frequency
+    pub fn new(frequency_hz: u64) -> Self {
+        Self {
+            frequency_hz: if frequency_hz == 0 { 1_000_000_000 } else { frequency_hz },
+        }
+    }
+
+    // Retrieve active GPU timer clock tick frequency in Hertz
+    pub fn get_timestamp_frequency(&self) -> u64 {
+        self.frequency_hz
+    }
+
+    // Convert raw GPU timer ticks to elapsed nanoseconds
+    pub fn ticks_to_nanoseconds(&self, ticks: u64) -> u64 {
+        ((ticks as u128 * 1_000_000_000) / self.frequency_hz as u128) as u64
+    }
+
+    // Convert raw GPU timer ticks to elapsed microseconds
+    pub fn ticks_to_microseconds(&self, ticks: u64) -> u64 {
+        ((ticks as u128 * 1_000_000) / self.frequency_hz as u128) as u64
+    }
+
+    // Calculate execution duration in microseconds between two timestamp ticks
+    pub fn compute_duration_microseconds(&self, start_ticks: u64, end_ticks: u64) -> u64 {
+        let delta = end_ticks.saturating_sub(start_ticks);
+        self.ticks_to_microseconds(delta)
+    }
+
+    // Build execution span descriptor from start and end GPU ticks
+    pub fn calculate_execution_span(&self, start_ticks: u64, end_ticks: u64, label: &[u8]) -> GpuExecutionSpan {
+        let mut name = [0u8; 16];
+        let copy_len = label.len().min(15);
+        name[..copy_len].copy_from_slice(&label[..copy_len]);
+        GpuExecutionSpan {
+            start_ticks,
+            end_ticks,
+            duration_us: self.compute_duration_microseconds(start_ticks, end_ticks),
+            label: name,
+        }
+    }
+
+    // Record timestamp query into query heap slot
+    pub fn record_timestamp(
+        &self,
+        heap: &mut D3D12QueryHeap,
+        slot_index: u32,
+        current_gpu_ticks: u64,
+    ) -> Result<(), QueryError> {
+        heap.end_query(D3D12_QUERY_TYPE::Timestamp, slot_index, current_gpu_ticks, None)
+    }
+}
