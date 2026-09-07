@@ -583,6 +583,10 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_xinput_service_subsystem() {
         serial_write_str("[KNT-PANIC] Userland game controller and XInput runtime service self-test failed!\r\n");
     }
+    // Initialize and verify Handheld PC Haptic Waveform Library & Audio-to-Haptics Transducer Service (TASK-KNT-150)
+    if !drivers::input::test_haptic_dsp_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld haptic waveform and audio transducer engine self-test failed!\r\n");
+    }
 
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
