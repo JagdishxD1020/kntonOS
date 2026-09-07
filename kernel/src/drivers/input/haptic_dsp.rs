@@ -591,3 +591,37 @@ pub fn verify_xinput_rumble_mapping() -> bool {
 
     true
 }
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Handheld PC Haptic Waveform & Audio Transducer Engine.
+pub fn test_haptic_dsp_subsystem() -> bool {
+    serial_write_str("[KNT-INPUT] Testing Handheld PC haptic waveform & audio transducer service...\r\n");
+
+    // 1. Verify actuator hardware model, resonance tracking, and thermal protection
+    if !verify_actuator_model() {
+        serial_write_str("[KNT-PANIC] Haptic actuator model or thermal protection failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify pre-baked tactile waveform library and synthesis engine
+    if !verify_waveform_library() {
+        serial_write_str("[KNT-PANIC] Tactile waveform library synthesis verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify audio-to-haptics 4th-order Butterworth filter, envelope, and compressor
+    if !verify_audio_to_haptics() {
+        serial_write_str("[KNT-PANIC] Audio-to-haptics DSP filter and envelope follower failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify dual-motor legacy XInput rumble mapping
+    if !verify_xinput_rumble_mapping() {
+        serial_write_str("[KNT-PANIC] XInput rumble motor to LRA parameter conversion failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-HAPTIC-DSP-PASS] Handheld haptic waveform and audio transducer engine verified\r\n");
+    true
+}
