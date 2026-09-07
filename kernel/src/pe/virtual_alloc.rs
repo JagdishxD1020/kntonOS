@@ -552,3 +552,60 @@ pub unsafe fn win32_heap_validate(
         heap.blocks.iter().any(|b| b.in_use && (b.ptr == mem_addr || (mem_addr >= b.ptr && mem_addr < b.ptr + b.size)))
     }
 }
+
+static PROCESS_HEAP: Spinlock<HANDLE> = Spinlock::new(0);
+
+/// Retrieves a handle to the default process heap.
+pub unsafe fn win32_get_process_heap() -> HANDLE {
+    let mut ph = PROCESS_HEAP.lock();
+    if *ph == 0 {
+        let handle = win32_heap_create(0, 0x10000, 0);
+        *ph = handle;
+    }
+    *ph
+}
+
+/// Returns the number of active heaps and optionally copies heap handles into the buffer.
+pub unsafe fn win32_get_process_heaps(number_of_heaps: u32, process_heaps: *mut HANDLE) -> u32 {
+    let table = HEAP_TABLE.lock();
+    let total = table.len() as u32;
+
+    if number_of_heaps > 0 && !process_heaps.is_null() {
+        let count = (number_of_heaps as usize).min(table.len());
+        for (i, &handle) in table.keys().take(count).enumerate() {
+            *process_heaps.add(i) = handle;
+        }
+    }
+
+    total
+}
+
+/// Retrieves the size of a memory block allocated from a heap.
+pub unsafe fn win32_heap_size(h_heap: HANDLE, _dw_flags: u32, lp_mem: *const u8) -> usize {
+    if lp_mem.is_null() {
+        return usize::MAX;
+    }
+
+    let table = HEAP_TABLE.lock();
+    let heap = match table.get(&h_heap) {
+        Some(h) => h,
+        None => return usize::MAX,
+    };
+
+    let mem_addr = lp_mem as usize;
+    for block in heap.blocks.iter() {
+        if block.in_use {
+            if block.ptr == mem_addr {
+                return block.size;
+            }
+            if mem_addr > block.ptr && mem_addr < block.ptr + block.size {
+                let header = &*(block.ptr as *const BlockHeader);
+                if header.magic == BLOCK_MAGIC_TAG {
+                    return header.size;
+                }
+            }
+        }
+    }
+
+    usize::MAX
+}
