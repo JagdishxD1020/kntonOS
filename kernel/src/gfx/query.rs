@@ -434,3 +434,65 @@ impl PipelineStatisticsAccumulator {
         heap.end_query(D3D12_QUERY_TYPE::PipelineStatistics, slot_index, 0, Some(delta))
     }
 }
+
+// Hardware occlusion query evaluation and visibility culler
+pub struct OcclusionCullingEngine;
+
+impl OcclusionCullingEngine {
+    // Begin occlusion query on proxy bounding geometry
+    pub fn begin_query(
+        heap: &mut D3D12QueryHeap,
+        slot_index: u32,
+        binary: bool,
+    ) -> Result<(), QueryError> {
+        let q_type = if binary {
+            D3D12_QUERY_TYPE::BinaryOcclusion
+        } else {
+            D3D12_QUERY_TYPE::Occlusion
+        };
+        heap.begin_query(q_type, slot_index)
+    }
+
+    // End occlusion query recording rendered sample count or binary visibility
+    pub fn end_query(
+        heap: &mut D3D12QueryHeap,
+        slot_index: u32,
+        samples_passed: u64,
+        binary: bool,
+    ) -> Result<(), QueryError> {
+        let q_type = if binary {
+            D3D12_QUERY_TYPE::BinaryOcclusion
+        } else {
+            D3D12_QUERY_TYPE::Occlusion
+        };
+        let stored_val = if binary {
+            if samples_passed > 0 { 1 } else { 0 }
+        } else {
+            samples_passed
+        };
+        heap.end_query(q_type, slot_index, stored_val, None)
+    }
+
+    // Evaluate visibility status of a resolved occlusion query slot
+    pub fn is_visible(heap: &D3D12QueryHeap, slot_index: u32) -> Result<bool, QueryError> {
+        let slot = heap.slots.get(slot_index as usize).ok_or(QueryError::InvalidSlotIndex)?;
+        if !slot.is_resolved {
+            return Err(QueryError::SlotNotResolved);
+        }
+        Ok(slot.raw_data > 0)
+    }
+
+    // Filter array of candidate instance slots, returning only visible indices
+    pub fn filter_visible_instances(
+        heap: &D3D12QueryHeap,
+        candidate_slots: &[u32],
+    ) -> Result<Vec<u32>, QueryError> {
+        let mut visible = Vec::new();
+        for &slot_idx in candidate_slots {
+            if Self::is_visible(heap, slot_idx)? {
+                visible.push(slot_idx);
+            }
+        }
+        Ok(visible)
+    }
+}
