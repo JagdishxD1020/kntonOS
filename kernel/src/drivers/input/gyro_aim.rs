@@ -1112,3 +1112,109 @@ pub fn verify_imu_hardware_model() -> bool {
 
     true
 }
+
+use crate::drivers::input::imu::{atan2_f32, sqrt_f32, RAD_TO_DEG};
+
+/// Real-time complementary orientation filter fusing gyro angular rates and accelerometer gravity vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComplementaryOrientationFilter {
+    pub alpha: f32,
+    pub pitch_deg: f32,
+    pub roll_deg: f32,
+    pub yaw_deg: f32,
+    pub is_initialized: bool,
+}
+
+impl Default for ComplementaryOrientationFilter {
+    fn default() -> Self {
+        Self::new(0.98)
+    }
+}
+
+impl ComplementaryOrientationFilter {
+    // Creates a new complementary filter with specified gyro/accel fusion ratio.
+    pub fn new(alpha: f32) -> Self {
+        Self {
+            alpha: alpha.clamp(0.5, 0.999),
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+            yaw_deg: 0.0,
+            is_initialized: false,
+        }
+    }
+
+    // Updates orientation estimate with new calibrated accelerometer and gyroscope readings.
+    pub fn update(&mut self, sample: &ImuCalibratedSample, dt_sec: f32) {
+        let (ax, ay, az) = sample.accel_g;
+        let (gx, gy, gz) = sample.gyro_dps;
+
+        let roll_acc = atan2_f32(ay, az) * RAD_TO_DEG;
+        let hyp = sqrt_f32(ay * ay + az * az);
+        let pitch_acc = atan2_f32(-ax, hyp) * RAD_TO_DEG;
+
+        if !self.is_initialized {
+            self.pitch_deg = pitch_acc;
+            self.roll_deg = roll_acc;
+            self.yaw_deg = 0.0;
+            self.is_initialized = true;
+            return;
+        }
+
+        // Fuse accelerometer gravity reference with integrated angular rates
+        self.pitch_deg = self.alpha * (self.pitch_deg + gy * dt_sec) + (1.0 - self.alpha) * pitch_acc;
+        self.roll_deg = self.alpha * (self.roll_deg + gx * dt_sec) + (1.0 - self.alpha) * roll_acc;
+        self.yaw_deg += gz * dt_sec;
+    }
+
+    // Resets filter state and angles.
+    pub fn reset(&mut self) {
+        self.pitch_deg = 0.0;
+        self.roll_deg = 0.0;
+        self.yaw_deg = 0.0;
+        self.is_initialized = false;
+    }
+}
+
+/// Verifies complementary filter sensor fusion, tilt estimation, and yaw rate integration.
+pub fn verify_complementary_orientation_filter() -> bool {
+    let mut filt = ComplementaryOrientationFilter::new(0.98);
+
+    // 1. Initial flat sample
+    let flat_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.0, 1.0),
+        gyro_dps: (0.0, 0.0, 0.0),
+        timestamp_us: 0,
+    };
+    filt.update(&flat_sample, 0.01);
+    if filt.pitch_deg.abs() > 0.05 || filt.roll_deg.abs() > 0.05 {
+        return false;
+    }
+
+    // 2. Converge to 45 degree roll tilt over 300 steps (3 seconds at 100Hz)
+    let tilted_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.7071, 0.7071),
+        gyro_dps: (0.0, 0.0, 0.0),
+        timestamp_us: 10000,
+    };
+    for _ in 0..300 {
+        filt.update(&tilted_sample, 0.01);
+    }
+    if (filt.roll_deg - 45.0).abs() > 0.5 {
+        return false;
+    }
+
+    // 3. Integrate 10 dps yaw rate for 1.0 second (100 steps of 0.01s)
+    let yaw_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.7071, 0.7071),
+        gyro_dps: (0.0, 0.0, 10.0),
+        timestamp_us: 20000,
+    };
+    for _ in 0..100 {
+        filt.update(&yaw_sample, 0.01);
+    }
+    if (filt.yaw_deg - 10.0).abs() > 0.2 {
+        return false;
+    }
+
+    true
+}
