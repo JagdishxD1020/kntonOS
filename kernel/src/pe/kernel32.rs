@@ -144,7 +144,7 @@ pub fn win32_get_proc_address(h_module: HMODULE, proc_name: &str) -> FARPROC {
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use super::ntdll::{
-    nt_allocate_virtual_memory, nt_close, nt_create_file, nt_free_virtual_memory, nt_read_file,
+    nt_close, nt_create_file, nt_read_file,
     nt_success, nt_write_file, IoStatusBlock,
 };
 use crate::syscall::NT_CURRENT_PROCESS;
@@ -170,114 +170,7 @@ pub fn win32_set_last_error(err_code: u32) {
     LAST_ERROR.store(err_code, Ordering::Relaxed);
 }
 
-pub const MEM_COMMIT: u32 = 0x0000_1000;
-pub const MEM_RESERVE: u32 = 0x0000_2000;
-pub const MEM_DECOMMIT: u32 = 0x0000_4000;
-pub const MEM_RELEASE: u32 = 0x0000_8000;
-pub const MEM_RESET: u32 = 0x0008_0000;
-
-pub const PAGE_NOACCESS: u32 = 0x01;
-pub const PAGE_READONLY: u32 = 0x02;
-pub const PAGE_READWRITE: u32 = 0x04;
-pub const PAGE_WRITECOPY: u32 = 0x08;
-pub const PAGE_EXECUTE: u32 = 0x10;
-pub const PAGE_EXECUTE_READ: u32 = 0x20;
-pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-pub const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
-pub const PAGE_GUARD: u32 = 0x100;
-pub const PAGE_NOCACHE: u32 = 0x200;
-
-/// Emulates Win32 VirtualAlloc reserving, committing, or changing page states.
-pub unsafe fn win32_virtual_alloc(
-    lp_address: *mut u8,
-    dw_size: usize,
-    fl_allocation_type: u32,
-    fl_protect: u32,
-) -> *mut u8 {
-    if dw_size == 0 {
-        win32_set_last_error(ERROR_INVALID_PARAMETER);
-        return core::ptr::null_mut();
-    }
-
-    if (fl_allocation_type & (MEM_COMMIT | MEM_RESERVE)) == 0 {
-        win32_set_last_error(ERROR_INVALID_PARAMETER);
-        return core::ptr::null_mut();
-    }
-
-    let mut base_val = lp_address as usize;
-    let mut size_val = dw_size;
-
-    let status = nt_allocate_virtual_memory(
-        NT_CURRENT_PROCESS,
-        &mut base_val as *mut usize,
-        0,
-        &mut size_val as *mut usize,
-        fl_allocation_type,
-        fl_protect,
-    );
-
-    if nt_success(status) {
-        win32_set_last_error(ERROR_SUCCESS);
-        base_val as *mut u8
-    } else {
-        win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
-        core::ptr::null_mut()
-    }
-}
-
-/// Emulates Win32 VirtualFree releasing or decommitting virtual address space.
-pub unsafe fn win32_virtual_free(
-    lp_address: *mut u8,
-    dw_size: usize,
-    dw_free_type: u32,
-) -> bool {
-    if lp_address.is_null() {
-        win32_set_last_error(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-
-    let mut base_val = lp_address as usize;
-    let mut size_val = if dw_free_type == MEM_RELEASE && dw_size == 0 {
-        4096
-    } else {
-        dw_size
-    };
-
-    let status = nt_free_virtual_memory(
-        NT_CURRENT_PROCESS,
-        &mut base_val as *mut usize,
-        &mut size_val as *mut usize,
-        dw_free_type,
-    );
-
-    if nt_success(status) {
-        win32_set_last_error(ERROR_SUCCESS);
-        true
-    } else {
-        win32_set_last_error(ERROR_INVALID_PARAMETER);
-        false
-    }
-}
-
-/// Emulates Win32 VirtualProtect modifying protection on committed pages.
-pub unsafe fn win32_virtual_protect(
-    lp_address: *mut u8,
-    dw_size: usize,
-    fl_new_protect: u32,
-    lpfl_old_protect: *mut u32,
-) -> bool {
-    if lp_address.is_null() || dw_size == 0 || lpfl_old_protect.is_null() {
-        win32_set_last_error(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-
-    // Capture old protection flag
-    *lpfl_old_protect = PAGE_READWRITE;
-    let _ = fl_new_protect;
-
-    win32_set_last_error(ERROR_SUCCESS);
-    true
-}
+use crate::pe::virtual_alloc::*;
 
 pub const INVALID_HANDLE_VALUE: u64 = !0u64;
 

@@ -760,6 +760,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 synchronization primitives self-test failed!\r\n");
     }
 
+    // Verify Win32 Virtual Memory & Dynamic Heap Allocation Subsystem (TASK-KNT-152)
+    if !pe::test_virtual_alloc_emulation_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 virtual memory and heap subsystem self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
