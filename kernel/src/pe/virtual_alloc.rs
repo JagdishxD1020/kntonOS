@@ -446,3 +446,109 @@ pub unsafe fn win32_heap_destroy(h_heap: HANDLE) -> bool {
         false
     }
 }
+
+pub const BLOCK_MAGIC_TAG: u32 = 0x4B4E_5448;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockHeader {
+    pub magic: u32,
+    pub size: usize,
+    pub alignment: usize,
+    pub user_offset: u32,
+    pub in_use: bool,
+}
+
+/// Allocates an aligned block from the heap for SIMD and cache-line gaming buffers.
+pub unsafe fn win32_heap_alloc_aligned(
+    h_heap: HANDLE,
+    dw_flags: u32,
+    dw_bytes: usize,
+    alignment: usize,
+) -> *mut u8 {
+    if dw_bytes == 0 {
+        return core::ptr::null_mut();
+    }
+
+    let align = if alignment >= 16 && alignment.is_power_of_two() {
+        alignment
+    } else {
+        16
+    };
+
+    let header_size = core::mem::size_of::<BlockHeader>();
+    let total_alloc = dw_bytes + align + header_size;
+
+    let raw_ptr = win32_heap_alloc(h_heap, dw_flags, total_alloc);
+    if raw_ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let raw_addr = raw_ptr as usize;
+    let min_user = raw_addr + header_size;
+    let aligned_user = (min_user + align - 1) & !(align - 1);
+    let user_offset = (aligned_user - raw_addr) as u32;
+
+    let header = BlockHeader {
+        magic: BLOCK_MAGIC_TAG,
+        size: dw_bytes,
+        alignment: align,
+        user_offset,
+        in_use: true,
+    };
+
+    *(raw_ptr as *mut BlockHeader) = header;
+
+    aligned_user as *mut u8
+}
+
+/// Frees an aligned block allocated by win32_heap_alloc_aligned.
+pub unsafe fn win32_heap_free_aligned(
+    h_heap: HANDLE,
+    _dw_flags: u32,
+    lp_mem: *mut u8,
+) -> bool {
+    if lp_mem.is_null() {
+        return false;
+    }
+
+    let user_addr = lp_mem as usize;
+    let mut table = HEAP_TABLE.lock();
+    let heap = match table.get_mut(&h_heap) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    for block in heap.blocks.iter_mut() {
+        if block.in_use && user_addr >= block.ptr && user_addr < block.ptr + block.size {
+            let header = &mut *(block.ptr as *mut BlockHeader);
+            if header.magic == BLOCK_MAGIC_TAG {
+                header.in_use = false;
+                block.in_use = false;
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Validates the integrity of a heap or specific heap block.
+pub unsafe fn win32_heap_validate(
+    h_heap: HANDLE,
+    _dw_flags: u32,
+    lp_mem: *const u8,
+) -> bool {
+    let table = HEAP_TABLE.lock();
+    let heap = match table.get(&h_heap) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    if lp_mem.is_null() {
+        true
+    } else {
+        let mem_addr = lp_mem as usize;
+        heap.blocks.iter().any(|b| b.in_use && (b.ptr == mem_addr || (mem_addr >= b.ptr && mem_addr < b.ptr + b.size)))
+    }
+}
