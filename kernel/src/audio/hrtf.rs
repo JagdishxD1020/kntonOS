@@ -1,7 +1,7 @@
 //! Head-Related Transfer Function (HRTF) Dataset, ITD Delay Line & ILD Filtering.
 //! Implements binaural acoustic modeling for headphone gaming and immersive 3D sound:
 
-use crate::graphics::types::{sin_f32, PI, HALF_PI};
+use crate::graphics::types::{sin_f32, sqrt_f32, PI, HALF_PI};
 
 /// Audio sample rate standard in KntonOS audio pipeline (48 kHz).
 pub const AUDIO_SAMPLE_RATE: f32 = 48_000.0;
@@ -24,6 +24,181 @@ pub const MAX_ITD_SAMPLES: f32 = 48.0;
 
 /// Number of azimuth bins in the discrete HRTF database (every 15° around 360°).
 pub const AZIMUTH_BINS: usize = 24;
+
+// 3D Spatial Vector and Geometry
+
+/// 3D Vector for HRTF spatial geometry and kinematics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct HrtfVector3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl HrtfVector3 {
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    pub const fn zero() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    #[inline]
+    pub fn add(self, rhs: Self) -> Self {
+        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+
+    #[inline]
+    pub fn sub(self, rhs: Self) -> Self {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+
+    #[inline]
+    pub fn scale(self, s: f32) -> Self {
+        Self::new(self.x * s, self.y * s, self.z * s)
+    }
+
+    #[inline]
+    pub fn dot(self, rhs: Self) -> f32 {
+        self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
+    }
+
+    #[inline]
+    pub fn cross(self, rhs: Self) -> Self {
+        Self::new(
+            self.y * rhs.z - self.z * rhs.y,
+            self.z * rhs.x - self.x * rhs.z,
+            self.x * rhs.y - self.y * rhs.x,
+        )
+    }
+
+    #[inline]
+    pub fn length_squared(self) -> f32 {
+        self.dot(self)
+    }
+
+    #[inline]
+    pub fn length(self) -> f32 {
+        sqrt_f32(self.length_squared())
+    }
+
+    #[inline]
+    pub fn normalize(self) -> Self {
+        let len = self.length();
+        if len > 1e-6 {
+            self.scale(1.0 / len)
+        } else {
+            Self::zero()
+        }
+    }
+}
+
+/// 3D Spatial Listener geometry representing position, cranial orientation and velocity.
+#[derive(Clone, Copy, Debug)]
+pub struct HrtfListenerGeometry {
+    pub position: HrtfVector3,
+    pub velocity: HrtfVector3,
+    pub forward: HrtfVector3,
+    pub up: HrtfVector3,
+    pub right: HrtfVector3,
+}
+
+impl HrtfListenerGeometry {
+    pub fn new() -> Self {
+        Self {
+            position: HrtfVector3::zero(),
+            velocity: HrtfVector3::zero(),
+            forward: HrtfVector3::new(0.0, 0.0, 1.0),
+            up: HrtfVector3::new(0.0, 1.0, 0.0),
+            right: HrtfVector3::new(1.0, 0.0, 0.0),
+        }
+    }
+
+    pub fn set_orientation(&mut self, forward: HrtfVector3, up: HrtfVector3) {
+        self.forward = forward.normalize();
+        let up_norm = up.normalize();
+        self.right = up_norm.cross(self.forward).normalize();
+        self.up = self.forward.cross(self.right).normalize();
+    }
+
+    /// Transforms world point into listener cranial coordinate frame.
+    pub fn world_to_cranial(&self, world_pos: HrtfVector3) -> HrtfVector3 {
+        let delta = world_pos.sub(self.position);
+        HrtfVector3::new(
+            delta.dot(self.right),
+            delta.dot(self.up),
+            delta.dot(self.forward),
+        )
+    }
+}
+
+/// 3D Spatial Emitter geometry representing source position, velocity, and distance bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct HrtfEmitterGeometry {
+    pub position: HrtfVector3,
+    pub velocity: HrtfVector3,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub rolloff_factor: f32,
+}
+
+impl HrtfEmitterGeometry {
+    pub fn new() -> Self {
+        Self {
+            position: HrtfVector3::zero(),
+            velocity: HrtfVector3::zero(),
+            min_distance: 1.0,
+            max_distance: 50.0,
+            rolloff_factor: 1.0,
+        }
+    }
+
+    /// Computes distance, unit line-of-sight vector, and relative cranial azimuth & elevation.
+    pub fn relative_to_listener(&self, listener: &HrtfListenerGeometry) -> (f32, HrtfVector3, f32, f32) {
+        let delta = self.position.sub(listener.position);
+        let dist = delta.length();
+        let los_unit = if dist > 1e-6 { delta.scale(1.0 / dist) } else { HrtfVector3::new(0.0, 0.0, 1.0) };
+        let local = listener.world_to_cranial(self.position);
+        let azimuth = crate::audio::spatializer::atan2_f32(local.x, local.z);
+        let horiz_dist = sqrt_f32(local.x * local.x + local.z * local.z);
+        let elevation = crate::audio::spatializer::atan2_f32(local.y, horiz_dist);
+        (dist, los_unit, azimuth, elevation)
+    }
+}
+
+/// Verifies 3D spatial listener and emitter geometry and cranial coordinate transformation.
+pub fn verify_spatial_geometry() -> bool {
+    let mut listener = HrtfListenerGeometry::new();
+    listener.position = HrtfVector3::new(10.0, 0.0, 0.0);
+    listener.set_orientation(HrtfVector3::new(0.0, 0.0, 1.0), HrtfVector3::new(0.0, 1.0, 0.0));
+
+    // Verify orthogonality: forward . up = 0, forward . right = 0, up . right = 0
+    if listener.forward.dot(listener.up).abs() > 1e-5
+        || listener.forward.dot(listener.right).abs() > 1e-5
+        || listener.up.dot(listener.right).abs() > 1e-5
+    {
+        return false;
+    }
+
+    let mut emitter = HrtfEmitterGeometry::new();
+    // Place emitter 5 meters to the right (+X) and 10 meters forward (+Z) relative to listener
+    emitter.position = HrtfVector3::new(15.0, 0.0, 10.0);
+    let (dist, _los, azimuth, elevation) = emitter.relative_to_listener(&listener);
+
+    // Expected cranial local: x = 5, y = 0, z = 10 -> dist = sqrt(125) ~ 11.1803
+    let expected_dist = sqrt_f32(125.0);
+    if (dist - expected_dist).abs() > 0.01 {
+        return false;
+    }
+    // Azimuth = atan2(5, 10) ~ 0.4636 rad (> 0, sound on right)
+    if azimuth <= 0.0 || elevation.abs() > 1e-4 {
+        return false;
+    }
+
+    true
+}
 
 // Interaural Time Difference (ITD) Delay Line
 
