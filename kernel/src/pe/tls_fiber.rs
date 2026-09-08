@@ -498,3 +498,127 @@ pub fn win32_get_fiber_switch_count() -> usize {
 pub fn win32_get_last_switched_fiber() -> HANDLE {
     *LAST_SWITCHED_FIBER.lock()
 }
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static TLS_CALLBACK_COUNT: AtomicU32 = AtomicU32::new(0);
+static TLS_CALLBACK_REASON: AtomicU32 = AtomicU32::new(0);
+static FIBER_RUN_FLAG: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_tls_callback_handler(_dll: *mut u8, reason: u32, _res: *mut u8) {
+    TLS_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+    TLS_CALLBACK_REASON.store(reason, Ordering::SeqCst);
+}
+
+unsafe extern "system" fn test_fiber_routine_handler(param: usize) {
+    FIBER_RUN_FLAG.store(param as u32, Ordering::SeqCst);
+}
+
+/// Self-test suite verifying Win32 TLS and fiber cooperative multitasking subsystem.
+pub fn test_tls_fiber_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TLS-FIBER-TEST] Executing Win32 TLS & Fiber verification...\r\n");
+
+    // 1. Verify dynamic TLS allocation, get/set value, and per-thread isolation
+    let slot0 = win32_tls_alloc();
+    if slot0 == TLS_OUT_OF_INDEXES {
+        return false;
+    }
+    if !win32_tls_set_value(slot0, 0x1234_5678) {
+        return false;
+    }
+    if win32_tls_get_value(slot0) != 0x1234_5678 {
+        return false;
+    }
+
+    if !win32_tls_set_value_for_thread(42, slot0, 0x9999_AAAA) {
+        return false;
+    }
+    if win32_tls_get_value_for_thread(42, slot0) != 0x9999_AAAA {
+        return false;
+    }
+    if win32_tls_get_value(slot0) != 0x1234_5678 {
+        return false;
+    }
+
+    if !win32_tls_free(slot0) {
+        return false;
+    }
+    if win32_tls_get_value(slot0) != 0 {
+        return false;
+    }
+
+    let mut allocated_slots = [0u32; 32];
+    for i in 0..32 {
+        allocated_slots[i] = win32_tls_alloc();
+        if allocated_slots[i] == TLS_OUT_OF_INDEXES {
+            return false;
+        }
+    }
+    for &slot in &allocated_slots {
+        if !win32_tls_free(slot) {
+            return false;
+        }
+    }
+
+    // 2. Verify static TLS directory registration and callback dispatch
+    win32_register_static_tls(
+        0x0040_0000,
+        ImageTlsDirectory64::default(),
+        &[test_tls_callback_handler as *const () as usize],
+    );
+
+    let executed_attach = unsafe { win32_execute_tls_callbacks(0x0040_0000 as *mut u8, DLL_PROCESS_ATTACH) };
+    if executed_attach != 1 || TLS_CALLBACK_COUNT.load(Ordering::SeqCst) != 1 || TLS_CALLBACK_REASON.load(Ordering::SeqCst) != DLL_PROCESS_ATTACH {
+        return false;
+    }
+
+    let executed_thread = unsafe { win32_execute_tls_callbacks(0x0040_0000 as *mut u8, DLL_THREAD_ATTACH) };
+    if executed_thread != 1 || TLS_CALLBACK_COUNT.load(Ordering::SeqCst) != 2 || TLS_CALLBACK_REASON.load(Ordering::SeqCst) != DLL_THREAD_ATTACH {
+        return false;
+    }
+
+    if !win32_unregister_static_tls(0x0040_0000) {
+        return false;
+    }
+
+    // 3. Verify fiber conversion, parameter passing, and cooperative switching
+    let primary = win32_convert_thread_to_fiber(0xABCD);
+    if primary == 0 || win32_get_current_fiber() != primary || win32_get_fiber_data() != 0xABCD {
+        return false;
+    }
+
+    let sec_fiber = win32_create_fiber(4096, test_fiber_routine_handler as *const () as usize, 0x55AA);
+    if sec_fiber == 0 {
+        return false;
+    }
+
+    if unsafe { !win32_switch_to_fiber(sec_fiber) } {
+        return false;
+    }
+    if FIBER_RUN_FLAG.load(Ordering::SeqCst) != 0x55AA {
+        return false;
+    }
+    if win32_get_last_switched_fiber() != sec_fiber || win32_get_fiber_switch_count() == 0 {
+        return false;
+    }
+
+    if unsafe { !win32_switch_to_fiber(primary) } {
+        return false;
+    }
+    if win32_get_current_fiber() != primary {
+        return false;
+    }
+
+    if !win32_delete_fiber(sec_fiber) {
+        return false;
+    }
+    if !win32_convert_fiber_to_thread() {
+        return false;
+    }
+    if win32_get_current_fiber() != 0 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-TLS-FIBER-PASS] Win32 TLS and fiber cooperative execution verified\r\n");
+    true
+}
