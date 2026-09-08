@@ -39,6 +39,7 @@ pub use biometric::*;
 pub use trigger_motor::*;
 pub use xinput::*;
 pub use haptic_dsp::test_haptic_dsp_subsystem;
+pub use gyro_aim::test_gyro_motion_translation_subsystem;
 pub use haptic_dsp::*;
 
 use crate::serial_write_str;

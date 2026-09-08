@@ -922,3 +922,582 @@ pub fn verify_motion_transfer_and_yaw_autocentering() -> bool {
 
     true
 }
+
+// Handheld IMU hardware device profiles.
+
+/// Supported handheld gaming device hardware IMU profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldDeviceType {
+    SteamDeck,
+    RogAlly,
+    LegionGo,
+}
+
+impl HandheldDeviceType {
+    // Gyroscope sensitivity in LSB per degree-per-second (e.g. ±2000 dps full-scale).
+    pub const fn gyro_lsb_per_dps(&self) -> f32 {
+        match self {
+            Self::SteamDeck => 16.4,   // ±2000 dps (16-bit 65536 / 4000)
+            Self::RogAlly => 16.4,     // ±2000 dps
+            Self::LegionGo => 16.384,  // ±2000 dps
+        }
+    }
+
+    // Accelerometer sensitivity in LSB per m/s^2 (e.g. ±8g full-scale).
+    pub const fn accel_lsb_per_g(&self) -> f32 {
+        match self {
+            Self::SteamDeck => 4096.0, // ±8g
+            Self::RogAlly => 4096.0,   // ±8g
+            Self::LegionGo => 4096.0,  // ±8g
+        }
+    }
+}
+
+/// Raw 6-axis inertial measurement unit (IMU) packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Imu6AxisRawSample {
+    pub raw_accel_x: i16,
+    pub raw_accel_y: i16,
+    pub raw_accel_z: i16,
+    pub raw_gyro_x: i16,
+    pub raw_gyro_y: i16,
+    pub raw_gyro_z: i16,
+    pub timestamp_us: u64,
+}
+
+/// Calibrated and physical unit-scaled 6-axis IMU measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImuCalibratedSample {
+    pub accel_g: (f32, f32, f32),
+    pub gyro_dps: (f32, f32, f32),
+    pub timestamp_us: u64,
+}
+
+/// IMU calibration and sensitivity scaling supervisor.
+#[derive(Debug, Clone)]
+pub struct ImuCalibrationManager {
+    pub device: HandheldDeviceType,
+    pub gyro_bias_dps: (f32, f32, f32),
+    pub accel_bias_g: (f32, f32, f32),
+    pub bias_accumulator_gyro: (f32, f32, f32),
+    pub bias_accumulator_accel: (f32, f32, f32),
+    pub sample_count: usize,
+    pub is_calibrated: bool,
+}
+
+impl ImuCalibrationManager {
+    // Creates a new IMU calibration manager for specified handheld device profile.
+    pub fn new(device: HandheldDeviceType) -> Self {
+        Self {
+            device,
+            gyro_bias_dps: (0.0, 0.0, 0.0),
+            accel_bias_g: (0.0, 0.0, 0.0),
+            bias_accumulator_gyro: (0.0, 0.0, 0.0),
+            bias_accumulator_accel: (0.0, 0.0, 0.0),
+            sample_count: 0,
+            is_calibrated: false,
+        }
+    }
+
+    // Accumulates a stationary raw sample into calibration average.
+    pub fn accumulate_sample(&mut self, sample: &Imu6AxisRawSample) {
+        let g_scale = self.device.gyro_lsb_per_dps();
+        let a_scale = self.device.accel_lsb_per_g();
+
+        let gx = (sample.raw_gyro_x as f32) / g_scale;
+        let gy = (sample.raw_gyro_y as f32) / g_scale;
+        let gz = (sample.raw_gyro_z as f32) / g_scale;
+
+        let ax = (sample.raw_accel_x as f32) / a_scale;
+        let ay = (sample.raw_accel_y as f32) / a_scale;
+        let az = (sample.raw_accel_z as f32) / a_scale;
+
+        self.bias_accumulator_gyro.0 += gx;
+        self.bias_accumulator_gyro.1 += gy;
+        self.bias_accumulator_gyro.2 += gz;
+
+        self.bias_accumulator_accel.0 += ax;
+        self.bias_accumulator_accel.1 += ay;
+        // Assume z-axis aligned with gravity (1.0g) during static flat calibration
+        self.bias_accumulator_accel.2 += az - 1.0;
+
+        self.sample_count += 1;
+    }
+
+    // Computes bias offsets from accumulated samples.
+    pub fn finalize_calibration(&mut self) -> bool {
+        if self.sample_count == 0 {
+            return false;
+        }
+        let count_f = self.sample_count as f32;
+        self.gyro_bias_dps = (
+            self.bias_accumulator_gyro.0 / count_f,
+            self.bias_accumulator_gyro.1 / count_f,
+            self.bias_accumulator_gyro.2 / count_f,
+        );
+        self.accel_bias_g = (
+            self.bias_accumulator_accel.0 / count_f,
+            self.bias_accumulator_accel.1 / count_f,
+            self.bias_accumulator_accel.2 / count_f,
+        );
+        self.is_calibrated = true;
+        true
+    }
+
+    // Converts raw sensor readings into calibrated physical units.
+    pub fn process_raw(&self, raw: &Imu6AxisRawSample) -> ImuCalibratedSample {
+        let g_scale = self.device.gyro_lsb_per_dps();
+        let a_scale = self.device.accel_lsb_per_g();
+
+        let gx = (raw.raw_gyro_x as f32) / g_scale - self.gyro_bias_dps.0;
+        let gy = (raw.raw_gyro_y as f32) / g_scale - self.gyro_bias_dps.1;
+        let gz = (raw.raw_gyro_z as f32) / g_scale - self.gyro_bias_dps.2;
+
+        let ax = (raw.raw_accel_x as f32) / a_scale - self.accel_bias_g.0;
+        let ay = (raw.raw_accel_y as f32) / a_scale - self.accel_bias_g.1;
+        let az = (raw.raw_accel_z as f32) / a_scale - self.accel_bias_g.2;
+
+        ImuCalibratedSample {
+            accel_g: (ax, ay, az),
+            gyro_dps: (gx, gy, gz),
+            timestamp_us: raw.timestamp_us,
+        }
+    }
+}
+
+/// Verifies IMU raw data parsing, sensitivity scaling, and stationary bias cancellation.
+pub fn verify_imu_hardware_model() -> bool {
+    let mut cal = ImuCalibrationManager::new(HandheldDeviceType::SteamDeck);
+
+    // Feed 10 stationary samples with 1.0 dps gyro drift and 1g vertical gravity
+    let drift_raw_gyro = (16.4 * 1.0) as i16;
+    let gravity_raw_accel = 4096;
+
+    for i in 0..10 {
+        let raw = Imu6AxisRawSample {
+            raw_accel_x: 0,
+            raw_accel_y: 0,
+            raw_accel_z: gravity_raw_accel,
+            raw_gyro_x: drift_raw_gyro,
+            raw_gyro_y: 0,
+            raw_gyro_z: 0,
+            timestamp_us: (i as u64) * 1000,
+        };
+        cal.accumulate_sample(&raw);
+    }
+
+    if !cal.finalize_calibration() {
+        return false;
+    }
+
+    // Calibrated bias must equal ~1.0 dps on X
+    if (cal.gyro_bias_dps.0 - 1.0).abs() > 0.05 {
+        return false;
+    }
+
+    // Process stationary sample: net gyro X should now be zeroed
+    let test_raw = Imu6AxisRawSample {
+        raw_accel_x: 0,
+        raw_accel_y: 0,
+        raw_accel_z: gravity_raw_accel,
+        raw_gyro_x: drift_raw_gyro,
+        raw_gyro_y: 0,
+        raw_gyro_z: 0,
+        timestamp_us: 10000,
+    };
+    let processed = cal.process_raw(&test_raw);
+    if processed.gyro_dps.0.abs() > 0.05 || (processed.accel_g.2 - 1.0).abs() > 0.05 {
+        return false;
+    }
+
+    true
+}
+
+use crate::drivers::input::imu::{atan2_f32, sqrt_f32, RAD_TO_DEG};
+
+/// Real-time complementary orientation filter fusing gyro angular rates and accelerometer gravity vector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComplementaryOrientationFilter {
+    pub alpha: f32,
+    pub pitch_deg: f32,
+    pub roll_deg: f32,
+    pub yaw_deg: f32,
+    pub is_initialized: bool,
+}
+
+impl Default for ComplementaryOrientationFilter {
+    fn default() -> Self {
+        Self::new(0.98)
+    }
+}
+
+impl ComplementaryOrientationFilter {
+    // Creates a new complementary filter with specified gyro/accel fusion ratio.
+    pub fn new(alpha: f32) -> Self {
+        Self {
+            alpha: alpha.clamp(0.5, 0.999),
+            pitch_deg: 0.0,
+            roll_deg: 0.0,
+            yaw_deg: 0.0,
+            is_initialized: false,
+        }
+    }
+
+    // Updates orientation estimate with new calibrated accelerometer and gyroscope readings.
+    pub fn update(&mut self, sample: &ImuCalibratedSample, dt_sec: f32) {
+        let (ax, ay, az) = sample.accel_g;
+        let (gx, gy, gz) = sample.gyro_dps;
+
+        let roll_acc = atan2_f32(ay, az) * RAD_TO_DEG;
+        let hyp = sqrt_f32(ay * ay + az * az);
+        let pitch_acc = atan2_f32(-ax, hyp) * RAD_TO_DEG;
+
+        if !self.is_initialized {
+            self.pitch_deg = pitch_acc;
+            self.roll_deg = roll_acc;
+            self.yaw_deg = 0.0;
+            self.is_initialized = true;
+            return;
+        }
+
+        // Fuse accelerometer gravity reference with integrated angular rates
+        self.pitch_deg = self.alpha * (self.pitch_deg + gy * dt_sec) + (1.0 - self.alpha) * pitch_acc;
+        self.roll_deg = self.alpha * (self.roll_deg + gx * dt_sec) + (1.0 - self.alpha) * roll_acc;
+        self.yaw_deg += gz * dt_sec;
+    }
+
+    // Resets filter state and angles.
+    pub fn reset(&mut self) {
+        self.pitch_deg = 0.0;
+        self.roll_deg = 0.0;
+        self.yaw_deg = 0.0;
+        self.is_initialized = false;
+    }
+}
+
+/// Verifies complementary filter sensor fusion, tilt estimation, and yaw rate integration.
+pub fn verify_complementary_orientation_filter() -> bool {
+    let mut filt = ComplementaryOrientationFilter::new(0.98);
+
+    // 1. Initial flat sample
+    let flat_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.0, 1.0),
+        gyro_dps: (0.0, 0.0, 0.0),
+        timestamp_us: 0,
+    };
+    filt.update(&flat_sample, 0.01);
+    if filt.pitch_deg.abs() > 0.05 || filt.roll_deg.abs() > 0.05 {
+        return false;
+    }
+
+    // 2. Converge to 45 degree roll tilt over 300 steps (3 seconds at 100Hz)
+    let tilted_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.7071, 0.7071),
+        gyro_dps: (0.0, 0.0, 0.0),
+        timestamp_us: 10000,
+    };
+    for _ in 0..300 {
+        filt.update(&tilted_sample, 0.01);
+    }
+    if (filt.roll_deg - 45.0).abs() > 0.5 {
+        return false;
+    }
+
+    // 3. Integrate 10 dps yaw rate for 1.0 second (100 steps of 0.01s)
+    let yaw_sample = ImuCalibratedSample {
+        accel_g: (0.0, 0.7071, 0.7071),
+        gyro_dps: (0.0, 0.0, 10.0),
+        timestamp_us: 20000,
+    };
+    for _ in 0..100 {
+        filt.update(&yaw_sample, 0.01);
+    }
+    if (filt.yaw_deg - 10.0).abs() > 0.2 {
+        return false;
+    }
+
+    true
+}
+
+
+// Motion to mouse translation engine with dynamic deadzone and jitter filtering.
+
+/// Motion-to-mouse translation engine converting angular rates to high-precision mouse counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionToMouseEngine {
+    pub sensitivity: f32,
+    pub base_deadzone_dps: f32,
+    pub dynamic_deadzone_dps: f32,
+    pub recent_speed_dps: f32,
+    pub accum_x: f32,
+    pub accum_y: f32,
+}
+
+impl Default for MotionToMouseEngine {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl MotionToMouseEngine {
+    // Creates a new motion-to-mouse translator with specified sensitivity multiplier.
+    pub fn new(sensitivity: f32) -> Self {
+        Self {
+            sensitivity: sensitivity.clamp(0.1, 10.0),
+            base_deadzone_dps: 0.20,
+            dynamic_deadzone_dps: 0.20,
+            recent_speed_dps: 0.0,
+            accum_x: 0.0,
+            accum_y: 0.0,
+        }
+    }
+
+    // Applies deadzone filter to remove steady-hand jitter while preserving direction.
+    pub fn apply_deadzone(&self, rate: f32, deadzone: f32) -> f32 {
+        let abs_rate = if rate < 0.0 { -rate } else { rate };
+        if abs_rate <= deadzone {
+            return 0.0;
+        }
+        let sign = if rate < 0.0 { -1.0 } else { 1.0 };
+        sign * (abs_rate - deadzone)
+    }
+
+    // Translates angular rates (deg/s) into discrete integer mouse delta counts.
+    pub fn process_motion(&mut self, yaw_dps: f32, pitch_dps: f32, dt_sec: f32) -> (i32, i32) {
+        let abs_yaw = if yaw_dps < 0.0 { -yaw_dps } else { yaw_dps };
+        let abs_pitch = if pitch_dps < 0.0 { -pitch_dps } else { pitch_dps };
+        let current_speed = abs_yaw.max(abs_pitch);
+
+        // Dynamic deadzone adapts: relaxes during active flicking, tightens during precision aiming
+        self.recent_speed_dps = 0.9 * self.recent_speed_dps + 0.1 * current_speed;
+        if self.recent_speed_dps > 15.0 {
+            self.dynamic_deadzone_dps = 0.05;
+        } else {
+            self.dynamic_deadzone_dps = self.base_deadzone_dps;
+        }
+
+        let eff_yaw = self.apply_deadzone(yaw_dps, self.dynamic_deadzone_dps);
+        let eff_pitch = self.apply_deadzone(pitch_dps, self.dynamic_deadzone_dps);
+
+        // Standard 10 mouse dots per degree * natural sensitivity
+        let counts_per_deg = 10.0 * self.sensitivity;
+        let dx_f = eff_yaw * counts_per_deg * dt_sec;
+        let dy_f = eff_pitch * counts_per_deg * dt_sec;
+
+        self.accum_x += dx_f;
+        self.accum_y += dy_f;
+
+        let out_dx = self.accum_x as i32;
+        let out_dy = self.accum_y as i32;
+        self.accum_x -= out_dx as f32;
+        self.accum_y -= out_dy as f32;
+
+        (out_dx, out_dy)
+    }
+
+    // Resets fractional sub-pixel accumulator and velocity history.
+    pub fn reset(&mut self) {
+        self.recent_speed_dps = 0.0;
+        self.dynamic_deadzone_dps = self.base_deadzone_dps;
+        self.accum_x = 0.0;
+        self.accum_y = 0.0;
+    }
+}
+
+/// Verifies motion-to-mouse delta conversion, jitter suppression deadzone, and sub-pixel accumulation.
+pub fn verify_motion_to_mouse_translation() -> bool {
+    let mut engine = MotionToMouseEngine::new(1.0);
+
+    // 1. Verify steady-hand tremor is filtered out
+    let (dx_tremor, dy_tremor) = engine.process_motion(0.12, 0.12, 0.01);
+    if dx_tremor != 0 || dy_tremor != 0 || engine.accum_x != 0.0 || engine.accum_y != 0.0 {
+        return false;
+    }
+
+    // 2. Verify intentional motion produces mouse delta
+    let mut total_dx = 0;
+    for _ in 0..100 {
+        let (dx, _) = engine.process_motion(10.0, 0.0, 0.01);
+        total_dx += dx;
+    }
+    if total_dx < 90 || total_dx > 105 {
+        return false;
+    }
+
+    // 3. Verify sub-pixel fractional accumulator preserves fractional counts
+    engine.reset();
+    let mut accumulated_ticks = 0;
+    for _ in 0..20 {
+        let (dx, _) = engine.process_motion(1.0, 0.0, 0.01);
+        accumulated_ticks += dx;
+    }
+    if accumulated_ticks == 0 && engine.accum_x == 0.0 {
+        return false;
+    }
+
+    true
+}
+
+
+// Capacitive touch stick and ADS trigger engagement gating.
+
+/// Activation gating modes controlling when gyroscopic aiming is engaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionAimGatingMode {
+    AlwaysOn,
+    ThumbstickTouchOnly,
+    TriggerAdsOnly,
+    ThumbstickOrTrigger,
+    ButtonHeld,
+}
+
+/// Instantaneous controller sensor inputs used for aiming activation evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotionAimGatingInputs {
+    pub right_stick_touch: bool,
+    pub left_trigger_analog: f32,
+    pub right_trackpad_touch: bool,
+    pub grip_button_pressed: bool,
+}
+
+/// Capacitive stick and ADS trigger engagement governor with hysteresis latching.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionAimGatingGovernor {
+    pub mode: MotionAimGatingMode,
+    pub trigger_ads_threshold: f32,
+    pub release_hysteresis_ms: u32,
+    pub active_latch: bool,
+    pub time_since_release_ms: u32,
+}
+
+impl Default for MotionAimGatingGovernor {
+    fn default() -> Self {
+        Self::new(MotionAimGatingMode::ThumbstickOrTrigger)
+    }
+}
+
+impl MotionAimGatingGovernor {
+    // Creates a new gating governor with specified activation mode.
+    pub fn new(mode: MotionAimGatingMode) -> Self {
+        Self {
+            mode,
+            trigger_ads_threshold: 0.15,
+            release_hysteresis_ms: 50,
+            active_latch: false,
+            time_since_release_ms: 0,
+        }
+    }
+
+    // Evaluates sensor inputs, updates engagement latch, and handles release debounce.
+    pub fn update(&mut self, inputs: &MotionAimGatingInputs, dt_ms: u32) -> bool {
+        let raw_active = match self.mode {
+            MotionAimGatingMode::AlwaysOn => true,
+            MotionAimGatingMode::ThumbstickTouchOnly => {
+                inputs.right_stick_touch || inputs.right_trackpad_touch
+            }
+            MotionAimGatingMode::TriggerAdsOnly => {
+                inputs.left_trigger_analog >= self.trigger_ads_threshold
+            }
+            MotionAimGatingMode::ThumbstickOrTrigger => {
+                inputs.right_stick_touch || inputs.right_trackpad_touch || (inputs.left_trigger_analog >= self.trigger_ads_threshold)
+            }
+            MotionAimGatingMode::ButtonHeld => inputs.grip_button_pressed,
+        };
+
+        if raw_active {
+            self.active_latch = true;
+            self.time_since_release_ms = 0;
+        } else {
+            self.time_since_release_ms += dt_ms;
+            if self.time_since_release_ms >= self.release_hysteresis_ms {
+                self.active_latch = false;
+            }
+        }
+
+        self.active_latch
+    }
+
+    // Gates translated mouse delta counts based on active engagement state.
+    pub fn gate_motion(&self, dx: i32, dy: i32) -> (i32, i32) {
+        if self.active_latch {
+            (dx, dy)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+/// Verifies capacitive touch and ADS trigger engagement, hysteresis hold, and motion gating.
+pub fn verify_capacitive_trigger_gating() -> bool {
+    let mut governor = MotionAimGatingGovernor::new(MotionAimGatingMode::ThumbstickOrTrigger);
+
+    // 1. Idle state: not engaged, motion is blocked
+    let idle_inputs = MotionAimGatingInputs::default();
+    if governor.update(&idle_inputs, 10) || governor.gate_motion(10, 10) != (0, 0) {
+        return false;
+    }
+
+    // 2. Thumb touches stick: engages latch, motion passes
+    let touch_inputs = MotionAimGatingInputs {
+        right_stick_touch: true,
+        ..Default::default()
+    };
+    if !governor.update(&touch_inputs, 10) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    // 3. Thumb released for 20ms (< 50ms hysteresis): remains latched
+    if !governor.update(&idle_inputs, 20) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    // 4. Thumb released for additional 40ms (total 60ms >= 50ms): unlatches
+    if governor.update(&idle_inputs, 40) || governor.gate_motion(10, 10) != (0, 0) {
+        return false;
+    }
+
+    // 5. Left trigger pulled for ADS (0.35 >= 0.15): engages latch
+    let ads_inputs = MotionAimGatingInputs {
+        left_trigger_analog: 0.35,
+        ..Default::default()
+    };
+    if !governor.update(&ads_inputs, 10) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    true
+}
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Handheld PC Gyroscope & Motion-Assisted Aiming Subsystem.
+pub fn test_gyro_motion_translation_subsystem() -> bool {
+    serial_write_str("[KNT-INPUT] Testing Handheld PC gyroscope & motion-assisted aiming service...\r\n");
+
+    // 1. Verify IMU hardware model, sensitivity scaling, and calibration
+    if !verify_imu_hardware_model() {
+        serial_write_str("[KNT-PANIC] Handheld IMU hardware model and calibration failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify complementary orientation fusion filter combining gyro and gravity
+    if !verify_complementary_orientation_filter() {
+        serial_write_str("[KNT-PANIC] Complementary orientation fusion filter verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify motion-to-mouse translation, dynamic deadzone, and jitter filter
+    if !verify_motion_to_mouse_translation() {
+        serial_write_str("[KNT-PANIC] Motion-to-mouse translation and deadzone verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify capacitive stick-touch and ADS trigger gating governor
+    if !verify_capacitive_trigger_gating() {
+        serial_write_str("[KNT-PANIC] Capacitive stick and ADS trigger gating verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-GYRO-AIM-PASS] Handheld gyroscope and motion-assisted aiming engine verified\r\n");
+    true
+}
