@@ -29,6 +29,7 @@ pub mod pso;
 pub mod resource_barrier;
 pub mod bundle;
 pub mod query;
+pub mod dxr;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -58,6 +59,7 @@ pub use pso::*;
 pub use resource_barrier::*;
 pub use bundle::*;
 pub use query::*;
+pub use dxr::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
