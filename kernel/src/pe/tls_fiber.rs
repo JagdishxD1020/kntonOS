@@ -244,3 +244,183 @@ pub unsafe fn win32_execute_tls_callbacks(dll_handle: *mut u8, reason: u32) -> u
 
     executed
 }
+
+pub const FIBER_FLAG_FLOAT_SWITCH: u32 = 0x0000_0001;
+pub const FIBER_DEFAULT_STACK_SIZE: usize = 16 * 1024;
+
+/// Callee-saved x86-64 execution state for cooperative fiber multitasking.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FiberContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub fiber_data: usize,
+}
+
+#[derive(Debug)]
+pub struct Win32Fiber {
+    pub handle: HANDLE,
+    pub fiber_data: usize,
+    pub stack_base: usize,
+    pub stack_size: usize,
+    pub stack_buffer: Option<Vec<u8>>,
+    pub is_primary: bool,
+    pub context: FiberContext,
+    pub routine: Option<usize>,
+    pub parameter: usize,
+    pub completed: bool,
+}
+
+static NEXT_FIBER_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x000F_0001);
+static FIBER_TABLE: Spinlock<BTreeMap<HANDLE, Win32Fiber>> = Spinlock::new(BTreeMap::new());
+static CURRENT_FIBER: Spinlock<BTreeMap<u32, HANDLE>> = Spinlock::new(BTreeMap::new());
+
+/// Converts the current thread into a cooperative Win32 fiber.
+pub fn win32_convert_thread_to_fiber(lp_parameter: usize) -> HANDLE {
+    let tid = get_current_tid();
+    let mut current_map = CURRENT_FIBER.lock();
+    if let Some(&existing) = current_map.get(&tid) {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ALREADY_EXISTS);
+        return existing;
+    }
+
+    let mut gen = NEXT_FIBER_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let fiber = Win32Fiber {
+        handle,
+        fiber_data: lp_parameter,
+        stack_base: 0,
+        stack_size: 0,
+        stack_buffer: None,
+        is_primary: true,
+        context: FiberContext {
+            fiber_data: lp_parameter,
+            ..Default::default()
+        },
+        routine: None,
+        parameter: lp_parameter,
+        completed: false,
+    };
+
+    let mut table = FIBER_TABLE.lock();
+    table.insert(handle, fiber);
+    current_map.insert(tid, handle);
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    handle
+}
+
+/// Converts the calling fiber back to a regular Win32 thread.
+pub fn win32_convert_fiber_to_thread() -> bool {
+    let tid = get_current_tid();
+    let mut current_map = CURRENT_FIBER.lock();
+    if let Some(handle) = current_map.remove(&tid) {
+        let mut table = FIBER_TABLE.lock();
+        table.remove(&handle);
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        false
+    }
+}
+
+/// Retrieves a handle to the currently executing fiber.
+pub fn win32_get_current_fiber() -> HANDLE {
+    let tid = get_current_tid();
+    let current_map = CURRENT_FIBER.lock();
+    current_map.get(&tid).copied().unwrap_or(0)
+}
+
+/// Retrieves the caller-defined fiber data for the current fiber.
+pub fn win32_get_fiber_data() -> usize {
+    let handle = win32_get_current_fiber();
+    if handle == 0 {
+        return 0;
+    }
+    let table = FIBER_TABLE.lock();
+    table.get(&handle).map(|f| f.fiber_data).unwrap_or(0)
+}
+
+/// Creates a new cooperative fiber with isolated stack and execution routine.
+pub fn win32_create_fiber(
+    dw_stack_size: usize,
+    lp_start_routine: usize,
+    lp_parameter: usize,
+) -> HANDLE {
+    if lp_start_routine == 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    let stack_sz = if dw_stack_size > 0 {
+        dw_stack_size.min(FIBER_DEFAULT_STACK_SIZE)
+    } else {
+        FIBER_DEFAULT_STACK_SIZE
+    };
+
+    let mut stack_buf = alloc::vec![0u8; stack_sz];
+    let stack_top = (stack_buf.as_mut_ptr() as usize + stack_sz) & !0x0F;
+
+    let mut gen = NEXT_FIBER_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let fiber = Win32Fiber {
+        handle,
+        fiber_data: lp_parameter,
+        stack_base: stack_buf.as_ptr() as usize,
+        stack_size: stack_sz,
+        stack_buffer: Some(stack_buf),
+        is_primary: false,
+        context: FiberContext {
+            rip: lp_start_routine as u64,
+            rsp: stack_top as u64,
+            fiber_data: lp_parameter,
+            ..Default::default()
+        },
+        routine: Some(lp_start_routine),
+        parameter: lp_parameter,
+        completed: false,
+    };
+
+    let mut table = FIBER_TABLE.lock();
+    table.insert(handle, fiber);
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    handle
+}
+
+/// Deletes an existing fiber and releases its allocated stack.
+pub fn win32_delete_fiber(lp_fiber: HANDLE) -> bool {
+    let tid = get_current_tid();
+    let current_map = CURRENT_FIBER.lock();
+    if let Some(&cur) = current_map.get(&tid) {
+        if cur == lp_fiber {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    }
+    drop(current_map);
+
+    let mut table = FIBER_TABLE.lock();
+    if table.remove(&lp_fiber).is_some() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        false
+    }
+}

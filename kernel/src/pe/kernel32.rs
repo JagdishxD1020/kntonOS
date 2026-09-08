@@ -157,6 +157,7 @@ pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_MOD_NOT_FOUND: u32 = 126;
 pub const ERROR_PROC_NOT_FOUND: u32 = 127;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
 
 static LAST_ERROR: AtomicU32 = AtomicU32::new(0);
 
