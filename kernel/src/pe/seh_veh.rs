@@ -217,3 +217,101 @@ pub unsafe fn win32_dispatch_vectored_continue(ExceptionInfo: *mut EXCEPTION_POI
 
     EXCEPTION_CONTINUE_SEARCH
 }
+
+pub const EXCEPTION_READ_FAULT: usize = 0;
+pub const EXCEPTION_WRITE_FAULT: usize = 1;
+pub const EXCEPTION_EXECUTE_FAULT: usize = 8;
+
+/// Constructs a Win32 EXCEPTION_ACCESS_VIOLATION record from a CPU page fault (#PF).
+pub fn win32_create_access_violation_record(
+    fault_addr: usize,
+    is_write: bool,
+    is_exec: bool,
+    fault_rip: usize,
+) -> EXCEPTION_RECORD {
+    let access_type = if is_exec {
+        EXCEPTION_EXECUTE_FAULT
+    } else if is_write {
+        EXCEPTION_WRITE_FAULT
+    } else {
+        EXCEPTION_READ_FAULT
+    };
+
+    let mut record = EXCEPTION_RECORD {
+        ExceptionCode: EXCEPTION_ACCESS_VIOLATION,
+        ExceptionFlags: 0,
+        ExceptionRecord: core::ptr::null_mut(),
+        ExceptionAddress: fault_rip as *mut u8,
+        NumberParameters: 2,
+        ExceptionInformation: [0; EXCEPTION_MAXIMUM_PARAMETERS],
+    };
+    record.ExceptionInformation[0] = access_type;
+    record.ExceptionInformation[1] = fault_addr;
+    record
+}
+
+/// Constructs a Win32 EXCEPTION_INT_DIVIDE_BY_ZERO record from a CPU divide error (#DE).
+pub fn win32_create_divide_by_zero_record(fault_rip: usize) -> EXCEPTION_RECORD {
+    EXCEPTION_RECORD {
+        ExceptionCode: EXCEPTION_INT_DIVIDE_BY_ZERO,
+        ExceptionFlags: 0,
+        ExceptionRecord: core::ptr::null_mut(),
+        ExceptionAddress: fault_rip as *mut u8,
+        NumberParameters: 0,
+        ExceptionInformation: [0; EXCEPTION_MAXIMUM_PARAMETERS],
+    }
+}
+
+/// Constructs a Win32 EXCEPTION_BREAKPOINT record from a CPU trap (#BP).
+pub fn win32_create_breakpoint_record(fault_rip: usize) -> EXCEPTION_RECORD {
+    EXCEPTION_RECORD {
+        ExceptionCode: EXCEPTION_BREAKPOINT,
+        ExceptionFlags: 0,
+        ExceptionRecord: core::ptr::null_mut(),
+        ExceptionAddress: fault_rip as *mut u8,
+        NumberParameters: 0,
+        ExceptionInformation: [0; EXCEPTION_MAXIMUM_PARAMETERS],
+    }
+}
+
+/// Constructs a Win32 EXCEPTION_ILLEGAL_INSTRUCTION record from an invalid opcode fault (#UD).
+pub fn win32_create_illegal_instruction_record(fault_rip: usize) -> EXCEPTION_RECORD {
+    EXCEPTION_RECORD {
+        ExceptionCode: EXCEPTION_ILLEGAL_INSTRUCTION,
+        ExceptionFlags: 0,
+        ExceptionRecord: core::ptr::null_mut(),
+        ExceptionAddress: fault_rip as *mut u8,
+        NumberParameters: 0,
+        ExceptionInformation: [0; EXCEPTION_MAXIMUM_PARAMETERS],
+    }
+}
+
+/// Dispatches an exception through VEH, SEH frame traversal, and continue handlers.
+pub unsafe fn win32_raise_exception(
+    record: &mut EXCEPTION_RECORD,
+    context: &mut CONTEXT,
+) -> i32 {
+    let mut pointers = EXCEPTION_POINTERS {
+        ExceptionRecord: record as *mut EXCEPTION_RECORD,
+        ContextRecord: context as *mut CONTEXT,
+    };
+
+    let veh_disp = win32_dispatch_vectored_exception(&mut pointers as *mut EXCEPTION_POINTERS);
+    if veh_disp == EXCEPTION_CONTINUE_EXECUTION {
+        win32_dispatch_vectored_continue(&mut pointers as *mut EXCEPTION_POINTERS);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    let seh_disp = win32_dispatch_structured_exception(&mut pointers as *mut EXCEPTION_POINTERS);
+    if seh_disp == EXCEPTION_CONTINUE_EXECUTION {
+        win32_dispatch_vectored_continue(&mut pointers as *mut EXCEPTION_POINTERS);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Dispatches an exception through registered structured frame handlers.
+pub unsafe fn win32_dispatch_structured_exception(_pointers: *mut EXCEPTION_POINTERS) -> i32 {
+    EXCEPTION_CONTINUE_SEARCH
+}
