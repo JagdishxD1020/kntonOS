@@ -1,8 +1,120 @@
+#![allow(non_camel_case_types, non_snake_case)]
 //! Direct3D 12 Variable Rate Shading (VRS Tier 2) Subsystem.
 //! Implements hardware-accelerated Variable Rate Shading (VRS) Tier 2 specifications:
 
 use alloc::vec;
 use alloc::vec::Vec;
+
+// Direct3D 12 standard coarse pixel shading rate enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_SHADING_RATE {
+    D3D12_SHADING_RATE_1X1 = 0,
+    D3D12_SHADING_RATE_1X2 = 0x1,
+    D3D12_SHADING_RATE_2X1 = 0x4,
+    D3D12_SHADING_RATE_2X2 = 0x5,
+    D3D12_SHADING_RATE_2X4 = 0x6,
+    D3D12_SHADING_RATE_4X2 = 0x9,
+    D3D12_SHADING_RATE_4X4 = 0xa,
+}
+
+impl D3D12_SHADING_RATE {
+    // Horizontal dimension in pixels
+    pub const fn width(self) -> u32 {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 | Self::D3D12_SHADING_RATE_1X2 => 1,
+            Self::D3D12_SHADING_RATE_2X1 | Self::D3D12_SHADING_RATE_2X2 | Self::D3D12_SHADING_RATE_2X4 => 2,
+            Self::D3D12_SHADING_RATE_4X2 | Self::D3D12_SHADING_RATE_4X4 => 4,
+        }
+    }
+
+    // Vertical dimension in pixels
+    pub const fn height(self) -> u32 {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 | Self::D3D12_SHADING_RATE_2X1 => 1,
+            Self::D3D12_SHADING_RATE_1X2 | Self::D3D12_SHADING_RATE_2X2 | Self::D3D12_SHADING_RATE_4X2 => 2,
+            Self::D3D12_SHADING_RATE_2X4 | Self::D3D12_SHADING_RATE_4X4 => 4,
+        }
+    }
+
+    // Convert from width and height dimensions
+    pub const fn from_dimensions(width: u32, height: u32) -> Option<Self> {
+        match (width, height) {
+            (1, 1) => Some(Self::D3D12_SHADING_RATE_1X1),
+            (1, 2) => Some(Self::D3D12_SHADING_RATE_1X2),
+            (2, 1) => Some(Self::D3D12_SHADING_RATE_2X1),
+            (2, 2) => Some(Self::D3D12_SHADING_RATE_2X2),
+            (2, 4) => Some(Self::D3D12_SHADING_RATE_2X4),
+            (4, 2) => Some(Self::D3D12_SHADING_RATE_4X2),
+            (4, 4) => Some(Self::D3D12_SHADING_RATE_4X4),
+            _ => None,
+        }
+    }
+
+    // Convert to ShadingRate
+    pub const fn to_shading_rate(self) -> ShadingRate {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 => ShadingRate::Rate1x1,
+            Self::D3D12_SHADING_RATE_1X2 => ShadingRate::Rate1x2,
+            Self::D3D12_SHADING_RATE_2X1 => ShadingRate::Rate2x1,
+            Self::D3D12_SHADING_RATE_2X2 => ShadingRate::Rate2x2,
+            Self::D3D12_SHADING_RATE_2X4 => ShadingRate::Rate2x4,
+            Self::D3D12_SHADING_RATE_4X2 => ShadingRate::Rate4x2,
+            Self::D3D12_SHADING_RATE_4X4 => ShadingRate::Rate4x4,
+        }
+    }
+
+    // Convert from ShadingRate
+    pub const fn from_shading_rate(rate: ShadingRate) -> Self {
+        match rate {
+            ShadingRate::Rate1x1 => Self::D3D12_SHADING_RATE_1X1,
+            ShadingRate::Rate1x2 => Self::D3D12_SHADING_RATE_1X2,
+            ShadingRate::Rate2x1 => Self::D3D12_SHADING_RATE_2X1,
+            ShadingRate::Rate2x2 => Self::D3D12_SHADING_RATE_2X2,
+            ShadingRate::Rate2x4 => Self::D3D12_SHADING_RATE_2X4,
+            ShadingRate::Rate4x2 => Self::D3D12_SHADING_RATE_4X2,
+            ShadingRate::Rate4x4 => Self::D3D12_SHADING_RATE_4X4,
+        }
+    }
+}
+
+// Direct3D 12 coarse pixel shading rate combiner mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_SHADING_RATE_COMBINER {
+    D3D12_SHADING_RATE_COMBINER_PASSTHROUGH = 0,
+    D3D12_SHADING_RATE_COMBINER_OVERRIDE = 1,
+    D3D12_SHADING_RATE_COMBINER_MIN = 2,
+    D3D12_SHADING_RATE_COMBINER_MAX = 3,
+    D3D12_SHADING_RATE_COMBINER_SUM = 4,
+}
+
+impl D3D12_SHADING_RATE_COMBINER {
+    // Combine two D3D12 shading rates according to this combiner rule
+    pub fn combine(self, rate_a: D3D12_SHADING_RATE, rate_b: D3D12_SHADING_RATE) -> D3D12_SHADING_RATE {
+        match self {
+            Self::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH => rate_a,
+            Self::D3D12_SHADING_RATE_COMBINER_OVERRIDE => rate_b,
+            Self::D3D12_SHADING_RATE_COMBINER_MIN => {
+                let w = core::cmp::min(rate_a.width(), rate_b.width());
+                let h = core::cmp::min(rate_a.height(), rate_b.height());
+                D3D12_SHADING_RATE::from_dimensions(w, h).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1)
+            }
+            Self::D3D12_SHADING_RATE_COMBINER_MAX => {
+                let w = core::cmp::max(rate_a.width(), rate_b.width());
+                let h = core::cmp::max(rate_a.height(), rate_b.height());
+                D3D12_SHADING_RATE::from_dimensions(w, h).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+            }
+            Self::D3D12_SHADING_RATE_COMBINER_SUM => {
+                let w = core::cmp::min(4, rate_a.width() * rate_b.width());
+                let h = core::cmp::min(4, rate_a.height() * rate_b.height());
+                let w_valid = if w >= 4 { 4 } else if w >= 2 { 2 } else { 1 };
+                let h_valid = if h >= 4 { 4 } else if h >= 2 { 2 } else { 1 };
+                D3D12_SHADING_RATE::from_dimensions(w_valid, h_valid).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+            }
+        }
+    }
+}
 
 /// Errors returned by the Variable Rate Shading subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
