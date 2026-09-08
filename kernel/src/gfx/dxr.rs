@@ -511,3 +511,111 @@ impl DxrShaderBindingTable {
         Ok((buffer, desc))
     }
 }
+
+// Recorded DispatchRays command with validated shader table bindings
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxrDispatchRaysCommand {
+    pub desc: D3D12_DISPATCH_RAYS_DESC,
+}
+
+impl DxrDispatchRaysCommand {
+    // Validate dispatch descriptor parameters and memory alignments
+    pub fn new(desc: D3D12_DISPATCH_RAYS_DESC) -> Result<Self, DxrError> {
+        if desc.width == 0 || desc.width > 16384 {
+            return Err(DxrError::InvalidDispatchDimensions);
+        }
+        if desc.height == 0 || desc.height > 16384 {
+            return Err(DxrError::InvalidDispatchDimensions);
+        }
+        if desc.depth == 0 || desc.depth > 16384 {
+            return Err(DxrError::InvalidDispatchDimensions);
+        }
+
+        if desc.ray_generation_shader_record.start_address == 0
+            || (desc.ray_generation_shader_record.start_address % 64) != 0
+            || desc.ray_generation_shader_record.size_in_bytes < 32
+        {
+            return Err(DxrError::InvalidShaderBindingTable);
+        }
+
+        if desc.miss_shader_table.size_in_bytes > 0 {
+            if (desc.miss_shader_table.start_address % 64) != 0
+                || desc.miss_shader_table.stride_in_bytes < 32
+                || (desc.miss_shader_table.stride_in_bytes % 32) != 0
+            {
+                return Err(DxrError::InvalidShaderBindingTable);
+            }
+        }
+
+        if desc.hit_group_table.size_in_bytes > 0 {
+            if (desc.hit_group_table.start_address % 64) != 0
+                || desc.hit_group_table.stride_in_bytes < 32
+                || (desc.hit_group_table.stride_in_bytes % 32) != 0
+            {
+                return Err(DxrError::InvalidShaderBindingTable);
+            }
+        }
+
+        if desc.callable_shader_table.size_in_bytes > 0 {
+            if (desc.callable_shader_table.start_address % 64) != 0
+                || desc.callable_shader_table.stride_in_bytes < 32
+                || (desc.callable_shader_table.stride_in_bytes % 32) != 0
+            {
+                return Err(DxrError::InvalidShaderBindingTable);
+            }
+        }
+
+        Ok(Self { desc })
+    }
+
+    // Total rays dispatched
+    pub fn total_rays(&self) -> u64 {
+        (self.desc.width as u64) * (self.desc.height as u64) * (self.desc.depth as u64)
+    }
+}
+
+// Raytracing command stream recorder
+#[derive(Debug, Default)]
+pub struct DxrCommandRecorder {
+    pub build_commands: Vec<BuildRaytracingAccelerationStructureCommand>,
+    pub dispatch_commands: Vec<DxrDispatchRaysCommand>,
+    pub pending_uav_barrier: bool,
+}
+
+impl DxrCommandRecorder {
+    // Create new DXR command recorder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Record acceleration structure build
+    pub fn record_build(
+        &mut self,
+        desc: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC,
+    ) -> Result<(), DxrError> {
+        let cmd = BuildRaytracingAccelerationStructureCommand::new(desc)?;
+        self.build_commands.push(cmd);
+        self.pending_uav_barrier = true;
+        Ok(())
+    }
+
+    // Insert BVH UAV barrier prior to ray traversal
+    pub fn insert_uav_barrier(&mut self) {
+        self.pending_uav_barrier = false;
+    }
+
+    // Record ray dispatch operation
+    pub fn record_dispatch(
+        &mut self,
+        desc: D3D12_DISPATCH_RAYS_DESC,
+    ) -> Result<(), DxrError> {
+        let cmd = DxrDispatchRaysCommand::new(desc)?;
+        self.dispatch_commands.push(cmd);
+        Ok(())
+    }
+
+    // Calculate total rays recorded across all dispatches
+    pub fn total_dispatched_rays(&self) -> u64 {
+        self.dispatch_commands.iter().map(|c| c.total_rays()).sum()
+    }
+}
