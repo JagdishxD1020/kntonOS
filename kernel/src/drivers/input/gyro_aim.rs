@@ -1337,3 +1337,133 @@ pub fn verify_motion_to_mouse_translation() -> bool {
 
     true
 }
+
+
+// Capacitive touch stick and ADS trigger engagement gating.
+
+/// Activation gating modes controlling when gyroscopic aiming is engaged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionAimGatingMode {
+    AlwaysOn,
+    ThumbstickTouchOnly,
+    TriggerAdsOnly,
+    ThumbstickOrTrigger,
+    ButtonHeld,
+}
+
+/// Instantaneous controller sensor inputs used for aiming activation evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotionAimGatingInputs {
+    pub right_stick_touch: bool,
+    pub left_trigger_analog: f32,
+    pub right_trackpad_touch: bool,
+    pub grip_button_pressed: bool,
+}
+
+/// Capacitive stick and ADS trigger engagement governor with hysteresis latching.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionAimGatingGovernor {
+    pub mode: MotionAimGatingMode,
+    pub trigger_ads_threshold: f32,
+    pub release_hysteresis_ms: u32,
+    pub active_latch: bool,
+    pub time_since_release_ms: u32,
+}
+
+impl Default for MotionAimGatingGovernor {
+    fn default() -> Self {
+        Self::new(MotionAimGatingMode::ThumbstickOrTrigger)
+    }
+}
+
+impl MotionAimGatingGovernor {
+    // Creates a new gating governor with specified activation mode.
+    pub fn new(mode: MotionAimGatingMode) -> Self {
+        Self {
+            mode,
+            trigger_ads_threshold: 0.15,
+            release_hysteresis_ms: 50,
+            active_latch: false,
+            time_since_release_ms: 0,
+        }
+    }
+
+    // Evaluates sensor inputs, updates engagement latch, and handles release debounce.
+    pub fn update(&mut self, inputs: &MotionAimGatingInputs, dt_ms: u32) -> bool {
+        let raw_active = match self.mode {
+            MotionAimGatingMode::AlwaysOn => true,
+            MotionAimGatingMode::ThumbstickTouchOnly => {
+                inputs.right_stick_touch || inputs.right_trackpad_touch
+            }
+            MotionAimGatingMode::TriggerAdsOnly => {
+                inputs.left_trigger_analog >= self.trigger_ads_threshold
+            }
+            MotionAimGatingMode::ThumbstickOrTrigger => {
+                inputs.right_stick_touch || inputs.right_trackpad_touch || (inputs.left_trigger_analog >= self.trigger_ads_threshold)
+            }
+            MotionAimGatingMode::ButtonHeld => inputs.grip_button_pressed,
+        };
+
+        if raw_active {
+            self.active_latch = true;
+            self.time_since_release_ms = 0;
+        } else {
+            self.time_since_release_ms += dt_ms;
+            if self.time_since_release_ms >= self.release_hysteresis_ms {
+                self.active_latch = false;
+            }
+        }
+
+        self.active_latch
+    }
+
+    // Gates translated mouse delta counts based on active engagement state.
+    pub fn gate_motion(&self, dx: i32, dy: i32) -> (i32, i32) {
+        if self.active_latch {
+            (dx, dy)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+/// Verifies capacitive touch and ADS trigger engagement, hysteresis hold, and motion gating.
+pub fn verify_capacitive_trigger_gating() -> bool {
+    let mut governor = MotionAimGatingGovernor::new(MotionAimGatingMode::ThumbstickOrTrigger);
+
+    // 1. Idle state: not engaged, motion is blocked
+    let idle_inputs = MotionAimGatingInputs::default();
+    if governor.update(&idle_inputs, 10) || governor.gate_motion(10, 10) != (0, 0) {
+        return false;
+    }
+
+    // 2. Thumb touches stick: engages latch, motion passes
+    let touch_inputs = MotionAimGatingInputs {
+        right_stick_touch: true,
+        ..Default::default()
+    };
+    if !governor.update(&touch_inputs, 10) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    // 3. Thumb released for 20ms (< 50ms hysteresis): remains latched
+    if !governor.update(&idle_inputs, 20) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    // 4. Thumb released for additional 40ms (total 60ms >= 50ms): unlatches
+    if governor.update(&idle_inputs, 40) || governor.gate_motion(10, 10) != (0, 0) {
+        return false;
+    }
+
+    // 5. Left trigger pulled for ADS (0.35 >= 0.15): engages latch
+    let ads_inputs = MotionAimGatingInputs {
+        left_trigger_analog: 0.35,
+        ..Default::default()
+    };
+    if !governor.update(&ads_inputs, 10) || governor.gate_motion(10, 10) != (10, 10) {
+        return false;
+    }
+
+    true
+}
