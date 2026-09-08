@@ -1218,3 +1218,122 @@ pub fn verify_complementary_orientation_filter() -> bool {
 
     true
 }
+
+
+// Motion to mouse translation engine with dynamic deadzone and jitter filtering.
+
+/// Motion-to-mouse translation engine converting angular rates to high-precision mouse counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionToMouseEngine {
+    pub sensitivity: f32,
+    pub base_deadzone_dps: f32,
+    pub dynamic_deadzone_dps: f32,
+    pub recent_speed_dps: f32,
+    pub accum_x: f32,
+    pub accum_y: f32,
+}
+
+impl Default for MotionToMouseEngine {
+    fn default() -> Self {
+        Self::new(1.0)
+    }
+}
+
+impl MotionToMouseEngine {
+    // Creates a new motion-to-mouse translator with specified sensitivity multiplier.
+    pub fn new(sensitivity: f32) -> Self {
+        Self {
+            sensitivity: sensitivity.clamp(0.1, 10.0),
+            base_deadzone_dps: 0.20,
+            dynamic_deadzone_dps: 0.20,
+            recent_speed_dps: 0.0,
+            accum_x: 0.0,
+            accum_y: 0.0,
+        }
+    }
+
+    // Applies deadzone filter to remove steady-hand jitter while preserving direction.
+    pub fn apply_deadzone(&self, rate: f32, deadzone: f32) -> f32 {
+        let abs_rate = if rate < 0.0 { -rate } else { rate };
+        if abs_rate <= deadzone {
+            return 0.0;
+        }
+        let sign = if rate < 0.0 { -1.0 } else { 1.0 };
+        sign * (abs_rate - deadzone)
+    }
+
+    // Translates angular rates (deg/s) into discrete integer mouse delta counts.
+    pub fn process_motion(&mut self, yaw_dps: f32, pitch_dps: f32, dt_sec: f32) -> (i32, i32) {
+        let abs_yaw = if yaw_dps < 0.0 { -yaw_dps } else { yaw_dps };
+        let abs_pitch = if pitch_dps < 0.0 { -pitch_dps } else { pitch_dps };
+        let current_speed = abs_yaw.max(abs_pitch);
+
+        // Dynamic deadzone adapts: relaxes during active flicking, tightens during precision aiming
+        self.recent_speed_dps = 0.9 * self.recent_speed_dps + 0.1 * current_speed;
+        if self.recent_speed_dps > 15.0 {
+            self.dynamic_deadzone_dps = 0.05;
+        } else {
+            self.dynamic_deadzone_dps = self.base_deadzone_dps;
+        }
+
+        let eff_yaw = self.apply_deadzone(yaw_dps, self.dynamic_deadzone_dps);
+        let eff_pitch = self.apply_deadzone(pitch_dps, self.dynamic_deadzone_dps);
+
+        // Standard 10 mouse dots per degree * natural sensitivity
+        let counts_per_deg = 10.0 * self.sensitivity;
+        let dx_f = eff_yaw * counts_per_deg * dt_sec;
+        let dy_f = eff_pitch * counts_per_deg * dt_sec;
+
+        self.accum_x += dx_f;
+        self.accum_y += dy_f;
+
+        let out_dx = self.accum_x as i32;
+        let out_dy = self.accum_y as i32;
+        self.accum_x -= out_dx as f32;
+        self.accum_y -= out_dy as f32;
+
+        (out_dx, out_dy)
+    }
+
+    // Resets fractional sub-pixel accumulator and velocity history.
+    pub fn reset(&mut self) {
+        self.recent_speed_dps = 0.0;
+        self.dynamic_deadzone_dps = self.base_deadzone_dps;
+        self.accum_x = 0.0;
+        self.accum_y = 0.0;
+    }
+}
+
+/// Verifies motion-to-mouse delta conversion, jitter suppression deadzone, and sub-pixel accumulation.
+pub fn verify_motion_to_mouse_translation() -> bool {
+    let mut engine = MotionToMouseEngine::new(1.0);
+
+    // 1. Verify steady-hand tremor is filtered out
+    let (dx_tremor, dy_tremor) = engine.process_motion(0.12, 0.12, 0.01);
+    if dx_tremor != 0 || dy_tremor != 0 || engine.accum_x != 0.0 || engine.accum_y != 0.0 {
+        return false;
+    }
+
+    // 2. Verify intentional motion produces mouse delta
+    let mut total_dx = 0;
+    for _ in 0..100 {
+        let (dx, _) = engine.process_motion(10.0, 0.0, 0.01);
+        total_dx += dx;
+    }
+    if total_dx < 90 || total_dx > 105 {
+        return false;
+    }
+
+    // 3. Verify sub-pixel fractional accumulator preserves fractional counts
+    engine.reset();
+    let mut accumulated_ticks = 0;
+    for _ in 0..20 {
+        let (dx, _) = engine.process_motion(1.0, 0.0, 0.01);
+        accumulated_ticks += dx;
+    }
+    if accumulated_ticks == 0 && engine.accum_x == 0.0 {
+        return false;
+    }
+
+    true
+}
