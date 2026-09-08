@@ -88,3 +88,132 @@ pub struct EXCEPTION_POINTERS {
     pub ExceptionRecord: *mut EXCEPTION_RECORD,
     pub ContextRecord: *mut CONTEXT,
 }
+
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use crate::memory::spinlock::Spinlock;
+
+#[allow(non_camel_case_types)]
+pub type PVECTORED_EXCEPTION_HANDLER = Option<unsafe extern "system" fn(ExceptionInfo: *mut EXCEPTION_POINTERS) -> i32>;
+
+#[derive(Clone, Copy)]
+struct VehNode {
+    handle: HANDLE,
+    handler: unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32,
+}
+
+static NEXT_VEH_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x000E_0001);
+static VEH_HANDLERS: Spinlock<VecDeque<VehNode>> = Spinlock::new(VecDeque::new());
+static VCH_HANDLERS: Spinlock<VecDeque<VehNode>> = Spinlock::new(VecDeque::new());
+
+/// Registers a vectored exception handler called before structured exception handling.
+pub fn win32_add_vectored_exception_handler(
+    First: u32,
+    Handler: unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32,
+) -> HANDLE {
+    let mut gen = NEXT_VEH_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let node = VehNode { handle, handler: Handler };
+    let mut handlers = VEH_HANDLERS.lock();
+    if First != 0 {
+        handlers.push_front(node);
+    } else {
+        handlers.push_back(node);
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    handle
+}
+
+/// Unregisters a previously registered vectored exception handler.
+pub fn win32_remove_vectored_exception_handler(Handle: HANDLE) -> u32 {
+    let mut handlers = VEH_HANDLERS.lock();
+    if let Some(pos) = handlers.iter().position(|n| n.handle == Handle) {
+        handlers.remove(pos);
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        1
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// Registers a vectored continue handler called after an exception is resolved.
+pub fn win32_add_vectored_continue_handler(
+    First: u32,
+    Handler: unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32,
+) -> HANDLE {
+    let mut gen = NEXT_VEH_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let node = VehNode { handle, handler: Handler };
+    let mut handlers = VCH_HANDLERS.lock();
+    if First != 0 {
+        handlers.push_front(node);
+    } else {
+        handlers.push_back(node);
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    handle
+}
+
+/// Unregisters a previously registered vectored continue handler.
+pub fn win32_remove_vectored_continue_handler(Handle: HANDLE) -> u32 {
+    let mut handlers = VCH_HANDLERS.lock();
+    if let Some(pos) = handlers.iter().position(|n| n.handle == Handle) {
+        handlers.remove(pos);
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        1
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// Dispatches an exception through registered vectored exception handlers in priority order.
+pub unsafe fn win32_dispatch_vectored_exception(ExceptionInfo: *mut EXCEPTION_POINTERS) -> i32 {
+    if ExceptionInfo.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let handlers_snapshot: Vec<unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32> = {
+        let handlers = VEH_HANDLERS.lock();
+        handlers.iter().map(|n| n.handler).collect()
+    };
+
+    for handler in handlers_snapshot {
+        let disposition = handler(ExceptionInfo);
+        if disposition == EXCEPTION_CONTINUE_EXECUTION {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Dispatches an exception through registered vectored continue handlers in priority order.
+pub unsafe fn win32_dispatch_vectored_continue(ExceptionInfo: *mut EXCEPTION_POINTERS) -> i32 {
+    if ExceptionInfo.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let handlers_snapshot: Vec<unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32> = {
+        let handlers = VCH_HANDLERS.lock();
+        handlers.iter().map(|n| n.handler).collect()
+    };
+
+    for handler in handlers_snapshot {
+        let disposition = handler(ExceptionInfo);
+        if disposition == EXCEPTION_CONTINUE_EXECUTION {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
+}
