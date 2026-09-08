@@ -11,6 +11,7 @@ pub mod raw_input;
 pub mod synch;
 pub mod virtual_alloc;
 pub mod tls_fiber;
+pub mod seh_veh;
 
 pub use header::*;
 pub use ntdll::*;
@@ -21,6 +22,7 @@ pub use raw_input::*;
 pub use synch::*;
 pub use virtual_alloc::*;
 pub use tls_fiber::*;
+pub use seh_veh::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
