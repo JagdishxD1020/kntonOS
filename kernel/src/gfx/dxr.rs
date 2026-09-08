@@ -619,3 +619,143 @@ impl DxrCommandRecorder {
         self.dispatch_commands.iter().map(|c| c.total_rays()).sum()
     }
 }
+
+// Comprehensive verification test suite for DXR acceleration structure & DispatchRays subsystem
+pub fn test_dxr_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DXR] Initializing Direct3D 12 raytracing acceleration structure self-test...\r\n");
+
+    // 1. BLAS geometry inputs and prebuild sizing info calculation
+    let tri = D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC::new(0x1000_0000, 300, 32, 0x1000_4000, 300);
+    let geom = D3D12_RAYTRACING_GEOMETRY_DESC::triangles(D3D12_RAYTRACING_GEOMETRY_FLAGS::OPAQUE, tri);
+    let blas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS::blas(
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS::PREFER_FAST_TRACE,
+        alloc::vec![geom],
+    );
+    let blas_prebuild = match get_raytracing_acceleration_structure_prebuild_info(&blas_inputs) {
+        Ok(info) => info,
+        Err(_) => {
+            crate::serial_write_str("[KNT-DXR-FAIL] BLAS prebuild info calculation failed\r\n");
+            return false;
+        }
+    };
+    if blas_prebuild.result_data_max_size_in_bytes == 0 || (blas_prebuild.result_data_max_size_in_bytes % 64) != 0 {
+        crate::serial_write_str("[KNT-DXR-FAIL] Invalid BLAS prebuild result buffer size\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * BLAS geometry description and memory prebuild sizing verified\r\n");
+
+    // 2. Build command validation with GPU virtual address alignments
+    let valid_blas_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+        dest_acceleration_structure_data: 0x2000_0000,
+        inputs: blas_inputs,
+        source_acceleration_structure_data: 0,
+        scratch_acceleration_structure_data: 0x2001_0000,
+    };
+    if BuildRaytracingAccelerationStructureCommand::new(valid_blas_desc.clone()).is_err() {
+        crate::serial_write_str("[KNT-DXR-FAIL] Valid BLAS build command failed validation\r\n");
+        return false;
+    }
+
+    let mut unaligned_desc = valid_blas_desc.clone();
+    unaligned_desc.dest_acceleration_structure_data = 0x2000_0003;
+    if BuildRaytracingAccelerationStructureCommand::new(unaligned_desc) != Err(DxrError::InvalidAlignment) {
+        crate::serial_write_str("[KNT-DXR-FAIL] Unaligned dest address was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * BLAS build command recording and 64-byte alignment validation verified\r\n");
+
+    // 3. TLAS instance descriptors and prebuild sizing
+    let inst = D3D12_RAYTRACING_INSTANCE_DESC::identity(1, 0, 0x2000_0000);
+    let tlas_inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS::tlas(
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS::NONE,
+        alloc::vec![inst],
+        0x3000_0000,
+    );
+    let tlas_prebuild = match get_raytracing_acceleration_structure_prebuild_info(&tlas_inputs) {
+        Ok(info) => info,
+        Err(_) => {
+            crate::serial_write_str("[KNT-DXR-FAIL] TLAS prebuild info calculation failed\r\n");
+            return false;
+        }
+    };
+    if tlas_prebuild.result_data_max_size_in_bytes == 0 || (tlas_prebuild.result_data_max_size_in_bytes % 64) != 0 {
+        crate::serial_write_str("[KNT-DXR-FAIL] Invalid TLAS prebuild result buffer size\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * TLAS instance descriptors and hierarchy sizing verified\r\n");
+
+    // 4. Shader Binding Table generation and record packing
+    let mut sbt = DxrShaderBindingTable::new();
+    let raygen_record = DxrShaderRecord::new([0xAA; 32], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let miss_record = DxrShaderRecord::new([0xBB; 32], &[]);
+    let hit_record = DxrShaderRecord::new([0xCC; 32], &[9, 10, 11, 12]);
+    sbt.set_raygen(raygen_record);
+    sbt.add_miss(miss_record);
+    sbt.add_hit_group(hit_record);
+
+    let (sbt_buffer, dispatch_desc) = match sbt.build(0x4000_0000, 1920, 1080, 1) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-DXR-FAIL] Shader binding table generation failed\r\n");
+            return false;
+        }
+    };
+    if sbt_buffer.is_empty() || (sbt_buffer.len() % 64) != 0 {
+        crate::serial_write_str("[KNT-DXR-FAIL] SBT buffer alignment mismatch\r\n");
+        return false;
+    }
+    if dispatch_desc.ray_generation_shader_record.start_address != 0x4000_0000 {
+        crate::serial_write_str("[KNT-DXR-FAIL] RayGen table base address mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Shader Binding Table 64-byte record packing verified\r\n");
+
+    // 5. DispatchRays command parameter validation
+    let dispatch_cmd = match DxrDispatchRaysCommand::new(dispatch_desc) {
+        Ok(cmd) => cmd,
+        Err(_) => {
+            crate::serial_write_str("[KNT-DXR-FAIL] DispatchRays command validation failed\r\n");
+            return false;
+        }
+    };
+    if dispatch_cmd.total_rays() != 1920 * 1080 {
+        crate::serial_write_str("[KNT-DXR-FAIL] Dispatched ray count mismatch\r\n");
+        return false;
+    }
+
+    let mut invalid_desc = dispatch_desc;
+    invalid_desc.width = 20000;
+    if DxrDispatchRaysCommand::new(invalid_desc) != Err(DxrError::InvalidDispatchDimensions) {
+        crate::serial_write_str("[KNT-DXR-FAIL] Out-of-bounds dispatch dimensions were not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DispatchRays descriptor validation and dimension limits verified\r\n");
+
+    // 6. Command recorder execution flow and UAV barrier tracking
+    let mut recorder = DxrCommandRecorder::new();
+    if recorder.record_build(valid_blas_desc).is_err() {
+        crate::serial_write_str("[KNT-DXR-FAIL] Recorder failed to record BLAS build\r\n");
+        return false;
+    }
+    if !recorder.pending_uav_barrier {
+        crate::serial_write_str("[KNT-DXR-FAIL] Expected pending UAV barrier after build\r\n");
+        return false;
+    }
+    recorder.insert_uav_barrier();
+    if recorder.pending_uav_barrier {
+        crate::serial_write_str("[KNT-DXR-FAIL] UAV barrier was not cleared\r\n");
+        return false;
+    }
+    if recorder.record_dispatch(dispatch_desc).is_err() {
+        crate::serial_write_str("[KNT-DXR-FAIL] Recorder failed to record dispatch rays\r\n");
+        return false;
+    }
+    if recorder.total_dispatched_rays() != 1920 * 1080 {
+        crate::serial_write_str("[KNT-DXR-FAIL] Recorder total dispatched rays mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DXR command stream recording and BVH execution barrier verified\r\n");
+
+    crate::serial_write_str("[KNT-DXR-PASS] Direct3D 12 raytracing acceleration structure engine verified\r\n");
+    true
+}
