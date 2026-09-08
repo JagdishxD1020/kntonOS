@@ -424,3 +424,77 @@ pub fn win32_delete_fiber(lp_fiber: HANDLE) -> bool {
         false
     }
 }
+
+static TOTAL_FIBER_SWITCHES: Spinlock<usize> = Spinlock::new(0);
+static LAST_SWITCHED_FIBER: Spinlock<HANDLE> = Spinlock::new(0);
+
+/// Switches execution cooperatively to the specified target fiber.
+pub unsafe fn win32_switch_to_fiber(lp_fiber: HANDLE) -> bool {
+    let tid = get_current_tid();
+    let cur_handle = win32_get_current_fiber();
+    if cur_handle == 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    if cur_handle == lp_fiber {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        return true;
+    }
+
+    let mut table = FIBER_TABLE.lock();
+    if !table.contains_key(&lp_fiber) {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // Capture callee-saved state of current fiber
+    let dummy_var = 0u64;
+    let local_sp = (&dummy_var as *const u64 as usize) as u64;
+    if let Some(cur_fiber) = table.get_mut(&cur_handle) {
+        cur_fiber.context.rsp = local_sp;
+        cur_fiber.context.rbp = local_sp;
+        cur_fiber.context.fiber_data = cur_fiber.fiber_data;
+    }
+
+    // Update active fiber for current thread
+    {
+        let mut cur_map = CURRENT_FIBER.lock();
+        cur_map.insert(tid, lp_fiber);
+    }
+
+    *TOTAL_FIBER_SWITCHES.lock() += 1;
+    *LAST_SWITCHED_FIBER.lock() = lp_fiber;
+
+    let (routine_opt, param) = {
+        if let Some(target) = table.get_mut(&lp_fiber) {
+            let r = if !target.completed { target.routine } else { None };
+            (r, target.parameter)
+        } else {
+            (None, 0)
+        }
+    };
+    drop(table);
+
+    if let Some(routine_addr) = routine_opt {
+        let func: unsafe extern "system" fn(usize) = core::mem::transmute(routine_addr);
+        func(param);
+        let mut table = FIBER_TABLE.lock();
+        if let Some(target) = table.get_mut(&lp_fiber) {
+            target.completed = true;
+        }
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Retrieves the total count of cooperative fiber switches performed.
+pub fn win32_get_fiber_switch_count() -> usize {
+    *TOTAL_FIBER_SWITCHES.lock()
+}
+
+/// Retrieves the handle of the most recently switched-to fiber.
+pub fn win32_get_last_switched_fiber() -> HANDLE {
+    *LAST_SWITCHED_FIBER.lock()
+}
