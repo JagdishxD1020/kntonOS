@@ -1467,3 +1467,37 @@ pub fn verify_capacitive_trigger_gating() -> bool {
 
     true
 }
+
+use crate::serial_write_str;
+
+/// Comprehensive verification self-test suite for Handheld PC Gyroscope & Motion-Assisted Aiming Subsystem.
+pub fn test_gyro_motion_translation_subsystem() -> bool {
+    serial_write_str("[KNT-INPUT] Testing Handheld PC gyroscope & motion-assisted aiming service...\r\n");
+
+    // 1. Verify IMU hardware model, sensitivity scaling, and calibration
+    if !verify_imu_hardware_model() {
+        serial_write_str("[KNT-PANIC] Handheld IMU hardware model and calibration failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify complementary orientation fusion filter combining gyro and gravity
+    if !verify_complementary_orientation_filter() {
+        serial_write_str("[KNT-PANIC] Complementary orientation fusion filter verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify motion-to-mouse translation, dynamic deadzone, and jitter filter
+    if !verify_motion_to_mouse_translation() {
+        serial_write_str("[KNT-PANIC] Motion-to-mouse translation and deadzone verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify capacitive stick-touch and ADS trigger gating governor
+    if !verify_capacitive_trigger_gating() {
+        serial_write_str("[KNT-PANIC] Capacitive stick and ADS trigger gating verification failed!\r\n");
+        return false;
+    }
+
+    serial_write_str("[KNT-GYRO-AIM-PASS] Handheld gyroscope and motion-assisted aiming engine verified\r\n");
+    true
+}

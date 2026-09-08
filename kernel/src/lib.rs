@@ -587,6 +587,10 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_haptic_dsp_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld haptic waveform and audio transducer engine self-test failed!\r\n");
     }
+    // Initialize and verify Handheld PC Gyroscope & Motion-Assisted Aiming Translation Subsystem (TASK-KNT-154)
+    if !drivers::input::test_gyro_motion_translation_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld gyroscope and motion-assisted aiming engine self-test failed!\r\n");
+    }
 
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
