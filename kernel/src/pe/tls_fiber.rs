@@ -152,3 +152,95 @@ pub fn win32_tls_set_value_for_thread(tid: u32, dw_tls_index: u32, lp_tls_value:
     let mut mgr = TLS_MANAGER.lock();
     mgr.set_value(tid, dw_tls_index as usize, lp_tls_value)
 }
+
+pub const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+
+pub const DLL_PROCESS_DETACH: u32 = 0;
+pub const DLL_PROCESS_ATTACH: u32 = 1;
+pub const DLL_THREAD_ATTACH: u32 = 2;
+pub const DLL_THREAD_DETACH: u32 = 3;
+
+/// Win32 64-bit PE TLS directory descriptor.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageTlsDirectory64 {
+    pub start_address_of_raw_data: u64,
+    pub end_address_of_raw_data: u64,
+    pub address_of_index: u64,
+    pub address_of_callbacks: u64,
+    pub size_of_zero_fill: u32,
+    pub characteristics: u32,
+}
+
+#[allow(non_camel_case_types)]
+pub type PIMAGE_TLS_CALLBACK = Option<unsafe extern "system" fn(dll_handle: *mut u8, reason: u32, reserved: *mut u8)>;
+
+#[derive(Debug, Clone)]
+pub struct StaticTlsRegistration {
+    pub image_base: usize,
+    pub tls_dir: ImageTlsDirectory64,
+    pub callbacks: Vec<usize>,
+}
+
+static STATIC_TLS_TABLE: Spinlock<Vec<StaticTlsRegistration>> = Spinlock::new(Vec::new());
+
+/// Registers a PE module's static TLS directory descriptor and callback array.
+pub fn win32_register_static_tls(
+    image_base: usize,
+    tls_dir: ImageTlsDirectory64,
+    callbacks: &[usize],
+) {
+    let mut table = STATIC_TLS_TABLE.lock();
+    if let Some(pos) = table.iter().position(|r| r.image_base == image_base) {
+        table[pos] = StaticTlsRegistration {
+            image_base,
+            tls_dir,
+            callbacks: callbacks.to_vec(),
+        };
+    } else {
+        table.push(StaticTlsRegistration {
+            image_base,
+            tls_dir,
+            callbacks: callbacks.to_vec(),
+        });
+    }
+}
+
+/// Unregisters static TLS for a module.
+pub fn win32_unregister_static_tls(image_base: usize) -> bool {
+    let mut table = STATIC_TLS_TABLE.lock();
+    if let Some(pos) = table.iter().position(|r| r.image_base == image_base) {
+        table.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Dispatches static TLS callbacks for all registered modules matching the given reason.
+pub unsafe fn win32_execute_tls_callbacks(dll_handle: *mut u8, reason: u32) -> usize {
+    let callbacks_to_run: Vec<usize> = {
+        let table = STATIC_TLS_TABLE.lock();
+        let mut list = Vec::new();
+        for entry in table.iter() {
+            if dll_handle.is_null() || dll_handle as usize == entry.image_base {
+                for &cb in &entry.callbacks {
+                    if cb != 0 {
+                        list.push(cb);
+                    }
+                }
+            }
+        }
+        list
+    };
+
+    let mut executed = 0;
+    for cb_addr in callbacks_to_run {
+        let callback: unsafe extern "system" fn(*mut u8, u32, *mut u8) =
+            core::mem::transmute(cb_addr);
+        callback(dll_handle, reason, core::ptr::null_mut());
+        executed += 1;
+    }
+
+    executed
+}
