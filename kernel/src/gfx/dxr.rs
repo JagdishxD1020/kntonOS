@@ -4,6 +4,9 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
 use alloc::vec::Vec;
+use crate::gfx::dispatch_rays::{
+    D3D12_DISPATCH_RAYS_DESC, D3D12_GPU_VIRTUAL_ADDRESS_RANGE, D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE,
+};
 use crate::gfx::dxr_as::D3D12_RAYTRACING_INSTANCE_DESC;
 
 // Acceleration structure memory alignment requirement in GPU virtual memory
@@ -336,5 +339,175 @@ impl BuildRaytracingAccelerationStructureCommand {
             desc,
             prebuild_info,
         })
+    }
+}
+
+// Shader record containing a 32-byte identifier and arbitrary local root arguments
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxrShaderRecord {
+    pub shader_id: [u8; 32],
+    pub local_arguments: Vec<u8>,
+}
+
+impl DxrShaderRecord {
+    // Create a new shader record
+    pub fn new(shader_id: [u8; 32], local_arguments: &[u8]) -> Self {
+        Self {
+            shader_id,
+            local_arguments: local_arguments.to_vec(),
+        }
+    }
+
+    // Byte length of identifier plus local arguments
+    pub fn raw_size(&self) -> usize {
+        32 + self.local_arguments.len()
+    }
+}
+
+// Shader Binding Table generator organizing RayGen, Miss, HitGroup, and Callable records
+#[derive(Debug, Clone, Default)]
+pub struct DxrShaderBindingTable {
+    pub raygen: Option<DxrShaderRecord>,
+    pub miss_records: Vec<DxrShaderRecord>,
+    pub hit_group_records: Vec<DxrShaderRecord>,
+    pub callable_records: Vec<DxrShaderRecord>,
+}
+
+impl DxrShaderBindingTable {
+    // Create an empty shader binding table
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Set ray generation shader record
+    pub fn set_raygen(&mut self, record: DxrShaderRecord) {
+        self.raygen = Some(record);
+    }
+
+    // Add miss shader record
+    pub fn add_miss(&mut self, record: DxrShaderRecord) {
+        self.miss_records.push(record);
+    }
+
+    // Add hit group shader record
+    pub fn add_hit_group(&mut self, record: DxrShaderRecord) {
+        self.hit_group_records.push(record);
+    }
+
+    // Add callable shader record
+    pub fn add_callable(&mut self, record: DxrShaderRecord) {
+        self.callable_records.push(record);
+    }
+
+    // Calculate aligned stride for a list of shader records
+    fn calculate_stride(records: &[DxrShaderRecord]) -> usize {
+        let max_size = records.iter().map(|r| r.raw_size()).max().unwrap_or(32);
+        (max_size + 63) & !63
+    }
+
+    // Build the packed SBT memory buffer and populate dispatch rays descriptor
+    pub fn build(
+        &self,
+        base_gpu_va: u64,
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) -> Result<(Vec<u8>, D3D12_DISPATCH_RAYS_DESC), DxrError> {
+        if (base_gpu_va % 64) != 0 {
+            return Err(DxrError::InvalidAlignment);
+        }
+        let raygen = self.raygen.as_ref().ok_or(DxrError::MissingRayGenRecord)?;
+
+        let mut buffer = Vec::new();
+
+        // 1. RayGen Record (must be aligned to 64 bytes)
+        let raygen_va = base_gpu_va;
+        let raygen_size = ((raygen.raw_size() + 63) & !63) as u64;
+        buffer.extend_from_slice(&raygen.shader_id);
+        buffer.extend_from_slice(&raygen.local_arguments);
+        buffer.resize(raygen_size as usize, 0);
+
+        // Helper to align buffer to 64 bytes
+        let align_buf = |buf: &mut Vec<u8>| {
+            let rem = buf.len() % 64;
+            if rem != 0 {
+                buf.resize(buf.len() + (64 - rem), 0);
+            }
+        };
+
+        // 2. Miss Shader Table
+        align_buf(&mut buffer);
+        let miss_va = base_gpu_va + buffer.len() as u64;
+        let miss_stride = if self.miss_records.is_empty() {
+            0
+        } else {
+            Self::calculate_stride(&self.miss_records)
+        };
+        for record in &self.miss_records {
+            let offset = buffer.len();
+            buffer.extend_from_slice(&record.shader_id);
+            buffer.extend_from_slice(&record.local_arguments);
+            buffer.resize(offset + miss_stride, 0);
+        }
+        let miss_size = (self.miss_records.len() * miss_stride) as u64;
+
+        // 3. Hit Group Table
+        align_buf(&mut buffer);
+        let hit_va = base_gpu_va + buffer.len() as u64;
+        let hit_stride = if self.hit_group_records.is_empty() {
+            0
+        } else {
+            Self::calculate_stride(&self.hit_group_records)
+        };
+        for record in &self.hit_group_records {
+            let offset = buffer.len();
+            buffer.extend_from_slice(&record.shader_id);
+            buffer.extend_from_slice(&record.local_arguments);
+            buffer.resize(offset + hit_stride, 0);
+        }
+        let hit_size = (self.hit_group_records.len() * hit_stride) as u64;
+
+        // 4. Callable Table
+        align_buf(&mut buffer);
+        let call_va = base_gpu_va + buffer.len() as u64;
+        let call_stride = if self.callable_records.is_empty() {
+            0
+        } else {
+            Self::calculate_stride(&self.callable_records)
+        };
+        for record in &self.callable_records {
+            let offset = buffer.len();
+            buffer.extend_from_slice(&record.shader_id);
+            buffer.extend_from_slice(&record.local_arguments);
+            buffer.resize(offset + call_stride, 0);
+        }
+        let call_size = (self.callable_records.len() * call_stride) as u64;
+
+        let desc = D3D12_DISPATCH_RAYS_DESC {
+            ray_generation_shader_record: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+                start_address: raygen_va,
+                size_in_bytes: raygen_size,
+            },
+            miss_shader_table: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                start_address: if miss_size > 0 { miss_va } else { 0 },
+                size_in_bytes: miss_size,
+                stride_in_bytes: miss_stride as u64,
+            },
+            hit_group_table: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                start_address: if hit_size > 0 { hit_va } else { 0 },
+                size_in_bytes: hit_size,
+                stride_in_bytes: hit_stride as u64,
+            },
+            callable_shader_table: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                start_address: if call_size > 0 { call_va } else { 0 },
+                size_in_bytes: call_size,
+                stride_in_bytes: call_stride as u64,
+            },
+            width,
+            height,
+            depth,
+        };
+
+        Ok((buffer, desc))
     }
 }
