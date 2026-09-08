@@ -432,6 +432,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 bundle pre-compilation subsystem self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Query Heap, GPU Timestamp & Occlusion Engine (TASK-KNT-153)
+    if !gfx::test_query_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 query heap subsystem self-test failed!\r\n");
+    }
+
     // Initialize and verify AHCI SATA Persistent Storage Subsystem
     if !drivers::storage::test_ahci_sata_subsystem() {
         serial_write_str("[KNT-PANIC] AHCI SATA storage subsystem self-test failed!\r\n");

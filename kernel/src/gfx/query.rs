@@ -496,3 +496,149 @@ impl OcclusionCullingEngine {
         Ok(visible)
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Query Heap and Profiler Engine
+pub fn test_query_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Query Heap, GPU Timestamps & Occlusion Engine...\r\n");
+
+    // 1. Verify query heap allocation, slot bounds, and query type validation
+    let occ_desc = D3D12_QUERY_HEAP_DESC::new(D3D12_QUERY_HEAP_TYPE::Occlusion, 4);
+    let mut occ_heap = match D3D12QueryHeap::new(occ_desc) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-QUERY-FAIL] Failed to allocate occlusion query heap\r\n");
+            return false;
+        }
+    };
+
+    let ts_desc = D3D12_QUERY_HEAP_DESC::new(D3D12_QUERY_HEAP_TYPE::Timestamp, 8);
+    let mut ts_heap = match D3D12QueryHeap::new(ts_desc) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-QUERY-FAIL] Failed to allocate timestamp query heap\r\n");
+            return false;
+        }
+    };
+
+    let stats_desc = D3D12_QUERY_HEAP_DESC::new(D3D12_QUERY_HEAP_TYPE::PipelineStatistics, 4);
+    let mut stats_heap = match D3D12QueryHeap::new(stats_desc) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-QUERY-FAIL] Failed to allocate pipeline statistics query heap\r\n");
+            return false;
+        }
+    };
+
+    if occ_heap.validate_query_type(D3D12_QUERY_TYPE::Timestamp).is_ok() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Incompatible query type must be rejected\r\n");
+        return false;
+    }
+    if ts_heap.begin_query(D3D12_QUERY_TYPE::Timestamp, 0).is_ok() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] BeginQuery on timestamp query must be rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Query heap descriptor validation and slot allocation verified\r\n");
+
+    // 2. Verify GPU timestamp frequency profiler and execution span calculation
+    let profiler = GpuTimestampProfiler::new(100_000_000); // 100 MHz clock
+    if profiler.get_timestamp_frequency() != 100_000_000 {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Profiler frequency mismatch\r\n");
+        return false;
+    }
+
+    let start_ticks = 10_000_000;
+    let end_ticks = 10_500_000; // 500,000 ticks = 5 ms = 5,000 us
+    if profiler.record_timestamp(&mut ts_heap, 0, start_ticks).is_err()
+        || profiler.record_timestamp(&mut ts_heap, 1, end_ticks).is_err()
+    {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Failed to record timestamp queries\r\n");
+        return false;
+    }
+
+    let span = profiler.calculate_execution_span(start_ticks, end_ticks, b"MainRenderPass");
+    if span.duration_us != 5_000 {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Timestamp microsecond duration mismatch\r\n");
+        return false;
+    }
+
+    let mut ts_resolve_buf = [0u8; 16];
+    if ts_heap.resolve_query_data(D3D12_QUERY_TYPE::Timestamp, 0, 2, &mut ts_resolve_buf, 0).is_err() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Failed to resolve timestamp queries\r\n");
+        return false;
+    }
+    let resolved_t0 = u64::from_le_bytes(ts_resolve_buf[0..8].try_into().unwrap());
+    let resolved_t1 = u64::from_le_bytes(ts_resolve_buf[8..16].try_into().unwrap());
+    if resolved_t0 != start_ticks || resolved_t1 != end_ticks {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Resolved timestamp payload mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * GPU timestamp timer frequency profiling and span duration verified\r\n");
+
+    // 3. Verify pipeline statistics counter accumulation and delta recording
+    let mut accumulator = PipelineStatisticsAccumulator::new();
+    if accumulator.begin_query(&mut stats_heap, 0).is_err() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Failed to begin pipeline statistics query\r\n");
+        return false;
+    }
+
+    accumulator.record_draw(36, 12, 500);
+    accumulator.record_dispatch(4, 4, 1, 64); // 16 groups * 64 threads = 1024 CS invocations
+
+    if accumulator.end_query(&mut stats_heap, 0).is_err() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Failed to end pipeline statistics query\r\n");
+        return false;
+    }
+
+    let mut stats_resolve_buf = [0u8; 88];
+    if stats_heap.resolve_query_data(D3D12_QUERY_TYPE::PipelineStatistics, 0, 1, &mut stats_resolve_buf, 0).is_err() {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Failed to resolve pipeline statistics query\r\n");
+        return false;
+    }
+    let ia_verts = u64::from_le_bytes(stats_resolve_buf[0..8].try_into().unwrap());
+    let ia_prims = u64::from_le_bytes(stats_resolve_buf[8..16].try_into().unwrap());
+    let vs_invs = u64::from_le_bytes(stats_resolve_buf[16..24].try_into().unwrap());
+    let ps_invs = u64::from_le_bytes(stats_resolve_buf[56..64].try_into().unwrap());
+    let cs_invs = u64::from_le_bytes(stats_resolve_buf[80..88].try_into().unwrap());
+
+    if ia_verts != 36 || ia_prims != 12 || vs_invs != 36 || ps_invs != 500 || cs_invs != 1024 {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Pipeline statistics counter mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Pipeline statistics accumulator and differential delta reporting verified\r\n");
+
+    // 4. Verify occlusion and binary visibility culling
+    if OcclusionCullingEngine::begin_query(&mut occ_heap, 0, false).is_err()
+        || OcclusionCullingEngine::end_query(&mut occ_heap, 0, 150, false).is_err()
+    {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Standard occlusion query failed\r\n");
+        return false;
+    }
+
+    if OcclusionCullingEngine::begin_query(&mut occ_heap, 1, true).is_err()
+        || OcclusionCullingEngine::end_query(&mut occ_heap, 1, 0, true).is_err()
+    {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Binary occlusion query failed\r\n");
+        return false;
+    }
+
+    if OcclusionCullingEngine::is_visible(&occ_heap, 0) != Ok(true)
+        || OcclusionCullingEngine::is_visible(&occ_heap, 1) != Ok(false)
+    {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Occlusion visibility evaluation mismatch\r\n");
+        return false;
+    }
+
+    let candidates = [0, 1];
+    let visible_instances = match OcclusionCullingEngine::filter_visible_instances(&occ_heap, &candidates) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if visible_instances != alloc::vec![0] {
+        crate::serial_write_str("[KNT-QUERY-FAIL] Occlusion culling candidate filtering mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Binary occlusion culling and visibility candidate filtering verified\r\n");
+
+    crate::serial_write_str("[KNT-D3D12-QUERY-PASS] Direct3D 12 query heap and GPU timestamp engine verified\r\n");
+    true
+}
