@@ -200,6 +200,84 @@ impl D3D12_FEATURE_DATA_D3D12_OPTIONS6 {
     }
 }
 
+
+// Standard DXGI format for VRS Shading Rate Image (8-bit unsigned integer per tile)
+pub const DXGI_FORMAT_R8_UINT: u32 = 62;
+
+// Screen-space VRS tile coordinate translation and grid addressing engine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrsTileCoordinateEngine {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub tile_size: u32,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub row_pitch: u32,
+    pub format: u32,
+}
+
+impl VrsTileCoordinateEngine {
+    // Construct new tile coordinate translation engine for given screen resolution and tile size
+    pub fn new(screen_width: u32, screen_height: u32, tile_size: u32, format: u32) -> Result<Self, VrsError> {
+        if screen_width == 0 || screen_height == 0 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        if tile_size != 16 && tile_size != 32 && tile_size != 8 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        if format != DXGI_FORMAT_R8_UINT {
+            return Err(VrsError::TierNotSupported);
+        }
+
+        let tiles_x = (screen_width + tile_size - 1) / tile_size;
+        let tiles_y = (screen_height + tile_size - 1) / tile_size;
+        let row_pitch = (tiles_x + 255) & !255;
+
+        Ok(Self {
+            screen_width,
+            screen_height,
+            tile_size,
+            tiles_x,
+            tiles_y,
+            row_pitch,
+            format,
+        })
+    }
+
+    // Map screen pixel coordinate (x, y) to tile coordinate (tile_x, tile_y) and linear tile index
+    pub fn pixel_to_tile(&self, pixel_x: u32, pixel_y: u32) -> Result<(u32, u32, usize), VrsError> {
+        if pixel_x >= self.screen_width || pixel_y >= self.screen_height {
+            return Err(VrsError::OutOfBounds);
+        }
+        let tile_x = pixel_x / self.tile_size;
+        let tile_y = pixel_y / self.tile_size;
+        let linear_index = (tile_y * self.tiles_x + tile_x) as usize;
+        Ok((tile_x, tile_y, linear_index))
+    }
+
+    // Map tile coordinate to bounding pixel rectangle (min_x, min_y, max_x, max_y)
+    pub fn tile_to_pixel_bounds(&self, tile_x: u32, tile_y: u32) -> Result<(u32, u32, u32, u32), VrsError> {
+        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
+            return Err(VrsError::OutOfBounds);
+        }
+        let min_x = tile_x * self.tile_size;
+        let min_y = tile_y * self.tile_size;
+        let max_x = core::cmp::min(min_x + self.tile_size, self.screen_width);
+        let max_y = core::cmp::min(min_y + self.tile_size, self.screen_height);
+        Ok((min_x, min_y, max_x, max_y))
+    }
+
+    // Calculate buffer allocation size matching row pitch alignment
+    pub fn required_buffer_size(&self) -> usize {
+        (self.row_pitch as usize) * (self.tiles_y as usize)
+    }
+
+    // Total active tile count in the grid
+    pub fn total_tiles(&self) -> usize {
+        (self.tiles_x as usize) * (self.tiles_y as usize)
+    }
+}
+
 /// Errors returned by the Variable Rate Shading subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VrsError {
