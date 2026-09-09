@@ -116,6 +116,90 @@ impl D3D12_SHADING_RATE_COMBINER {
     }
 }
 
+// Hardware Variable Rate Shading tier capabilities
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_VARIABLE_SHADING_RATE_TIER {
+    D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED = 0,
+    D3D12_VARIABLE_SHADING_RATE_TIER_1 = 1,
+    D3D12_VARIABLE_SHADING_RATE_TIER_2 = 2,
+}
+
+// Hardware feature query results for D3D12 Options6 (VRS Tier capabilities)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12_FEATURE_DATA_D3D12_OPTIONS6 {
+    pub AdditionalShadingRatesSupported: bool,
+    pub PerPrimitiveShadingRateSupportedWithViewportIndexing: bool,
+    pub VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER,
+    pub ShadingRateImageTileSize: u32,
+    pub BackgroundProcessingSupported: bool,
+}
+
+impl D3D12_FEATURE_DATA_D3D12_OPTIONS6 {
+    // Construct default unsupported VRS feature descriptor
+    pub const fn unsupported() -> Self {
+        Self {
+            AdditionalShadingRatesSupported: false,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: false,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED,
+            ShadingRateImageTileSize: 0,
+            BackgroundProcessingSupported: false,
+        }
+    }
+
+    // Construct Tier 1 capability descriptor
+    pub const fn tier1(additional_rates: bool) -> Self {
+        Self {
+            AdditionalShadingRatesSupported: additional_rates,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: false,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_1,
+            ShadingRateImageTileSize: 0,
+            BackgroundProcessingSupported: true,
+        }
+    }
+
+    // Construct Tier 2 capability descriptor with specified screen-space tile size
+    pub fn tier2(tile_size: u32, additional_rates: bool) -> Result<Self, VrsError> {
+        if tile_size != 8 && tile_size != 16 && tile_size != 32 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        Ok(Self {
+            AdditionalShadingRatesSupported: additional_rates,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: true,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2,
+            ShadingRateImageTileSize: tile_size,
+            BackgroundProcessingSupported: true,
+        })
+    }
+
+    // Check whether screen-space image-based VRS is supported
+    pub const fn supports_image_based_vrs(&self) -> bool {
+        matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2)
+            && self.ShadingRateImageTileSize > 0
+    }
+
+    // Check whether per-primitive shading rate is supported
+    pub const fn supports_per_primitive_vrs(&self) -> bool {
+        matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2)
+    }
+
+    // Validate if a requested coarse rate is supported by hardware
+    pub fn validate_shading_rate(&self, rate: D3D12_SHADING_RATE) -> bool {
+        if matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED) {
+            return false;
+        }
+        match rate {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 => true,
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4 => self.AdditionalShadingRatesSupported,
+        }
+    }
+}
+
 /// Errors returned by the Variable Rate Shading subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VrsError {
