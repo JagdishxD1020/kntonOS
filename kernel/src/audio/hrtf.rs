@@ -341,6 +341,125 @@ pub fn verify_doppler_pitch_shifter() -> bool {
     true
 }
 
+// Binaural HRTF Acoustic Model (ITD, ILD, and Distance Attenuation)
+
+/// DirectSound 3D binaural acoustic rendering parameters for left and right ears.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ds3dBinauralParams {
+    pub left_delay_samples: f32,
+    pub right_delay_samples: f32,
+    pub left_gain: f32,
+    pub right_gain: f32,
+    pub left_cutoff_alpha: f32,
+    pub right_cutoff_alpha: f32,
+    pub distance_attenuation: f32,
+}
+
+/// DirectSound 3D binaural acoustic model computing ITD, ILD head shadow, and distance rolloff.
+pub struct Ds3dBinauralAcousticModel {
+    pub head_radius: f32,
+    pub sound_speed: f32,
+}
+
+impl Ds3dBinauralAcousticModel {
+    pub const fn new() -> Self {
+        Self {
+            head_radius: HEAD_RADIUS,
+            sound_speed: DS3D_SPEED_OF_SOUND,
+        }
+    }
+
+    /// Evaluates inverse distance attenuation based on DirectSound 3D minimum/maximum distance bounds.
+    pub fn calculate_distance_attenuation(&self, emitter: &HrtfEmitterGeometry, distance: f32) -> f32 {
+        if distance <= emitter.min_distance {
+            return 1.0;
+        }
+        if distance >= emitter.max_distance {
+            return 0.0;
+        }
+        let delta = distance - emitter.min_distance;
+        let denom = emitter.min_distance + emitter.rolloff_factor * delta;
+        if denom > 1e-4 {
+            (emitter.min_distance / denom).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Computes full binaural parameters for emitter relative to listener.
+    pub fn evaluate_parameters(
+        &self,
+        emitter: &HrtfEmitterGeometry,
+        listener: &HrtfListenerGeometry,
+    ) -> Ds3dBinauralParams {
+        let (dist, _los, azimuth, _elevation) = emitter.relative_to_listener(listener);
+        let dist_gain = self.calculate_distance_attenuation(emitter, dist);
+
+        // Calculate Woodworth ITD delay in audio samples
+        let (l_itd, r_itd) = calculate_itd_samples(azimuth);
+
+        // Calculate ILD head-shadow filter parameters
+        let ((l_alpha, l_shadow_gain), (r_alpha, r_shadow_gain)) = calculate_ild_parameters(azimuth);
+
+        Ds3dBinauralParams {
+            left_delay_samples: l_itd,
+            right_delay_samples: r_itd,
+            left_gain: dist_gain * l_shadow_gain,
+            right_gain: dist_gain * r_shadow_gain,
+            left_cutoff_alpha: l_alpha,
+            right_cutoff_alpha: r_alpha,
+            distance_attenuation: dist_gain,
+        }
+    }
+}
+
+/// Verifies binaural acoustic modeling (ITD time delay, ILD attenuation, and distance damping).
+pub fn verify_binaural_acoustic_model() -> bool {
+    let model = Ds3dBinauralAcousticModel::new();
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+
+    // 1. Center frontal source (azimuth = 0.0)
+    emitter.position = HrtfVector3::new(0.0, 0.0, 5.0);
+    let center_params = model.evaluate_parameters(&emitter, &listener);
+    if center_params.left_delay_samples != 0.0 || center_params.right_delay_samples != 0.0 {
+        return false;
+    }
+    if (center_params.left_gain - center_params.right_gain).abs() > 1e-4 {
+        return false;
+    }
+    if (center_params.left_cutoff_alpha - center_params.right_cutoff_alpha).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Lateral source directly to the right (+90 degrees)
+    emitter.position = HrtfVector3::new(5.0, 0.0, 0.0);
+    let right_params = model.evaluate_parameters(&emitter, &listener);
+    // Right ear direct: delay = 0, gain higher, alpha = 1.0
+    if right_params.right_delay_samples != 0.0 {
+        return false;
+    }
+    // Left ear (contralateral): delayed ~31 samples, attenuated, alpha < 0.5
+    if right_params.left_delay_samples < 28.0 || right_params.left_delay_samples > 35.0 {
+        return false;
+    }
+    if right_params.right_gain <= right_params.left_gain {
+        return false;
+    }
+    if right_params.left_cutoff_alpha >= 0.5 || right_params.right_cutoff_alpha != 1.0 {
+        return false;
+    }
+
+    // 3. Distance rolloff
+    emitter.position = HrtfVector3::new(0.0, 0.0, 20.0);
+    let far_params = model.evaluate_parameters(&emitter, &listener);
+    if far_params.distance_attenuation >= center_params.distance_attenuation {
+        return false;
+    }
+
+    true
+}
+
 // Interaural Time Difference (ITD) Delay Line
 
 /// Circular delay line supporting fractional-sample delay with linear interpolation.
