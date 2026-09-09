@@ -407,6 +407,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 VRS Tier 2 shading rate image generator self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
+    if !gfx::test_vrs_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 variable rate shading engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 User-Mode Driver (UMD) Command Streamer & Swapchain Service (TASK-KNT-139)
     if !gfx::test_swapchain_service_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 UMD command streamer and swapchain service self-test failed!\r\n");

@@ -1,8 +1,375 @@
+#![allow(non_camel_case_types, non_snake_case)]
 //! Direct3D 12 Variable Rate Shading (VRS Tier 2) Subsystem.
 //! Implements hardware-accelerated Variable Rate Shading (VRS) Tier 2 specifications:
 
 use alloc::vec;
 use alloc::vec::Vec;
+
+// Direct3D 12 standard coarse pixel shading rate enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_SHADING_RATE {
+    D3D12_SHADING_RATE_1X1 = 0,
+    D3D12_SHADING_RATE_1X2 = 0x1,
+    D3D12_SHADING_RATE_2X1 = 0x4,
+    D3D12_SHADING_RATE_2X2 = 0x5,
+    D3D12_SHADING_RATE_2X4 = 0x6,
+    D3D12_SHADING_RATE_4X2 = 0x9,
+    D3D12_SHADING_RATE_4X4 = 0xa,
+}
+
+impl D3D12_SHADING_RATE {
+    // Horizontal dimension in pixels
+    pub const fn width(self) -> u32 {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 | Self::D3D12_SHADING_RATE_1X2 => 1,
+            Self::D3D12_SHADING_RATE_2X1 | Self::D3D12_SHADING_RATE_2X2 | Self::D3D12_SHADING_RATE_2X4 => 2,
+            Self::D3D12_SHADING_RATE_4X2 | Self::D3D12_SHADING_RATE_4X4 => 4,
+        }
+    }
+
+    // Vertical dimension in pixels
+    pub const fn height(self) -> u32 {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 | Self::D3D12_SHADING_RATE_2X1 => 1,
+            Self::D3D12_SHADING_RATE_1X2 | Self::D3D12_SHADING_RATE_2X2 | Self::D3D12_SHADING_RATE_4X2 => 2,
+            Self::D3D12_SHADING_RATE_2X4 | Self::D3D12_SHADING_RATE_4X4 => 4,
+        }
+    }
+
+    // Convert from width and height dimensions
+    pub const fn from_dimensions(width: u32, height: u32) -> Option<Self> {
+        match (width, height) {
+            (1, 1) => Some(Self::D3D12_SHADING_RATE_1X1),
+            (1, 2) => Some(Self::D3D12_SHADING_RATE_1X2),
+            (2, 1) => Some(Self::D3D12_SHADING_RATE_2X1),
+            (2, 2) => Some(Self::D3D12_SHADING_RATE_2X2),
+            (2, 4) => Some(Self::D3D12_SHADING_RATE_2X4),
+            (4, 2) => Some(Self::D3D12_SHADING_RATE_4X2),
+            (4, 4) => Some(Self::D3D12_SHADING_RATE_4X4),
+            _ => None,
+        }
+    }
+
+    // Convert to ShadingRate
+    pub const fn to_shading_rate(self) -> ShadingRate {
+        match self {
+            Self::D3D12_SHADING_RATE_1X1 => ShadingRate::Rate1x1,
+            Self::D3D12_SHADING_RATE_1X2 => ShadingRate::Rate1x2,
+            Self::D3D12_SHADING_RATE_2X1 => ShadingRate::Rate2x1,
+            Self::D3D12_SHADING_RATE_2X2 => ShadingRate::Rate2x2,
+            Self::D3D12_SHADING_RATE_2X4 => ShadingRate::Rate2x4,
+            Self::D3D12_SHADING_RATE_4X2 => ShadingRate::Rate4x2,
+            Self::D3D12_SHADING_RATE_4X4 => ShadingRate::Rate4x4,
+        }
+    }
+
+    // Convert from ShadingRate
+    pub const fn from_shading_rate(rate: ShadingRate) -> Self {
+        match rate {
+            ShadingRate::Rate1x1 => Self::D3D12_SHADING_RATE_1X1,
+            ShadingRate::Rate1x2 => Self::D3D12_SHADING_RATE_1X2,
+            ShadingRate::Rate2x1 => Self::D3D12_SHADING_RATE_2X1,
+            ShadingRate::Rate2x2 => Self::D3D12_SHADING_RATE_2X2,
+            ShadingRate::Rate2x4 => Self::D3D12_SHADING_RATE_2X4,
+            ShadingRate::Rate4x2 => Self::D3D12_SHADING_RATE_4X2,
+            ShadingRate::Rate4x4 => Self::D3D12_SHADING_RATE_4X4,
+        }
+    }
+}
+
+// Direct3D 12 coarse pixel shading rate combiner mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_SHADING_RATE_COMBINER {
+    D3D12_SHADING_RATE_COMBINER_PASSTHROUGH = 0,
+    D3D12_SHADING_RATE_COMBINER_OVERRIDE = 1,
+    D3D12_SHADING_RATE_COMBINER_MIN = 2,
+    D3D12_SHADING_RATE_COMBINER_MAX = 3,
+    D3D12_SHADING_RATE_COMBINER_SUM = 4,
+}
+
+impl D3D12_SHADING_RATE_COMBINER {
+    // Combine two D3D12 shading rates according to this combiner rule
+    pub fn combine(self, rate_a: D3D12_SHADING_RATE, rate_b: D3D12_SHADING_RATE) -> D3D12_SHADING_RATE {
+        match self {
+            Self::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH => rate_a,
+            Self::D3D12_SHADING_RATE_COMBINER_OVERRIDE => rate_b,
+            Self::D3D12_SHADING_RATE_COMBINER_MIN => {
+                let w = core::cmp::min(rate_a.width(), rate_b.width());
+                let h = core::cmp::min(rate_a.height(), rate_b.height());
+                D3D12_SHADING_RATE::from_dimensions(w, h).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1)
+            }
+            Self::D3D12_SHADING_RATE_COMBINER_MAX => {
+                let w = core::cmp::max(rate_a.width(), rate_b.width());
+                let h = core::cmp::max(rate_a.height(), rate_b.height());
+                D3D12_SHADING_RATE::from_dimensions(w, h).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+            }
+            Self::D3D12_SHADING_RATE_COMBINER_SUM => {
+                let w = core::cmp::min(4, rate_a.width() * rate_b.width());
+                let h = core::cmp::min(4, rate_a.height() * rate_b.height());
+                let w_valid = if w >= 4 { 4 } else if w >= 2 { 2 } else { 1 };
+                let h_valid = if h >= 4 { 4 } else if h >= 2 { 2 } else { 1 };
+                D3D12_SHADING_RATE::from_dimensions(w_valid, h_valid).unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+            }
+        }
+    }
+}
+
+// Hardware Variable Rate Shading tier capabilities
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_VARIABLE_SHADING_RATE_TIER {
+    D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED = 0,
+    D3D12_VARIABLE_SHADING_RATE_TIER_1 = 1,
+    D3D12_VARIABLE_SHADING_RATE_TIER_2 = 2,
+}
+
+// Hardware feature query results for D3D12 Options6 (VRS Tier capabilities)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12_FEATURE_DATA_D3D12_OPTIONS6 {
+    pub AdditionalShadingRatesSupported: bool,
+    pub PerPrimitiveShadingRateSupportedWithViewportIndexing: bool,
+    pub VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER,
+    pub ShadingRateImageTileSize: u32,
+    pub BackgroundProcessingSupported: bool,
+}
+
+impl D3D12_FEATURE_DATA_D3D12_OPTIONS6 {
+    // Construct default unsupported VRS feature descriptor
+    pub const fn unsupported() -> Self {
+        Self {
+            AdditionalShadingRatesSupported: false,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: false,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED,
+            ShadingRateImageTileSize: 0,
+            BackgroundProcessingSupported: false,
+        }
+    }
+
+    // Construct Tier 1 capability descriptor
+    pub const fn tier1(additional_rates: bool) -> Self {
+        Self {
+            AdditionalShadingRatesSupported: additional_rates,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: false,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_1,
+            ShadingRateImageTileSize: 0,
+            BackgroundProcessingSupported: true,
+        }
+    }
+
+    // Construct Tier 2 capability descriptor with specified screen-space tile size
+    pub fn tier2(tile_size: u32, additional_rates: bool) -> Result<Self, VrsError> {
+        if tile_size != 8 && tile_size != 16 && tile_size != 32 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        Ok(Self {
+            AdditionalShadingRatesSupported: additional_rates,
+            PerPrimitiveShadingRateSupportedWithViewportIndexing: true,
+            VariableShadingRateTier: D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2,
+            ShadingRateImageTileSize: tile_size,
+            BackgroundProcessingSupported: true,
+        })
+    }
+
+    // Check whether screen-space image-based VRS is supported
+    pub const fn supports_image_based_vrs(&self) -> bool {
+        matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2)
+            && self.ShadingRateImageTileSize > 0
+    }
+
+    // Check whether per-primitive shading rate is supported
+    pub const fn supports_per_primitive_vrs(&self) -> bool {
+        matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_2)
+    }
+
+    // Validate if a requested coarse rate is supported by hardware
+    pub fn validate_shading_rate(&self, rate: D3D12_SHADING_RATE) -> bool {
+        if matches!(self.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED) {
+            return false;
+        }
+        match rate {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 => true,
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4 => self.AdditionalShadingRatesSupported,
+        }
+    }
+}
+
+
+// Standard DXGI format for VRS Shading Rate Image (8-bit unsigned integer per tile)
+pub const DXGI_FORMAT_R8_UINT: u32 = 62;
+
+// Screen-space VRS tile coordinate translation and grid addressing engine
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrsTileCoordinateEngine {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub tile_size: u32,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub row_pitch: u32,
+    pub format: u32,
+}
+
+impl VrsTileCoordinateEngine {
+    // Construct new tile coordinate translation engine for given screen resolution and tile size
+    pub fn new(screen_width: u32, screen_height: u32, tile_size: u32, format: u32) -> Result<Self, VrsError> {
+        if screen_width == 0 || screen_height == 0 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        if tile_size != 16 && tile_size != 32 && tile_size != 8 {
+            return Err(VrsError::InvalidDimensions);
+        }
+        if format != DXGI_FORMAT_R8_UINT {
+            return Err(VrsError::TierNotSupported);
+        }
+
+        let tiles_x = (screen_width + tile_size - 1) / tile_size;
+        let tiles_y = (screen_height + tile_size - 1) / tile_size;
+        let row_pitch = (tiles_x + 255) & !255;
+
+        Ok(Self {
+            screen_width,
+            screen_height,
+            tile_size,
+            tiles_x,
+            tiles_y,
+            row_pitch,
+            format,
+        })
+    }
+
+    // Map screen pixel coordinate (x, y) to tile coordinate (tile_x, tile_y) and linear tile index
+    pub fn pixel_to_tile(&self, pixel_x: u32, pixel_y: u32) -> Result<(u32, u32, usize), VrsError> {
+        if pixel_x >= self.screen_width || pixel_y >= self.screen_height {
+            return Err(VrsError::OutOfBounds);
+        }
+        let tile_x = pixel_x / self.tile_size;
+        let tile_y = pixel_y / self.tile_size;
+        let linear_index = (tile_y * self.tiles_x + tile_x) as usize;
+        Ok((tile_x, tile_y, linear_index))
+    }
+
+    // Map tile coordinate to bounding pixel rectangle (min_x, min_y, max_x, max_y)
+    pub fn tile_to_pixel_bounds(&self, tile_x: u32, tile_y: u32) -> Result<(u32, u32, u32, u32), VrsError> {
+        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
+            return Err(VrsError::OutOfBounds);
+        }
+        let min_x = tile_x * self.tile_size;
+        let min_y = tile_y * self.tile_size;
+        let max_x = core::cmp::min(min_x + self.tile_size, self.screen_width);
+        let max_y = core::cmp::min(min_y + self.tile_size, self.screen_height);
+        Ok((min_x, min_y, max_x, max_y))
+    }
+
+    // Calculate buffer allocation size matching row pitch alignment
+    pub fn required_buffer_size(&self) -> usize {
+        (self.row_pitch as usize) * (self.tiles_y as usize)
+    }
+
+    // Total active tile count in the grid
+    pub fn total_tiles(&self) -> usize {
+        (self.tiles_x as usize) * (self.tiles_y as usize)
+    }
+}
+
+
+// Command list VRS state tracker managing per-draw and image-based shading rates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrsCommandListState {
+    pub options: D3D12_FEATURE_DATA_D3D12_OPTIONS6,
+    pub current_rate: D3D12_SHADING_RATE,
+    pub current_combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    pub bound_image_gpu_va: Option<u64>,
+    pub recorded_draw_count: u32,
+}
+
+impl VrsCommandListState {
+    // Construct new VRS command list state tracker with hardware capability options
+    pub fn new(options: D3D12_FEATURE_DATA_D3D12_OPTIONS6) -> Self {
+        Self {
+            options,
+            current_rate: D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+            current_combiners: [
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            ],
+            bound_image_gpu_va: None,
+            recorded_draw_count: 0,
+        }
+    }
+
+    // Record RSSetShadingRate per-draw coarse shading rate and combiners
+    pub fn rs_set_shading_rate(
+        &mut self,
+        rate: D3D12_SHADING_RATE,
+        combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    ) -> Result<(), VrsError> {
+        if !self.options.validate_shading_rate(rate) {
+            return Err(VrsError::TierNotSupported);
+        }
+
+        // Tier 1 does not support non-passthrough combiners since SRI and SV_ShadingRate require Tier 2
+        if matches!(self.options.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_1) {
+            if combiners[0] != D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+                || combiners[1] != D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+            {
+                return Err(VrsError::TierNotSupported);
+            }
+        }
+
+        self.current_rate = rate;
+        self.current_combiners = combiners;
+        Ok(())
+    }
+
+    // Record RSSetShadingRateImage screen-space shading rate image binding
+    pub fn rs_set_shading_rate_image(&mut self, image_gpu_va: Option<u64>) -> Result<(), VrsError> {
+        if let Some(va) = image_gpu_va {
+            if !self.options.supports_image_based_vrs() {
+                return Err(VrsError::TierNotSupported);
+            }
+            if (va % 64) != 0 {
+                return Err(VrsError::InvalidDimensions);
+            }
+            self.bound_image_gpu_va = Some(va);
+        } else {
+            self.bound_image_gpu_va = None;
+        }
+        Ok(())
+    }
+
+    // Evaluate effective multi-stage shading rate for a given screen tile and primitive
+    pub fn evaluate_effective_rate(
+        &self,
+        tile_rate: Option<D3D12_SHADING_RATE>,
+        primitive_rate: Option<D3D12_SHADING_RATE>,
+    ) -> D3D12_SHADING_RATE {
+        // Stage 0: Combine Draw rate and Screen-Space Image rate
+        let rate_stage0 = match (self.bound_image_gpu_va, tile_rate) {
+            (Some(_), Some(t_rate)) => self.current_combiners[0].combine(self.current_rate, t_rate),
+            _ => self.current_rate,
+        };
+
+        // Stage 1: Combine Intermediate rate and Per-Primitive rate
+        match primitive_rate {
+            Some(p_rate) if self.options.supports_per_primitive_vrs() => {
+                self.current_combiners[1].combine(rate_stage0, p_rate)
+            }
+            _ => rate_stage0,
+        }
+    }
+
+    // Record draw call invocation
+    pub fn record_draw(&mut self) {
+        self.recorded_draw_count += 1;
+    }
+}
 
 /// Errors returned by the Variable Rate Shading subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1307,3 +1674,179 @@ pub fn test_vrs_tier2_shading_rate_image_subsystem() -> bool {
 
 
 
+
+// Comprehensive verification test suite for Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine
+pub fn test_vrs_subsystem() -> bool {
+    crate::serial_write_str("[KNT-VRS] Initializing Direct3D 12 Variable Rate Shading self-test...\r\n");
+
+    // 1. Shading rate definitions and dimension validation
+    let r1x1 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1;
+    let r2x2 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2;
+    let r4x4 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4;
+    if r1x1.width() != 1 || r1x1.height() != 1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 1x1 rate dimension mismatch\r\n");
+        return false;
+    }
+    if r2x2.width() != 2 || r2x2.height() != 2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 2x2 rate dimension mismatch\r\n");
+        return false;
+    }
+    if r4x4.width() != 4 || r4x4.height() != 4 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 4x4 rate dimension mismatch\r\n");
+        return false;
+    }
+    if D3D12_SHADING_RATE::from_dimensions(2, 4) != Some(D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] from_dimensions 2x4 lookup mismatch\r\n");
+        return false;
+    }
+    if r2x2.to_shading_rate() != ShadingRate::Rate2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] ShadingRate round-trip conversion mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_SHADING_RATE discrete dimensions and conversion verified\r\n");
+
+    // 2. Combiner evaluation rules
+    let c_min = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN;
+    let c_max = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX;
+    let c_sum = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_SUM;
+    let c_override = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE;
+    let c_pass = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+
+    if c_min.combine(r2x2, r4x4) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Min mismatch\r\n");
+        return false;
+    }
+    if c_max.combine(r1x1, r2x2) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Max mismatch\r\n");
+        return false;
+    }
+    if c_override.combine(r1x1, r4x4) != r4x4 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Override mismatch\r\n");
+        return false;
+    }
+    if c_pass.combine(r2x2, r4x4) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Passthrough mismatch\r\n");
+        return false;
+    }
+    let r2x1 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1;
+    let r1x2 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2;
+    if c_sum.combine(r2x1, r1x2) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Sum (2x1 + 1x2 -> 2x2) mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_SHADING_RATE_COMBINER multi-stage evaluation verified\r\n");
+
+    // 3. Adapter VRS feature support options
+    let opt_tier1 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier1(false);
+    if !opt_tier1.validate_shading_rate(r2x2) || opt_tier1.validate_shading_rate(r4x4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 1 rate validation mismatch\r\n");
+        return false;
+    }
+    if opt_tier1.supports_image_based_vrs() || opt_tier1.supports_per_primitive_vrs() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 1 must not support image or per-primitive VRS\r\n");
+        return false;
+    }
+
+    let opt_tier2 = match D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier2(16, true) {
+        Ok(opt) => opt,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 feature initialization failed\r\n");
+            return false;
+        }
+    };
+    if !opt_tier2.supports_image_based_vrs() || !opt_tier2.supports_per_primitive_vrs() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 feature queries must be true\r\n");
+        return false;
+    }
+    if !opt_tier2.validate_shading_rate(r4x4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 with additional rates must allow 4x4\r\n");
+        return false;
+    }
+    if D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier2(12, true).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Invalid tile size (12) was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_OPTIONS6 VRS tier capability queries and validation verified\r\n");
+
+    // 4. Tile coordinate translation engine
+    let tile_engine = match VrsTileCoordinateEngine::new(1920, 1080, 16, DXGI_FORMAT_R8_UINT) {
+        Ok(e) => e,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tile coordinate engine creation failed\r\n");
+            return false;
+        }
+    };
+    if tile_engine.tiles_x != 120 || tile_engine.tiles_y != 68 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 1920x1080 tile dimensions mismatch\r\n");
+        return false;
+    }
+    let (tx, ty, idx) = match tile_engine.pixel_to_tile(1919, 1079) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Pixel to tile mapping failed\r\n");
+            return false;
+        }
+    };
+    if tx != 119 || ty != 67 || idx != (67 * 120 + 119) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Last pixel tile coordinate mismatch\r\n");
+        return false;
+    }
+    let bounds = match tile_engine.tile_to_pixel_bounds(0, 0) {
+        Ok(b) => b,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tile to pixel bounds failed\r\n");
+            return false;
+        }
+    };
+    if bounds != (0, 0, 16, 16) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Origin tile pixel bounds mismatch\r\n");
+        return false;
+    }
+    if VrsTileCoordinateEngine::new(1920, 1080, 16, 100).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Invalid non-R8_UINT format was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * 16x16 / 32x32 screen-space tile coordinate grid translation verified\r\n");
+
+    // 5. Command list state recording (RSSetShadingRate & RSSetShadingRateImage)
+    let mut cmd_tier1 = VrsCommandListState::new(opt_tier1);
+    let invalid_tier1_res = cmd_tier1.rs_set_shading_rate(r2x2, [c_min, c_pass]);
+    if invalid_tier1_res != Err(VrsError::TierNotSupported) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Non-passthrough combiners on Tier 1 were not rejected\r\n");
+        return false;
+    }
+    if cmd_tier1.rs_set_shading_rate_image(Some(0x1000)).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Setting SRI on Tier 1 was not rejected\r\n");
+        return false;
+    }
+
+    let mut cmd_tier2 = VrsCommandListState::new(opt_tier2);
+    if cmd_tier2.rs_set_shading_rate(r2x2, [c_min, c_override]).is_err() {
+        crate::serial_write_str("[KNT-VRS-FAIL] RSSetShadingRate failed on Tier 2\r\n");
+        return false;
+    }
+    if cmd_tier2.rs_set_shading_rate_image(Some(0x2001)).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Unaligned SRI GPU VA was not rejected\r\n");
+        return false;
+    }
+    if cmd_tier2.rs_set_shading_rate_image(Some(0x2000)).is_err() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Valid 64-byte aligned SRI GPU VA failed\r\n");
+        return false;
+    }
+
+    // Effective rate: Draw(2x2) with Image(4x4, Min) -> 2x2; Primitive(1x1, Override) -> 1x1
+    let eff_rate = cmd_tier2.evaluate_effective_rate(Some(r4x4), Some(r1x1));
+    if eff_rate != r1x1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Multi-stage effective shading rate mismatch\r\n");
+        return false;
+    }
+    cmd_tier2.record_draw();
+    if cmd_tier2.recorded_draw_count != 1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Recorded draw count mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * RSSetShadingRate and RSSetShadingRateImage recording verified\r\n");
+
+    crate::serial_write_str("[KNT-VRS-PASS] Direct3D 12 variable rate shading engine verified\r\n");
+    true
+}
