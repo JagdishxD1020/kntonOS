@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! Win32 Performance Counters & High-Resolution QueryPerformanceCounter Engine.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,4 +67,68 @@ pub fn win32_calibrate_tsc_frequency() -> u64 {
     INVARIANT_TSC.store(true, Ordering::Release);
     CALIBRATED.store(true, Ordering::Release);
     freq
+}
+
+use core::sync::atomic::AtomicI64;
+
+static LAST_QPC_TICKS: AtomicI64 = AtomicI64::new(0);
+
+/// Retrieves the frequency of the performance counter in counts per second (standard 10 MHz).
+pub fn win32_query_performance_frequency(lpFrequency: *mut i64) -> bool {
+    if lpFrequency.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    unsafe {
+        *lpFrequency = QPC_STANDARD_FREQ_HZ as i64;
+    }
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Retrieves the current value of the performance counter with high-resolution TSC backing.
+pub fn win32_query_performance_counter(lpPerformanceCount: *mut i64) -> bool {
+    if lpPerformanceCount.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let tsc = win32_read_tsc();
+    let tsc_base = TSC_BASE_OFFSET.load(Ordering::Relaxed);
+    let elapsed_tsc = tsc.saturating_sub(tsc_base);
+    let tsc_freq = win32_get_tsc_frequency();
+
+    let qpc_ticks = ((elapsed_tsc as u128 * QPC_STANDARD_FREQ_HZ as u128) / tsc_freq as u128) as i64;
+
+    let mut current_last = LAST_QPC_TICKS.load(Ordering::Relaxed);
+    let mut count = qpc_ticks.max(current_last);
+    while let Err(actual) = LAST_QPC_TICKS.compare_exchange_weak(
+        current_last,
+        count,
+        Ordering::SeqCst,
+        Ordering::Relaxed,
+    ) {
+        current_last = actual;
+        count = qpc_ticks.max(current_last);
+    }
+
+    unsafe {
+        *lpPerformanceCount = count;
+    }
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Convenience helper reading the performance counter directly.
+pub fn win32_qpc_ticks() -> i64 {
+    let mut count: i64 = 0;
+    win32_query_performance_counter(&mut count as *mut i64);
+    count
+}
+
+/// Converts performance counter counts (10 MHz) into nanoseconds.
+#[inline(always)]
+pub fn win32_qpc_to_ns(qpc_ticks: i64) -> u64 {
+    (qpc_ticks.max(0) as u64).saturating_mul(100)
 }
