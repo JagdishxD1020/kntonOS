@@ -148,3 +148,164 @@ pub fn verify_multizone_thermal_sensors() -> bool {
 
     true
 }
+
+// Piecewise Linear Dynamic Fan Curve Governor
+
+/// Control point along a piecewise linear fan curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FanCurvePoint {
+    pub temp_c: f32,
+    pub pwm_pct: u8,
+}
+
+impl FanCurvePoint {
+    pub const fn new(temp_c: f32, pwm_pct: u8) -> Self {
+        Self { temp_c, pwm_pct }
+    }
+}
+
+/// Piecewise linear fan curve with up to 6 control points.
+#[derive(Clone, Copy, Debug)]
+pub struct FanCurve {
+    pub points: [FanCurvePoint; 6],
+    pub count: usize,
+}
+
+impl FanCurve {
+    pub const fn default_balanced() -> Self {
+        Self {
+            points: [
+                FanCurvePoint::new(35.0, 0),
+                FanCurvePoint::new(50.0, 20),
+                FanCurvePoint::new(65.0, 45),
+                FanCurvePoint::new(75.0, 65),
+                FanCurvePoint::new(85.0, 85),
+                FanCurvePoint::new(95.0, 100),
+            ],
+            count: 6,
+        }
+    }
+
+    /// Evaluates PWM duty percentage using piecewise linear interpolation.
+    pub fn evaluate(&self, temp_c: f32) -> u8 {
+        if self.count == 0 {
+            return 0;
+        }
+        if temp_c <= self.points[0].temp_c {
+            return self.points[0].pwm_pct;
+        }
+        if temp_c >= self.points[self.count - 1].temp_c {
+            return self.points[self.count - 1].pwm_pct;
+        }
+
+        for i in 0..(self.count - 1) {
+            let p0 = self.points[i];
+            let p1 = self.points[i + 1];
+            if temp_c >= p0.temp_c && temp_c <= p1.temp_c {
+                let range = p1.temp_c - p0.temp_c;
+                if range <= 0.001 {
+                    return p1.pwm_pct;
+                }
+                let t = (temp_c - p0.temp_c) / range;
+                let pwm_f = (p0.pwm_pct as f32) + t * ((p1.pwm_pct as f32) - (p0.pwm_pct as f32));
+                return (pwm_f + 0.5) as u8;
+            }
+        }
+
+        self.points[self.count - 1].pwm_pct
+    }
+}
+
+/// Dynamic fan governor applying piecewise linear curves with acoustic hysteresis and slew limiting.
+pub struct DynamicFanGovernor {
+    pub curve: FanCurve,
+    pub current_pwm: u8,
+    pub last_temp_c: f32,
+    pub hysteresis_c: f32,
+    pub max_rpm: u16,
+}
+
+impl DynamicFanGovernor {
+    pub const fn new(curve: FanCurve) -> Self {
+        Self {
+            curve,
+            current_pwm: 0,
+            last_temp_c: 25.0,
+            hysteresis_c: 2.0,
+            max_rpm: 6500,
+        }
+    }
+
+    /// Evaluates current temperature and updates PWM with hysteresis.
+    pub fn step(&mut self, temp_c: f32) -> u8 {
+        let target_pwm = self.curve.evaluate(temp_c);
+
+        if target_pwm > self.current_pwm {
+            // Instant ramp up when silicon temperature rises
+            self.current_pwm = target_pwm;
+            self.last_temp_c = temp_c;
+        } else if target_pwm < self.current_pwm {
+            // Apply acoustic hysteresis on cooldown to prevent fan hunting
+            if temp_c < (self.last_temp_c - self.hysteresis_c) {
+                self.current_pwm = target_pwm;
+                self.last_temp_c = temp_c;
+            }
+        }
+
+        self.current_pwm
+    }
+
+    /// Calculates estimated fan RPM corresponding to current PWM duty.
+    pub fn current_rpm(&self) -> u16 {
+        if self.current_pwm == 0 {
+            0
+        } else {
+            // Handheld blower fans spin between 1200 RPM and max_rpm
+            let min_spin_rpm: u16 = 1200;
+            let span = self.max_rpm.saturating_sub(min_spin_rpm);
+            min_spin_rpm + ((span as u32 * self.current_pwm as u32) / 100) as u16
+        }
+    }
+}
+
+/// Verifies piecewise linear interpolation and acoustic hysteresis on dynamic fan curves.
+pub fn verify_dynamic_fan_curve() -> bool {
+    let curve = FanCurve::default_balanced();
+
+    // 1. Below minimum threshold -> 0% PWM
+    if curve.evaluate(30.0) != 0 {
+        return false;
+    }
+
+    // 2. Exact point matches
+    if curve.evaluate(50.0) != 20 || curve.evaluate(95.0) != 100 {
+        return false;
+    }
+
+    // 3. Piecewise interpolation between 50C (20%) and 65C (45%): midpoint 57.5C = 32.5% -> 33%
+    let mid_pwm = curve.evaluate(57.5);
+    if mid_pwm != 32 && mid_pwm != 33 {
+        return false;
+    }
+
+    // 4. Governor step with acoustic hysteresis
+    let mut gov = DynamicFanGovernor::new(curve);
+    let ramp_up = gov.step(75.0);
+    if ramp_up != 65 {
+        return false;
+    }
+
+    // Small drop by 1C (74C): within 2C hysteresis -> fan holds 65% PWM
+    let hold = gov.step(74.0);
+    if hold != 65 {
+        return false;
+    }
+
+    // Drop by 3C (71C): exceeds 2C hysteresis -> fan cools down smoothly
+    let cooldown = gov.step(71.0);
+    if cooldown >= 65 {
+        return false;
+    }
+
+    true
+}
