@@ -717,6 +717,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] OpenAL 1.1 audio service self-test failed!\r\n");
     }
 
+    // Initialize and verify DirectSound 3D Doppler Shift & Binaural HRTF Spatialization Filter (TASK-KNT-157)
+    if !audio::test_hrtf_doppler_subsystem() {
+        serial_write_str("[KNT-PANIC] Binaural HRTF spatial audio filter and Doppler engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
     if !crypto::test_crypto_rng_subsystem() {

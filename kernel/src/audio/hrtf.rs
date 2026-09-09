@@ -1,7 +1,7 @@
 //! Head-Related Transfer Function (HRTF) Dataset, ITD Delay Line & ILD Filtering.
 //! Implements binaural acoustic modeling for headphone gaming and immersive 3D sound:
 
-use crate::graphics::types::{sin_f32, PI, HALF_PI};
+use crate::graphics::types::{sin_f32, sqrt_f32, PI, HALF_PI};
 
 /// Audio sample rate standard in KntonOS audio pipeline (48 kHz).
 pub const AUDIO_SAMPLE_RATE: f32 = 48_000.0;
@@ -24,6 +24,591 @@ pub const MAX_ITD_SAMPLES: f32 = 48.0;
 
 /// Number of azimuth bins in the discrete HRTF database (every 15° around 360°).
 pub const AZIMUTH_BINS: usize = 24;
+
+// 3D Spatial Vector and Geometry
+
+/// 3D Vector for HRTF spatial geometry and kinematics.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub struct HrtfVector3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl HrtfVector3 {
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    pub const fn zero() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    #[inline]
+    pub fn add(self, rhs: Self) -> Self {
+        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+    }
+
+    #[inline]
+    pub fn sub(self, rhs: Self) -> Self {
+        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+    }
+
+    #[inline]
+    pub fn scale(self, s: f32) -> Self {
+        Self::new(self.x * s, self.y * s, self.z * s)
+    }
+
+    #[inline]
+    pub fn dot(self, rhs: Self) -> f32 {
+        self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
+    }
+
+    #[inline]
+    pub fn cross(self, rhs: Self) -> Self {
+        Self::new(
+            self.y * rhs.z - self.z * rhs.y,
+            self.z * rhs.x - self.x * rhs.z,
+            self.x * rhs.y - self.y * rhs.x,
+        )
+    }
+
+    #[inline]
+    pub fn length_squared(self) -> f32 {
+        self.dot(self)
+    }
+
+    #[inline]
+    pub fn length(self) -> f32 {
+        sqrt_f32(self.length_squared())
+    }
+
+    #[inline]
+    pub fn normalize(self) -> Self {
+        let len = self.length();
+        if len > 1e-6 {
+            self.scale(1.0 / len)
+        } else {
+            Self::zero()
+        }
+    }
+}
+
+/// 3D Spatial Listener geometry representing position, cranial orientation and velocity.
+#[derive(Clone, Copy, Debug)]
+pub struct HrtfListenerGeometry {
+    pub position: HrtfVector3,
+    pub velocity: HrtfVector3,
+    pub forward: HrtfVector3,
+    pub up: HrtfVector3,
+    pub right: HrtfVector3,
+}
+
+impl HrtfListenerGeometry {
+    pub fn new() -> Self {
+        Self {
+            position: HrtfVector3::zero(),
+            velocity: HrtfVector3::zero(),
+            forward: HrtfVector3::new(0.0, 0.0, 1.0),
+            up: HrtfVector3::new(0.0, 1.0, 0.0),
+            right: HrtfVector3::new(1.0, 0.0, 0.0),
+        }
+    }
+
+    pub fn set_orientation(&mut self, forward: HrtfVector3, up: HrtfVector3) {
+        self.forward = forward.normalize();
+        let up_norm = up.normalize();
+        self.right = up_norm.cross(self.forward).normalize();
+        self.up = self.forward.cross(self.right).normalize();
+    }
+
+    /// Transforms world point into listener cranial coordinate frame.
+    pub fn world_to_cranial(&self, world_pos: HrtfVector3) -> HrtfVector3 {
+        let delta = world_pos.sub(self.position);
+        HrtfVector3::new(
+            delta.dot(self.right),
+            delta.dot(self.up),
+            delta.dot(self.forward),
+        )
+    }
+}
+
+/// 3D Spatial Emitter geometry representing source position, velocity, and distance bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct HrtfEmitterGeometry {
+    pub position: HrtfVector3,
+    pub velocity: HrtfVector3,
+    pub min_distance: f32,
+    pub max_distance: f32,
+    pub rolloff_factor: f32,
+}
+
+impl HrtfEmitterGeometry {
+    pub fn new() -> Self {
+        Self {
+            position: HrtfVector3::zero(),
+            velocity: HrtfVector3::zero(),
+            min_distance: 1.0,
+            max_distance: 50.0,
+            rolloff_factor: 1.0,
+        }
+    }
+
+    /// Computes distance, unit line-of-sight vector, and relative cranial azimuth & elevation.
+    pub fn relative_to_listener(&self, listener: &HrtfListenerGeometry) -> (f32, HrtfVector3, f32, f32) {
+        let delta = self.position.sub(listener.position);
+        let dist = delta.length();
+        let los_unit = if dist > 1e-6 { delta.scale(1.0 / dist) } else { HrtfVector3::new(0.0, 0.0, 1.0) };
+        let local = listener.world_to_cranial(self.position);
+        let azimuth = crate::audio::spatializer::atan2_f32(local.x, local.z);
+        let horiz_dist = sqrt_f32(local.x * local.x + local.z * local.z);
+        let elevation = crate::audio::spatializer::atan2_f32(local.y, horiz_dist);
+        (dist, los_unit, azimuth, elevation)
+    }
+}
+
+/// Verifies 3D spatial listener and emitter geometry and cranial coordinate transformation.
+pub fn verify_spatial_geometry() -> bool {
+    let mut listener = HrtfListenerGeometry::new();
+    listener.position = HrtfVector3::new(10.0, 0.0, 0.0);
+    listener.set_orientation(HrtfVector3::new(0.0, 0.0, 1.0), HrtfVector3::new(0.0, 1.0, 0.0));
+
+    // Verify orthogonality: forward . up = 0, forward . right = 0, up . right = 0
+    if listener.forward.dot(listener.up).abs() > 1e-5
+        || listener.forward.dot(listener.right).abs() > 1e-5
+        || listener.up.dot(listener.right).abs() > 1e-5
+    {
+        return false;
+    }
+
+    let mut emitter = HrtfEmitterGeometry::new();
+    // Place emitter 5 meters to the right (+X) and 10 meters forward (+Z) relative to listener
+    emitter.position = HrtfVector3::new(15.0, 0.0, 10.0);
+    let (dist, _los, azimuth, elevation) = emitter.relative_to_listener(&listener);
+
+    // Expected cranial local: x = 5, y = 0, z = 10 -> dist = sqrt(125) ~ 11.1803
+    let expected_dist = sqrt_f32(125.0);
+    if (dist - expected_dist).abs() > 0.01 {
+        return false;
+    }
+    // Azimuth = atan2(5, 10) ~ 0.4636 rad (> 0, sound on right)
+    if azimuth <= 0.0 || elevation.abs() > 1e-4 {
+        return false;
+    }
+
+    true
+}
+
+// DirectSound 3D Doppler Shift and Dynamic Frequency Scaling
+
+/// Standard speed of sound in dry air at 20°C in DirectSound 3D specifications (343.3 m/s).
+pub const DS3D_SPEED_OF_SOUND: f32 = 343.3;
+
+/// Computes DirectSound 3D Doppler frequency scaling factor based on relative velocity projections.
+pub fn calculate_ds3d_doppler_factor(
+    emitter: &HrtfEmitterGeometry,
+    listener: &HrtfListenerGeometry,
+    sound_speed: f32,
+    doppler_factor: f32,
+) -> f32 {
+    let delta = listener.position.sub(emitter.position);
+    let dist = delta.length();
+    if dist < 1e-4 {
+        return 1.0;
+    }
+
+    // Unit vector directed from emitter towards listener
+    let u_el = delta.scale(1.0 / dist);
+
+    // Emitter velocity projected towards listener (positive = approaching listener)
+    let v_e_approach = emitter.velocity.dot(u_el);
+    // Listener velocity projected towards emitter (positive = approaching emitter)
+    let v_l_approach = -listener.velocity.dot(u_el);
+
+    let c = if sound_speed > 10.0 { sound_speed } else { DS3D_SPEED_OF_SOUND };
+    let df = doppler_factor.clamp(0.0, 10.0);
+
+    // Limit projected velocities to 95% sound speed to prevent acoustic singularities
+    let max_v = 0.95 * c;
+    let clamped_ve = (df * v_e_approach).clamp(-max_v, max_v);
+    let clamped_vl = (df * v_l_approach).clamp(-max_v, max_v);
+
+    // DirectSound formula: pitch = (c + v_l_approach) / (c - v_e_approach)
+    let ratio = (c + clamped_vl) / (c - clamped_ve);
+    ratio.clamp(0.1, 10.0)
+}
+
+/// Circular buffer capacity for Doppler pitch shifting resampler.
+pub const DOPPLER_BUFFER_CAPACITY: usize = 512;
+pub const DOPPLER_BUFFER_MASK: usize = DOPPLER_BUFFER_CAPACITY - 1;
+
+/// DirectSound 3D Doppler pitch shifter using fractional linear interpolation resampling.
+#[derive(Clone, Copy)]
+pub struct Ds3dDopplerPitchShifter {
+    buffer: [i16; DOPPLER_BUFFER_CAPACITY],
+    write_pos: usize,
+    read_cursor: f32,
+}
+
+impl Ds3dDopplerPitchShifter {
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; DOPPLER_BUFFER_CAPACITY],
+            write_pos: 0,
+            read_cursor: 0.0,
+        }
+    }
+
+    /// Pushes an incoming sample into the Doppler circular buffer.
+    #[inline]
+    pub fn push(&mut self, sample: i16) {
+        self.buffer[self.write_pos] = sample;
+        self.write_pos = (self.write_pos + 1) & DOPPLER_BUFFER_MASK;
+    }
+
+    /// Processes an input block and writes pitch-shifted audio into output slice.
+    pub fn process_block(&mut self, input: &[i16], output: &mut [i16], pitch_ratio: f32) {
+        let clamped_ratio = pitch_ratio.clamp(0.2, 5.0);
+
+        for &sample in input {
+            self.push(sample);
+        }
+
+        let out_len = output.len();
+        for i in 0..out_len {
+            let offset = self.read_cursor;
+            let idx0 = offset as usize;
+            let frac = offset - (idx0 as f32);
+
+            let s0 = self.buffer[idx0 & DOPPLER_BUFFER_MASK] as f32;
+            let s1 = self.buffer[(idx0 + 1) & DOPPLER_BUFFER_MASK] as f32;
+
+            let interp = s0 + frac * (s1 - s0);
+            output[i] = interp.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+
+            self.read_cursor += clamped_ratio;
+            if self.read_cursor >= DOPPLER_BUFFER_CAPACITY as f32 {
+                self.read_cursor -= DOPPLER_BUFFER_CAPACITY as f32;
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer = [0; DOPPLER_BUFFER_CAPACITY];
+        self.write_pos = 0;
+        self.read_cursor = 0.0;
+    }
+}
+
+/// Verifies DirectSound 3D Doppler pitch shift calculation and fractional resampling.
+pub fn verify_doppler_pitch_shifter() -> bool {
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+    emitter.position = HrtfVector3::new(0.0, 0.0, 100.0);
+
+    // 1. Stationary emitter and listener -> factor must be 1.0
+    let f_stat = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if (f_stat - 1.0).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Emitter moving towards listener along -Z at 34.33 m/s (~0.1 c) -> higher pitch ~1.111
+    emitter.velocity = HrtfVector3::new(0.0, 0.0, -34.33);
+    let f_approach = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if f_approach <= 1.05 || f_approach >= 1.15 {
+        return false;
+    }
+
+    // 3. Emitter moving away from listener along +Z at 34.33 m/s -> lower pitch ~0.909
+    emitter.velocity = HrtfVector3::new(0.0, 0.0, 34.33);
+    let f_recede = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if f_recede >= 0.95 || f_recede <= 0.85 {
+        return false;
+    }
+
+    // 4. Verify Doppler resampler with pitch shifting
+    let mut shifter = Ds3dDopplerPitchShifter::new();
+    let input = [1000i16; 64];
+    let mut output = [0i16; 64];
+    shifter.process_block(&input, &mut output, 1.1);
+
+    // Steady state DC input must yield DC output
+    if output[32] != 1000 {
+        return false;
+    }
+
+    true
+}
+
+// Binaural HRTF Acoustic Model (ITD, ILD, and Distance Attenuation)
+
+/// DirectSound 3D binaural acoustic rendering parameters for left and right ears.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ds3dBinauralParams {
+    pub left_delay_samples: f32,
+    pub right_delay_samples: f32,
+    pub left_gain: f32,
+    pub right_gain: f32,
+    pub left_cutoff_alpha: f32,
+    pub right_cutoff_alpha: f32,
+    pub distance_attenuation: f32,
+}
+
+/// DirectSound 3D binaural acoustic model computing ITD, ILD head shadow, and distance rolloff.
+pub struct Ds3dBinauralAcousticModel {
+    pub head_radius: f32,
+    pub sound_speed: f32,
+}
+
+impl Ds3dBinauralAcousticModel {
+    pub const fn new() -> Self {
+        Self {
+            head_radius: HEAD_RADIUS,
+            sound_speed: DS3D_SPEED_OF_SOUND,
+        }
+    }
+
+    /// Evaluates inverse distance attenuation based on DirectSound 3D minimum/maximum distance bounds.
+    pub fn calculate_distance_attenuation(&self, emitter: &HrtfEmitterGeometry, distance: f32) -> f32 {
+        if distance <= emitter.min_distance {
+            return 1.0;
+        }
+        if distance >= emitter.max_distance {
+            return 0.0;
+        }
+        let delta = distance - emitter.min_distance;
+        let denom = emitter.min_distance + emitter.rolloff_factor * delta;
+        if denom > 1e-4 {
+            (emitter.min_distance / denom).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Computes full binaural parameters for emitter relative to listener.
+    pub fn evaluate_parameters(
+        &self,
+        emitter: &HrtfEmitterGeometry,
+        listener: &HrtfListenerGeometry,
+    ) -> Ds3dBinauralParams {
+        let (dist, _los, azimuth, _elevation) = emitter.relative_to_listener(listener);
+        let dist_gain = self.calculate_distance_attenuation(emitter, dist);
+
+        // Calculate Woodworth ITD delay in audio samples
+        let (l_itd, r_itd) = calculate_itd_samples(azimuth);
+
+        // Calculate ILD head-shadow filter parameters
+        let ((l_alpha, l_shadow_gain), (r_alpha, r_shadow_gain)) = calculate_ild_parameters(azimuth);
+
+        Ds3dBinauralParams {
+            left_delay_samples: l_itd,
+            right_delay_samples: r_itd,
+            left_gain: dist_gain * l_shadow_gain,
+            right_gain: dist_gain * r_shadow_gain,
+            left_cutoff_alpha: l_alpha,
+            right_cutoff_alpha: r_alpha,
+            distance_attenuation: dist_gain,
+        }
+    }
+}
+
+/// Verifies binaural acoustic modeling (ITD time delay, ILD attenuation, and distance damping).
+pub fn verify_binaural_acoustic_model() -> bool {
+    let model = Ds3dBinauralAcousticModel::new();
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+
+    // 1. Center frontal source (azimuth = 0.0)
+    emitter.position = HrtfVector3::new(0.0, 0.0, 5.0);
+    let center_params = model.evaluate_parameters(&emitter, &listener);
+    if center_params.left_delay_samples != 0.0 || center_params.right_delay_samples != 0.0 {
+        return false;
+    }
+    if (center_params.left_gain - center_params.right_gain).abs() > 1e-4 {
+        return false;
+    }
+    if (center_params.left_cutoff_alpha - center_params.right_cutoff_alpha).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Lateral source directly to the right (+90 degrees)
+    emitter.position = HrtfVector3::new(5.0, 0.0, 0.0);
+    let right_params = model.evaluate_parameters(&emitter, &listener);
+    // Right ear direct: delay = 0, gain higher, alpha = 1.0
+    if right_params.right_delay_samples != 0.0 {
+        return false;
+    }
+    // Left ear (contralateral): delayed ~31 samples, attenuated, alpha < 0.5
+    if right_params.left_delay_samples < 28.0 || right_params.left_delay_samples > 35.0 {
+        return false;
+    }
+    if right_params.right_gain <= right_params.left_gain {
+        return false;
+    }
+    if right_params.left_cutoff_alpha >= 0.5 || right_params.right_cutoff_alpha != 1.0 {
+        return false;
+    }
+
+    // 3. Distance rolloff
+    emitter.position = HrtfVector3::new(0.0, 0.0, 20.0);
+    let far_params = model.evaluate_parameters(&emitter, &listener);
+    if far_params.distance_attenuation >= center_params.distance_attenuation {
+        return false;
+    }
+
+    true
+}
+
+// Real-Time Headphone FIR Binaural Filter Bank
+
+/// Real-time 48kHz headphone binaural filter bank combining Doppler resampling, ITD, ILD, and 16-tap FIR convolution.
+pub struct HeadphoneBinauralFilterBank {
+    pub doppler: Ds3dDopplerPitchShifter,
+    pub left_delay: EarDelayLine,
+    pub right_delay: EarDelayLine,
+    pub left_ild: IldFilter,
+    pub right_ild: IldFilter,
+    pub left_convolver: FirConvolver,
+    pub right_convolver: FirConvolver,
+    pub dataset: HrtfDataset,
+    pub acoustic_model: Ds3dBinauralAcousticModel,
+}
+
+impl HeadphoneBinauralFilterBank {
+    pub fn new() -> Self {
+        Self {
+            doppler: Ds3dDopplerPitchShifter::new(),
+            left_delay: EarDelayLine::new(),
+            right_delay: EarDelayLine::new(),
+            left_ild: IldFilter::new(),
+            right_ild: IldFilter::new(),
+            left_convolver: FirConvolver::new(),
+            right_convolver: FirConvolver::new(),
+            dataset: HrtfDataset::new(),
+            acoustic_model: Ds3dBinauralAcousticModel::new(),
+        }
+    }
+
+    /// Processes a block of mono PCM samples into spatialized binaural stereo output.
+    pub fn process_mono_to_binaural(
+        &mut self,
+        mono_input: &[i16],
+        stereo_output: &mut [(i16, i16)],
+        emitter: &HrtfEmitterGeometry,
+        listener: &HrtfListenerGeometry,
+        sound_speed: f32,
+        doppler_factor: f32,
+    ) {
+        let n = mono_input.len().min(stereo_output.len());
+        if n == 0 {
+            return;
+        }
+
+        // 1. Calculate Doppler pitch scale factor and resample
+        let pitch = calculate_ds3d_doppler_factor(emitter, listener, sound_speed, doppler_factor);
+        let mut resampled = [0i16; 128];
+        let process_len = n.min(128);
+        self.doppler.process_block(&mono_input[..process_len], &mut resampled[..process_len], pitch);
+
+        // 2. Compute binaural acoustic parameters (ITD, ILD, distance rolloff)
+        let params = self.acoustic_model.evaluate_parameters(emitter, listener);
+        let (_dist, _los, azimuth, _elevation) = emitter.relative_to_listener(listener);
+
+        // 3. Lookup 16-tap HRIR FIR filter coefficients for azimuth
+        let hrir = self.dataset.lookup(azimuth);
+
+        // 4. Convolve resampled samples through ITD, ILD, and 16-tap FIR filters
+        for i in 0..process_len {
+            let s = resampled[i];
+
+            self.left_delay.push(s);
+            self.right_delay.push(s);
+
+            let s_left_delayed = self.left_delay.read_delayed(params.left_delay_samples);
+            let s_right_delayed = self.right_delay.read_delayed(params.right_delay_samples);
+
+            let s_left_ild = self.left_ild.process(s_left_delayed, params.left_cutoff_alpha, params.left_gain);
+            let s_right_ild = self.right_ild.process(s_right_delayed, params.right_cutoff_alpha, params.right_gain);
+
+            let out_l = self.left_convolver.process(s_left_ild, &hrir.left_taps);
+            let out_r = self.right_convolver.process(s_right_ild, &hrir.right_taps);
+
+            stereo_output[i] = (out_l, out_r);
+        }
+    }
+
+    /// Resets all delay lines, filters, and convolver histories.
+    pub fn reset(&mut self) {
+        self.doppler.reset();
+        self.left_delay.clear();
+        self.right_delay.clear();
+        self.left_ild.reset();
+        self.right_ild.reset();
+        self.left_convolver.reset();
+        self.right_convolver.reset();
+    }
+}
+
+/// Verifies real-time 16-tap binaural FIR headphone filter bank and spatial energy distribution.
+pub fn verify_headphone_filter_bank() -> bool {
+    let mut filter_bank = HeadphoneBinauralFilterBank::new();
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+
+    // 1. Sound emitter on the RIGHT (+X)
+    emitter.position = HrtfVector3::new(4.0, 0.0, 2.0);
+    let mono_in = [4000i16; 64];
+    let mut stereo_out = [(0i16, 0i16); 64];
+
+    filter_bank.process_mono_to_binaural(
+        &mono_in,
+        &mut stereo_out,
+        &emitter,
+        &listener,
+        DS3D_SPEED_OF_SOUND,
+        1.0,
+    );
+
+    let mut energy_l: i64 = 0;
+    let mut energy_r: i64 = 0;
+    // Inspect steady-state samples 16..64
+    for i in 16..64 {
+        energy_l += stereo_out[i].0.abs() as i64;
+        energy_r += stereo_out[i].1.abs() as i64;
+    }
+
+    // Right ear must receive significantly more acoustic energy than left ear
+    if energy_r <= energy_l || energy_r == 0 {
+        return false;
+    }
+
+    // 2. Sound emitter on the LEFT (-X)
+    filter_bank.reset();
+    emitter.position = HrtfVector3::new(-4.0, 0.0, 2.0);
+    filter_bank.process_mono_to_binaural(
+        &mono_in,
+        &mut stereo_out,
+        &emitter,
+        &listener,
+        DS3D_SPEED_OF_SOUND,
+        1.0,
+    );
+
+    let mut left_energy_l: i64 = 0;
+    let mut left_energy_r: i64 = 0;
+    for i in 16..64 {
+        left_energy_l += stereo_out[i].0.abs() as i64;
+        left_energy_r += stereo_out[i].1.abs() as i64;
+    }
+
+    // Left ear must receive significantly more acoustic energy than right ear
+    if left_energy_l <= left_energy_r || left_energy_l == 0 {
+        return false;
+    }
+
+    true
+}
 
 // Interaural Time Difference (ITD) Delay Line
 
@@ -408,5 +993,38 @@ pub fn test_hrtf_dsp_core() -> bool {
         return false;
     }
 
+    true
+}
+
+
+/// Verification self-test suite for DirectSound 3D Doppler Shift & Binaural HRTF Spatialization Filter.
+pub fn test_hrtf_doppler_subsystem() -> bool {
+    crate::serial_write_str("[KNT-AUDIO-TEST] Testing DirectSound 3D Doppler Shift & Binaural HRTF Spatialization...\r\n");
+
+    // 1. Verify 3D spatial listener and emitter geometry
+    if !verify_spatial_geometry() {
+        crate::serial_write_str("[KNT-PANIC] 3D spatial listener and emitter geometry verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify DirectSound 3D Doppler pitch shifter and dynamic frequency scaling
+    if !verify_doppler_pitch_shifter() {
+        crate::serial_write_str("[KNT-PANIC] DirectSound 3D Doppler pitch shifter verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Woodworth ITD phase delay and ILD head shadow acoustic model
+    if !verify_binaural_acoustic_model() {
+        crate::serial_write_str("[KNT-PANIC] Binaural ITD and ILD acoustic model verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify real-time 16-tap binaural FIR headphone filter bank
+    if !verify_headphone_filter_bank() {
+        crate::serial_write_str("[KNT-PANIC] Headphone binaural FIR filter bank verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-HRTF-PASS] Binaural HRTF spatial audio filter and Doppler engine verified\r\n");
     true
 }
