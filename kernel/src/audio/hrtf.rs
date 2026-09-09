@@ -995,3 +995,36 @@ pub fn test_hrtf_dsp_core() -> bool {
 
     true
 }
+
+
+/// Verification self-test suite for DirectSound 3D Doppler Shift & Binaural HRTF Spatialization Filter.
+pub fn test_hrtf_doppler_subsystem() -> bool {
+    crate::serial_write_str("[KNT-AUDIO-TEST] Testing DirectSound 3D Doppler Shift & Binaural HRTF Spatialization...\r\n");
+
+    // 1. Verify 3D spatial listener and emitter geometry
+    if !verify_spatial_geometry() {
+        crate::serial_write_str("[KNT-PANIC] 3D spatial listener and emitter geometry verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify DirectSound 3D Doppler pitch shifter and dynamic frequency scaling
+    if !verify_doppler_pitch_shifter() {
+        crate::serial_write_str("[KNT-PANIC] DirectSound 3D Doppler pitch shifter verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Woodworth ITD phase delay and ILD head shadow acoustic model
+    if !verify_binaural_acoustic_model() {
+        crate::serial_write_str("[KNT-PANIC] Binaural ITD and ILD acoustic model verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify real-time 16-tap binaural FIR headphone filter bank
+    if !verify_headphone_filter_bank() {
+        crate::serial_write_str("[KNT-PANIC] Headphone binaural FIR filter bank verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-HRTF-PASS] Binaural HRTF spatial audio filter and Doppler engine verified\r\n");
+    true
+}
