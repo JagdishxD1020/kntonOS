@@ -460,6 +460,156 @@ pub fn verify_binaural_acoustic_model() -> bool {
     true
 }
 
+// Real-Time Headphone FIR Binaural Filter Bank
+
+/// Real-time 48kHz headphone binaural filter bank combining Doppler resampling, ITD, ILD, and 16-tap FIR convolution.
+pub struct HeadphoneBinauralFilterBank {
+    pub doppler: Ds3dDopplerPitchShifter,
+    pub left_delay: EarDelayLine,
+    pub right_delay: EarDelayLine,
+    pub left_ild: IldFilter,
+    pub right_ild: IldFilter,
+    pub left_convolver: FirConvolver,
+    pub right_convolver: FirConvolver,
+    pub dataset: HrtfDataset,
+    pub acoustic_model: Ds3dBinauralAcousticModel,
+}
+
+impl HeadphoneBinauralFilterBank {
+    pub fn new() -> Self {
+        Self {
+            doppler: Ds3dDopplerPitchShifter::new(),
+            left_delay: EarDelayLine::new(),
+            right_delay: EarDelayLine::new(),
+            left_ild: IldFilter::new(),
+            right_ild: IldFilter::new(),
+            left_convolver: FirConvolver::new(),
+            right_convolver: FirConvolver::new(),
+            dataset: HrtfDataset::new(),
+            acoustic_model: Ds3dBinauralAcousticModel::new(),
+        }
+    }
+
+    /// Processes a block of mono PCM samples into spatialized binaural stereo output.
+    pub fn process_mono_to_binaural(
+        &mut self,
+        mono_input: &[i16],
+        stereo_output: &mut [(i16, i16)],
+        emitter: &HrtfEmitterGeometry,
+        listener: &HrtfListenerGeometry,
+        sound_speed: f32,
+        doppler_factor: f32,
+    ) {
+        let n = mono_input.len().min(stereo_output.len());
+        if n == 0 {
+            return;
+        }
+
+        // 1. Calculate Doppler pitch scale factor and resample
+        let pitch = calculate_ds3d_doppler_factor(emitter, listener, sound_speed, doppler_factor);
+        let mut resampled = [0i16; 128];
+        let process_len = n.min(128);
+        self.doppler.process_block(&mono_input[..process_len], &mut resampled[..process_len], pitch);
+
+        // 2. Compute binaural acoustic parameters (ITD, ILD, distance rolloff)
+        let params = self.acoustic_model.evaluate_parameters(emitter, listener);
+        let (_dist, _los, azimuth, _elevation) = emitter.relative_to_listener(listener);
+
+        // 3. Lookup 16-tap HRIR FIR filter coefficients for azimuth
+        let hrir = self.dataset.lookup(azimuth);
+
+        // 4. Convolve resampled samples through ITD, ILD, and 16-tap FIR filters
+        for i in 0..process_len {
+            let s = resampled[i];
+
+            self.left_delay.push(s);
+            self.right_delay.push(s);
+
+            let s_left_delayed = self.left_delay.read_delayed(params.left_delay_samples);
+            let s_right_delayed = self.right_delay.read_delayed(params.right_delay_samples);
+
+            let s_left_ild = self.left_ild.process(s_left_delayed, params.left_cutoff_alpha, params.left_gain);
+            let s_right_ild = self.right_ild.process(s_right_delayed, params.right_cutoff_alpha, params.right_gain);
+
+            let out_l = self.left_convolver.process(s_left_ild, &hrir.left_taps);
+            let out_r = self.right_convolver.process(s_right_ild, &hrir.right_taps);
+
+            stereo_output[i] = (out_l, out_r);
+        }
+    }
+
+    /// Resets all delay lines, filters, and convolver histories.
+    pub fn reset(&mut self) {
+        self.doppler.reset();
+        self.left_delay.clear();
+        self.right_delay.clear();
+        self.left_ild.reset();
+        self.right_ild.reset();
+        self.left_convolver.reset();
+        self.right_convolver.reset();
+    }
+}
+
+/// Verifies real-time 16-tap binaural FIR headphone filter bank and spatial energy distribution.
+pub fn verify_headphone_filter_bank() -> bool {
+    let mut filter_bank = HeadphoneBinauralFilterBank::new();
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+
+    // 1. Sound emitter on the RIGHT (+X)
+    emitter.position = HrtfVector3::new(4.0, 0.0, 2.0);
+    let mono_in = [4000i16; 64];
+    let mut stereo_out = [(0i16, 0i16); 64];
+
+    filter_bank.process_mono_to_binaural(
+        &mono_in,
+        &mut stereo_out,
+        &emitter,
+        &listener,
+        DS3D_SPEED_OF_SOUND,
+        1.0,
+    );
+
+    let mut energy_l: i64 = 0;
+    let mut energy_r: i64 = 0;
+    // Inspect steady-state samples 16..64
+    for i in 16..64 {
+        energy_l += stereo_out[i].0.abs() as i64;
+        energy_r += stereo_out[i].1.abs() as i64;
+    }
+
+    // Right ear must receive significantly more acoustic energy than left ear
+    if energy_r <= energy_l || energy_r == 0 {
+        return false;
+    }
+
+    // 2. Sound emitter on the LEFT (-X)
+    filter_bank.reset();
+    emitter.position = HrtfVector3::new(-4.0, 0.0, 2.0);
+    filter_bank.process_mono_to_binaural(
+        &mono_in,
+        &mut stereo_out,
+        &emitter,
+        &listener,
+        DS3D_SPEED_OF_SOUND,
+        1.0,
+    );
+
+    let mut left_energy_l: i64 = 0;
+    let mut left_energy_r: i64 = 0;
+    for i in 16..64 {
+        left_energy_l += stereo_out[i].0.abs() as i64;
+        left_energy_r += stereo_out[i].1.abs() as i64;
+    }
+
+    // Left ear must receive significantly more acoustic energy than right ear
+    if left_energy_l <= left_energy_r || left_energy_l == 0 {
+        return false;
+    }
+
+    true
+}
+
 // Interaural Time Difference (ITD) Delay Line
 
 /// Circular delay line supporting fractional-sample delay with linear interpolation.
