@@ -200,6 +200,147 @@ pub fn verify_spatial_geometry() -> bool {
     true
 }
 
+// DirectSound 3D Doppler Shift and Dynamic Frequency Scaling
+
+/// Standard speed of sound in dry air at 20°C in DirectSound 3D specifications (343.3 m/s).
+pub const DS3D_SPEED_OF_SOUND: f32 = 343.3;
+
+/// Computes DirectSound 3D Doppler frequency scaling factor based on relative velocity projections.
+pub fn calculate_ds3d_doppler_factor(
+    emitter: &HrtfEmitterGeometry,
+    listener: &HrtfListenerGeometry,
+    sound_speed: f32,
+    doppler_factor: f32,
+) -> f32 {
+    let delta = listener.position.sub(emitter.position);
+    let dist = delta.length();
+    if dist < 1e-4 {
+        return 1.0;
+    }
+
+    // Unit vector directed from emitter towards listener
+    let u_el = delta.scale(1.0 / dist);
+
+    // Emitter velocity projected towards listener (positive = approaching listener)
+    let v_e_approach = emitter.velocity.dot(u_el);
+    // Listener velocity projected towards emitter (positive = approaching emitter)
+    let v_l_approach = -listener.velocity.dot(u_el);
+
+    let c = if sound_speed > 10.0 { sound_speed } else { DS3D_SPEED_OF_SOUND };
+    let df = doppler_factor.clamp(0.0, 10.0);
+
+    // Limit projected velocities to 95% sound speed to prevent acoustic singularities
+    let max_v = 0.95 * c;
+    let clamped_ve = (df * v_e_approach).clamp(-max_v, max_v);
+    let clamped_vl = (df * v_l_approach).clamp(-max_v, max_v);
+
+    // DirectSound formula: pitch = (c + v_l_approach) / (c - v_e_approach)
+    let ratio = (c + clamped_vl) / (c - clamped_ve);
+    ratio.clamp(0.1, 10.0)
+}
+
+/// Circular buffer capacity for Doppler pitch shifting resampler.
+pub const DOPPLER_BUFFER_CAPACITY: usize = 512;
+pub const DOPPLER_BUFFER_MASK: usize = DOPPLER_BUFFER_CAPACITY - 1;
+
+/// DirectSound 3D Doppler pitch shifter using fractional linear interpolation resampling.
+#[derive(Clone, Copy)]
+pub struct Ds3dDopplerPitchShifter {
+    buffer: [i16; DOPPLER_BUFFER_CAPACITY],
+    write_pos: usize,
+    read_cursor: f32,
+}
+
+impl Ds3dDopplerPitchShifter {
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; DOPPLER_BUFFER_CAPACITY],
+            write_pos: 0,
+            read_cursor: 0.0,
+        }
+    }
+
+    /// Pushes an incoming sample into the Doppler circular buffer.
+    #[inline]
+    pub fn push(&mut self, sample: i16) {
+        self.buffer[self.write_pos] = sample;
+        self.write_pos = (self.write_pos + 1) & DOPPLER_BUFFER_MASK;
+    }
+
+    /// Processes an input block and writes pitch-shifted audio into output slice.
+    pub fn process_block(&mut self, input: &[i16], output: &mut [i16], pitch_ratio: f32) {
+        let clamped_ratio = pitch_ratio.clamp(0.2, 5.0);
+
+        for &sample in input {
+            self.push(sample);
+        }
+
+        let out_len = output.len();
+        for i in 0..out_len {
+            let offset = self.read_cursor;
+            let idx0 = offset as usize;
+            let frac = offset - (idx0 as f32);
+
+            let s0 = self.buffer[idx0 & DOPPLER_BUFFER_MASK] as f32;
+            let s1 = self.buffer[(idx0 + 1) & DOPPLER_BUFFER_MASK] as f32;
+
+            let interp = s0 + frac * (s1 - s0);
+            output[i] = interp.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+
+            self.read_cursor += clamped_ratio;
+            if self.read_cursor >= DOPPLER_BUFFER_CAPACITY as f32 {
+                self.read_cursor -= DOPPLER_BUFFER_CAPACITY as f32;
+            }
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.buffer = [0; DOPPLER_BUFFER_CAPACITY];
+        self.write_pos = 0;
+        self.read_cursor = 0.0;
+    }
+}
+
+/// Verifies DirectSound 3D Doppler pitch shift calculation and fractional resampling.
+pub fn verify_doppler_pitch_shifter() -> bool {
+    let listener = HrtfListenerGeometry::new();
+    let mut emitter = HrtfEmitterGeometry::new();
+    emitter.position = HrtfVector3::new(0.0, 0.0, 100.0);
+
+    // 1. Stationary emitter and listener -> factor must be 1.0
+    let f_stat = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if (f_stat - 1.0).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Emitter moving towards listener along -Z at 34.33 m/s (~0.1 c) -> higher pitch ~1.111
+    emitter.velocity = HrtfVector3::new(0.0, 0.0, -34.33);
+    let f_approach = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if f_approach <= 1.05 || f_approach >= 1.15 {
+        return false;
+    }
+
+    // 3. Emitter moving away from listener along +Z at 34.33 m/s -> lower pitch ~0.909
+    emitter.velocity = HrtfVector3::new(0.0, 0.0, 34.33);
+    let f_recede = calculate_ds3d_doppler_factor(&emitter, &listener, DS3D_SPEED_OF_SOUND, 1.0);
+    if f_recede >= 0.95 || f_recede <= 0.85 {
+        return false;
+    }
+
+    // 4. Verify Doppler resampler with pitch shifting
+    let mut shifter = Ds3dDopplerPitchShifter::new();
+    let input = [1000i16; 64];
+    let mut output = [0i16; 64];
+    shifter.process_block(&input, &mut output, 1.1);
+
+    // Steady state DC input must yield DC output
+    if output[32] != 1000 {
+        return false;
+    }
+
+    true
+}
+
 // Interaural Time Difference (ITD) Delay Line
 
 /// Circular delay line supporting fractional-sample delay with linear interpolation.
