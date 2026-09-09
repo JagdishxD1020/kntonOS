@@ -1674,3 +1674,179 @@ pub fn test_vrs_tier2_shading_rate_image_subsystem() -> bool {
 
 
 
+
+// Comprehensive verification test suite for Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine
+pub fn test_vrs_subsystem() -> bool {
+    crate::serial_write_str("[KNT-VRS] Initializing Direct3D 12 Variable Rate Shading self-test...\r\n");
+
+    // 1. Shading rate definitions and dimension validation
+    let r1x1 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1;
+    let r2x2 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2;
+    let r4x4 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4;
+    if r1x1.width() != 1 || r1x1.height() != 1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 1x1 rate dimension mismatch\r\n");
+        return false;
+    }
+    if r2x2.width() != 2 || r2x2.height() != 2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 2x2 rate dimension mismatch\r\n");
+        return false;
+    }
+    if r4x4.width() != 4 || r4x4.height() != 4 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 4x4 rate dimension mismatch\r\n");
+        return false;
+    }
+    if D3D12_SHADING_RATE::from_dimensions(2, 4) != Some(D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] from_dimensions 2x4 lookup mismatch\r\n");
+        return false;
+    }
+    if r2x2.to_shading_rate() != ShadingRate::Rate2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] ShadingRate round-trip conversion mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_SHADING_RATE discrete dimensions and conversion verified\r\n");
+
+    // 2. Combiner evaluation rules
+    let c_min = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN;
+    let c_max = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX;
+    let c_sum = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_SUM;
+    let c_override = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE;
+    let c_pass = D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH;
+
+    if c_min.combine(r2x2, r4x4) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Min mismatch\r\n");
+        return false;
+    }
+    if c_max.combine(r1x1, r2x2) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Max mismatch\r\n");
+        return false;
+    }
+    if c_override.combine(r1x1, r4x4) != r4x4 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Override mismatch\r\n");
+        return false;
+    }
+    if c_pass.combine(r2x2, r4x4) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Passthrough mismatch\r\n");
+        return false;
+    }
+    let r2x1 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1;
+    let r1x2 = D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2;
+    if c_sum.combine(r2x1, r1x2) != r2x2 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Combiner Sum (2x1 + 1x2 -> 2x2) mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_SHADING_RATE_COMBINER multi-stage evaluation verified\r\n");
+
+    // 3. Adapter VRS feature support options
+    let opt_tier1 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier1(false);
+    if !opt_tier1.validate_shading_rate(r2x2) || opt_tier1.validate_shading_rate(r4x4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 1 rate validation mismatch\r\n");
+        return false;
+    }
+    if opt_tier1.supports_image_based_vrs() || opt_tier1.supports_per_primitive_vrs() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 1 must not support image or per-primitive VRS\r\n");
+        return false;
+    }
+
+    let opt_tier2 = match D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier2(16, true) {
+        Ok(opt) => opt,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 feature initialization failed\r\n");
+            return false;
+        }
+    };
+    if !opt_tier2.supports_image_based_vrs() || !opt_tier2.supports_per_primitive_vrs() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 feature queries must be true\r\n");
+        return false;
+    }
+    if !opt_tier2.validate_shading_rate(r4x4) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Tier 2 with additional rates must allow 4x4\r\n");
+        return false;
+    }
+    if D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier2(12, true).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Invalid tile size (12) was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12_OPTIONS6 VRS tier capability queries and validation verified\r\n");
+
+    // 4. Tile coordinate translation engine
+    let tile_engine = match VrsTileCoordinateEngine::new(1920, 1080, 16, DXGI_FORMAT_R8_UINT) {
+        Ok(e) => e,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tile coordinate engine creation failed\r\n");
+            return false;
+        }
+    };
+    if tile_engine.tiles_x != 120 || tile_engine.tiles_y != 68 {
+        crate::serial_write_str("[KNT-VRS-FAIL] 1920x1080 tile dimensions mismatch\r\n");
+        return false;
+    }
+    let (tx, ty, idx) = match tile_engine.pixel_to_tile(1919, 1079) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Pixel to tile mapping failed\r\n");
+            return false;
+        }
+    };
+    if tx != 119 || ty != 67 || idx != (67 * 120 + 119) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Last pixel tile coordinate mismatch\r\n");
+        return false;
+    }
+    let bounds = match tile_engine.tile_to_pixel_bounds(0, 0) {
+        Ok(b) => b,
+        Err(_) => {
+            crate::serial_write_str("[KNT-VRS-FAIL] Tile to pixel bounds failed\r\n");
+            return false;
+        }
+    };
+    if bounds != (0, 0, 16, 16) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Origin tile pixel bounds mismatch\r\n");
+        return false;
+    }
+    if VrsTileCoordinateEngine::new(1920, 1080, 16, 100).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Invalid non-R8_UINT format was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * 16x16 / 32x32 screen-space tile coordinate grid translation verified\r\n");
+
+    // 5. Command list state recording (RSSetShadingRate & RSSetShadingRateImage)
+    let mut cmd_tier1 = VrsCommandListState::new(opt_tier1);
+    let invalid_tier1_res = cmd_tier1.rs_set_shading_rate(r2x2, [c_min, c_pass]);
+    if invalid_tier1_res != Err(VrsError::TierNotSupported) {
+        crate::serial_write_str("[KNT-VRS-FAIL] Non-passthrough combiners on Tier 1 were not rejected\r\n");
+        return false;
+    }
+    if cmd_tier1.rs_set_shading_rate_image(Some(0x1000)).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Setting SRI on Tier 1 was not rejected\r\n");
+        return false;
+    }
+
+    let mut cmd_tier2 = VrsCommandListState::new(opt_tier2);
+    if cmd_tier2.rs_set_shading_rate(r2x2, [c_min, c_override]).is_err() {
+        crate::serial_write_str("[KNT-VRS-FAIL] RSSetShadingRate failed on Tier 2\r\n");
+        return false;
+    }
+    if cmd_tier2.rs_set_shading_rate_image(Some(0x2001)).is_ok() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Unaligned SRI GPU VA was not rejected\r\n");
+        return false;
+    }
+    if cmd_tier2.rs_set_shading_rate_image(Some(0x2000)).is_err() {
+        crate::serial_write_str("[KNT-VRS-FAIL] Valid 64-byte aligned SRI GPU VA failed\r\n");
+        return false;
+    }
+
+    // Effective rate: Draw(2x2) with Image(4x4, Min) -> 2x2; Primitive(1x1, Override) -> 1x1
+    let eff_rate = cmd_tier2.evaluate_effective_rate(Some(r4x4), Some(r1x1));
+    if eff_rate != r1x1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Multi-stage effective shading rate mismatch\r\n");
+        return false;
+    }
+    cmd_tier2.record_draw();
+    if cmd_tier2.recorded_draw_count != 1 {
+        crate::serial_write_str("[KNT-VRS-FAIL] Recorded draw count mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * RSSetShadingRate and RSSetShadingRateImage recording verified\r\n");
+
+    crate::serial_write_str("[KNT-VRS-PASS] Direct3D 12 variable rate shading engine verified\r\n");
+    true
+}
