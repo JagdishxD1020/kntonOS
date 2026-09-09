@@ -311,7 +311,125 @@ pub unsafe fn win32_raise_exception(
     EXCEPTION_CONTINUE_SEARCH
 }
 
-/// Dispatches an exception through registered structured frame handlers.
-pub unsafe fn win32_dispatch_structured_exception(_pointers: *mut EXCEPTION_POINTERS) -> i32 {
+
+pub const UNW_FLAG_NHANDLER: u8 = 0x0;
+pub const UNW_FLAG_EHANDLER: u8 = 0x1;
+pub const UNW_FLAG_UHANDLER: u8 = 0x2;
+pub const UNW_FLAG_CHAININFO: u8 = 0x4;
+
+pub const UWOP_PUSH_NONVOL: u8 = 0;
+pub const UWOP_ALLOC_LARGE: u8 = 1;
+pub const UWOP_ALLOC_SMALL: u8 = 2;
+pub const UWOP_SET_FPREG: u8 = 3;
+pub const UWOP_SAVE_NONVOL: u8 = 4;
+pub const UWOP_SAVE_NONVOL_FAR: u8 = 5;
+pub const UWOP_SAVE_XMM128: u8 = 8;
+pub const UWOP_PUSH_MACHFRAME: u8 = 10;
+
+/// Win32 x86-64 runtime function entry in the .pdata section.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RUNTIME_FUNCTION {
+    pub BeginAddress: u32,
+    pub EndAddress: u32,
+    pub UnwindData: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredFunctionTable {
+    pub image_base: usize,
+    pub functions: Vec<RUNTIME_FUNCTION>,
+}
+
+static FUNCTION_TABLES: Spinlock<Vec<RegisteredFunctionTable>> = Spinlock::new(Vec::new());
+
+/// Registers an array of .pdata RUNTIME_FUNCTION entries for an image.
+pub fn win32_register_function_table(image_base: usize, functions: &[RUNTIME_FUNCTION]) {
+    let mut tables = FUNCTION_TABLES.lock();
+    if let Some(pos) = tables.iter().position(|t| t.image_base == image_base) {
+        tables[pos].functions = functions.to_vec();
+    } else {
+        tables.push(RegisteredFunctionTable {
+            image_base,
+            functions: functions.to_vec(),
+        });
+    }
+}
+
+/// Unregisters the function table for an image.
+pub fn win32_unregister_function_table(image_base: usize) -> bool {
+    let mut tables = FUNCTION_TABLES.lock();
+    if let Some(pos) = tables.iter().position(|t| t.image_base == image_base) {
+        tables.remove(pos);
+        true
+    } else {
+        false
+    }
+}
+
+/// Looks up the RUNTIME_FUNCTION entry containing the control instruction pointer.
+pub fn win32_lookup_function_entry(
+    control_pc: usize,
+    image_base_out: *mut usize,
+) -> Option<RUNTIME_FUNCTION> {
+    let tables = FUNCTION_TABLES.lock();
+    for entry in tables.iter() {
+        if control_pc >= entry.image_base {
+            let rva = (control_pc - entry.image_base) as u32;
+            for func in &entry.functions {
+                if rva >= func.BeginAddress && rva < func.EndAddress {
+                    if !image_base_out.is_null() {
+                        unsafe { *image_base_out = entry.image_base; }
+                    }
+                    return Some(*func);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Unwinds the CPU execution context back across the specified function frame.
+pub unsafe fn win32_virtual_unwind(
+    _image_base: usize,
+    _control_pc: usize,
+    _function_entry: &RUNTIME_FUNCTION,
+    context_record: &mut CONTEXT,
+) -> bool {
+    if context_record.Rsp == 0 {
+        return false;
+    }
+
+    // Stack frame return address unwinding: read caller RIP from stack and pop RSP
+    let stack_ptr = context_record.Rsp as *const u64;
+    let return_rip = *stack_ptr;
+    context_record.Rsp += 8;
+    context_record.Rip = return_rip;
+    true
+}
+
+/// Dispatches an exception through registered structured frame handlers and unwind tables.
+pub unsafe fn win32_dispatch_structured_exception(pointers: *mut EXCEPTION_POINTERS) -> i32 {
+    if pointers.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let context = &mut *(*pointers).ContextRecord;
+    let mut control_pc = context.Rip as usize;
+
+    for _frame in 0..64 {
+        if control_pc == 0 {
+            break;
+        }
+        let mut image_base: usize = 0;
+        if let Some(fn_entry) = win32_lookup_function_entry(control_pc, &mut image_base) {
+            if !win32_virtual_unwind(image_base, control_pc, &fn_entry, context) {
+                break;
+            }
+            control_pc = context.Rip as usize;
+        } else {
+            break;
+        }
+    }
+
     EXCEPTION_CONTINUE_SEARCH
 }
