@@ -433,3 +433,154 @@ pub unsafe fn win32_dispatch_structured_exception(pointers: *mut EXCEPTION_POINT
 
     EXCEPTION_CONTINUE_SEARCH
 }
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+static HANDLER1_CALL_ORDER: AtomicU32 = AtomicU32::new(0);
+static HANDLER2_CALL_ORDER: AtomicU32 = AtomicU32::new(0);
+static CALL_COUNTER: AtomicU32 = AtomicU32::new(0);
+static VCH_CALLED: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_veh_handler1(_info: *mut EXCEPTION_POINTERS) -> i32 {
+    let order = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    HANDLER1_CALL_ORDER.store(order, Ordering::SeqCst);
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+unsafe extern "system" fn test_veh_handler2(_info: *mut EXCEPTION_POINTERS) -> i32 {
+    let order = CALL_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    HANDLER2_CALL_ORDER.store(order, Ordering::SeqCst);
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+unsafe extern "system" fn test_vch_handler(_info: *mut EXCEPTION_POINTERS) -> i32 {
+    VCH_CALLED.store(1, Ordering::SeqCst);
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
+/// Self-test suite verifying Win32 SEH, VEH, CPU trap bridging, and x86-64 stack unwinding.
+pub fn test_seh_veh_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SEH-VEH-TEST] Executing Win32 SEH & VEH verification...\r\n");
+
+    // 1. Verify CPU trap to Win32 exception records bridge
+    let mut av = win32_create_access_violation_record(0xDEAD_BEEF, true, false, 0x401000);
+    if av.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || av.NumberParameters != 2 {
+        return false;
+    }
+    if av.ExceptionInformation[0] != EXCEPTION_WRITE_FAULT || av.ExceptionInformation[1] != 0xDEAD_BEEF {
+        return false;
+    }
+    if av.ExceptionAddress as usize != 0x401000 {
+        return false;
+    }
+
+    let de = win32_create_divide_by_zero_record(0x401050);
+    if de.ExceptionCode != EXCEPTION_INT_DIVIDE_BY_ZERO || de.ExceptionAddress as usize != 0x401050 {
+        return false;
+    }
+
+    let bp = win32_create_breakpoint_record(0x401080);
+    if bp.ExceptionCode != EXCEPTION_BREAKPOINT || bp.ExceptionAddress as usize != 0x401080 {
+        return false;
+    }
+
+    let ud = win32_create_illegal_instruction_record(0x4010A0);
+    if ud.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION || ud.ExceptionAddress as usize != 0x4010A0 {
+        return false;
+    }
+
+    // 2. Verify Vectored Exception Handler priority ordering and continuation
+    CALL_COUNTER.store(0, Ordering::SeqCst);
+    HANDLER1_CALL_ORDER.store(0, Ordering::SeqCst);
+    HANDLER2_CALL_ORDER.store(0, Ordering::SeqCst);
+
+    let h2 = win32_add_vectored_exception_handler(0, test_veh_handler2);
+    let h1 = win32_add_vectored_exception_handler(1, test_veh_handler1);
+    if h1 == 0 || h2 == 0 {
+        return false;
+    }
+
+    let mut ctx = CONTEXT::default();
+    let mut pointers = EXCEPTION_POINTERS {
+        ExceptionRecord: &mut av as *mut _,
+        ContextRecord: &mut ctx as *mut _,
+    };
+
+    let veh_disp = unsafe { win32_dispatch_vectored_exception(&mut pointers as *mut _) };
+    if veh_disp != EXCEPTION_CONTINUE_EXECUTION {
+        return false;
+    }
+    if HANDLER1_CALL_ORDER.load(Ordering::SeqCst) != 1 || HANDLER2_CALL_ORDER.load(Ordering::SeqCst) != 2 {
+        return false;
+    }
+
+    if win32_remove_vectored_exception_handler(h1) != 1 {
+        return false;
+    }
+    if win32_remove_vectored_exception_handler(h2) != 1 {
+        return false;
+    }
+    let veh_disp_empty = unsafe { win32_dispatch_vectored_exception(&mut pointers as *mut _) };
+    if veh_disp_empty != EXCEPTION_CONTINUE_SEARCH {
+        return false;
+    }
+
+    // 3. Verify Vectored Continue Handler dispatching
+    VCH_CALLED.store(0, Ordering::SeqCst);
+    let vch_h = win32_add_vectored_continue_handler(0, test_vch_handler);
+    if vch_h == 0 {
+        return false;
+    }
+    let vch_disp = unsafe { win32_dispatch_vectored_continue(&mut pointers as *mut _) };
+    if vch_disp != EXCEPTION_CONTINUE_EXECUTION || VCH_CALLED.load(Ordering::SeqCst) != 1 {
+        return false;
+    }
+    if win32_remove_vectored_continue_handler(vch_h) != 1 {
+        return false;
+    }
+
+    // 4. Verify x86-64 .pdata function lookup and virtual unwinding
+    let fn_table = [RUNTIME_FUNCTION {
+        BeginAddress: 0x1000,
+        EndAddress: 0x2000,
+        UnwindData: 0x3000,
+    }];
+    win32_register_function_table(0x0040_0000, &fn_table);
+
+    let mut img_base = 0usize;
+    let found = win32_lookup_function_entry(0x0040_1500, &mut img_base);
+    if found.is_none() || img_base != 0x0040_0000 {
+        return false;
+    }
+    let func_entry = found.unwrap();
+    if func_entry.BeginAddress != 0x1000 || func_entry.EndAddress != 0x2000 {
+        return false;
+    }
+
+    let mock_stack: [u64; 2] = [0x0040_1100, 0x0040_2200];
+    let mut unwind_ctx = CONTEXT::default();
+    unwind_ctx.Rsp = mock_stack.as_ptr() as u64;
+    unwind_ctx.Rip = 0x0040_1500;
+
+    let unwind_ok = unsafe { win32_virtual_unwind(0x0040_0000, 0x0040_1500, &func_entry, &mut unwind_ctx) };
+    if !unwind_ok || unwind_ctx.Rip != 0x0040_1100 || unwind_ctx.Rsp != (mock_stack.as_ptr() as u64 + 8) {
+        return false;
+    }
+
+    if !win32_unregister_function_table(0x0040_0000) {
+        return false;
+    }
+
+    // 5. Verify high-level exception raise
+    let h_temp = win32_add_vectored_exception_handler(0, test_veh_handler2);
+    let raise_disp = unsafe { win32_raise_exception(&mut av, &mut ctx) };
+    if raise_disp != EXCEPTION_CONTINUE_EXECUTION {
+        return false;
+    }
+    if win32_remove_vectored_exception_handler(h_temp) != 1 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-SEH-VEH-PASS] Win32 SEH and VEH exception handling engine verified\r\n");
+    true
+}
