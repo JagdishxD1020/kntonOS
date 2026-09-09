@@ -278,6 +278,99 @@ impl VrsTileCoordinateEngine {
     }
 }
 
+
+// Command list VRS state tracker managing per-draw and image-based shading rates
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrsCommandListState {
+    pub options: D3D12_FEATURE_DATA_D3D12_OPTIONS6,
+    pub current_rate: D3D12_SHADING_RATE,
+    pub current_combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    pub bound_image_gpu_va: Option<u64>,
+    pub recorded_draw_count: u32,
+}
+
+impl VrsCommandListState {
+    // Construct new VRS command list state tracker with hardware capability options
+    pub fn new(options: D3D12_FEATURE_DATA_D3D12_OPTIONS6) -> Self {
+        Self {
+            options,
+            current_rate: D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+            current_combiners: [
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            ],
+            bound_image_gpu_va: None,
+            recorded_draw_count: 0,
+        }
+    }
+
+    // Record RSSetShadingRate per-draw coarse shading rate and combiners
+    pub fn rs_set_shading_rate(
+        &mut self,
+        rate: D3D12_SHADING_RATE,
+        combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    ) -> Result<(), VrsError> {
+        if !self.options.validate_shading_rate(rate) {
+            return Err(VrsError::TierNotSupported);
+        }
+
+        // Tier 1 does not support non-passthrough combiners since SRI and SV_ShadingRate require Tier 2
+        if matches!(self.options.VariableShadingRateTier, D3D12_VARIABLE_SHADING_RATE_TIER::D3D12_VARIABLE_SHADING_RATE_TIER_1) {
+            if combiners[0] != D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+                || combiners[1] != D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+            {
+                return Err(VrsError::TierNotSupported);
+            }
+        }
+
+        self.current_rate = rate;
+        self.current_combiners = combiners;
+        Ok(())
+    }
+
+    // Record RSSetShadingRateImage screen-space shading rate image binding
+    pub fn rs_set_shading_rate_image(&mut self, image_gpu_va: Option<u64>) -> Result<(), VrsError> {
+        if let Some(va) = image_gpu_va {
+            if !self.options.supports_image_based_vrs() {
+                return Err(VrsError::TierNotSupported);
+            }
+            if (va % 64) != 0 {
+                return Err(VrsError::InvalidDimensions);
+            }
+            self.bound_image_gpu_va = Some(va);
+        } else {
+            self.bound_image_gpu_va = None;
+        }
+        Ok(())
+    }
+
+    // Evaluate effective multi-stage shading rate for a given screen tile and primitive
+    pub fn evaluate_effective_rate(
+        &self,
+        tile_rate: Option<D3D12_SHADING_RATE>,
+        primitive_rate: Option<D3D12_SHADING_RATE>,
+    ) -> D3D12_SHADING_RATE {
+        // Stage 0: Combine Draw rate and Screen-Space Image rate
+        let rate_stage0 = match (self.bound_image_gpu_va, tile_rate) {
+            (Some(_), Some(t_rate)) => self.current_combiners[0].combine(self.current_rate, t_rate),
+            _ => self.current_rate,
+        };
+
+        // Stage 1: Combine Intermediate rate and Per-Primitive rate
+        match primitive_rate {
+            Some(p_rate) if self.options.supports_per_primitive_vrs() => {
+                self.current_combiners[1].combine(rate_stage0, p_rate)
+            }
+            _ => rate_stage0,
+        }
+    }
+
+    // Record draw call invocation
+    pub fn record_draw(&mut self) {
+        self.recorded_draw_count += 1;
+    }
+}
+
 /// Errors returned by the Variable Rate Shading subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VrsError {
