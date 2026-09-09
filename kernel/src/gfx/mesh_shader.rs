@@ -1,7 +1,55 @@
+#![allow(non_camel_case_types, non_snake_case, dead_code)]
 //! Direct3D 12 Mesh Shader & Amplification Shader Primitive Pipeline Engine.
-//! Replaces legacy fixed-function Input Assembler and VS/HS/DS/GS geometry stages
+// Replaces legacy fixed-function Input Assembler and VS/HS/DS/GS geometry stages
 
 use alloc::vec::Vec;
+use crate::gfx::pso::D3D12_SHADER_BYTECODE;
+
+// Pipeline state subobject type for Amplification Shader (AS)
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: u32 = 24;
+
+// Pipeline state subobject type for Mesh Shader (MS)
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: u32 = 25;
+
+// Mesh shader primitive output topology (triangles or lines)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY {
+    UNDEFINED = 0,
+    LINES = 1,
+    TRIANGLES = 2,
+}
+
+// Complete D3D12 mesh and amplification shader pipeline state stream descriptor
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+    pub root_signature_gpu_va: u64,
+    pub amplification_shader: Option<D3D12_SHADER_BYTECODE>,
+    pub mesh_shader: D3D12_SHADER_BYTECODE,
+    pub primitive_topology: D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY,
+    pub payload_size_bytes: u32,
+}
+
+impl D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+    // Validate pipeline subobjects and topology
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.mesh_shader.is_empty() {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        if self.primitive_topology == D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::UNDEFINED {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        if let Some(ref as_bc) = self.amplification_shader {
+            if as_bc.is_empty() {
+                return Err(MeshShaderError::InvalidPipelineConfig);
+            }
+        }
+        if self.payload_size_bytes > 16384 {
+            return Err(MeshShaderError::ExceededMaxPayload(self.payload_size_bytes as usize));
+        }
+        Ok(())
+    }
+}
 
 /// Direct3D 12 maximum allowable output vertices per meshlet (D3D12_MESH_SHADER_MAX_VERTICES).
 pub const MAX_MESHLET_VERTICES: usize = 64;
