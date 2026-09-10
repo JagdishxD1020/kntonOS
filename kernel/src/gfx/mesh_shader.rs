@@ -1027,3 +1027,128 @@ impl MeshShaderEngine {
         Ok(all_outputs)
     }
 }
+
+// Comprehensive verification test suite for Direct3D 12 Mesh Shader & Amplification Shader Pipeline
+pub fn test_d3d12_mesh_shader_pipeline() -> bool {
+    crate::serial_write_str("[KNT-MESH] Initializing Direct3D 12 mesh and amplification shader self-test...\r\n");
+
+    // 1. Pipeline subobject descriptors and topology validation
+    if D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS != 24 || D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS != 25 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Pipeline subobject type enum values mismatch\r\n");
+        return false;
+    }
+
+    let as_bc = D3D12_SHADER_BYTECODE::new(&[0xAA; 128]);
+    let ms_bc = D3D12_SHADER_BYTECODE::new(&[0xBB; 256]);
+    let valid_pso = D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+        root_signature_gpu_va: 0x1000_0000,
+        amplification_shader: Some(as_bc),
+        mesh_shader: ms_bc,
+        primitive_topology: D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::TRIANGLES,
+        payload_size_bytes: 2048,
+    };
+    if valid_pso.validate().is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Valid D3D12 mesh shader PSO failed validation\r\n");
+        return false;
+    }
+
+    let mut invalid_pso = valid_pso.clone();
+    invalid_pso.primitive_topology = D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::UNDEFINED;
+    if invalid_pso.validate().is_ok() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Undefined primitive topology was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12 mesh and amplification shader pipeline subobjects and topology verified\r\n");
+
+    // 2. Meshlet geometry limits (<=256 vertices, <=512 primitives) and packed index layout
+    let valid_meshlet = D3D12_MESHLET::new(0, 256, 0, 512);
+    if valid_meshlet.validate().is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] 256-vertex / 512-primitive meshlet failed validation\r\n");
+        return false;
+    }
+    let overflow_meshlet_v = D3D12_MESHLET::new(0, 257, 0, 100);
+    if overflow_meshlet_v.validate() != Err(MeshShaderError::ExceededMaxVertices(257)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Vertex count exceeding 256 was not rejected\r\n");
+        return false;
+    }
+    let overflow_meshlet_p = D3D12_MESHLET::new(0, 100, 0, 513);
+    if overflow_meshlet_p.validate() != Err(MeshShaderError::ExceededMaxPrimitives(513)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Primitive count exceeding 512 was not rejected\r\n");
+        return false;
+    }
+
+    let tri = D3D12_MESHLET_TRIANGLE::new(5, 12, 250);
+    let packed = tri.to_packed_u32();
+    let unpacked = D3D12_MESHLET_TRIANGLE::from_packed_u32(packed);
+    if unpacked != tri {
+        crate::serial_write_str("[KNT-MESH-FAIL] Packed 10-bit meshlet triangle index round-trip mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Meshlet 256-vertex / 512-primitive limits and packed triangle indices verified\r\n");
+
+    // 3. Task payload sharing and threadgroup barrier synchronization
+    let mut payload = D3D12_AMPLIFICATION_TASK_PAYLOAD::new();
+    let meshlets = [0, 4, 12, 19];
+    if payload.set_meshlets(&meshlets).is_err() || payload.meshlet_count != 4 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload meshlet list setting failed\r\n");
+        return false;
+    }
+    let sample_bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    if payload.write_payload_bytes(16, &sample_bytes).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload byte write failed\r\n");
+        return false;
+    }
+    let read_back = match payload.read_payload_bytes(16, 8) {
+        Ok(b) => b,
+        Err(_) => {
+            crate::serial_write_str("[KNT-MESH-FAIL] Task payload byte read failed\r\n");
+            return false;
+        }
+    };
+    if read_back != sample_bytes {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload data mismatch\r\n");
+        return false;
+    }
+    let oversized = [0u8; 16385];
+    if payload.write_payload_bytes(0, &oversized) != Err(MeshShaderError::ExceededMaxPayload(16385)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload exceeding 16 KiB was not rejected\r\n");
+        return false;
+    }
+
+    let mut barrier = D3D12_TASK_PAYLOAD_BARRIER::new();
+    if barrier.is_synchronized {
+        crate::serial_write_str("[KNT-MESH-FAIL] New payload barrier must be unsynchronized\r\n");
+        return false;
+    }
+    barrier.sync_threadgroup();
+    if !barrier.is_synchronized || barrier.barrier_generation != 1 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Payload barrier sync generation mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Amplification-to-Mesh task payload sharing and threadgroup barrier verified\r\n");
+
+    // 4. Command list DispatchMesh recording and parameter validation
+    let mut recorder = D3D12MeshShaderCommandRecorder::new();
+    if recorder.set_pipeline_state(valid_pso).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Command recorder failed to set mesh shader PSO\r\n");
+        return false;
+    }
+    let dispatch_args = D3D12_DISPATCH_MESH_ARGUMENTS::new(4, 2, 1);
+    if recorder.dispatch_mesh(dispatch_args, Some(payload)).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Failed to record DispatchMesh command\r\n");
+        return false;
+    }
+    if recorder.total_dispatched_threadgroups() != 8 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Total dispatched threadgroups count mismatch\r\n");
+        return false;
+    }
+    let invalid_args = D3D12_DISPATCH_MESH_ARGUMENTS::new(0, 10, 1);
+    if recorder.dispatch_mesh(invalid_args, None) != Err(MeshShaderError::InvalidThreadgroupDimension) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Zero threadgroup count was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DispatchMesh command recording and 3D threadgroup validation verified\r\n");
+
+    crate::serial_write_str("[KNT-MESH-SHADER-PASS] Direct3D 12 mesh and amplification shader pipeline verified\r\n");
+    true
+}

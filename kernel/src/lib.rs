@@ -352,6 +352,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 mesh shader pipeline self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Mesh Shader & Amplification Shader Pipeline (TASK-KNT-162)
+    if !gfx::test_d3d12_mesh_shader_pipeline() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 mesh and amplification shader pipeline self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Work Graphs & Autonomous GPU Shader Execution Engine
     if !gfx::test_work_graphs_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 work graphs subsystem self-test failed!\r\n");
