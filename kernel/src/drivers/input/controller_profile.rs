@@ -127,3 +127,214 @@ pub fn verify_profile_data_model_and_stick_curves() -> bool {
 
     true
 }
+
+// Input Action Remapping Matrix, Trigger Thresholds, and Grip Paddles
+
+/// Physical and virtual handheld gamepad buttons and back grip paddles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandheldButton {
+    A,
+    B,
+    X,
+    Y,
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
+    LeftBumper,
+    RightBumper,
+    LeftStickClick,
+    RightStickClick,
+    Start,
+    Back,
+    Guide,
+    PaddleL4,
+    PaddleL5,
+    PaddleR4,
+    PaddleR5,
+}
+
+pub const BUTTON_COUNT: usize = 19;
+
+impl HandheldButton {
+    pub const fn to_index(self) -> usize {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+            Self::X => 2,
+            Self::Y => 3,
+            Self::DpadUp => 4,
+            Self::DpadDown => 5,
+            Self::DpadLeft => 6,
+            Self::DpadRight => 7,
+            Self::LeftBumper => 8,
+            Self::RightBumper => 9,
+            Self::LeftStickClick => 10,
+            Self::RightStickClick => 11,
+            Self::Start => 12,
+            Self::Back => 13,
+            Self::Guide => 14,
+            Self::PaddleL4 => 15,
+            Self::PaddleL5 => 16,
+            Self::PaddleR4 => 17,
+            Self::PaddleR5 => 18,
+        }
+    }
+
+    pub const fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(Self::A),
+            1 => Some(Self::B),
+            2 => Some(Self::X),
+            3 => Some(Self::Y),
+            4 => Some(Self::DpadUp),
+            5 => Some(Self::DpadDown),
+            6 => Some(Self::DpadLeft),
+            7 => Some(Self::DpadRight),
+            8 => Some(Self::LeftBumper),
+            9 => Some(Self::RightBumper),
+            10 => Some(Self::LeftStickClick),
+            11 => Some(Self::RightStickClick),
+            12 => Some(Self::Start),
+            13 => Some(Self::Back),
+            14 => Some(Self::Guide),
+            15 => Some(Self::PaddleL4),
+            16 => Some(Self::PaddleL5),
+            17 => Some(Self::PaddleR4),
+            18 => Some(Self::PaddleR5),
+            _ => None,
+        }
+    }
+}
+
+/// Analog trigger digital activation threshold and hair-trigger configuration.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TriggerThresholdConfig {
+    pub activation_threshold: f32,
+    pub hair_trigger_mode: bool,
+}
+
+impl TriggerThresholdConfig {
+    pub const fn normal() -> Self {
+        Self {
+            activation_threshold: 0.50,
+            hair_trigger_mode: false,
+        }
+    }
+
+    pub const fn hair_trigger() -> Self {
+        Self {
+            activation_threshold: 0.20,
+            hair_trigger_mode: true,
+        }
+    }
+
+    pub fn is_activated(&self, raw_0_to_1: f32) -> bool {
+        raw_0_to_1 >= self.activation_threshold
+    }
+}
+
+/// Physical-to-virtual button remapping lookup table.
+#[derive(Clone, Copy, Debug)]
+pub struct ButtonRemappingTable {
+    pub mappings: [Option<HandheldButton>; BUTTON_COUNT],
+}
+
+impl ButtonRemappingTable {
+    pub const fn identity() -> Self {
+        Self {
+            mappings: [
+                Some(HandheldButton::A),
+                Some(HandheldButton::B),
+                Some(HandheldButton::X),
+                Some(HandheldButton::Y),
+                Some(HandheldButton::DpadUp),
+                Some(HandheldButton::DpadDown),
+                Some(HandheldButton::DpadLeft),
+                Some(HandheldButton::DpadRight),
+                Some(HandheldButton::LeftBumper),
+                Some(HandheldButton::RightBumper),
+                Some(HandheldButton::LeftStickClick),
+                Some(HandheldButton::RightStickClick),
+                Some(HandheldButton::Start),
+                Some(HandheldButton::Back),
+                Some(HandheldButton::Guide),
+                // Default back paddles assigned to face buttons
+                Some(HandheldButton::A), // L4 -> A (jump)
+                Some(HandheldButton::X), // L5 -> X (reload)
+                Some(HandheldButton::B), // R4 -> B (crouch)
+                Some(HandheldButton::Y), // R5 -> Y (switch weapon)
+            ],
+        }
+    }
+
+    pub fn remap(&self, physical: HandheldButton) -> Option<HandheldButton> {
+        self.mappings[physical.to_index()]
+    }
+
+    pub fn set_mapping(&mut self, physical: HandheldButton, target: Option<HandheldButton>) {
+        self.mappings[physical.to_index()] = target;
+    }
+}
+
+/// Controller remapping manager evaluating button tables and analog triggers.
+pub struct ControllerRemapManager {
+    pub table: ButtonRemappingTable,
+    pub left_trigger: TriggerThresholdConfig,
+    pub right_trigger: TriggerThresholdConfig,
+}
+
+impl ControllerRemapManager {
+    pub const fn new() -> Self {
+        Self {
+            table: ButtonRemappingTable::identity(),
+            left_trigger: TriggerThresholdConfig::normal(),
+            right_trigger: TriggerThresholdConfig::hair_trigger(),
+        }
+    }
+
+    /// Remaps a 32-bit physical button bitmask to virtual output bitmask.
+    pub fn remap_button_mask(&self, physical_mask: u32) -> u32 {
+        let mut out_mask: u32 = 0;
+        for i in 0..BUTTON_COUNT {
+            if (physical_mask & (1 << i)) != 0 {
+                if let Some(phys_btn) = HandheldButton::from_index(i) {
+                    if let Some(virt_btn) = self.table.remap(phys_btn) {
+                        out_mask |= 1 << virt_btn.to_index();
+                    }
+                }
+            }
+        }
+        out_mask
+    }
+}
+
+/// Verifies input button remapping matrix, trigger thresholds, and grip paddles.
+pub fn verify_button_remapping_and_paddles() -> bool {
+    let mut manager = ControllerRemapManager::new();
+
+    // 1. Verify default paddle L4 mapping -> outputs virtual A (bit 0)
+    let l4_bit = 1 << HandheldButton::PaddleL4.to_index();
+    let remapped_l4 = manager.remap_button_mask(l4_bit);
+    if remapped_l4 != (1 << HandheldButton::A.to_index()) {
+        return false;
+    }
+
+    // 2. Custom remapping: remap B to LeftStickClick
+    manager.table.set_mapping(HandheldButton::B, Some(HandheldButton::LeftStickClick));
+    let b_bit = 1 << HandheldButton::B.to_index();
+    let remapped_b = manager.remap_button_mask(b_bit);
+    if remapped_b != (1 << HandheldButton::LeftStickClick.to_index()) {
+        return false;
+    }
+
+    // 3. Hair trigger threshold verification (activation at 0.20)
+    if manager.right_trigger.is_activated(0.15) {
+        return false;
+    }
+    if !manager.right_trigger.is_activated(0.25) {
+        return false;
+    }
+
+    true
+}
