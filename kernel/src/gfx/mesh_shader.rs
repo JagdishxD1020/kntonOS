@@ -121,6 +121,79 @@ impl D3D12_MESHLET {
     }
 }
 
+
+// Direct3D 12 maximum allowable task payload size shared from AS to MS (16 KiB)
+pub const D3D12_AMPLIFICATION_MAX_PAYLOAD_SIZE: usize = 16384;
+
+// Amplification-to-Mesh Shader task payload container for inter-stage data sharing
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct D3D12_AMPLIFICATION_TASK_PAYLOAD {
+    pub payload_data: Vec<u8>,
+    pub meshlet_indices: Vec<u32>,
+    pub meshlet_count: u32,
+}
+
+impl D3D12_AMPLIFICATION_TASK_PAYLOAD {
+    // Construct an empty task payload
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Set list of surviving meshlet IDs to dispatch to the mesh shader stage
+    pub fn set_meshlets(&mut self, indices: &[u32]) -> Result<(), MeshShaderError> {
+        let count = indices.len() as u32;
+        self.meshlet_indices = indices.to_vec();
+        self.meshlet_count = count;
+        Ok(())
+    }
+
+    // Write arbitrary user payload data into the task payload buffer up to 16 KiB
+    pub fn write_payload_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MeshShaderError> {
+        let total = offset + bytes.len();
+        if total > D3D12_AMPLIFICATION_MAX_PAYLOAD_SIZE {
+            return Err(MeshShaderError::ExceededMaxPayload(total));
+        }
+        if self.payload_data.len() < total {
+            self.payload_data.resize(total, 0);
+        }
+        self.payload_data[offset..total].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    // Read payload bytes from the task payload buffer
+    pub fn read_payload_bytes(&self, offset: usize, length: usize) -> Result<&[u8], MeshShaderError> {
+        if offset + length > self.payload_data.len() {
+            return Err(MeshShaderError::BufferOverflow);
+        }
+        Ok(&self.payload_data[offset..offset + length])
+    }
+}
+
+// Amplification shader threadgroup synchronization and memory barrier tracker
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D12_TASK_PAYLOAD_BARRIER {
+    pub is_synchronized: bool,
+    pub barrier_generation: u32,
+}
+
+impl D3D12_TASK_PAYLOAD_BARRIER {
+    // Construct new unsynchronized threadgroup barrier
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Execute threadgroup payload memory barrier ensuring all AS writes are visible to MS
+    pub fn sync_threadgroup(&mut self) {
+        self.is_synchronized = true;
+        self.barrier_generation = self.barrier_generation.wrapping_add(1);
+    }
+
+    // Invalidate synchronization state prior to next AS write phase
+    pub fn invalidate(&mut self) {
+        self.is_synchronized = false;
+    }
+}
+
 /// Direct3D 12 maximum allowable output vertices per meshlet (D3D12_MESH_SHADER_MAX_VERTICES).
 pub const MAX_MESHLET_VERTICES: usize = 64;
 
