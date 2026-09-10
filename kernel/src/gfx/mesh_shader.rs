@@ -51,6 +51,76 @@ impl D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
     }
 }
 
+
+// Direct3D 12 maximum allowable meshlet output vertices (hardware limit = 256)
+pub const D3D12_MESH_SHADER_MAX_TOTAL_VERTICES: u32 = 256;
+
+// Direct3D 12 maximum allowable meshlet output primitives (hardware limit = 512)
+pub const D3D12_MESH_SHADER_MAX_TOTAL_PRIMITIVES: u32 = 512;
+
+// Meshlet triangle primitive local index layout (three local vertex indices)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_MESHLET_TRIANGLE {
+    pub i0: u8,
+    pub i1: u8,
+    pub i2: u8,
+}
+
+impl D3D12_MESHLET_TRIANGLE {
+    // Create new triangle primitive
+    pub const fn new(i0: u8, i1: u8, i2: u8) -> Self {
+        Self { i0, i1, i2 }
+    }
+
+    // Encode into packed 32-bit uint (10 bits per index: [9:0] i0, [19:10] i1, [29:20] i2)
+    pub const fn to_packed_u32(&self) -> u32 {
+        (self.i0 as u32) | ((self.i1 as u32) << 10) | ((self.i2 as u32) << 20)
+    }
+
+    // Decode from packed 32-bit uint
+    pub const fn from_packed_u32(val: u32) -> Self {
+        Self {
+            i0: (val & 0x3FF) as u8,
+            i1: ((val >> 10) & 0x3FF) as u8,
+            i2: ((val >> 20) & 0x3FF) as u8,
+        }
+    }
+}
+
+// D3D12 meshlet geometry chunk descriptor referencing vertex and index buffer offsets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_MESHLET {
+    pub VertOffset: u32,
+    pub VertCount: u32,
+    pub PrimOffset: u32,
+    pub PrimCount: u32,
+}
+
+impl D3D12_MESHLET {
+    // Construct new meshlet descriptor
+    pub const fn new(vert_offset: u32, vert_count: u32, prim_offset: u32, prim_count: u32) -> Self {
+        Self {
+            VertOffset: vert_offset,
+            VertCount: vert_count,
+            PrimOffset: prim_offset,
+            PrimCount: prim_count,
+        }
+    }
+
+    // Validate meshlet vertex count (<= 256) and primitive count (<= 512)
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.VertCount == 0 || self.VertCount > D3D12_MESH_SHADER_MAX_TOTAL_VERTICES {
+            return Err(MeshShaderError::ExceededMaxVertices(self.VertCount));
+        }
+        if self.PrimCount == 0 || self.PrimCount > D3D12_MESH_SHADER_MAX_TOTAL_PRIMITIVES {
+            return Err(MeshShaderError::ExceededMaxPrimitives(self.PrimCount));
+        }
+        Ok(())
+    }
+}
+
 /// Direct3D 12 maximum allowable output vertices per meshlet (D3D12_MESH_SHADER_MAX_VERTICES).
 pub const MAX_MESHLET_VERTICES: usize = 64;
 
