@@ -1,7 +1,292 @@
+#![allow(non_camel_case_types, non_snake_case, dead_code)]
 //! Direct3D 12 Mesh Shader & Amplification Shader Primitive Pipeline Engine.
-//! Replaces legacy fixed-function Input Assembler and VS/HS/DS/GS geometry stages
+// Replaces legacy fixed-function Input Assembler and VS/HS/DS/GS geometry stages
 
 use alloc::vec::Vec;
+use crate::gfx::pso::D3D12_SHADER_BYTECODE;
+
+// Pipeline state subobject type for Amplification Shader (AS)
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: u32 = 24;
+
+// Pipeline state subobject type for Mesh Shader (MS)
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: u32 = 25;
+
+// Mesh shader primitive output topology (triangles or lines)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY {
+    UNDEFINED = 0,
+    LINES = 1,
+    TRIANGLES = 2,
+}
+
+// Complete D3D12 mesh and amplification shader pipeline state stream descriptor
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+    pub root_signature_gpu_va: u64,
+    pub amplification_shader: Option<D3D12_SHADER_BYTECODE>,
+    pub mesh_shader: D3D12_SHADER_BYTECODE,
+    pub primitive_topology: D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY,
+    pub payload_size_bytes: u32,
+}
+
+impl D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+    // Validate pipeline subobjects and topology
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.mesh_shader.is_empty() {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        if self.primitive_topology == D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::UNDEFINED {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        if let Some(ref as_bc) = self.amplification_shader {
+            if as_bc.is_empty() {
+                return Err(MeshShaderError::InvalidPipelineConfig);
+            }
+        }
+        if self.payload_size_bytes > 16384 {
+            return Err(MeshShaderError::ExceededMaxPayload(self.payload_size_bytes as usize));
+        }
+        Ok(())
+    }
+}
+
+
+// Direct3D 12 maximum allowable meshlet output vertices (hardware limit = 256)
+pub const D3D12_MESH_SHADER_MAX_TOTAL_VERTICES: u32 = 256;
+
+// Direct3D 12 maximum allowable meshlet output primitives (hardware limit = 512)
+pub const D3D12_MESH_SHADER_MAX_TOTAL_PRIMITIVES: u32 = 512;
+
+// Meshlet triangle primitive local index layout (three local vertex indices)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_MESHLET_TRIANGLE {
+    pub i0: u8,
+    pub i1: u8,
+    pub i2: u8,
+}
+
+impl D3D12_MESHLET_TRIANGLE {
+    // Create new triangle primitive
+    pub const fn new(i0: u8, i1: u8, i2: u8) -> Self {
+        Self { i0, i1, i2 }
+    }
+
+    // Encode into packed 32-bit uint (10 bits per index: [9:0] i0, [19:10] i1, [29:20] i2)
+    pub const fn to_packed_u32(&self) -> u32 {
+        (self.i0 as u32) | ((self.i1 as u32) << 10) | ((self.i2 as u32) << 20)
+    }
+
+    // Decode from packed 32-bit uint
+    pub const fn from_packed_u32(val: u32) -> Self {
+        Self {
+            i0: (val & 0x3FF) as u8,
+            i1: ((val >> 10) & 0x3FF) as u8,
+            i2: ((val >> 20) & 0x3FF) as u8,
+        }
+    }
+}
+
+// D3D12 meshlet geometry chunk descriptor referencing vertex and index buffer offsets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_MESHLET {
+    pub VertOffset: u32,
+    pub VertCount: u32,
+    pub PrimOffset: u32,
+    pub PrimCount: u32,
+}
+
+impl D3D12_MESHLET {
+    // Construct new meshlet descriptor
+    pub const fn new(vert_offset: u32, vert_count: u32, prim_offset: u32, prim_count: u32) -> Self {
+        Self {
+            VertOffset: vert_offset,
+            VertCount: vert_count,
+            PrimOffset: prim_offset,
+            PrimCount: prim_count,
+        }
+    }
+
+    // Validate meshlet vertex count (<= 256) and primitive count (<= 512)
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.VertCount == 0 || self.VertCount > D3D12_MESH_SHADER_MAX_TOTAL_VERTICES {
+            return Err(MeshShaderError::ExceededMaxVertices(self.VertCount));
+        }
+        if self.PrimCount == 0 || self.PrimCount > D3D12_MESH_SHADER_MAX_TOTAL_PRIMITIVES {
+            return Err(MeshShaderError::ExceededMaxPrimitives(self.PrimCount));
+        }
+        Ok(())
+    }
+}
+
+
+// Direct3D 12 maximum allowable task payload size shared from AS to MS (16 KiB)
+pub const D3D12_AMPLIFICATION_MAX_PAYLOAD_SIZE: usize = 16384;
+
+// Amplification-to-Mesh Shader task payload container for inter-stage data sharing
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct D3D12_AMPLIFICATION_TASK_PAYLOAD {
+    pub payload_data: Vec<u8>,
+    pub meshlet_indices: Vec<u32>,
+    pub meshlet_count: u32,
+}
+
+impl D3D12_AMPLIFICATION_TASK_PAYLOAD {
+    // Construct an empty task payload
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Set list of surviving meshlet IDs to dispatch to the mesh shader stage
+    pub fn set_meshlets(&mut self, indices: &[u32]) -> Result<(), MeshShaderError> {
+        let count = indices.len() as u32;
+        self.meshlet_indices = indices.to_vec();
+        self.meshlet_count = count;
+        Ok(())
+    }
+
+    // Write arbitrary user payload data into the task payload buffer up to 16 KiB
+    pub fn write_payload_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MeshShaderError> {
+        let total = offset + bytes.len();
+        if total > D3D12_AMPLIFICATION_MAX_PAYLOAD_SIZE {
+            return Err(MeshShaderError::ExceededMaxPayload(total));
+        }
+        if self.payload_data.len() < total {
+            self.payload_data.resize(total, 0);
+        }
+        self.payload_data[offset..total].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    // Read payload bytes from the task payload buffer
+    pub fn read_payload_bytes(&self, offset: usize, length: usize) -> Result<&[u8], MeshShaderError> {
+        if offset + length > self.payload_data.len() {
+            return Err(MeshShaderError::BufferOverflow);
+        }
+        Ok(&self.payload_data[offset..offset + length])
+    }
+}
+
+// Amplification shader threadgroup synchronization and memory barrier tracker
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D12_TASK_PAYLOAD_BARRIER {
+    pub is_synchronized: bool,
+    pub barrier_generation: u32,
+}
+
+impl D3D12_TASK_PAYLOAD_BARRIER {
+    // Construct new unsynchronized threadgroup barrier
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Execute threadgroup payload memory barrier ensuring all AS writes are visible to MS
+    pub fn sync_threadgroup(&mut self) {
+        self.is_synchronized = true;
+        self.barrier_generation = self.barrier_generation.wrapping_add(1);
+    }
+
+    // Invalidate synchronization state prior to next AS write phase
+    pub fn invalidate(&mut self) {
+        self.is_synchronized = false;
+    }
+}
+
+
+// Direct3D 12 3D threadgroup dispatch arguments for mesh and amplification shaders
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_DISPATCH_MESH_ARGUMENTS {
+    pub ThreadGroupCountX: u32,
+    pub ThreadGroupCountY: u32,
+    pub ThreadGroupCountZ: u32,
+}
+
+impl D3D12_DISPATCH_MESH_ARGUMENTS {
+    // Create new dispatch dimensions descriptor
+    pub const fn new(x: u32, y: u32, z: u32) -> Self {
+        Self {
+            ThreadGroupCountX: x,
+            ThreadGroupCountY: y,
+            ThreadGroupCountZ: z,
+        }
+    }
+
+    // Total threadgroups dispatched across all three dimensions
+    pub fn total_threadgroups(&self) -> u64 {
+        (self.ThreadGroupCountX as u64)
+            * (self.ThreadGroupCountY as u64)
+            * (self.ThreadGroupCountZ as u64)
+    }
+
+    // Validate dispatch bounds (each dimension in 1..=65535)
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.ThreadGroupCountX == 0 || self.ThreadGroupCountX > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        if self.ThreadGroupCountY == 0 || self.ThreadGroupCountY > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        if self.ThreadGroupCountZ == 0 || self.ThreadGroupCountZ > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        Ok(())
+    }
+}
+
+// Recorded DispatchMesh command
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_DISPATCH_MESH_COMMAND {
+    pub arguments: D3D12_DISPATCH_MESH_ARGUMENTS,
+    pub payload: Option<D3D12_AMPLIFICATION_TASK_PAYLOAD>,
+}
+
+// Mesh and Amplification shader command list recorder
+#[derive(Debug, Default)]
+pub struct D3D12MeshShaderCommandRecorder {
+    pub current_pipeline: Option<D3D12_MESH_SHADER_PIPELINE_STATE_DESC>,
+    pub recorded_dispatches: Vec<D3D12_DISPATCH_MESH_COMMAND>,
+    pub payload_barrier: D3D12_TASK_PAYLOAD_BARRIER,
+}
+
+impl D3D12MeshShaderCommandRecorder {
+    // Create new mesh shader command recorder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Set active mesh shader pipeline state
+    pub fn set_pipeline_state(&mut self, pso: D3D12_MESH_SHADER_PIPELINE_STATE_DESC) -> Result<(), MeshShaderError> {
+        pso.validate()?;
+        self.current_pipeline = Some(pso);
+        Ok(())
+    }
+
+    // Record DispatchMesh invocation with validated dimensions
+    pub fn dispatch_mesh(
+        &mut self,
+        args: D3D12_DISPATCH_MESH_ARGUMENTS,
+        payload: Option<D3D12_AMPLIFICATION_TASK_PAYLOAD>,
+    ) -> Result<(), MeshShaderError> {
+        if self.current_pipeline.is_none() {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        args.validate()?;
+        self.recorded_dispatches.push(D3D12_DISPATCH_MESH_COMMAND {
+            arguments: args,
+            payload,
+        });
+        self.payload_barrier.sync_threadgroup();
+        Ok(())
+    }
+
+    // Calculate total threadgroups dispatched across all recorded commands
+    pub fn total_dispatched_threadgroups(&self) -> u64 {
+        self.recorded_dispatches.iter().map(|c| c.arguments.total_threadgroups()).sum()
+    }
+}
 
 /// Direct3D 12 maximum allowable output vertices per meshlet (D3D12_MESH_SHADER_MAX_VERTICES).
 pub const MAX_MESHLET_VERTICES: usize = 64;
@@ -741,4 +1026,129 @@ impl MeshShaderEngine {
         }
         Ok(all_outputs)
     }
+}
+
+// Comprehensive verification test suite for Direct3D 12 Mesh Shader & Amplification Shader Pipeline
+pub fn test_d3d12_mesh_shader_pipeline() -> bool {
+    crate::serial_write_str("[KNT-MESH] Initializing Direct3D 12 mesh and amplification shader self-test...\r\n");
+
+    // 1. Pipeline subobject descriptors and topology validation
+    if D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS != 24 || D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS != 25 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Pipeline subobject type enum values mismatch\r\n");
+        return false;
+    }
+
+    let as_bc = D3D12_SHADER_BYTECODE::new(&[0xAA; 128]);
+    let ms_bc = D3D12_SHADER_BYTECODE::new(&[0xBB; 256]);
+    let valid_pso = D3D12_MESH_SHADER_PIPELINE_STATE_DESC {
+        root_signature_gpu_va: 0x1000_0000,
+        amplification_shader: Some(as_bc),
+        mesh_shader: ms_bc,
+        primitive_topology: D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::TRIANGLES,
+        payload_size_bytes: 2048,
+    };
+    if valid_pso.validate().is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Valid D3D12 mesh shader PSO failed validation\r\n");
+        return false;
+    }
+
+    let mut invalid_pso = valid_pso.clone();
+    invalid_pso.primitive_topology = D3D12_MESH_SHADER_PRIMITIVE_TOPOLOGY::UNDEFINED;
+    if invalid_pso.validate().is_ok() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Undefined primitive topology was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D12 mesh and amplification shader pipeline subobjects and topology verified\r\n");
+
+    // 2. Meshlet geometry limits (<=256 vertices, <=512 primitives) and packed index layout
+    let valid_meshlet = D3D12_MESHLET::new(0, 256, 0, 512);
+    if valid_meshlet.validate().is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] 256-vertex / 512-primitive meshlet failed validation\r\n");
+        return false;
+    }
+    let overflow_meshlet_v = D3D12_MESHLET::new(0, 257, 0, 100);
+    if overflow_meshlet_v.validate() != Err(MeshShaderError::ExceededMaxVertices(257)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Vertex count exceeding 256 was not rejected\r\n");
+        return false;
+    }
+    let overflow_meshlet_p = D3D12_MESHLET::new(0, 100, 0, 513);
+    if overflow_meshlet_p.validate() != Err(MeshShaderError::ExceededMaxPrimitives(513)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Primitive count exceeding 512 was not rejected\r\n");
+        return false;
+    }
+
+    let tri = D3D12_MESHLET_TRIANGLE::new(5, 12, 250);
+    let packed = tri.to_packed_u32();
+    let unpacked = D3D12_MESHLET_TRIANGLE::from_packed_u32(packed);
+    if unpacked != tri {
+        crate::serial_write_str("[KNT-MESH-FAIL] Packed 10-bit meshlet triangle index round-trip mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Meshlet 256-vertex / 512-primitive limits and packed triangle indices verified\r\n");
+
+    // 3. Task payload sharing and threadgroup barrier synchronization
+    let mut payload = D3D12_AMPLIFICATION_TASK_PAYLOAD::new();
+    let meshlets = [0, 4, 12, 19];
+    if payload.set_meshlets(&meshlets).is_err() || payload.meshlet_count != 4 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload meshlet list setting failed\r\n");
+        return false;
+    }
+    let sample_bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    if payload.write_payload_bytes(16, &sample_bytes).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload byte write failed\r\n");
+        return false;
+    }
+    let read_back = match payload.read_payload_bytes(16, 8) {
+        Ok(b) => b,
+        Err(_) => {
+            crate::serial_write_str("[KNT-MESH-FAIL] Task payload byte read failed\r\n");
+            return false;
+        }
+    };
+    if read_back != sample_bytes {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload data mismatch\r\n");
+        return false;
+    }
+    let oversized = [0u8; 16385];
+    if payload.write_payload_bytes(0, &oversized) != Err(MeshShaderError::ExceededMaxPayload(16385)) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Task payload exceeding 16 KiB was not rejected\r\n");
+        return false;
+    }
+
+    let mut barrier = D3D12_TASK_PAYLOAD_BARRIER::new();
+    if barrier.is_synchronized {
+        crate::serial_write_str("[KNT-MESH-FAIL] New payload barrier must be unsynchronized\r\n");
+        return false;
+    }
+    barrier.sync_threadgroup();
+    if !barrier.is_synchronized || barrier.barrier_generation != 1 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Payload barrier sync generation mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Amplification-to-Mesh task payload sharing and threadgroup barrier verified\r\n");
+
+    // 4. Command list DispatchMesh recording and parameter validation
+    let mut recorder = D3D12MeshShaderCommandRecorder::new();
+    if recorder.set_pipeline_state(valid_pso).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Command recorder failed to set mesh shader PSO\r\n");
+        return false;
+    }
+    let dispatch_args = D3D12_DISPATCH_MESH_ARGUMENTS::new(4, 2, 1);
+    if recorder.dispatch_mesh(dispatch_args, Some(payload)).is_err() {
+        crate::serial_write_str("[KNT-MESH-FAIL] Failed to record DispatchMesh command\r\n");
+        return false;
+    }
+    if recorder.total_dispatched_threadgroups() != 8 {
+        crate::serial_write_str("[KNT-MESH-FAIL] Total dispatched threadgroups count mismatch\r\n");
+        return false;
+    }
+    let invalid_args = D3D12_DISPATCH_MESH_ARGUMENTS::new(0, 10, 1);
+    if recorder.dispatch_mesh(invalid_args, None) != Err(MeshShaderError::InvalidThreadgroupDimension) {
+        crate::serial_write_str("[KNT-MESH-FAIL] Zero threadgroup count was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DispatchMesh command recording and 3D threadgroup validation verified\r\n");
+
+    crate::serial_write_str("[KNT-MESH-SHADER-PASS] Direct3D 12 mesh and amplification shader pipeline verified\r\n");
+    true
 }
