@@ -257,3 +257,87 @@ pub fn win32_spin_wait_until(target_qpc: i64) {
         core::hint::spin_loop();
     }
 }
+
+/// Self-test suite verifying Win32 high-resolution performance counter engine.
+pub fn test_perf_counter_subsystem() -> bool {
+    crate::serial_write_str("[KNT-PERF-COUNTER-TEST] Executing Win32 Performance Counter verification...\r\n");
+
+    // 1. Verify Invariant TSC rate calibration
+    let tsc_hz = win32_calibrate_tsc_frequency();
+    if tsc_hz == 0 || !win32_is_invariant_tsc() {
+        return false;
+    }
+    let tsc1 = win32_read_tsc();
+    let tsc2 = win32_read_tsc();
+    if tsc2 < tsc1 {
+        return false;
+    }
+
+    // 2. Verify QueryPerformanceFrequency & QueryPerformanceCounter
+    let mut freq: i64 = 0;
+    if !win32_query_performance_frequency(&mut freq as *mut _) || freq != 10_000_000 {
+        return false;
+    }
+
+    let mut count1: i64 = 0;
+    let mut count2: i64 = 0;
+    if !win32_query_performance_counter(&mut count1 as *mut _) {
+        return false;
+    }
+    if !win32_query_performance_counter(&mut count2 as *mut _) {
+        return false;
+    }
+    if count2 < count1 {
+        return false;
+    }
+
+    let ns = win32_qpc_to_ns(10_000);
+    if ns != 1_000_000 {
+        return false;
+    }
+
+    // 3. Verify Legacy and Multimedia Timer APIs
+    let ticks1 = win32_get_tick_count64();
+    let ticks32 = win32_get_tick_count();
+    let mmt = win32_time_get_time();
+    if ticks32 != ticks1 as u32 || mmt != ticks32 {
+        return false;
+    }
+
+    if win32_time_begin_period(1) != TIMERR_NOERROR {
+        return false;
+    }
+    if win32_get_current_timer_resolution_ms() != 1 {
+        return false;
+    }
+    if win32_time_end_period(1) != TIMERR_NOERROR {
+        return false;
+    }
+    if win32_get_current_timer_resolution_ms() != 15 {
+        return false;
+    }
+    if win32_time_begin_period(0) != TIMERR_NOCANDO {
+        return false;
+    }
+
+    // 4. Verify Frame Pacing & Sub-millisecond sleep
+    let pacer60 = win32_create_frame_pacer(60);
+    if pacer60.target_fps != 60 || pacer60.frame_interval_qpc != (10_000_000 / 60) {
+        return false;
+    }
+
+    let pacer120 = win32_create_frame_pacer(120);
+    if pacer120.target_fps != 120 || pacer120.frame_interval_qpc != (10_000_000 / 120) {
+        return false;
+    }
+
+    let before_sleep = win32_qpc_ticks();
+    win32_precise_sleep_us(500);
+    let after_sleep = win32_qpc_ticks();
+    if after_sleep < before_sleep + 4500 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-PERF-COUNTER-PASS] Win32 high-resolution performance counter engine verified\r\n");
+    true
+}
