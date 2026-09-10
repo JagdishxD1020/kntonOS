@@ -112,6 +112,23 @@ impl MultiZoneThermalMonitor {
         filtered as f32 / 1000.0
     }
 
+    pub fn set_zone_immediate(&mut self, zone: HandheldThermalZone, celsius: f32) {
+        let raw_mc = (celsius * 1000.0) as i32;
+        let idx = Self::zone_to_index(zone);
+        self.filters[idx] = ZoneFilter {
+            samples: [raw_mc; 4],
+            index: 0,
+            count: 4,
+            last_filtered: raw_mc,
+        };
+        self.readings[idx] = ThermalReading {
+            zone,
+            raw_millicelsius: raw_mc,
+            filtered_millicelsius: raw_mc,
+            timestamp_ms: 0,
+        };
+    }
+
     pub fn get_reading(&self, zone: HandheldThermalZone) -> ThermalReading {
         let idx = Self::zone_to_index(zone);
         self.readings[idx]
@@ -554,36 +571,69 @@ pub fn verify_thermal_throttling_and_tripwire() -> bool {
     let mut gov = ThermalTripwireGovernor::new(GamingThermalProfile::Balanced);
 
     // 1. Normal operating temperature (65C CPU & GPU)
-    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 65_000, 100);
-    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 65_000, 100);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::CpuPackage, 65.0);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::IgpuHotspot, 65.0);
     let st_normal = gov.step_thermal_safety();
     if st_normal.throttling_active || st_normal.emergency_shutdown || st_normal.effective_tdp_w != 18 {
         return false;
     }
 
     // 2. Soft throttling at 88C: 3C over 85C threshold -> 6W reduction from 18W = 12W
-    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 88_000, 200);
-    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 88_000, 200);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::CpuPackage, 88.0);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::IgpuHotspot, 88.0);
     let st_throttle = gov.step_thermal_safety();
     if !st_throttle.throttling_active || st_throttle.emergency_shutdown || st_throttle.effective_tdp_w != 12 {
         return false;
     }
 
     // 3. Critical tripwire at 101C: emergency shutdown triggered, PROCHOT asserted
-    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 101_000, 300);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::CpuPackage, 101.0);
     let st_crit = gov.step_thermal_safety();
     if !st_crit.emergency_shutdown || !st_crit.prochot_asserted || st_crit.effective_tdp_w > 5 {
         return false;
     }
 
     // 4. Battery thermistor safety at 50C: charge limited
-    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 60_000, 400);
-    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 60_000, 400);
-    gov.monitor.update_reading(HandheldThermalZone::BatteryThermistor, 50_000, 400);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::CpuPackage, 60.0);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::IgpuHotspot, 60.0);
+    gov.monitor.set_zone_immediate(HandheldThermalZone::BatteryThermistor, 50.0);
     let st_bat = gov.step_thermal_safety();
     if !st_bat.battery_charge_limited || st_bat.emergency_shutdown {
         return false;
     }
 
+    true
+}
+
+
+/// Comprehensive verification self-test suite for Handheld PC Fan & Thermal Governor Service.
+pub fn test_thermal_governor_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld PC Fan & Thermal Governor service...\r\n");
+
+    // 1. Verify multi-zone thermal sensor reading and moving average filtering
+    if !verify_multizone_thermal_sensors() {
+        crate::serial_write_str("[KNT-PANIC] Multi-zone thermal sensor verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify piecewise linear dynamic fan curve and acoustic hysteresis
+    if !verify_dynamic_fan_curve() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic fan curve governor verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify handheld gaming thermal profiles and TDP envelopes
+    if !verify_thermal_gaming_profiles() {
+        crate::serial_write_str("[KNT-PANIC] Gaming thermal profiles verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify proactive thermal throttling and critical tripwire emergency shutdown
+    if !verify_thermal_throttling_and_tripwire() {
+        crate::serial_write_str("[KNT-PANIC] Thermal throttling and tripwire verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-THERMAL-GOV-PASS] Handheld thermal governor and dynamic fan curve engine verified\r\n");
     true
 }

@@ -631,6 +631,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Dual-battery balance manager and USB-PD 3.1 EPR engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
+    if !drivers::power::test_thermal_governor_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld thermal governor and dynamic fan curve engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone Thermocouple & Peltier Active Cooler Module (TASK-KNT-119)
     if !drivers::thermal::test_peltier_active_cooler_subsystem() {
         serial_write_str("[KNT-PANIC] Peltier active cooler and thermocouple subsystem self-test failed!\r\n");

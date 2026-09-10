@@ -3,6 +3,7 @@
 pub mod battery_balance;
 pub mod thermal_gov;
 pub use thermal_gov::*;
+pub use thermal_gov::test_thermal_governor_subsystem;
 
 pub use battery_balance::*;
 
