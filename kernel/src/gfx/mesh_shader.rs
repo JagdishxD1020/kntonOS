@@ -194,6 +194,100 @@ impl D3D12_TASK_PAYLOAD_BARRIER {
     }
 }
 
+
+// Direct3D 12 3D threadgroup dispatch arguments for mesh and amplification shaders
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct D3D12_DISPATCH_MESH_ARGUMENTS {
+    pub ThreadGroupCountX: u32,
+    pub ThreadGroupCountY: u32,
+    pub ThreadGroupCountZ: u32,
+}
+
+impl D3D12_DISPATCH_MESH_ARGUMENTS {
+    // Create new dispatch dimensions descriptor
+    pub const fn new(x: u32, y: u32, z: u32) -> Self {
+        Self {
+            ThreadGroupCountX: x,
+            ThreadGroupCountY: y,
+            ThreadGroupCountZ: z,
+        }
+    }
+
+    // Total threadgroups dispatched across all three dimensions
+    pub fn total_threadgroups(&self) -> u64 {
+        (self.ThreadGroupCountX as u64)
+            * (self.ThreadGroupCountY as u64)
+            * (self.ThreadGroupCountZ as u64)
+    }
+
+    // Validate dispatch bounds (each dimension in 1..=65535)
+    pub fn validate(&self) -> Result<(), MeshShaderError> {
+        if self.ThreadGroupCountX == 0 || self.ThreadGroupCountX > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        if self.ThreadGroupCountY == 0 || self.ThreadGroupCountY > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        if self.ThreadGroupCountZ == 0 || self.ThreadGroupCountZ > 65535 {
+            return Err(MeshShaderError::InvalidThreadgroupDimension);
+        }
+        Ok(())
+    }
+}
+
+// Recorded DispatchMesh command
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_DISPATCH_MESH_COMMAND {
+    pub arguments: D3D12_DISPATCH_MESH_ARGUMENTS,
+    pub payload: Option<D3D12_AMPLIFICATION_TASK_PAYLOAD>,
+}
+
+// Mesh and Amplification shader command list recorder
+#[derive(Debug, Default)]
+pub struct D3D12MeshShaderCommandRecorder {
+    pub current_pipeline: Option<D3D12_MESH_SHADER_PIPELINE_STATE_DESC>,
+    pub recorded_dispatches: Vec<D3D12_DISPATCH_MESH_COMMAND>,
+    pub payload_barrier: D3D12_TASK_PAYLOAD_BARRIER,
+}
+
+impl D3D12MeshShaderCommandRecorder {
+    // Create new mesh shader command recorder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Set active mesh shader pipeline state
+    pub fn set_pipeline_state(&mut self, pso: D3D12_MESH_SHADER_PIPELINE_STATE_DESC) -> Result<(), MeshShaderError> {
+        pso.validate()?;
+        self.current_pipeline = Some(pso);
+        Ok(())
+    }
+
+    // Record DispatchMesh invocation with validated dimensions
+    pub fn dispatch_mesh(
+        &mut self,
+        args: D3D12_DISPATCH_MESH_ARGUMENTS,
+        payload: Option<D3D12_AMPLIFICATION_TASK_PAYLOAD>,
+    ) -> Result<(), MeshShaderError> {
+        if self.current_pipeline.is_none() {
+            return Err(MeshShaderError::InvalidPipelineConfig);
+        }
+        args.validate()?;
+        self.recorded_dispatches.push(D3D12_DISPATCH_MESH_COMMAND {
+            arguments: args,
+            payload,
+        });
+        self.payload_barrier.sync_threadgroup();
+        Ok(())
+    }
+
+    // Calculate total threadgroups dispatched across all recorded commands
+    pub fn total_dispatched_threadgroups(&self) -> u64 {
+        self.recorded_dispatches.iter().map(|c| c.arguments.total_threadgroups()).sum()
+    }
+}
+
 /// Direct3D 12 maximum allowable output vertices per meshlet (D3D12_MESH_SHADER_MAX_VERTICES).
 pub const MAX_MESHLET_VERTICES: usize = 64;
 
