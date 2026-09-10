@@ -464,3 +464,126 @@ pub fn verify_thermal_gaming_profiles() -> bool {
 
     true
 }
+
+// Thermal Tripwire and Proactive Throttling Governor
+
+/// Safety thresholds for handheld silicon, battery, and chassis skin comfort.
+pub const THROTTLE_START_TEMP_C: f32 = 85.0;
+pub const CRITICAL_SHUTDOWN_TEMP_C: f32 = 100.0;
+pub const BATTERY_HOT_TEMP_C: f32 = 45.0;
+pub const BATTERY_CRITICAL_TEMP_C: f32 = 60.0;
+pub const CHASSIS_COMFORT_TEMP_C: f32 = 48.0;
+
+/// Real-time status of thermal throttling and safety tripwires.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThermalThrottleStatus {
+    pub throttling_active: bool,
+    pub prochot_asserted: bool,
+    pub emergency_shutdown: bool,
+    pub effective_tdp_w: u16,
+    pub battery_charge_limited: bool,
+}
+
+impl ThermalThrottleStatus {
+    pub const fn normal(tdp_w: u16) -> Self {
+        Self {
+            throttling_active: false,
+            prochot_asserted: false,
+            emergency_shutdown: false,
+            effective_tdp_w: tdp_w,
+            battery_charge_limited: false,
+        }
+    }
+}
+
+/// Proactive thermal governor evaluating tripwires across multi-zone telemetry.
+pub struct ThermalTripwireGovernor {
+    pub monitor: MultiZoneThermalMonitor,
+    pub profile_gov: ThermalProfileGovernor,
+    pub status: ThermalThrottleStatus,
+}
+
+impl ThermalTripwireGovernor {
+    pub fn new(profile: GamingThermalProfile) -> Self {
+        let p_gov = ThermalProfileGovernor::new(profile);
+        let base_tdp = p_gov.envelope.sustained_tdp_w;
+        Self {
+            monitor: MultiZoneThermalMonitor::new(),
+            profile_gov: p_gov,
+            status: ThermalThrottleStatus::normal(base_tdp),
+        }
+    }
+
+    /// Evaluates multi-zone temperatures, updating fan curves and safety tripwires.
+    pub fn step_thermal_safety(&mut self) -> ThermalThrottleStatus {
+        let max_silicon = self.monitor.max_silicon_temperature();
+        let battery_t = self.monitor.get_reading(HandheldThermalZone::BatteryThermistor).celsius();
+        let (_pwm, base_tdp) = self.profile_gov.step_temperature(max_silicon);
+
+        let mut st = ThermalThrottleStatus::normal(base_tdp);
+
+        // 1. Critical silicon emergency shutdown tripwire (PROCHOT)
+        if max_silicon >= CRITICAL_SHUTDOWN_TEMP_C {
+            st.emergency_shutdown = true;
+            st.prochot_asserted = true;
+            st.throttling_active = true;
+            st.effective_tdp_w = 5; // Absolute hardware minimum floor
+        } else if max_silicon >= THROTTLE_START_TEMP_C {
+            // 2. Proactive soft throttling: reduce 2W per degree Celsius above 85C
+            let over_c = max_silicon - THROTTLE_START_TEMP_C;
+            let reduction = (over_c * 2.0) as u16;
+            st.throttling_active = true;
+            st.effective_tdp_w = base_tdp.saturating_sub(reduction).max(7);
+        }
+
+        // 3. Battery thermal protection tripwires
+        if battery_t >= BATTERY_CRITICAL_TEMP_C {
+            st.emergency_shutdown = true;
+            st.battery_charge_limited = true;
+        } else if battery_t >= BATTERY_HOT_TEMP_C {
+            st.battery_charge_limited = true;
+        }
+
+        self.status = st;
+        st
+    }
+}
+
+/// Verifies proactive thermal throttling, dynamic TDP scaling, and critical tripwire shutdown.
+pub fn verify_thermal_throttling_and_tripwire() -> bool {
+    let mut gov = ThermalTripwireGovernor::new(GamingThermalProfile::Balanced);
+
+    // 1. Normal operating temperature (65C CPU & GPU)
+    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 65_000, 100);
+    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 65_000, 100);
+    let st_normal = gov.step_thermal_safety();
+    if st_normal.throttling_active || st_normal.emergency_shutdown || st_normal.effective_tdp_w != 18 {
+        return false;
+    }
+
+    // 2. Soft throttling at 88C: 3C over 85C threshold -> 6W reduction from 18W = 12W
+    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 88_000, 200);
+    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 88_000, 200);
+    let st_throttle = gov.step_thermal_safety();
+    if !st_throttle.throttling_active || st_throttle.emergency_shutdown || st_throttle.effective_tdp_w != 12 {
+        return false;
+    }
+
+    // 3. Critical tripwire at 101C: emergency shutdown triggered, PROCHOT asserted
+    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 101_000, 300);
+    let st_crit = gov.step_thermal_safety();
+    if !st_crit.emergency_shutdown || !st_crit.prochot_asserted || st_crit.effective_tdp_w > 5 {
+        return false;
+    }
+
+    // 4. Battery thermistor safety at 50C: charge limited
+    gov.monitor.update_reading(HandheldThermalZone::CpuPackage, 60_000, 400);
+    gov.monitor.update_reading(HandheldThermalZone::IgpuHotspot, 60_000, 400);
+    gov.monitor.update_reading(HandheldThermalZone::BatteryThermistor, 50_000, 400);
+    let st_bat = gov.step_thermal_safety();
+    if !st_bat.battery_charge_limited || st_bat.emergency_shutdown {
+        return false;
+    }
+
+    true
+}
