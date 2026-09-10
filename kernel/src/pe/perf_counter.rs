@@ -132,3 +132,56 @@ pub fn win32_qpc_ticks() -> i64 {
 pub fn win32_qpc_to_ns(qpc_ticks: i64) -> u64 {
     (qpc_ticks.max(0) as u64).saturating_mul(100)
 }
+
+use core::sync::atomic::AtomicU32;
+
+pub const TIMERR_NOERROR: u32 = 0;
+pub const TIMERR_NOCANDO: u32 = 97;
+pub const TIMERR_STRUCT: u32 = 98;
+
+static CURRENT_TIMER_RESOLUTION_MS: AtomicU32 = AtomicU32::new(15);
+static PERIOD_REQUEST_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Requests a minimum resolution for periodic timers (e.g. 1ms for games).
+pub fn win32_time_begin_period(uPeriod: u32) -> u32 {
+    if uPeriod == 0 || uPeriod > 1000 {
+        return TIMERR_NOCANDO;
+    }
+    let target = uPeriod.max(1);
+    CURRENT_TIMER_RESOLUTION_MS.store(target, Ordering::Release);
+    PERIOD_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+    TIMERR_NOERROR
+}
+
+/// Clears a previously set minimum timer resolution.
+pub fn win32_time_end_period(uPeriod: u32) -> u32 {
+    if uPeriod == 0 || uPeriod > 1000 {
+        return TIMERR_NOCANDO;
+    }
+    let prev = PERIOD_REQUEST_COUNT.fetch_sub(1, Ordering::Relaxed);
+    if prev <= 1 {
+        CURRENT_TIMER_RESOLUTION_MS.store(15, Ordering::Release);
+    }
+    TIMERR_NOERROR
+}
+
+/// Returns the current active multimedia timer resolution in milliseconds.
+pub fn win32_get_current_timer_resolution_ms() -> u32 {
+    CURRENT_TIMER_RESOLUTION_MS.load(Ordering::Relaxed)
+}
+
+/// Retrieves the number of milliseconds that have elapsed since system boot (64-bit).
+pub fn win32_get_tick_count64() -> u64 {
+    let qpc = win32_qpc_ticks();
+    (qpc.max(0) as u64) / 10_000
+}
+
+/// Retrieves the number of milliseconds that have elapsed since system boot (32-bit).
+pub fn win32_get_tick_count() -> u32 {
+    win32_get_tick_count64() as u32
+}
+
+/// Retrieves the system time in milliseconds for multimedia and game timing.
+pub fn win32_time_get_time() -> u32 {
+    win32_get_tick_count()
+}
