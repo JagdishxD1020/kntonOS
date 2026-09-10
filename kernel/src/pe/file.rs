@@ -32,6 +32,32 @@ pub const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
+pub const FILE_BEGIN: u32 = 0;
+pub const FILE_CURRENT: u32 = 1;
+pub const FILE_END: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BY_HANDLE_FILE_INFORMATION {
+    pub dwFileAttributes: u32,
+    pub ftCreationTime: FILETIME,
+    pub ftLastAccessTime: FILETIME,
+    pub ftLastWriteTime: FILETIME,
+    pub dwVolumeSerialNumber: u32,
+    pub nFileSizeHigh: u32,
+    pub nFileSizeLow: u32,
+    pub nNumberOfLinks: u32,
+    pub nFileIndexHigh: u32,
+    pub nFileIndexLow: u32,
+}
+
 /// Translates a DOS/Windows-style file path into a canonical KntonOS VFS path.
 pub fn win32_dos_to_vfs_path(dos_path: &str) -> String {
     let trimmed = dos_path.trim();
@@ -369,6 +395,151 @@ pub unsafe fn win32_write_file(
 
     if !lp_number_of_bytes_written.is_null() {
         *lp_number_of_bytes_written = n_number_of_bytes_to_write;
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 SetFilePointerEx moving the file pointer of an open file.
+pub unsafe fn win32_set_file_pointer_ex(
+    h_file: u64,
+    li_distance_to_move: i64,
+    lp_new_file_pointer: *mut i64,
+    dw_move_method: u32,
+) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let mut table = FILE_HANDLE_TABLE.lock();
+    let file_obj = match table.get_mut(&h_file) {
+        Some(obj) => obj,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            return false;
+        }
+    };
+
+    if file_obj.is_console {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let file_len = {
+        let vfs = crate::fs::VFS.lock();
+        vfs.read_file(&file_obj.vfs_path).map(|d| d.len()).unwrap_or(0) as i64
+    };
+
+    let target_offset = match dw_move_method {
+        FILE_BEGIN => li_distance_to_move,
+        FILE_CURRENT => (file_obj.cursor as i64).saturating_add(li_distance_to_move),
+        FILE_END => file_len.saturating_add(li_distance_to_move),
+        _ => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+
+    if target_offset < 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    file_obj.cursor = target_offset as u64;
+
+    if !lp_new_file_pointer.is_null() {
+        *lp_new_file_pointer = target_offset;
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 GetFileSizeEx retrieving the size of the specified file.
+pub unsafe fn win32_get_file_size_ex(h_file: u64, lp_file_size: *mut i64) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 || lp_file_size.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let table = FILE_HANDLE_TABLE.lock();
+    let file_obj = match table.get(&h_file) {
+        Some(obj) => obj,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            return false;
+        }
+    };
+
+    if file_obj.is_console {
+        *lp_file_size = 0;
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        return true;
+    }
+
+    let vfs = crate::fs::VFS.lock();
+    let size = vfs.read_file(&file_obj.vfs_path).map(|d| d.len()).unwrap_or(0) as i64;
+    *lp_file_size = size;
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 GetFileInformationByHandle retrieving file geometry and attributes.
+pub unsafe fn win32_get_file_information_by_handle(
+    h_file: u64,
+    lp_file_information: *mut BY_HANDLE_FILE_INFORMATION,
+) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 || lp_file_information.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let table = FILE_HANDLE_TABLE.lock();
+    let file_obj = match table.get(&h_file) {
+        Some(obj) => obj,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            return false;
+        }
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if file_obj.is_console {
+        info.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    } else {
+        let vfs = crate::fs::VFS.lock();
+        let size = vfs.read_file(&file_obj.vfs_path).map(|d| d.len()).unwrap_or(0) as u64;
+        info.dwFileAttributes = file_obj.flags_and_attributes;
+        info.nFileSizeLow = (size & 0xFFFF_FFFF) as u32;
+        info.nFileSizeHigh = (size >> 32) as u32;
+        info.nNumberOfLinks = 1;
+        info.dwVolumeSerialNumber = 0x1A2B_3C4D;
+        info.nFileIndexLow = file_obj.handle as u32;
+        info.nFileIndexHigh = (file_obj.handle >> 32) as u32;
+        info.ftCreationTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+        info.ftLastAccessTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+        info.ftLastWriteTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+    }
+
+    *lp_file_information = info;
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 FlushFileBuffers flushing written buffers to disk.
+pub unsafe fn win32_flush_file_buffers(h_file: u64) -> bool {
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let table = FILE_HANDLE_TABLE.lock();
+    if !table.contains_key(&h_file) {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
     }
 
     crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
