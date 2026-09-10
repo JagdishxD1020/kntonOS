@@ -309,3 +309,158 @@ pub fn verify_dynamic_fan_curve() -> bool {
 
     true
 }
+
+// Gaming Thermal Profile Governor & TDP Envelopes
+
+/// Handheld gaming thermal profile modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GamingThermalProfile {
+    Quiet,
+    Balanced,
+    Performance,
+    Custom,
+}
+
+/// Power and thermal envelope for a gaming profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProfileTdpEnvelope {
+    pub sustained_tdp_w: u16,
+    pub boost_tdp_w: u16,
+    pub boost_duration_s: u8,
+    pub max_fan_pwm_pct: u8,
+}
+
+impl ProfileTdpEnvelope {
+    pub const fn quiet() -> Self {
+        Self {
+            sustained_tdp_w: 12,
+            boost_tdp_w: 15,
+            boost_duration_s: 5,
+            max_fan_pwm_pct: 50,
+        }
+    }
+
+    pub const fn balanced() -> Self {
+        Self {
+            sustained_tdp_w: 18,
+            boost_tdp_w: 22,
+            boost_duration_s: 10,
+            max_fan_pwm_pct: 80,
+        }
+    }
+
+    pub const fn performance() -> Self {
+        Self {
+            sustained_tdp_w: 28,
+            boost_tdp_w: 32,
+            boost_duration_s: 15,
+            max_fan_pwm_pct: 100,
+        }
+    }
+}
+
+impl FanCurve {
+    pub const fn quiet() -> Self {
+        Self {
+            points: [
+                FanCurvePoint::new(40.0, 0),
+                FanCurvePoint::new(55.0, 15),
+                FanCurvePoint::new(65.0, 25),
+                FanCurvePoint::new(75.0, 35),
+                FanCurvePoint::new(85.0, 45),
+                FanCurvePoint::new(95.0, 50),
+            ],
+            count: 6,
+        }
+    }
+
+    pub const fn performance() -> Self {
+        Self {
+            points: [
+                FanCurvePoint::new(35.0, 20),
+                FanCurvePoint::new(50.0, 40),
+                FanCurvePoint::new(65.0, 65),
+                FanCurvePoint::new(75.0, 80),
+                FanCurvePoint::new(85.0, 95),
+                FanCurvePoint::new(90.0, 100),
+            ],
+            count: 6,
+        }
+    }
+}
+
+/// Governor coordinating active gaming profiles, TDP ceilings, and fan response.
+pub struct ThermalProfileGovernor {
+    pub active_profile: GamingThermalProfile,
+    pub envelope: ProfileTdpEnvelope,
+    pub fan_governor: DynamicFanGovernor,
+}
+
+impl ThermalProfileGovernor {
+    pub fn new(profile: GamingThermalProfile) -> Self {
+        let (env, curve) = match profile {
+            GamingThermalProfile::Quiet => (ProfileTdpEnvelope::quiet(), FanCurve::quiet()),
+            GamingThermalProfile::Balanced => (ProfileTdpEnvelope::balanced(), FanCurve::default_balanced()),
+            GamingThermalProfile::Performance => (ProfileTdpEnvelope::performance(), FanCurve::performance()),
+            GamingThermalProfile::Custom => (ProfileTdpEnvelope::balanced(), FanCurve::default_balanced()),
+        };
+        Self {
+            active_profile: profile,
+            envelope: env,
+            fan_governor: DynamicFanGovernor::new(curve),
+        }
+    }
+
+    pub fn set_profile(&mut self, profile: GamingThermalProfile) {
+        self.active_profile = profile;
+        match profile {
+            GamingThermalProfile::Quiet => {
+                self.envelope = ProfileTdpEnvelope::quiet();
+                self.fan_governor.curve = FanCurve::quiet();
+            }
+            GamingThermalProfile::Balanced => {
+                self.envelope = ProfileTdpEnvelope::balanced();
+                self.fan_governor.curve = FanCurve::default_balanced();
+            }
+            GamingThermalProfile::Performance => {
+                self.envelope = ProfileTdpEnvelope::performance();
+                self.fan_governor.curve = FanCurve::performance();
+            }
+            GamingThermalProfile::Custom => {}
+        }
+    }
+
+    /// Evaluates current temperature, updating fan PWM clamped by profile envelope.
+    pub fn step_temperature(&mut self, temp_c: f32) -> (u8, u16) {
+        let raw_pwm = self.fan_governor.step(temp_c);
+        let clamped_pwm = raw_pwm.min(self.envelope.max_fan_pwm_pct);
+        (clamped_pwm, self.envelope.sustained_tdp_w)
+    }
+}
+
+/// Verifies gaming thermal profiles (Quiet acoustic ceiling, Balanced 15W-20W, and Performance 28W-30W).
+pub fn verify_thermal_gaming_profiles() -> bool {
+    let mut gov = ThermalProfileGovernor::new(GamingThermalProfile::Balanced);
+
+    // 1. Balanced mode default TDP and fan behavior
+    let (pwm_bal, tdp_bal) = gov.step_temperature(65.0);
+    if tdp_bal != 18 || pwm_bal != 45 {
+        return false;
+    }
+
+    // 2. Switch to Quiet mode: fan capped at 50%, TDP target 12W
+    gov.set_profile(GamingThermalProfile::Quiet);
+    let (pwm_quiet, tdp_quiet) = gov.step_temperature(90.0);
+    if tdp_quiet != 12 || pwm_quiet > 50 {
+        return false;
+    }
+
+    // 3. Switch to Performance mode: TDP 28W, fan up to 100%
+    gov.set_profile(GamingThermalProfile::Performance);
+    let (pwm_perf, tdp_perf) = gov.step_temperature(90.0);
+    if tdp_perf != 28 || pwm_perf != 100 {
+        return false;
+    }
+
+    true
+}
