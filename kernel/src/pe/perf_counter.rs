@@ -185,3 +185,75 @@ pub fn win32_get_tick_count() -> u32 {
 pub fn win32_time_get_time() -> u32 {
     win32_get_tick_count()
 }
+
+/// High-precision hybrid frame pacing controller for userland 3D games and compositor.
+#[derive(Debug, Clone, Copy)]
+pub struct FramePacer {
+    pub target_fps: u32,
+    pub frame_interval_qpc: i64,
+    pub last_frame_qpc: i64,
+    pub frame_count: u64,
+}
+
+impl FramePacer {
+    /// Creates a frame pacer configured for target frames per second.
+    pub fn new(target_fps: u32) -> Self {
+        let interval = if target_fps > 0 {
+            (QPC_STANDARD_FREQ_HZ as i64) / (target_fps as i64)
+        } else {
+            0
+        };
+        Self {
+            target_fps,
+            frame_interval_qpc: interval,
+            last_frame_qpc: win32_qpc_ticks(),
+            frame_count: 0,
+        }
+    }
+
+    /// Waits until the next frame boundary using hybrid spin-wait for sub-millisecond precision.
+    pub fn wait_next_frame(&mut self) -> u64 {
+        if self.frame_interval_qpc <= 0 {
+            self.frame_count += 1;
+            return self.frame_count;
+        }
+
+        let target_deadline = self.last_frame_qpc + self.frame_interval_qpc;
+        let mut now = win32_qpc_ticks();
+
+        while now < target_deadline {
+            core::hint::spin_loop();
+            now = win32_qpc_ticks();
+        }
+
+        self.last_frame_qpc = now;
+        self.frame_count += 1;
+        self.frame_count
+    }
+}
+
+/// Creates a new frame pacer for the specified target framerate.
+pub fn win32_create_frame_pacer(target_fps: u32) -> FramePacer {
+    FramePacer::new(target_fps)
+}
+
+/// Suspends execution for the specified duration in microseconds with sub-millisecond accuracy.
+pub fn win32_precise_sleep_us(microseconds: u64) {
+    if microseconds == 0 {
+        return;
+    }
+    let ticks_to_wait = (microseconds.saturating_mul(10)) as i64;
+    let start = win32_qpc_ticks();
+    let deadline = start + ticks_to_wait;
+
+    while win32_qpc_ticks() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
+/// Spins until the designated performance counter timestamp is reached.
+pub fn win32_spin_wait_until(target_qpc: i64) {
+    while win32_qpc_ticks() < target_qpc {
+        core::hint::spin_loop();
+    }
+}
