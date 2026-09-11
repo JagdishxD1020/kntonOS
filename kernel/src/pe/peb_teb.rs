@@ -578,3 +578,75 @@ pub fn win32_get_environment_strings_w() -> *mut u16 {
 pub fn win32_free_environment_strings_w(_penv: *mut u16) -> bool {
     true
 }
+
+// Global storage for process command line in ANSI/UTF-8 and UTF-16
+pub struct ProcessCommandLine {
+    cmdline_a: Vec<u8>,
+    cmdline_w: Vec<u16>,
+    initialized: bool,
+}
+
+impl ProcessCommandLine {
+    // Construct empty command line state
+    pub const fn empty() -> Self {
+        Self {
+            cmdline_a: Vec::new(),
+            cmdline_w: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    // Ensure initial default command line is set
+    pub fn ensure_init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+        self.set("init.exe");
+    }
+
+    // Update command line string in both UTF-8 and UTF-16 representations
+    pub fn set(&mut self, cmd: &str) {
+        self.initialized = true;
+        let mut a = Vec::from(cmd.as_bytes());
+        a.push(0);
+        self.cmdline_a = a;
+
+        let mut w: Vec<u16> = cmd.encode_utf16().collect();
+        w.push(0);
+        self.cmdline_w = w;
+    }
+}
+
+pub static PROCESS_CMDLINE: Spinlock<ProcessCommandLine> = Spinlock::new(ProcessCommandLine::empty());
+
+// Win32 GetCommandLineW returns pointer to null-terminated UTF-16 command line
+pub fn win32_get_command_line_w() -> *const u16 {
+    let mut cmd = PROCESS_CMDLINE.lock();
+    cmd.ensure_init();
+    cmd.cmdline_w.as_ptr()
+}
+
+// Win32 GetCommandLineA returns pointer to null-terminated UTF-8/ANSI command line
+pub fn win32_get_command_line_a() -> *const u8 {
+    let mut cmd = PROCESS_CMDLINE.lock();
+    cmd.ensure_init();
+    cmd.cmdline_a.as_ptr()
+}
+
+// Set process command line parameters
+pub fn win32_set_command_line(cmd: &str) {
+    let mut cl = PROCESS_CMDLINE.lock();
+    cl.set(cmd);
+}
+
+// Retrieve current command line as a Rust String
+pub fn win32_get_command_line_str() -> String {
+    let mut cmd = PROCESS_CMDLINE.lock();
+    cmd.ensure_init();
+    if cmd.cmdline_a.is_empty() {
+        return String::new();
+    }
+    let len = cmd.cmdline_a.len().saturating_sub(1);
+    String::from_utf8_lossy(&cmd.cmdline_a[..len]).into_owned()
+}
