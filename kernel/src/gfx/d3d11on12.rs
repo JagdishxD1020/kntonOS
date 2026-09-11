@@ -205,6 +205,44 @@ impl D3D11On12StateTracker {
     }
 }
 
+
+// Timeline fence synchronization tracker for CPU/GPU interop between D3D11 and D3D12
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D11On12FenceSync {
+    pub fence_handle: u64,
+    pub current_value: u64,
+    pub completed_value: u64,
+}
+
+impl D3D11On12FenceSync {
+    // Construct new fence synchronizer
+    pub fn new(fence_handle: u64) -> Self {
+        Self {
+            fence_handle,
+            current_value: 0,
+            completed_value: 0,
+        }
+    }
+
+    // Advance and signal fence returning the new monotonic value
+    pub fn signal(&mut self) -> u64 {
+        self.current_value += 1;
+        self.current_value
+    }
+
+    // Simulate completion of GPU work up to value
+    pub fn mark_completed(&mut self, value: u64) {
+        if value > self.completed_value {
+            self.completed_value = value;
+        }
+    }
+
+    // Check if fence value has been completed by GPU
+    pub fn is_completed(&self, value: u64) -> bool {
+        self.completed_value >= value
+    }
+}
+
 // D3D11-on-12 interop device interface
 #[derive(Debug, Clone)]
 pub struct ID3D11On12Device {
@@ -213,6 +251,7 @@ pub struct ID3D11On12Device {
     pub next_resource_id: u64,
     pub wrapped_resources: Vec<D3D11WrappedResource>,
     pub state_tracker: D3D11On12StateTracker,
+    pub fence_sync: D3D11On12FenceSync,
 }
 
 impl ID3D11On12Device {
@@ -224,6 +263,7 @@ impl ID3D11On12Device {
             next_resource_id: 1,
             wrapped_resources: Vec::new(),
             state_tracker: D3D11On12StateTracker::new(),
+            fence_sync: D3D11On12FenceSync::new(0x5000),
         }
     }
 
@@ -304,6 +344,69 @@ impl ID3D11On12Device {
         }
 
         Ok(self.state_tracker.transition_resource(res, target_state))
+    }
+
+    // Acquire wrapped resources transitioning them to in_state for D3D11 use
+    pub fn AcquireWrappedResources(&mut self, resource_ids: &[u64]) -> Result<(), D3D11On12Error> {
+        if resource_ids.is_empty() {
+            return Ok(());
+        }
+
+        for &id in resource_ids {
+            let res = self
+                .wrapped_resources
+                .iter()
+                .find(|r| r.resource_id == id)
+                .ok_or(D3D11On12Error::InvalidResource)?;
+            if res.is_acquired {
+                return Err(D3D11On12Error::ResourceAlreadyAcquired);
+            }
+        }
+
+        for &id in resource_ids {
+            let res = self
+                .wrapped_resources
+                .iter_mut()
+                .find(|r| r.resource_id == id)
+                .ok_or(D3D11On12Error::InvalidResource)?;
+            let target_in = res.in_state;
+            self.state_tracker.transition_resource(res, target_in);
+            res.is_acquired = true;
+        }
+
+        Ok(())
+    }
+
+    // Release wrapped resources transitioning them to out_state and signaling interop fence
+    pub fn ReleaseWrappedResources(&mut self, resource_ids: &[u64]) -> Result<u64, D3D11On12Error> {
+        if resource_ids.is_empty() {
+            return Ok(self.fence_sync.current_value);
+        }
+
+        for &id in resource_ids {
+            let res = self
+                .wrapped_resources
+                .iter()
+                .find(|r| r.resource_id == id)
+                .ok_or(D3D11On12Error::InvalidResource)?;
+            if !res.is_acquired {
+                return Err(D3D11On12Error::ResourceNotAcquired);
+            }
+        }
+
+        for &id in resource_ids {
+            let res = self
+                .wrapped_resources
+                .iter_mut()
+                .find(|r| r.resource_id == id)
+                .ok_or(D3D11On12Error::InvalidResource)?;
+            let target_out = res.out_state;
+            self.state_tracker.transition_resource(res, target_out);
+            res.is_acquired = false;
+        }
+
+        let fence_val = self.fence_sync.signal();
+        Ok(fence_val)
     }
 }
 
