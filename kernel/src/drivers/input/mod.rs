@@ -19,6 +19,8 @@ pub mod biometric;
 pub mod trigger_motor;
 pub mod xinput;
 pub mod haptic_dsp;
+pub mod controller_profile;
+pub use controller_profile::*;
 
 pub use imu::*;
 pub use gamepad::*;
@@ -40,6 +42,7 @@ pub use trigger_motor::*;
 pub use xinput::*;
 pub use haptic_dsp::test_haptic_dsp_subsystem;
 pub use gyro_aim::test_gyro_motion_translation_subsystem;
+pub use controller_profile::test_controller_profile_subsystem;
 pub use haptic_dsp::*;
 
 use crate::serial_write_str;
