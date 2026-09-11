@@ -598,3 +598,186 @@ pub fn verify_package_staging_and_overlayfs() -> bool {
 
     true
 }
+
+// Gaming Profile Switcher & Environment Activator
+
+pub const MAX_LIB_PATHS: usize = 4;
+pub const MAX_PROFILES: usize = 4;
+
+/// Gaming environment profile defining runtime DLLs, graphics layers, and CPU/GPU affinities.
+#[derive(Clone, Copy, Debug)]
+pub struct GamingEnvironmentProfile {
+    pub name: [u8; MAX_NAME_LEN],
+    pub name_len: usize,
+    pub proton_version: PackageVersion,
+    pub dxvk_version: PackageVersion,
+    pub fsr_enabled: bool,
+    pub cpu_affinity_mask: u64,
+    pub gpu_power_limit_w: u16,
+    pub library_paths: [[u8; MAX_PATH_LEN]; MAX_LIB_PATHS],
+    pub lib_path_lens: [usize; MAX_LIB_PATHS],
+    pub lib_path_count: usize,
+}
+
+impl GamingEnvironmentProfile {
+    pub fn new(
+        name_str: &str,
+        proton_ver: PackageVersion,
+        dxvk_ver: PackageVersion,
+        fsr_enabled: bool,
+        cpu_affinity: u64,
+        gpu_power_w: u16,
+    ) -> Self {
+        let mut name = [0u8; MAX_NAME_LEN];
+        let bytes = name_str.as_bytes();
+        let len = bytes.len().min(MAX_NAME_LEN);
+        let mut i = 0;
+        while i < len {
+            name[i] = bytes[i];
+            i += 1;
+        }
+
+        Self {
+            name,
+            name_len: len,
+            proton_version: proton_ver,
+            dxvk_version: dxvk_ver,
+            fsr_enabled,
+            cpu_affinity_mask: cpu_affinity,
+            gpu_power_limit_w: gpu_power_w,
+            library_paths: [[0u8; MAX_PATH_LEN]; MAX_LIB_PATHS],
+            lib_path_lens: [0usize; MAX_LIB_PATHS],
+            lib_path_count: 0,
+        }
+    }
+
+    pub fn add_library_path(&mut self, path_str: &str) -> bool {
+        if self.lib_path_count >= MAX_LIB_PATHS {
+            return false;
+        }
+        let bytes = path_str.as_bytes();
+        let len = bytes.len().min(MAX_PATH_LEN);
+        let idx = self.lib_path_count;
+        for i in 0..len {
+            self.library_paths[idx][i] = bytes[i];
+        }
+        self.lib_path_lens[idx] = len;
+        self.lib_path_count += 1;
+        true
+    }
+
+    pub fn name_as_str(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("")
+    }
+
+    pub fn library_path_str(&self, idx: usize) -> Option<&str> {
+        if idx >= self.lib_path_count {
+            None
+        } else {
+            core::str::from_utf8(&self.library_paths[idx][..self.lib_path_lens[idx]]).ok()
+        }
+    }
+}
+
+/// Dynamic profile switcher managing active game environment and library resolution paths.
+pub struct KpkgProfileSwitcher {
+    pub profiles: [Option<GamingEnvironmentProfile>; MAX_PROFILES],
+    pub active_profile_idx: Option<usize>,
+}
+
+impl KpkgProfileSwitcher {
+    pub const fn new() -> Self {
+        Self {
+            profiles: [None; MAX_PROFILES],
+            active_profile_idx: None,
+        }
+    }
+
+    pub fn register_profile(&mut self, profile: GamingEnvironmentProfile) -> bool {
+        for i in 0..MAX_PROFILES {
+            if self.profiles[i].is_none() {
+                self.profiles[i] = Some(profile);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Dynamically switches active gaming profile by name, reconfiguring library paths.
+    pub fn kpkg_switch_profile(&mut self, profile_name: &str) -> bool {
+        for i in 0..MAX_PROFILES {
+            if let Some(ref prof) = self.profiles[i] {
+                if prof.name_as_str() == profile_name {
+                    self.active_profile_idx = Some(i);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn active_profile(&self) -> Option<&GamingEnvironmentProfile> {
+        self.active_profile_idx.and_then(|idx| self.profiles[idx].as_ref())
+    }
+}
+
+/// Verifies dynamic gaming profile switching, environment activation, and library resolution paths.
+pub fn verify_gaming_profile_switcher() -> bool {
+    let mut switcher = KpkgProfileSwitcher::new();
+
+    let mut prof_default = GamingEnvironmentProfile::new(
+        "StandardCompatibility",
+        PackageVersion::new(9, 0, 1),
+        PackageVersion::new(2, 3, 0),
+        false,
+        0x000F, // Cores 0..3
+        15,     // 15W TDP
+    );
+    prof_default.add_library_path("/vfs/packages/proton-9.0/lib/");
+    prof_default.add_library_path("/vfs/packages/dxvk-2.3/lib/");
+    switcher.register_profile(prof_default);
+
+    let mut prof_esports = GamingEnvironmentProfile::new(
+        "EsportsLowLatency",
+        PackageVersion::new(9, 0, 3),
+        PackageVersion::new(2, 4, 0),
+        true,
+        0x00FF, // All 8 cores
+        28,     // 28W TDP
+    );
+    prof_esports.add_library_path("/vfs/packages/proton-ge-latest/lib/");
+    prof_esports.add_library_path("/vfs/packages/dxvk-async/lib/");
+    switcher.register_profile(prof_esports);
+
+    // 1. Initial state: no active profile
+    if switcher.active_profile().is_some() {
+        return false;
+    }
+
+    // 2. Switch to EsportsLowLatency profile
+    if !switcher.kpkg_switch_profile("EsportsLowLatency") {
+        return false;
+    }
+
+    let active = match switcher.active_profile() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    if active.name_as_str() != "EsportsLowLatency" {
+        return false;
+    }
+    if !active.fsr_enabled || active.gpu_power_limit_w != 28 || active.cpu_affinity_mask != 0x00FF {
+        return false;
+    }
+    if active.library_path_str(0) != Some("/vfs/packages/proton-ge-latest/lib/") {
+        return false;
+    }
+
+    // 3. Switch to non-existent profile fails gracefully
+    if switcher.kpkg_switch_profile("NonExistentProfile") {
+        return false;
+    }
+
+    true
+}
