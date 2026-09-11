@@ -612,6 +612,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld gyroscope and motion-assisted aiming engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Controller Profile Configurator & Remapping Daemon (TASK-KNT-164)
+    if !drivers::input::test_controller_profile_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld controller profile and remapping daemon self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");

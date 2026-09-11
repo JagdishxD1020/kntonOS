@@ -612,3 +612,36 @@ pub fn verify_chord_macro_detector() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld Controller Profile Configurator & Remapping Daemon.
+pub fn test_controller_profile_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Controller Profile Configurator & Remapping Daemon...\r\n");
+
+    // 1. Verify profile data models, stick deadzones, and sensitivity curves
+    if !verify_profile_data_model_and_stick_curves() {
+        crate::serial_write_str("[KNT-PANIC] Stick response curve and profile verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify button remapping table, trigger thresholds, and grip paddles
+    if !verify_button_remapping_and_paddles() {
+        crate::serial_write_str("[KNT-PANIC] Button remapping and grip paddle verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify gyro-to-stick and gyro-to-mouse redirection engine
+    if !verify_motion_redirection_engine() {
+        crate::serial_write_str("[KNT-PANIC] Motion redirection engine verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify quick-access chord macro detector and system shortcut dispatcher
+    if !verify_chord_macro_detector() {
+        crate::serial_write_str("[KNT-PANIC] Chord macro detector verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-INPUT-PROFILE-PASS] Handheld controller profile and remapping daemon verified\r\n");
+    true
+}
