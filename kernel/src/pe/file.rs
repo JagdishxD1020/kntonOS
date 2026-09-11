@@ -83,6 +83,16 @@ pub fn win32_dos_to_vfs_path(dos_path: &str) -> String {
         return path;
     }
 
+    // Extended-length namespace: \\?\ or //?/
+    let trimmed = if trimmed.starts_with(r"\\?\UNC\") || trimmed.starts_with("//?/UNC/") {
+        let unc_body = &trimmed[8..];
+        return canonicalize_vfs_path(&alloc::format!("/vfs/network/{}", unc_body.replace('\\', "/")));
+    } else if trimmed.starts_with(r"\\?\") || trimmed.starts_with("//?/") {
+        &trimmed[4..]
+    } else {
+        trimmed
+    };
+
     // 2. UNC path: \\server\share\...
     if trimmed.starts_with(r"\\") || trimmed.starts_with("//") {
         let unc_body = &trimmed[2..];
@@ -751,4 +761,179 @@ pub unsafe fn win32_find_close(h_find_file: u64) -> bool {
         crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
         false
     }
+}
+
+
+/// Comprehensive self-test suite for Win32 File I/O & DOS path translation subsystem.
+pub fn test_win32_file_io_subsystem() -> bool {
+    // 1. Path translation & DOS backward-slash normalization
+    if win32_dos_to_vfs_path(r"C:\Games\Doom\doom.exe") != "/vfs/drives/c/Games/Doom/doom.exe" {
+        return false;
+    }
+    if win32_dos_to_vfs_path("D:/Data/save.dat") != "/vfs/drives/d/Data/save.dat" {
+        return false;
+    }
+    if win32_dos_to_vfs_path(r"\\?\C:\Games\Doom") != "/vfs/drives/c/Games/Doom" {
+        return false;
+    }
+    if win32_dos_to_vfs_path(r"\\.\PhysicalDrive0") != "/dev/PhysicalDrive0" {
+        return false;
+    }
+    if win32_dos_to_vfs_path(r"\\server\share\file.txt") != "/vfs/network/server/share/file.txt" {
+        return false;
+    }
+    if !win32_path_is_relative(r"foo\bar.txt") || win32_path_is_relative(r"C:\foo\bar.txt") {
+        return false;
+    }
+
+    unsafe {
+        // 2. File creation, writing, geometry, and buffers
+        let file_path = r"C:\knton_test\payload.bin";
+        let h_file = win32_create_file(
+            file_path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+        );
+        if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+            return false;
+        }
+
+        let test_payload = b"KntonOS Win32 File I/O Engine Verification Payload 2026!";
+        let mut bytes_written = 0u32;
+        let w_ok = win32_write_file(
+            h_file,
+            test_payload.as_ptr(),
+            test_payload.len() as u32,
+            &mut bytes_written as *mut u32,
+        );
+        if !w_ok || bytes_written != test_payload.len() as u32 {
+            return false;
+        }
+
+        if !win32_flush_file_buffers(h_file) {
+            return false;
+        }
+
+        let mut f_size = 0i64;
+        if !win32_get_file_size_ex(h_file, &mut f_size as *mut i64) || f_size != test_payload.len() as i64 {
+            return false;
+        }
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if !win32_get_file_information_by_handle(h_file, &mut info as *mut BY_HANDLE_FILE_INFORMATION) {
+            return false;
+        }
+        if info.nFileSizeLow != test_payload.len() as u32 {
+            return false;
+        }
+
+        if !win32_close_handle(h_file) {
+            return false;
+        }
+
+        // 3. Re-open, Seeking, and Reading
+        let h_read = win32_create_file(
+            file_path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+        );
+        if h_read == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        let mut new_ptr = 0i64;
+        let seek_ok = win32_set_file_pointer_ex(h_read, 8, &mut new_ptr as *mut i64, FILE_BEGIN);
+        if !seek_ok || new_ptr != 8 {
+            return false;
+        }
+
+        let mut read_buf = [0u8; 5];
+        let mut bytes_read = 0u32;
+        let r_ok = win32_read_file(
+            h_read,
+            read_buf.as_mut_ptr(),
+            5,
+            &mut bytes_read as *mut u32,
+        );
+        if !r_ok || bytes_read != 5 || &read_buf != b"Win32" {
+            return false;
+        }
+
+        let seek_begin = win32_set_file_pointer_ex(h_read, 0, &mut new_ptr as *mut i64, FILE_BEGIN);
+        if !seek_begin || new_ptr != 0 {
+            return false;
+        }
+
+        let mut full_buf = [0u8; 64];
+        let r_full = win32_read_file(
+            h_read,
+            full_buf.as_mut_ptr(),
+            test_payload.len() as u32,
+            &mut bytes_read as *mut u32,
+        );
+        if !r_full || bytes_read != test_payload.len() as u32 || &full_buf[..bytes_read as usize] != test_payload {
+            return false;
+        }
+
+        if !win32_close_handle(h_read) {
+            return false;
+        }
+
+        // 4. Directory enumeration & FindFirstFile iterator
+        let file_path2 = r"C:\knton_test\another.txt";
+        let h_f2 = win32_create_file(
+            file_path2,
+            GENERIC_WRITE,
+            0,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+        );
+        if h_f2 == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        win32_close_handle(h_f2);
+
+        let mut find_data = WIN32_FIND_DATAW::default();
+        let h_find = win32_find_first_file(r"C:\knton_test\*.*", &mut find_data as *mut WIN32_FIND_DATAW);
+        if h_find == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        let mut found_count = 0;
+        let mut has_payload = false;
+        let mut has_another = false;
+
+        let mut check_entry = |d: &WIN32_FIND_DATAW| {
+            found_count += 1;
+            let len = d.cFileName.iter().position(|&c| c == 0).unwrap_or(d.cFileName.len());
+            let name_chars: alloc::vec::Vec<char> = d.cFileName[..len].iter().map(|&c| c as u8 as char).collect();
+            let name: alloc::string::String = name_chars.into_iter().collect();
+            if name == "payload.bin" {
+                has_payload = true;
+            } else if name == "another.txt" {
+                has_another = true;
+            }
+        };
+
+        check_entry(&find_data);
+
+        while win32_find_next_file(h_find, &mut find_data as *mut WIN32_FIND_DATAW) {
+            check_entry(&find_data);
+        }
+
+        if !win32_find_close(h_find) {
+            return false;
+        }
+
+        if found_count < 2 || !has_payload || !has_another {
+            return false;
+        }
+    }
+
+    crate::serial_write_str("[KNT-PE-FILE-IO-PASS] Win32 file I/O and VFS path translation verified\r\n");
+    true
 }

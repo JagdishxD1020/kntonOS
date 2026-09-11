@@ -804,6 +804,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 high-resolution performance counter engine self-test failed!\r\n");
     }
 
+    // Verify Win32 File I/O & VFS DOS Path Translation Subsystem (TASK-KNT-163)
+    if !pe::test_win32_file_io_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 file I/O and VFS path translation self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
