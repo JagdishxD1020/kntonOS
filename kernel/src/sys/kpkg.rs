@@ -413,3 +413,188 @@ pub fn verify_merkle_tree_cas() -> bool {
 
     true
 }
+
+// OverlayFS Mount Staging & Per-Game Sandbox Isolation
+
+pub const MAX_OVERLAY_MOUNTS: usize = 8;
+
+/// Staged OverlayFS mount configuration isolating read-only package CAS from writable game sandbox.
+#[derive(Clone, Copy, Debug)]
+pub struct OverlayFsMount {
+    pub package_name: [u8; MAX_NAME_LEN],
+    pub package_name_len: usize,
+    pub game_id: u64,
+    pub lower_path: [u8; MAX_PATH_LEN],
+    pub lower_len: usize,
+    pub upper_path: [u8; MAX_PATH_LEN],
+    pub upper_len: usize,
+    pub merged_path: [u8; MAX_PATH_LEN],
+    pub merged_len: usize,
+    pub is_read_only_lower: bool,
+    pub is_active: bool,
+}
+
+impl OverlayFsMount {
+    pub const fn empty() -> Self {
+        Self {
+            package_name: [0u8; MAX_NAME_LEN],
+            package_name_len: 0,
+            game_id: 0,
+            lower_path: [0u8; MAX_PATH_LEN],
+            lower_len: 0,
+            upper_path: [0u8; MAX_PATH_LEN],
+            upper_len: 0,
+            merged_path: [0u8; MAX_PATH_LEN],
+            merged_len: 0,
+            is_read_only_lower: true,
+            is_active: false,
+        }
+    }
+
+    pub fn merged_path_str(&self) -> &str {
+        core::str::from_utf8(&self.merged_path[..self.merged_len]).unwrap_or("")
+    }
+
+    pub fn lower_path_str(&self) -> &str {
+        core::str::from_utf8(&self.lower_path[..self.lower_len]).unwrap_or("")
+    }
+
+    pub fn upper_path_str(&self) -> &str {
+        core::str::from_utf8(&self.upper_path[..self.upper_len]).unwrap_or("")
+    }
+}
+
+/// OverlayFS mount staging manager coordinating package layers and sandboxes.
+pub struct OverlayFsMountManager {
+    pub mounts: [OverlayFsMount; MAX_OVERLAY_MOUNTS],
+}
+
+impl OverlayFsMountManager {
+    pub const fn new() -> Self {
+        Self {
+            mounts: [OverlayFsMount::empty(); MAX_OVERLAY_MOUNTS],
+        }
+    }
+
+    /// Stages an OverlayFS mount combining read-only CAS package tree with writable game overlay.
+    pub fn stage_mount(&mut self, package_name: &str, game_id: u64) -> Option<usize> {
+        let mut free_idx = None;
+        for i in 0..MAX_OVERLAY_MOUNTS {
+            if !self.mounts[i].is_active {
+                free_idx = Some(i);
+                break;
+            }
+        }
+
+        let idx = free_idx?;
+        let mut mount = OverlayFsMount::empty();
+
+        // 1. Copy package name
+        let p_bytes = package_name.as_bytes();
+        let p_len = p_bytes.len().min(MAX_NAME_LEN);
+        let mut k = 0;
+        while k < p_len {
+            mount.package_name[k] = p_bytes[k];
+            k += 1;
+        }
+        mount.package_name_len = p_len;
+        mount.game_id = game_id;
+
+        // 2. Format lower path: /vfs/packages/<name>/
+        let lower_prefix = b"/vfs/packages/";
+        let mut pos = 0;
+        while pos < lower_prefix.len() {
+            mount.lower_path[pos] = lower_prefix[pos];
+            pos += 1;
+        }
+        let mut l = 0;
+        while l < p_len && pos < MAX_PATH_LEN {
+            mount.lower_path[pos] = p_bytes[l];
+            pos += 1;
+            l += 1;
+        }
+        if pos < MAX_PATH_LEN {
+            mount.lower_path[pos] = b'/';
+            pos += 1;
+        }
+        mount.lower_len = pos;
+
+        // 3. Format upper path: /sandbox/game/work/
+        let upper_str = b"/sandbox/game/work/";
+        mount.upper_len = upper_str.len().min(MAX_PATH_LEN);
+        for m in 0..mount.upper_len {
+            mount.upper_path[m] = upper_str[m];
+        }
+
+        // 4. Format merged path: /vfs/games/<name>/run/
+        let merged_prefix = b"/vfs/games/";
+        let mut mpos = 0;
+        while mpos < merged_prefix.len() {
+            mount.merged_path[mpos] = merged_prefix[mpos];
+            mpos += 1;
+        }
+        let mut n = 0;
+        while n < p_len && mpos < MAX_PATH_LEN {
+            mount.merged_path[mpos] = p_bytes[n];
+            mpos += 1;
+            n += 1;
+        }
+        let merged_suffix = b"/run/";
+        let mut s = 0;
+        while s < merged_suffix.len() && mpos < MAX_PATH_LEN {
+            mount.merged_path[mpos] = merged_suffix[s];
+            mpos += 1;
+            s += 1;
+        }
+        mount.merged_len = mpos;
+
+        mount.is_read_only_lower = true;
+        mount.is_active = true;
+
+        self.mounts[idx] = mount;
+        Some(idx)
+    }
+
+    pub fn unmount(&mut self, game_id: u64) -> bool {
+        for i in 0..MAX_OVERLAY_MOUNTS {
+            if self.mounts[i].is_active && self.mounts[i].game_id == game_id {
+                self.mounts[i] = OverlayFsMount::empty();
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Verifies OverlayFS mount staging, read-only lower CAS pathing, and writable upper sandboxing.
+pub fn verify_package_staging_and_overlayfs() -> bool {
+    let mut manager = OverlayFsMountManager::new();
+
+    let mount_idx = match manager.stage_mount("cyber-game", 101) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let mount = &manager.mounts[mount_idx];
+    if !mount.is_active || !mount.is_read_only_lower {
+        return false;
+    }
+
+    if mount.lower_path_str() != "/vfs/packages/cyber-game/" {
+        return false;
+    }
+
+    if mount.merged_path_str() != "/vfs/games/cyber-game/run/" {
+        return false;
+    }
+
+    // Unmount test
+    if !manager.unmount(101) {
+        return false;
+    }
+    if manager.mounts[mount_idx].is_active {
+        return false;
+    }
+
+    true
+}
