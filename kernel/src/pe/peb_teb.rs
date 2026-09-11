@@ -1,6 +1,13 @@
 // Win32 Process and Thread Environment Blocks (PEB/TEB) Subsystem
 
+use alloc::string::String;
+use alloc::vec::Vec;
+use crate::memory::spinlock::Spinlock;
+use crate::pe::kernel32::{ERROR_INVALID_PARAMETER, ERROR_SUCCESS};
 use crate::pe::ntdll::UnicodeString as UNICODE_STRING;
+
+pub const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+pub const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
 
 // Standard x86-64 Win32 Client Identifier
 #[repr(C)]
@@ -359,3 +366,215 @@ pub const TEB_SELF_PTR_OFFSET: usize = 0x30;
 pub const TEB_CLIENT_ID_OFFSET: usize = 0x40;
 pub const TEB_PEB_OFFSET: usize = 0x60;
 pub const TEB_LAST_ERROR_OFFSET: usize = 0x68;
+
+// Convert null-terminated UTF-16 pointer to Rust String
+pub unsafe fn utf16_ptr_to_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(ptr, len);
+    Some(String::from_utf16_lossy(slice))
+}
+
+// Convert Rust &str to UTF-16 vector with null terminator
+pub fn str_to_utf16_null(s: &str) -> Vec<u16> {
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
+}
+
+// Case-insensitive ASCII comparison for environment variable names
+fn env_name_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).all(|(x, y)| x.to_ascii_uppercase() == y.to_ascii_uppercase())
+}
+
+// Global process environment state tracking variables and serialized UTF-16 block
+pub struct ProcessEnvironment {
+    vars: Vec<(String, String)>,
+    serialized_cache: Vec<u16>,
+    initialized: bool,
+}
+
+impl ProcessEnvironment {
+    // Construct empty process environment block
+    pub const fn empty() -> Self {
+        Self {
+            vars: Vec::new(),
+            serialized_cache: Vec::new(),
+            initialized: false,
+        }
+    }
+
+    // Initialize default environment variables if not yet populated
+    pub fn ensure_init(&mut self) {
+        if self.initialized {
+            return;
+        }
+        self.initialized = true;
+        self.set("SystemRoot", "C:\\Windows");
+        self.set("COMPUTERNAME", "KNTON-PC");
+        self.set("USERNAME", "Administrator");
+        self.set("OS", "Windows_NT");
+        self.set("PROCESSOR_ARCHITECTURE", "AMD64");
+        self.set("NUMBER_OF_PROCESSORS", "4");
+        self.set("PATH", "C:\\Windows\\System32;C:\\Windows");
+        self.rebuild_cache();
+    }
+
+    // Lookup variable value by case-insensitive name
+    pub fn get(&mut self, name: &str) -> Option<&str> {
+        self.ensure_init();
+        self.vars.iter().find(|(k, _)| env_name_eq(k, name)).map(|(_, v)| v.as_str())
+    }
+
+    // Insert or update variable value
+    pub fn set(&mut self, name: &str, value: &str) {
+        if let Some(pos) = self.vars.iter().position(|(k, _)| env_name_eq(k, name)) {
+            self.vars[pos].1 = String::from(value);
+        } else {
+            self.vars.push((String::from(name), String::from(value)));
+        }
+        self.rebuild_cache();
+    }
+
+    // Remove variable by case-insensitive name
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.ensure_init();
+        if let Some(pos) = self.vars.iter().position(|(k, _)| env_name_eq(k, name)) {
+            self.vars.remove(pos);
+            self.rebuild_cache();
+            true
+        } else {
+            false
+        }
+    }
+
+    // Rebuild UTF-16 serialized double-null terminated environment block
+    pub fn rebuild_cache(&mut self) {
+        let mut buf = Vec::new();
+        for (k, v) in &self.vars {
+            for ch in k.encode_utf16() {
+                buf.push(ch);
+            }
+            buf.push('=' as u16);
+            for ch in v.encode_utf16() {
+                buf.push(ch);
+            }
+            buf.push(0);
+        }
+        buf.push(0);
+        self.serialized_cache = buf;
+    }
+
+    // Parse raw double-null terminated UTF-16 block into key-value pairs
+    pub fn parse_block_w(block: &[u16]) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        let mut idx = 0;
+        while idx < block.len() {
+            if block[idx] == 0 {
+                break;
+            }
+            let start = idx;
+            while idx < block.len() && block[idx] != 0 {
+                idx += 1;
+            }
+            let entry = String::from_utf16_lossy(&block[start..idx]);
+            if let Some(eq_pos) = entry.find('=') {
+                let (k, v) = entry.split_at(eq_pos);
+                result.push((String::from(k), String::from(&v[1..])));
+            }
+            idx += 1;
+        }
+        result
+    }
+}
+
+pub static PROCESS_ENV: Spinlock<ProcessEnvironment> = Spinlock::new(ProcessEnvironment::empty());
+
+// Win32 GetEnvironmentVariableW retrieves variable value as UTF-16
+pub unsafe fn win32_get_environment_variable_w(
+    lp_name: *const u16,
+    lp_buffer: *mut u16,
+    n_size: u32,
+) -> u32 {
+    let name_str = match utf16_ptr_to_string(lp_name) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            crate::pe::kernel32::win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    };
+
+    let mut env = PROCESS_ENV.lock();
+    match env.get(&name_str) {
+        Some(val) => {
+            let val_utf16: Vec<u16> = val.encode_utf16().collect();
+            let val_len = val_utf16.len() as u32;
+            if lp_buffer.is_null() || n_size <= val_len {
+                return val_len + 1;
+            }
+            for (i, &ch) in val_utf16.iter().enumerate() {
+                *lp_buffer.add(i) = ch;
+            }
+            *lp_buffer.add(val_len as usize) = 0;
+            crate::pe::kernel32::win32_set_last_error(ERROR_SUCCESS);
+            val_len
+        }
+        None => {
+            crate::pe::kernel32::win32_set_last_error(ERROR_ENVVAR_NOT_FOUND);
+            0
+        }
+    }
+}
+
+// Win32 SetEnvironmentVariableW creates, updates, or deletes environment variable
+pub unsafe fn win32_set_environment_variable_w(
+    lp_name: *const u16,
+    lp_value: *const u16,
+) -> bool {
+    let name_str = match utf16_ptr_to_string(lp_name) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            crate::pe::kernel32::win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+
+    let mut env = PROCESS_ENV.lock();
+    env.ensure_init();
+    if lp_value.is_null() || *lp_value == 0 {
+        env.remove(&name_str);
+    } else {
+        match utf16_ptr_to_string(lp_value) {
+            Some(val_str) => env.set(&name_str, &val_str),
+            None => {
+                crate::pe::kernel32::win32_set_last_error(ERROR_INVALID_PARAMETER);
+                return false;
+            }
+        }
+    }
+    crate::pe::kernel32::win32_set_last_error(ERROR_SUCCESS);
+    true
+}
+
+// Win32 GetEnvironmentStringsW returns pointer to serialized UTF-16 environment block
+pub fn win32_get_environment_strings_w() -> *mut u16 {
+    let mut env = PROCESS_ENV.lock();
+    env.ensure_init();
+    if env.serialized_cache.is_empty() {
+        env.rebuild_cache();
+    }
+    env.serialized_cache.as_mut_ptr()
+}
+
+// Win32 FreeEnvironmentStringsW releases environment strings handle
+pub fn win32_free_environment_strings_w(_penv: *mut u16) -> bool {
+    true
+}
