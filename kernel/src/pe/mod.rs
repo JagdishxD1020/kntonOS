@@ -13,6 +13,7 @@ pub mod virtual_alloc;
 pub mod tls_fiber;
 pub mod seh_veh;
 pub mod perf_counter;
+pub mod peb_teb;
 
 pub use header::*;
 pub use ntdll::*;
@@ -25,6 +26,7 @@ pub use virtual_alloc::*;
 pub use tls_fiber::*;
 pub use seh_veh::*;
 pub use perf_counter::*;
+pub use peb_teb::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
