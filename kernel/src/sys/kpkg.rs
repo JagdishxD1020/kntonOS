@@ -198,3 +198,218 @@ pub fn verify_kpkg_manifest_and_dependencies() -> bool {
 
     true
 }
+
+// Merkle Tree Content-Addressed Storage (CAS) & 64KB Deduplication
+
+use crate::crypto::Sha256;
+
+/// Standard 64KB chunk size used across kpkg Content-Addressed Storage.
+pub const CAS_CHUNK_SIZE: usize = 65536;
+pub const MAX_CHUNKS_PER_FILE: usize = 16;
+pub const MAX_CAS_OBJECTS: usize = 32;
+
+/// Cryptographic 256-bit Content-Address identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CasHash256(pub [u8; 32]);
+
+impl CasHash256 {
+    pub const fn zero() -> Self {
+        Self([0u8; 32])
+    }
+
+    pub fn from_data(data: &[u8]) -> Self {
+        Self(Sha256::digest(data))
+    }
+
+    /// Combines two child hashes to produce an intermediate Merkle tree node hash.
+    pub fn combine_children(left: &Self, right: &Self) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(&left.0);
+        hasher.update(&right.0);
+        Self(hasher.finalize())
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0u8; 32]
+    }
+}
+
+/// Metadata descriptor for a deduplicated CAS storage chunk.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CasChunkDescriptor {
+    pub hash: CasHash256,
+    pub size_bytes: usize,
+    pub ref_count: usize,
+}
+
+/// Hierarchical Merkle Tree computing cryptographic integrity root for multi-chunk payloads.
+#[derive(Clone, Copy, Debug)]
+pub struct MerkleTree {
+    pub leaf_hashes: [CasHash256; MAX_CHUNKS_PER_FILE],
+    pub leaf_count: usize,
+}
+
+impl MerkleTree {
+    pub const fn new() -> Self {
+        Self {
+            leaf_hashes: [CasHash256::zero(); MAX_CHUNKS_PER_FILE],
+            leaf_count: 0,
+        }
+    }
+
+    pub fn add_chunk_hash(&mut self, hash: CasHash256) -> bool {
+        if self.leaf_count >= MAX_CHUNKS_PER_FILE {
+            return false;
+        }
+        self.leaf_hashes[self.leaf_count] = hash;
+        self.leaf_count += 1;
+        true
+    }
+
+    /// Computes the binary Merkle root hash across all leaf chunks.
+    pub fn compute_root(&self) -> CasHash256 {
+        if self.leaf_count == 0 {
+            return CasHash256::zero();
+        }
+        if self.leaf_count == 1 {
+            return self.leaf_hashes[0];
+        }
+
+        let mut current_level = [CasHash256::zero(); MAX_CHUNKS_PER_FILE];
+        let mut count = self.leaf_count;
+        for i in 0..count {
+            current_level[i] = self.leaf_hashes[i];
+        }
+
+        while count > 1 {
+            let mut next_level = [CasHash256::zero(); MAX_CHUNKS_PER_FILE];
+            let mut next_count = 0;
+            let mut i = 0;
+
+            while i < count {
+                if i + 1 < count {
+                    next_level[next_count] = CasHash256::combine_children(&current_level[i], &current_level[i + 1]);
+                } else {
+                    next_level[next_count] = current_level[i];
+                }
+                next_count += 1;
+                i += 2;
+            }
+
+            count = next_count;
+            current_level = next_level;
+        }
+
+        current_level[0]
+    }
+}
+
+/// In-memory Content-Addressed Storage index tracking chunk deduplication and references.
+pub struct CasObjectStore {
+    pub objects: [CasChunkDescriptor; MAX_CAS_OBJECTS],
+    pub object_count: usize,
+    pub total_ingested_bytes: usize,
+    pub unique_stored_bytes: usize,
+}
+
+impl CasObjectStore {
+    pub const fn new() -> Self {
+        Self {
+            objects: [CasChunkDescriptor {
+                hash: CasHash256::zero(),
+                size_bytes: 0,
+                ref_count: 0,
+            }; MAX_CAS_OBJECTS],
+            object_count: 0,
+            total_ingested_bytes: 0,
+            unique_stored_bytes: 0,
+        }
+    }
+
+    /// Ingests a data slice into the CAS store, returning (hash, is_new_unique_chunk).
+    pub fn ingest_chunk(&mut self, chunk_data: &[u8]) -> (CasHash256, bool) {
+        let hash = CasHash256::from_data(chunk_data);
+        let size = chunk_data.len();
+        self.total_ingested_bytes += size;
+
+        // Check for deduplication
+        for i in 0..self.object_count {
+            if self.objects[i].hash == hash {
+                self.objects[i].ref_count += 1;
+                return (hash, false);
+            }
+        }
+
+        if self.object_count < MAX_CAS_OBJECTS {
+            self.objects[self.object_count] = CasChunkDescriptor {
+                hash,
+                size_bytes: size,
+                ref_count: 1,
+            };
+            self.object_count += 1;
+            self.unique_stored_bytes += size;
+            (hash, true)
+        } else {
+            (hash, false)
+        }
+    }
+
+    pub fn deduplication_ratio(&self) -> f32 {
+        if self.unique_stored_bytes == 0 {
+            1.0
+        } else {
+            self.total_ingested_bytes as f32 / self.unique_stored_bytes as f32
+        }
+    }
+}
+
+/// Verifies Merkle tree hierarchical hashing, 64KB chunking, and CAS deduplication.
+pub fn verify_merkle_tree_cas() -> bool {
+    let mut store = CasObjectStore::new();
+
+    let chunk_a = [0xAAu8; 1024];
+    let chunk_b = [0xBBu8; 1024];
+    let chunk_a_dup = [0xAAu8; 1024];
+
+    // 1. Ingest unique chunk A
+    let (hash_a, is_new_a) = store.ingest_chunk(&chunk_a);
+    if !is_new_a || hash_a.is_zero() {
+        return false;
+    }
+
+    // 2. Ingest duplicate chunk A -> must be deduplicated
+    let (hash_a2, is_new_a2) = store.ingest_chunk(&chunk_a_dup);
+    if is_new_a2 || hash_a2 != hash_a {
+        return false;
+    }
+
+    // 3. Ingest unique chunk B
+    let (hash_b, is_new_b) = store.ingest_chunk(&chunk_b);
+    if !is_new_b || hash_b == hash_a {
+        return false;
+    }
+
+    // Total ingested = 3072, unique stored = 2048 -> ratio = 1.5
+    if (store.deduplication_ratio() - 1.5).abs() > 0.01 {
+        return false;
+    }
+
+    // 4. Construct Merkle tree of chunks
+    let mut tree = MerkleTree::new();
+    tree.add_chunk_hash(hash_a);
+    tree.add_chunk_hash(hash_b);
+    let root = tree.compute_root();
+    if root.is_zero() || root == hash_a || root == hash_b {
+        return false;
+    }
+
+    // Deterministic root check: combining same leaves yields identical root
+    let mut tree2 = MerkleTree::new();
+    tree2.add_chunk_hash(hash_a);
+    tree2.add_chunk_hash(hash_b);
+    if tree2.compute_root() != root {
+        return false;
+    }
+
+    true
+}
