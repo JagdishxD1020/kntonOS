@@ -440,3 +440,160 @@ pub fn d3d11on12_create_device(
 
     Ok((device11, context11, on12_device))
 }
+
+// Comprehensive verification test suite for Direct3D 11-on-12 compatibility translation layer
+pub fn test_d3d11on12_subsystem() -> bool {
+    crate::serial_write_str("[KNT-D3D11ON12] Initializing Direct3D 11-on-12 translation self-test...\r\n");
+
+    // 1. Device and context creation
+    let dummy_d3d12_device = 0x1000_0000u64;
+    let dummy_queue = 0x2000_0000u64;
+    let (device11, mut context11, mut on12_dev) = match d3d11on12_create_device(
+        dummy_d3d12_device,
+        0,
+        &[D3D11_FEATURE_LEVEL::LEVEL_11_0],
+        &[dummy_queue],
+    ) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-D3D11ON12-FAIL] Device creation failed\r\n");
+            return false;
+        }
+    };
+
+    if device11.get_feature_level() != D3D11_FEATURE_LEVEL::LEVEL_11_0 {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Feature level mismatch\r\n");
+        return false;
+    }
+    if d3d11on12_create_device(0, 0, &[], &[dummy_queue]).is_ok() {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Null device was not rejected\r\n");
+        return false;
+    }
+    if d3d11on12_create_device(dummy_d3d12_device, 0, &[], &[]).is_ok() {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Empty queue slice was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * D3D11On12 device creation and feature level negotiation verified\r\n");
+
+    // 2. Wrapped resource creation and binding flag management
+    let rt_flags = D3D11_RESOURCE_FLAGS {
+        BindFlags: D3D11_BIND_FLAG::RENDER_TARGET.0 | D3D11_BIND_FLAG::SHADER_RESOURCE.0,
+        MiscFlags: 0,
+        CPUAccessFlags: 0,
+        StructureByteStride: 0,
+    };
+    let rt_res_id = match on12_dev.CreateWrappedResource(
+        0x3000_0000,
+        &rt_flags,
+        D3D12_RESOURCE_STATES::RENDER_TARGET,
+        D3D12_RESOURCE_STATES::PRESENT,
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            crate::serial_write_str("[KNT-D3D11ON12-FAIL] Failed to wrap render target resource\r\n");
+            return false;
+        }
+    };
+
+    let rt_res = match on12_dev.get_wrapped_resource(rt_res_id) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if rt_res.dimension != D3D11_RESOURCE_DIMENSION::TEXTURE2D
+        || rt_res.current_state != D3D12_RESOURCE_STATES::PRESENT
+        || rt_res.is_acquired
+    {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Wrapped render target state mismatch\r\n");
+        return false;
+    }
+
+    let cb_flags = D3D11_RESOURCE_FLAGS {
+        BindFlags: D3D11_BIND_FLAG::CONSTANT_BUFFER.0,
+        MiscFlags: 0,
+        CPUAccessFlags: 0,
+        StructureByteStride: 64,
+    };
+    let cb_res_id = match on12_dev.CreateWrappedResource(
+        0x4000_0000,
+        &cb_flags,
+        D3D12_RESOURCE_STATES::VERTEX_AND_CONSTANT_BUFFER,
+        D3D12_RESOURCE_STATES::COMMON,
+    ) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let cb_res = match on12_dev.get_wrapped_resource(cb_res_id) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if cb_res.dimension != D3D11_RESOURCE_DIMENSION::BUFFER {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Constant buffer dimension mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Wrapped resource creation and D3D11 binding flags verified\r\n");
+
+    // 3. Resource acquisition and implicit state transition to in_state
+    if on12_dev.AcquireWrappedResources(&[rt_res_id]).is_err() {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Failed to acquire wrapped render target\r\n");
+        return false;
+    }
+    let acquired_rt = match on12_dev.get_wrapped_resource(rt_res_id) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if !acquired_rt.is_acquired || acquired_rt.current_state != D3D12_RESOURCE_STATES::RENDER_TARGET {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Resource state was not transitioned to in_state\r\n");
+        return false;
+    }
+    if on12_dev.AcquireWrappedResources(&[rt_res_id]) != Err(D3D11On12Error::ResourceAlreadyAcquired) {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Re-acquiring active resource was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * AcquireWrappedResources and implicit in_state transition verified\r\n");
+
+    // 4. Interop state transition while acquired in D3D11 context
+    let barrier = match on12_dev.transition_wrapped_resource(rt_res_id, D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE) {
+        Ok(Some(b)) => b,
+        _ => {
+            crate::serial_write_str("[KNT-D3D11ON12-FAIL] Transition to shader resource failed\r\n");
+            return false;
+        }
+    };
+    if barrier.state_before != D3D12_RESOURCE_STATES::RENDER_TARGET
+        || barrier.state_after != D3D12_RESOURCE_STATES::PIXEL_SHADER_RESOURCE
+    {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Transition barrier state mismatch\r\n");
+        return false;
+    }
+    context11.clear_render_target_view(0x3000_0000, [0.0, 0.2, 0.4, 1.0]);
+    crate::serial_write_str("  * Interop resource state transitions and barrier generation verified\r\n");
+
+    // 5. Release wrapped resources, transition to out_state, and fence signaling
+    let fence_val = match on12_dev.ReleaseWrappedResources(&[rt_res_id]) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::serial_write_str("[KNT-D3D11ON12-FAIL] Failed to release wrapped render target\r\n");
+            return false;
+        }
+    };
+    if fence_val != 1 {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Signaled fence value mismatch\r\n");
+        return false;
+    }
+    let released_rt = match on12_dev.get_wrapped_resource(rt_res_id) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if released_rt.is_acquired || released_rt.current_state != D3D12_RESOURCE_STATES::PRESENT {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Released resource was not transitioned to out_state\r\n");
+        return false;
+    }
+    if on12_dev.ReleaseWrappedResources(&[rt_res_id]) != Err(D3D11On12Error::ResourceNotAcquired) {
+        crate::serial_write_str("[KNT-D3D11ON12-FAIL] Releasing unacquired resource was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * ReleaseWrappedResources, out_state transition, and timeline fence verified\r\n");
+
+    crate::serial_write_str("[KNT-GFX-D3D11ON12-PASS] Direct3D 11-on-12 compatibility translation layer verified\r\n");
+    true
+}
