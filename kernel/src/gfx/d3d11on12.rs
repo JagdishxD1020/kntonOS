@@ -4,6 +4,7 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
 use alloc::vec::Vec;
+use crate::gfx::resource_barrier::D3D12_RESOURCE_STATES;
 
 // Errors produced during D3D11On12 translation operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +81,67 @@ impl ID3D11DeviceContext {
     }
 }
 
+
+// Direct3D 11 resource binding capabilities
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct D3D11_BIND_FLAG(pub u32);
+
+impl D3D11_BIND_FLAG {
+    pub const VERTEX_BUFFER: Self = Self(0x1);
+    pub const INDEX_BUFFER: Self = Self(0x2);
+    pub const CONSTANT_BUFFER: Self = Self(0x4);
+    pub const SHADER_RESOURCE: Self = Self(0x8);
+    pub const STREAM_OUTPUT: Self = Self(0x10);
+    pub const RENDER_TARGET: Self = Self(0x20);
+    pub const DEPTH_STENCIL: Self = Self(0x40);
+    pub const UNORDERED_ACCESS: Self = Self(0x80);
+
+    // Check if a flag is active in bitmask
+    pub const fn contains(&self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+// Resource dimensionality in D3D11
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum D3D11_RESOURCE_DIMENSION {
+    UNKNOWN = 0,
+    BUFFER = 1,
+    TEXTURE1D = 2,
+    TEXTURE2D = 3,
+    TEXTURE3D = 4,
+}
+
+// Description of D3D11 binding and access properties for a wrapped D3D12 resource
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D11_RESOURCE_FLAGS {
+    pub BindFlags: u32,
+    pub MiscFlags: u32,
+    pub CPUAccessFlags: u32,
+    pub StructureByteStride: u32,
+}
+
+// Interop descriptor binding a D3D12 resource handle to D3D11 usage
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D11WrappedResource {
+    pub resource_id: u64,
+    pub d3d12_resource: u64,
+    pub flags11: D3D11_RESOURCE_FLAGS,
+    pub dimension: D3D11_RESOURCE_DIMENSION,
+    pub in_state: D3D12_RESOURCE_STATES,
+    pub out_state: D3D12_RESOURCE_STATES,
+    pub current_state: D3D12_RESOURCE_STATES,
+    pub is_acquired: bool,
+}
+
 // D3D11-on-12 interop device interface
 #[derive(Debug, Clone)]
 pub struct ID3D11On12Device {
     pub d3d12_device: u64,
     pub command_queues: Vec<u64>,
     pub next_resource_id: u64,
+    pub wrapped_resources: Vec<D3D11WrappedResource>,
 }
 
 impl ID3D11On12Device {
@@ -95,6 +151,7 @@ impl ID3D11On12Device {
             d3d12_device,
             command_queues: queues.to_vec(),
             next_resource_id: 1,
+            wrapped_resources: Vec::new(),
         }
     }
 
@@ -103,6 +160,59 @@ impl ID3D11On12Device {
         let id = self.next_resource_id;
         self.next_resource_id += 1;
         id
+    }
+
+    // Create a wrapped D3D11 resource from an underlying D3D12 resource handle
+    pub fn CreateWrappedResource(
+        &mut self,
+        d3d12_resource: u64,
+        flags11: &D3D11_RESOURCE_FLAGS,
+        in_state: D3D12_RESOURCE_STATES,
+        out_state: D3D12_RESOURCE_STATES,
+    ) -> Result<u64, D3D11On12Error> {
+        if d3d12_resource == 0 {
+            return Err(D3D11On12Error::InvalidResource);
+        }
+
+        let dimension = if (flags11.BindFlags & D3D11_BIND_FLAG::RENDER_TARGET.0) != 0
+            || (flags11.BindFlags & D3D11_BIND_FLAG::DEPTH_STENCIL.0) != 0
+        {
+            D3D11_RESOURCE_DIMENSION::TEXTURE2D
+        } else if (flags11.BindFlags & (D3D11_BIND_FLAG::VERTEX_BUFFER.0 | D3D11_BIND_FLAG::INDEX_BUFFER.0 | D3D11_BIND_FLAG::CONSTANT_BUFFER.0)) != 0 {
+            D3D11_RESOURCE_DIMENSION::BUFFER
+        } else {
+            D3D11_RESOURCE_DIMENSION::TEXTURE2D
+        };
+
+        let resource_id = self.allocate_resource_id();
+        let wrapped = D3D11WrappedResource {
+            resource_id,
+            d3d12_resource,
+            flags11: *flags11,
+            dimension,
+            in_state,
+            out_state,
+            current_state: out_state,
+            is_acquired: false,
+        };
+        self.wrapped_resources.push(wrapped);
+        Ok(resource_id)
+    }
+
+    // Lookup wrapped resource by resource identifier
+    pub fn get_wrapped_resource(&self, resource_id: u64) -> Result<&D3D11WrappedResource, D3D11On12Error> {
+        self.wrapped_resources
+            .iter()
+            .find(|r| r.resource_id == resource_id)
+            .ok_or(D3D11On12Error::InvalidResource)
+    }
+
+    // Lookup wrapped resource mutably by resource identifier
+    pub fn get_wrapped_resource_mut(&mut self, resource_id: u64) -> Result<&mut D3D11WrappedResource, D3D11On12Error> {
+        self.wrapped_resources
+            .iter_mut()
+            .find(|r| r.resource_id == resource_id)
+            .ok_or(D3D11On12Error::InvalidResource)
     }
 }
 
