@@ -495,3 +495,120 @@ pub fn verify_motion_redirection_engine() -> bool {
 
     true
 }
+
+// Quick-Access Chord Macro Detector & System Shortcut Dispatcher
+
+/// System-level shortcut actions triggered by handheld button chords.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemShortcutAction {
+    ToggleHudOverlay,
+    CaptureScreenshot,
+    OpenQuickSettings,
+    ToggleVirtualKeyboard,
+    TogglePerformanceOverlay,
+}
+
+/// Definition of a dual-button chord combination.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChordDefinition {
+    pub modifier: HandheldButton,
+    pub action_button: HandheldButton,
+    pub action: SystemShortcutAction,
+}
+
+impl ChordDefinition {
+    pub const fn new(modifier: HandheldButton, action_button: HandheldButton, action: SystemShortcutAction) -> Self {
+        Self { modifier, action_button, action }
+    }
+}
+
+/// Chord macro detector identifying dual-button system combos and suppressing game passthrough.
+pub struct ChordMacroDetector {
+    pub chords: [ChordDefinition; 5],
+    pub chord_triggered_this_hold: bool,
+}
+
+impl ChordMacroDetector {
+    pub const fn new() -> Self {
+        Self {
+            chords: [
+                ChordDefinition::new(HandheldButton::Guide, HandheldButton::A, SystemShortcutAction::ToggleHudOverlay),
+                ChordDefinition::new(HandheldButton::Guide, HandheldButton::RightBumper, SystemShortcutAction::CaptureScreenshot),
+                ChordDefinition::new(HandheldButton::Guide, HandheldButton::X, SystemShortcutAction::OpenQuickSettings),
+                ChordDefinition::new(HandheldButton::Guide, HandheldButton::Y, SystemShortcutAction::ToggleVirtualKeyboard),
+                ChordDefinition::new(HandheldButton::Guide, HandheldButton::RightStickClick, SystemShortcutAction::TogglePerformanceOverlay),
+            ],
+            chord_triggered_this_hold: false,
+        }
+    }
+
+    /// Evaluates current button bitmask, detecting chords and masking consumed buttons.
+    pub fn update(&mut self, button_mask: u32) -> (Option<SystemShortcutAction>, u32) {
+        let guide_bit = 1 << HandheldButton::Guide.to_index();
+        let modifier_held = (button_mask & guide_bit) != 0;
+
+        if !modifier_held {
+            self.chord_triggered_this_hold = false;
+            return (None, button_mask);
+        }
+
+        let mut triggered_action = None;
+        let mut consumed_mask = guide_bit;
+
+        for chord in &self.chords {
+            let act_bit = 1 << chord.action_button.to_index();
+            if (button_mask & act_bit) != 0 {
+                consumed_mask |= act_bit;
+                if !self.chord_triggered_this_hold {
+                    triggered_action = Some(chord.action);
+                    self.chord_triggered_this_hold = true;
+                }
+                break;
+            }
+        }
+
+        let filtered_mask = button_mask & !consumed_mask;
+        (triggered_action, filtered_mask)
+    }
+}
+
+/// Verifies quick-access chord macro detection (Guide + A, Guide + Right Stick) and mask suppression.
+pub fn verify_chord_macro_detector() -> bool {
+    let mut detector = ChordMacroDetector::new();
+
+    // 1. Regular button A press: no chord, bitmask unchanged
+    let a_bit = 1 << HandheldButton::A.to_index();
+    let (act1, mask1) = detector.update(a_bit);
+    if act1.is_some() || mask1 != a_bit {
+        return false;
+    }
+
+    // 2. Guide + A chord: triggers ToggleHudOverlay, masks both Guide and A
+    let guide_bit = 1 << HandheldButton::Guide.to_index();
+    let combo = guide_bit | a_bit;
+    let (act2, mask2) = detector.update(combo);
+    if act2 != Some(SystemShortcutAction::ToggleHudOverlay) || (mask2 & combo) != 0 {
+        return false;
+    }
+
+    // 3. Continuous hold: does not re-trigger repeatedly (debounce / latch)
+    let (act3, _) = detector.update(combo);
+    if act3.is_some() {
+        return false;
+    }
+
+    // 4. Release modifier: resets detector
+    let (act4, mask4) = detector.update(0);
+    if act4.is_some() || mask4 != 0 {
+        return false;
+    }
+
+    // 5. Guide + RightBumper chord: triggers CaptureScreenshot
+    let rb_bit = 1 << HandheldButton::RightBumper.to_index();
+    let (act5, _) = detector.update(guide_bit | rb_bit);
+    if act5 != Some(SystemShortcutAction::CaptureScreenshot) {
+        return false;
+    }
+
+    true
+}
