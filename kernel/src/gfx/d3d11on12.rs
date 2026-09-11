@@ -135,6 +135,76 @@ pub struct D3D11WrappedResource {
     pub is_acquired: bool,
 }
 
+
+// Record of an explicit or implicit D3D12 resource barrier transition generated during interop
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D11On12TransitionBarrier {
+    pub resource_id: u64,
+    pub d3d12_resource: u64,
+    pub state_before: D3D12_RESOURCE_STATES,
+    pub state_after: D3D12_RESOURCE_STATES,
+    pub subresource: u32,
+}
+
+impl D3D11On12TransitionBarrier {
+    // Construct new interop transition barrier
+    pub const fn new(
+        resource_id: u64,
+        d3d12_resource: u64,
+        state_before: D3D12_RESOURCE_STATES,
+        state_after: D3D12_RESOURCE_STATES,
+    ) -> Self {
+        Self {
+            resource_id,
+            d3d12_resource,
+            state_before,
+            state_after,
+            subresource: 0xFFFF_FFFF,
+        }
+    }
+}
+
+// Interop state tracker recording transitions and maintaining barrier history
+#[derive(Debug, Clone, Default)]
+pub struct D3D11On12StateTracker {
+    pub pending_barriers: Vec<D3D11On12TransitionBarrier>,
+    pub total_transitions_count: u64,
+}
+
+impl D3D11On12StateTracker {
+    // Construct new state tracker
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Transition a wrapped resource to target state and record barrier if state changed
+    pub fn transition_resource(
+        &mut self,
+        resource: &mut D3D11WrappedResource,
+        target_state: D3D12_RESOURCE_STATES,
+    ) -> Option<D3D11On12TransitionBarrier> {
+        if resource.current_state == target_state {
+            return None;
+        }
+
+        let barrier = D3D11On12TransitionBarrier::new(
+            resource.resource_id,
+            resource.d3d12_resource,
+            resource.current_state,
+            target_state,
+        );
+        resource.current_state = target_state;
+        self.pending_barriers.push(barrier);
+        self.total_transitions_count += 1;
+        Some(barrier)
+    }
+
+    // Drain and return all pending transition barriers
+    pub fn drain_pending_barriers(&mut self) -> Vec<D3D11On12TransitionBarrier> {
+        core::mem::take(&mut self.pending_barriers)
+    }
+}
+
 // D3D11-on-12 interop device interface
 #[derive(Debug, Clone)]
 pub struct ID3D11On12Device {
@@ -142,6 +212,7 @@ pub struct ID3D11On12Device {
     pub command_queues: Vec<u64>,
     pub next_resource_id: u64,
     pub wrapped_resources: Vec<D3D11WrappedResource>,
+    pub state_tracker: D3D11On12StateTracker,
 }
 
 impl ID3D11On12Device {
@@ -152,6 +223,7 @@ impl ID3D11On12Device {
             command_queues: queues.to_vec(),
             next_resource_id: 1,
             wrapped_resources: Vec::new(),
+            state_tracker: D3D11On12StateTracker::new(),
         }
     }
 
@@ -213,6 +285,25 @@ impl ID3D11On12Device {
             .iter_mut()
             .find(|r| r.resource_id == resource_id)
             .ok_or(D3D11On12Error::InvalidResource)
+    }
+
+    // Transition a wrapped resource to target state and record transition barrier
+    pub fn transition_wrapped_resource(
+        &mut self,
+        resource_id: u64,
+        target_state: D3D12_RESOURCE_STATES,
+    ) -> Result<Option<D3D11On12TransitionBarrier>, D3D11On12Error> {
+        let res = self
+            .wrapped_resources
+            .iter_mut()
+            .find(|r| r.resource_id == resource_id)
+            .ok_or(D3D11On12Error::InvalidResource)?;
+
+        if !res.is_acquired {
+            return Err(D3D11On12Error::ResourceNotAcquired);
+        }
+
+        Ok(self.state_tracker.transition_resource(res, target_state))
     }
 }
 
