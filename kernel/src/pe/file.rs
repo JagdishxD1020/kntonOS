@@ -545,3 +545,210 @@ pub unsafe fn win32_flush_file_buffers(h_file: u64) -> bool {
     crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
     true
 }
+
+
+pub const ERROR_NO_MORE_FILES: u32 = 18;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WIN32_FIND_DATAW {
+    pub dwFileAttributes: u32,
+    pub ftCreationTime: FILETIME,
+    pub ftLastAccessTime: FILETIME,
+    pub ftLastWriteTime: FILETIME,
+    pub nFileSizeHigh: u32,
+    pub nFileSizeLow: u32,
+    pub dwReserved0: u32,
+    pub dwReserved1: u32,
+    pub cFileName: [u16; 260],
+    pub cAlternateFileName: [u16; 14],
+}
+
+impl Default for WIN32_FIND_DATAW {
+    fn default() -> Self {
+        Self {
+            dwFileAttributes: 0,
+            ftCreationTime: FILETIME::default(),
+            ftLastAccessTime: FILETIME::default(),
+            ftLastWriteTime: FILETIME::default(),
+            nFileSizeHigh: 0,
+            nFileSizeLow: 0,
+            dwReserved0: 0,
+            dwReserved1: 0,
+            cFileName: [0; 260],
+            cAlternateFileName: [0; 14],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FindEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FindFileContext {
+    pub entries: Vec<FindEntry>,
+    pub current_idx: usize,
+}
+
+static NEXT_FIND_HANDLE: Spinlock<u64> = Spinlock::new(0x000F_0001);
+static FIND_HANDLE_TABLE: Spinlock<BTreeMap<u64, FindFileContext>> = Spinlock::new(BTreeMap::new());
+
+fn matches_pattern(name: &str, pattern: &str) -> bool {
+    if pattern == "*" || pattern == "*.*" || pattern.is_empty() {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        if let Some(rest) = suffix.strip_prefix('.') {
+            return name.to_ascii_lowercase().ends_with(&alloc::format!(".{}", rest.to_ascii_lowercase()));
+        }
+        return name.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase());
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase());
+    }
+    name.eq_ignore_ascii_case(pattern)
+}
+
+fn copy_find_entry_to_dataw(entry: &FindEntry, data: &mut WIN32_FIND_DATAW) {
+    *data = WIN32_FIND_DATAW::default();
+    data.dwFileAttributes = if entry.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    data.nFileSizeLow = (entry.size & 0xFFFF_FFFF) as u32;
+    data.nFileSizeHigh = (entry.size >> 32) as u32;
+    data.ftCreationTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+    data.ftLastAccessTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+    data.ftLastWriteTime = FILETIME { dwLowDateTime: 0x1234_5678, dwHighDateTime: 0x01D9_0000 };
+
+    let mut i = 0;
+    for c in entry.name.encode_utf16() {
+        if i >= 259 {
+            break;
+        }
+        data.cFileName[i] = c;
+        i += 1;
+    }
+    data.cFileName[i] = 0;
+}
+
+/// Emulates Win32 FindFirstFile searching a directory for a file or subdirectory.
+pub unsafe fn win32_find_first_file(
+    lp_file_name: &str,
+    lp_find_file_data: *mut WIN32_FIND_DATAW,
+) -> u64 {
+    if lp_file_name.is_empty() || lp_find_file_data.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    let norm = lp_file_name.replace('\\', "/");
+    let (dir_part, pattern) = match norm.rsplit_once('/') {
+        Some((d, p)) => (if d.is_empty() { "/" } else { d }, p),
+        None => (".", norm.as_str()),
+    };
+
+    let vfs_dir = win32_dos_to_vfs_path(dir_part);
+    let vfs = crate::fs::VFS.lock();
+
+    let dir_entries = match vfs.list_directory(&vfs_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+
+    let mut matched_entries = Vec::new();
+    for entry in dir_entries {
+        if matches_pattern(&entry.name, pattern) {
+            let full_vfs = if vfs_dir.ends_with('/') {
+                alloc::format!("{}{}", vfs_dir, entry.name)
+            } else {
+                alloc::format!("{}/{}", vfs_dir, entry.name)
+            };
+            let size = vfs.read_file(&full_vfs).map(|d| d.len() as u64).unwrap_or(0);
+            matched_entries.push(FindEntry {
+                name: entry.name,
+                is_dir: entry.file_type == crate::fs::FileType::Directory,
+                size,
+            });
+        }
+    }
+
+    if matched_entries.is_empty() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    copy_find_entry_to_dataw(&matched_entries[0], &mut *lp_find_file_data);
+
+    let mut gen = NEXT_FIND_HANDLE.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let ctx = FindFileContext {
+        entries: matched_entries,
+        current_idx: 1,
+    };
+
+    let mut table = FIND_HANDLE_TABLE.lock();
+    table.insert(handle, ctx);
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    handle
+}
+
+/// Emulates Win32 FindNextFile continuing a file search from a previous FindFirstFile call.
+pub unsafe fn win32_find_next_file(
+    h_find_file: u64,
+    lp_find_file_data: *mut WIN32_FIND_DATAW,
+) -> bool {
+    if h_find_file == INVALID_HANDLE_VALUE || h_find_file == 0 || lp_find_file_data.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let mut table = FIND_HANDLE_TABLE.lock();
+    let ctx = match table.get_mut(&h_find_file) {
+        Some(c) => c,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            return false;
+        }
+    };
+
+    if ctx.current_idx >= ctx.entries.len() {
+        crate::pe::kernel32::win32_set_last_error(ERROR_NO_MORE_FILES);
+        return false;
+    }
+
+    copy_find_entry_to_dataw(&ctx.entries[ctx.current_idx], &mut *lp_find_file_data);
+    ctx.current_idx += 1;
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 FindClose closing a search handle.
+pub unsafe fn win32_find_close(h_find_file: u64) -> bool {
+    if h_find_file == INVALID_HANDLE_VALUE || h_find_file == 0 {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let mut table = FIND_HANDLE_TABLE.lock();
+    if table.remove(&h_find_file).is_some() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        false
+    }
+}
