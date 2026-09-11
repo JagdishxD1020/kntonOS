@@ -338,3 +338,160 @@ pub fn verify_button_remapping_and_paddles() -> bool {
 
     true
 }
+
+// Gyro-to-Stick & Gyro-to-Mouse Redirection Engine
+
+/// Target mode for gyro motion vector translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionRedirectionMode {
+    Disabled,
+    GyroToMouse,
+    GyroToRightStick,
+}
+
+/// Motion translation parameters and sensitivities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MotionRedirectionConfig {
+    pub mode: MotionRedirectionMode,
+    pub yaw_sensitivity: f32,
+    pub pitch_sensitivity: f32,
+    pub roll_factor: f32,
+    pub invert_yaw: bool,
+    pub invert_pitch: bool,
+    pub deadzone_dps: f32,
+    pub stick_deflection_scale: f32,
+}
+
+impl MotionRedirectionConfig {
+    pub const fn default_mouse() -> Self {
+        Self {
+            mode: MotionRedirectionMode::GyroToMouse,
+            yaw_sensitivity: 1.5,
+            pitch_sensitivity: 1.5,
+            roll_factor: 0.5,
+            invert_yaw: false,
+            invert_pitch: false,
+            deadzone_dps: 1.5,
+            stick_deflection_scale: 400.0,
+        }
+    }
+
+    pub const fn default_right_stick() -> Self {
+        Self {
+            mode: MotionRedirectionMode::GyroToRightStick,
+            yaw_sensitivity: 1.0,
+            pitch_sensitivity: 1.0,
+            roll_factor: 0.5,
+            invert_yaw: false,
+            invert_pitch: false,
+            deadzone_dps: 1.5,
+            stick_deflection_scale: 500.0,
+        }
+    }
+}
+
+/// Motion translation engine transforming angular rates to mouse deltas or stick deflections.
+pub struct MotionRedirectionEngine {
+    pub config: MotionRedirectionConfig,
+}
+
+impl MotionRedirectionEngine {
+    pub const fn new(config: MotionRedirectionConfig) -> Self {
+        Self { config }
+    }
+
+    /// Processes gyro angular rates in degrees/second, producing (mouse_dx, mouse_dy) and (stick_x, stick_y).
+    pub fn process_motion(
+        &self,
+        yaw_dps: f32,
+        pitch_dps: f32,
+        roll_dps: f32,
+    ) -> ((i16, i16), (i16, i16)) {
+        if self.config.mode == MotionRedirectionMode::Disabled {
+            return ((0, 0), (0, 0));
+        }
+
+        // Combine horizontal yaw and device roll
+        let eff_yaw = yaw_dps + self.config.roll_factor * roll_dps;
+        let eff_pitch = pitch_dps;
+
+        // Apply deadzone threshold
+        let filtered_yaw = if eff_yaw.abs() <= self.config.deadzone_dps {
+            0.0
+        } else {
+            eff_yaw - eff_yaw.signum() * self.config.deadzone_dps
+        };
+
+        let filtered_pitch = if eff_pitch.abs() <= self.config.deadzone_dps {
+            0.0
+        } else {
+            eff_pitch - eff_pitch.signum() * self.config.deadzone_dps
+        };
+
+        let inv_yaw_mult = if self.config.invert_yaw { -1.0 } else { 1.0 };
+        let inv_pitch_mult = if self.config.invert_pitch { -1.0 } else { 1.0 };
+
+        let scaled_yaw = filtered_yaw * self.config.yaw_sensitivity * inv_yaw_mult;
+        let scaled_pitch = filtered_pitch * self.config.pitch_sensitivity * inv_pitch_mult;
+
+        match self.config.mode {
+            MotionRedirectionMode::GyroToMouse => {
+                let dx = scaled_yaw.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                let dy = scaled_pitch.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                ((dx, dy), (0, 0))
+            }
+            MotionRedirectionMode::GyroToRightStick => {
+                let sx = (scaled_yaw * self.config.stick_deflection_scale)
+                    .clamp(-32768.0, 32767.0) as i16;
+                let sy = (scaled_pitch * self.config.stick_deflection_scale)
+                    .clamp(-32768.0, 32767.0) as i16;
+                ((0, 0), (sx, sy))
+            }
+            MotionRedirectionMode::Disabled => ((0, 0), (0, 0)),
+        }
+    }
+}
+
+/// Verifies motion vector redirection to analog right stick deflections and relative mouse deltas.
+pub fn verify_motion_redirection_engine() -> bool {
+    let mut config = MotionRedirectionConfig::default_mouse();
+    config.deadzone_dps = 2.0;
+    config.yaw_sensitivity = 2.0;
+
+    let engine_mouse = MotionRedirectionEngine::new(config);
+
+    // 1. Angular rate within noise deadzone (1.0 dps < 2.0 dps) -> zero output
+    let ((m_dx_dead, _), _) = engine_mouse.process_motion(1.0, 0.0, 0.0);
+    if m_dx_dead != 0 {
+        return false;
+    }
+
+    // 2. Active motion in GyroToMouse mode (12.0 dps -> (12 - 2) * 2 = 20 delta)
+    let ((m_dx, m_dy), (s_x, s_y)) = engine_mouse.process_motion(12.0, 0.0, 0.0);
+    if m_dx != 20 || m_dy != 0 || s_x != 0 || s_y != 0 {
+        return false;
+    }
+
+    // 3. Switch to GyroToRightStick mode
+    let mut config_stick = MotionRedirectionConfig::default_right_stick();
+    config_stick.deadzone_dps = 2.0;
+    config_stick.stick_deflection_scale = 500.0;
+    let engine_stick = MotionRedirectionEngine::new(config_stick);
+
+    let ((m2_dx, _), (s2_x, s2_y)) = engine_stick.process_motion(12.0, 0.0, 0.0);
+    // (12 - 2) * 1.0 * 500 = 5000 stick units
+    if m2_dx != 0 || s2_x != 5000 || s2_y != 0 {
+        return false;
+    }
+
+    // 4. Inversion toggle
+    let mut config_inv = config_stick;
+    config_inv.invert_yaw = true;
+    let engine_inv = MotionRedirectionEngine::new(config_inv);
+    let (_, (s3_x, _)) = engine_inv.process_motion(12.0, 0.0, 0.0);
+    if s3_x != -5000 {
+        return false;
+    }
+
+    true
+}
