@@ -650,3 +650,135 @@ pub fn win32_get_command_line_str() -> String {
     let len = cmd.cmdline_a.len().saturating_sub(1);
     String::from_utf8_lossy(&cmd.cmdline_a[..len]).into_owned()
 }
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+pub const IA32_GS_BASE: u32 = 0xC000_0101;
+pub const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+unsafe impl Send for TEB {}
+unsafe impl Sync for TEB {}
+unsafe impl Send for PEB {}
+unsafe impl Sync for PEB {}
+
+static CURRENT_TEB_PTR: AtomicU64 = AtomicU64::new(0);
+
+// Global thread environment manager tracking active TEB allocations and main PEB
+pub struct ThreadEnvironmentManager {
+    tebs: BTreeMap<u64, Box<TEB>>,
+    default_peb: Box<PEB>,
+}
+
+unsafe impl Send for ThreadEnvironmentManager {}
+unsafe impl Sync for ThreadEnvironmentManager {}
+
+impl ThreadEnvironmentManager {
+    // Initialize manager with default process environment block
+    pub fn new() -> Self {
+        Self {
+            tebs: BTreeMap::new(),
+            default_peb: Box::new(PEB::new(0x0040_0000, 0x0100_0000, 4)),
+        }
+    }
+
+    // Allocate and register new TEB for thread
+    pub fn create_teb(&mut self, pid: u64, tid: u64, stack_base: u64, stack_limit: u64) -> u64 {
+        let peb_addr = (&*self.default_peb as *const PEB) as u64;
+        let mut teb = Box::new(TEB::new(pid, tid, stack_base, stack_limit, peb_addr));
+        let teb_addr = (&*teb as *const TEB) as u64;
+        teb.tib.self_ptr = teb_addr;
+        self.tebs.insert(tid, teb);
+        teb_addr
+    }
+
+    // Update stack boundaries for an existing thread TEB
+    pub fn register_stack_bounds(&mut self, tid: u64, stack_base: u64, stack_limit: u64) -> bool {
+        if let Some(teb) = self.tebs.get_mut(&tid) {
+            teb.tib.stack_base = stack_base;
+            teb.tib.stack_limit = stack_limit;
+            teb.deallocation_stack = stack_limit;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Retrieve raw pointer to TEB by thread ID
+    pub fn get_teb(&mut self, tid: u64) -> Option<*mut TEB> {
+        self.tebs.get_mut(&tid).map(|b| &mut **b as *mut TEB)
+    }
+
+    // Remove thread TEB upon thread termination
+    pub fn destroy_teb(&mut self, tid: u64) -> bool {
+        self.tebs.remove(&tid).is_some()
+    }
+}
+
+pub static TEB_MANAGER: Spinlock<Option<ThreadEnvironmentManager>> = Spinlock::new(None);
+
+// Ensure thread environment manager is initialized
+fn with_teb_manager<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ThreadEnvironmentManager) -> R,
+{
+    let mut lock = TEB_MANAGER.lock();
+    if lock.is_none() {
+        *lock = Some(ThreadEnvironmentManager::new());
+    }
+    f(lock.as_mut().unwrap())
+}
+
+// Program CPU GS segment base register and software tracking
+pub unsafe fn write_gs_base(addr: u64) {
+    crate::arch::x86_64::syscall::wrmsr(IA32_GS_BASE, addr);
+    CURRENT_TEB_PTR.store(addr, Ordering::SeqCst);
+}
+
+// Read CPU GS segment base register with fallback to software cache
+pub unsafe fn read_gs_base() -> u64 {
+    let msr = crate::arch::x86_64::syscall::rdmsr(IA32_GS_BASE);
+    if msr != 0 {
+        msr
+    } else {
+        CURRENT_TEB_PTR.load(Ordering::SeqCst)
+    }
+}
+
+// Allocate TEB and initialize GS base for current thread
+pub fn win32_init_current_thread_teb(pid: u64, tid: u64, stack_base: u64, stack_limit: u64) -> u64 {
+    let teb_addr = with_teb_manager(|mgr| mgr.create_teb(pid, tid, stack_base, stack_limit));
+    unsafe {
+        write_gs_base(teb_addr);
+    }
+    teb_addr
+}
+
+// Register or update stack limits for specified thread
+pub fn win32_register_thread_stack(tid: u64, stack_base: u64, stack_limit: u64) -> bool {
+    with_teb_manager(|mgr| mgr.register_stack_bounds(tid, stack_base, stack_limit))
+}
+
+// Retrieve current thread TEB pointer via GS base
+pub fn win32_get_current_teb() -> *mut TEB {
+    let addr = unsafe { read_gs_base() };
+    addr as *mut TEB
+}
+
+// Retrieve process PEB pointer via current TEB
+pub fn win32_get_current_peb() -> *mut PEB {
+    let teb_ptr = win32_get_current_teb();
+    if !teb_ptr.is_null() {
+        let peb_addr = unsafe { (*teb_ptr).process_environment_block };
+        if peb_addr != 0 {
+            return peb_addr as *mut PEB;
+        }
+    }
+    with_teb_manager(|mgr| &mut *mgr.default_peb as *mut PEB)
+}
+
+// Destroy thread TEB
+pub fn win32_destroy_thread_teb(tid: u64) -> bool {
+    with_teb_manager(|mgr| mgr.destroy_teb(tid))
+}
