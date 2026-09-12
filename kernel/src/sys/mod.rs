@@ -6,6 +6,8 @@
 pub mod health;
 pub mod minidump;
 pub mod checkpoint;
+pub mod kpkg;
+pub use kpkg::*;
 
 pub use minidump::*;
 pub use checkpoint::*;
