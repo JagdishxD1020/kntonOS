@@ -191,3 +191,147 @@ pub fn verify_low_framerate_compensation() -> bool {
 
     true
 }
+
+/// Maximum presentation timestamp (PTS) queue capacity.
+pub const PTS_QUEUE_CAPACITY: usize = 16;
+
+/// Presentation timestamp (PTS) entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtsEntry {
+    pub frame_id: u64,
+    pub submit_time_us: u64,
+    pub target_present_us: u64,
+}
+
+/// Zero-stutter frame pacing smoother with microsecond jitter filtering.
+#[derive(Debug, Clone)]
+pub struct FramePacingSmoother {
+    pub queue: [PtsEntry; PTS_QUEUE_CAPACITY],
+    pub queue_len: usize,
+    pub history_intervals_us: [u32; 8],
+    pub history_count: usize,
+    pub history_idx: usize,
+    pub last_submit_us: u64,
+    pub last_scheduled_present_us: u64,
+    pub target_frame_us: u32,
+}
+
+impl FramePacingSmoother {
+    /// Creates a new frame pacing smoother initialized for 60Hz presentation.
+    pub const fn new() -> Self {
+        Self {
+            queue: [PtsEntry { frame_id: 0, submit_time_us: 0, target_present_us: 0 }; PTS_QUEUE_CAPACITY],
+            queue_len: 0,
+            history_intervals_us: [16666; 8],
+            history_count: 0,
+            history_idx: 0,
+            last_submit_us: 0,
+            last_scheduled_present_us: 0,
+            target_frame_us: 16666,
+        }
+    }
+
+    /// Enqueues a newly submitted frame and computes smoothed presentation target timestamp.
+    pub fn enqueue_frame(&mut self, frame_id: u64, submit_time_us: u64) -> Option<u64> {
+        if self.queue_len >= PTS_QUEUE_CAPACITY {
+            return None;
+        }
+
+        // Calculate delta interval from previous frame submit
+        if self.last_submit_us > 0 && submit_time_us > self.last_submit_us {
+            let interval = (submit_time_us - self.last_submit_us) as u32;
+            self.history_intervals_us[self.history_idx] = interval;
+            self.history_idx = (self.history_idx + 1) % 8;
+            if self.history_count < 8 {
+                self.history_count += 1;
+            }
+        }
+        self.last_submit_us = submit_time_us;
+
+        // Compute moving average smoothed interval to filter out CPU render jitter
+        let smoothed_interval_us = if self.history_count > 0 {
+            let sum: u32 = self.history_intervals_us[..self.history_count].iter().sum();
+            sum / (self.history_count as u32)
+        } else {
+            self.target_frame_us
+        };
+
+        // Schedule next presentation without micro-stutter
+        let target_present_us = if self.last_scheduled_present_us == 0 {
+            submit_time_us + smoothed_interval_us as u64
+        } else {
+            let earliest = submit_time_us;
+            let cadence = self.last_scheduled_present_us + smoothed_interval_us as u64;
+            if cadence < earliest {
+                earliest
+            } else {
+                cadence
+            }
+        };
+
+        self.last_scheduled_present_us = target_present_us;
+
+        let entry = PtsEntry {
+            frame_id,
+            submit_time_us,
+            target_present_us,
+        };
+        self.queue[self.queue_len] = entry;
+        self.queue_len += 1;
+
+        Some(target_present_us)
+    }
+
+    /// Pops the next ready frame for presentation if timestamp is reached.
+    pub fn pop_ready_frame(&mut self, current_time_us: u64) -> Option<PtsEntry> {
+        if self.queue_len == 0 {
+            return None;
+        }
+
+        if current_time_us >= self.queue[0].target_present_us {
+            let entry = self.queue[0];
+            // Shift remaining items
+            for i in 1..self.queue_len {
+                self.queue[i - 1] = self.queue[i];
+            }
+            self.queue_len -= 1;
+            Some(entry)
+        } else {
+            None
+        }
+    }
+}
+
+/// Unit verification for Frame Pacing Smoother.
+pub fn verify_frame_pacing_smoother() -> bool {
+    let mut smoother = FramePacingSmoother::new();
+
+    // Enqueue 4 frames with slight render submission jitter around 16.6ms (16666 us)
+    let p1 = smoother.enqueue_frame(1, 100_000);
+    let p2 = smoother.enqueue_frame(2, 116_000); // 16000 us
+    let p3 = smoother.enqueue_frame(3, 133_000); // 17000 us
+    let p4 = smoother.enqueue_frame(4, 149_500); // 16500 us
+
+    if p1.is_none() || p2.is_none() || p3.is_none() || p4.is_none() {
+        return false;
+    }
+    if smoother.queue_len != 4 {
+        return false;
+    }
+
+    // Attempt pop before target presentation time: should return None
+    if smoother.pop_ready_frame(105_000).is_some() {
+        return false;
+    }
+
+    // Target time reached: should pop frame 1
+    let ready1 = smoother.pop_ready_frame(117_000);
+    if ready1.is_none() || ready1.unwrap().frame_id != 1 {
+        return false;
+    }
+    if smoother.queue_len != 3 {
+        return false;
+    }
+
+    true
+}
