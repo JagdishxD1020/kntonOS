@@ -14,6 +14,7 @@ pub mod tls_fiber;
 pub mod seh_veh;
 pub mod perf_counter;
 pub mod file;
+pub mod peb_teb;
 
 pub use header::*;
 pub use ntdll::*;
@@ -27,6 +28,7 @@ pub use tls_fiber::*;
 pub use seh_veh::*;
 pub use perf_counter::*;
 pub use file::*;
+pub use peb_teb::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
