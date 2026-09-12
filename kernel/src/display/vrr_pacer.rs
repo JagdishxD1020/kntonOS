@@ -101,3 +101,93 @@ pub fn verify_vrr_timing_model() -> bool {
 
     true
 }
+
+/// Low Framerate Compensation (LFC) multiplier mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LfcMode {
+    Passthrough,
+    Double2x,
+    Triple3x,
+}
+
+/// Low Framerate Compensation state and repeat frame scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LowFramerateCompensator {
+    pub min_vrr_hz: u32,
+    pub max_vrr_hz: u32,
+    pub active_mode: LfcMode,
+    pub effective_refresh_hz: u32,
+    pub repeats_remaining: u8,
+}
+
+impl LowFramerateCompensator {
+    /// Creates a new LFC controller for 40Hz - 165Hz VRR displays.
+    pub const fn new() -> Self {
+        Self {
+            min_vrr_hz: VRR_MIN_REFRESH_HZ,
+            max_vrr_hz: VRR_MAX_REFRESH_HZ,
+            active_mode: LfcMode::Passthrough,
+            effective_refresh_hz: 60,
+            repeats_remaining: 0,
+        }
+    }
+
+    /// Evaluates input game framerate and determines LFC repeat multiplier.
+    pub fn evaluate_framerate(&mut self, input_hz: u32) -> LfcMode {
+        if input_hz >= self.min_vrr_hz {
+            self.active_mode = LfcMode::Passthrough;
+            self.effective_refresh_hz = input_hz.min(self.max_vrr_hz);
+            self.repeats_remaining = 0;
+        } else if input_hz * 2 >= self.min_vrr_hz && input_hz * 2 <= self.max_vrr_hz {
+            // 2x repeat insertion (e.g. 20Hz - 39Hz -> 40Hz - 78Hz)
+            self.active_mode = LfcMode::Double2x;
+            self.effective_refresh_hz = input_hz * 2;
+            self.repeats_remaining = 1;
+        } else {
+            // 3x repeat insertion (e.g. below 20Hz -> 3x into VRR range)
+            self.active_mode = LfcMode::Triple3x;
+            self.effective_refresh_hz = (input_hz * 3).min(self.max_vrr_hz).max(self.min_vrr_hz);
+            self.repeats_remaining = 2;
+        }
+        self.active_mode
+    }
+
+    /// Determines if a repeat presentation frame should be displayed.
+    pub fn step_repeat(&mut self) -> bool {
+        if self.repeats_remaining > 0 {
+            self.repeats_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Unit verification for Low Framerate Compensation (LFC).
+pub fn verify_low_framerate_compensation() -> bool {
+    let mut lfc = LowFramerateCompensator::new();
+    if lfc.evaluate_framerate(60) != LfcMode::Passthrough || lfc.effective_refresh_hz != 60 {
+        return false;
+    }
+    if lfc.step_repeat() {
+        return false;
+    }
+
+    // 30 FPS drops below 40Hz: should trigger 2x LFC (60Hz effective)
+    if lfc.evaluate_framerate(30) != LfcMode::Double2x || lfc.effective_refresh_hz != 60 {
+        return false;
+    }
+    if !lfc.step_repeat() || lfc.step_repeat() {
+        return false;
+    }
+
+    // 15 FPS: should trigger 3x LFC (45Hz effective)
+    if lfc.evaluate_framerate(15) != LfcMode::Triple3x || lfc.effective_refresh_hz != 45 {
+        return false;
+    }
+    if !lfc.step_repeat() || !lfc.step_repeat() || lfc.step_repeat() {
+        return false;
+    }
+
+    true
+}
