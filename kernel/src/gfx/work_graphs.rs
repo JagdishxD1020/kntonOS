@@ -861,3 +861,192 @@ impl D3D12_STATE_SUBOBJECT_WORK_GRAPH {
         }
     }
 }
+
+// D3D12 Node ID pairing a 32-bit name hash and array index
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE_ID {
+    pub name_hash: u32,
+    pub index: u32,
+}
+
+impl D3D12_NODE_ID {
+    // Construct a node identifier from string name and index
+    pub fn new(name: &str, index: u32) -> Self {
+        let mut hash: u32 = 0x811c9dc5;
+        for b in name.as_bytes() {
+            hash ^= *b as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        Self { name_hash: hash, index }
+    }
+}
+
+// Memory layout specification for node input and output records
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE_RECORD_LAYOUT {
+    pub byte_stride: u32,
+    pub alignment: u32,
+    pub max_records: u32,
+}
+
+impl D3D12_NODE_RECORD_LAYOUT {
+    // Construct a record layout specification
+    pub fn new(byte_stride: u32, alignment: u32, max_records: u32) -> Self {
+        Self {
+            byte_stride,
+            alignment: alignment.max(4),
+            max_records,
+        }
+    }
+}
+
+// Broadcasting node launch parameters and dispatch grid dimensions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_BROADCASTING_LAUNCH_OVERRIDES {
+    pub dispatch_grid: [u32; 3],
+    pub max_dispatch_grid: [u32; 3],
+}
+
+// Coalescing node launch parameters and record grouping threshold
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_COALESCING_LAUNCH_OVERRIDES {
+    pub max_records_per_threadgroup: u32,
+}
+
+// Threadgroup node launch parameters
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_THREAD_LAUNCH_OVERRIDES {
+    pub threadgroup_size: [u32; 3],
+}
+
+// Complete D3D12 node descriptor supporting Broadcaster, Coalescing, and Thread nodes
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE {
+    pub node_id: D3D12_NODE_ID,
+    pub node_type: WorkGraphNodeType,
+    pub shader_id: [u8; 32],
+    pub input_record_layout: D3D12_NODE_RECORD_LAYOUT,
+    pub output_record_layout: D3D12_NODE_RECORD_LAYOUT,
+    pub broadcasting_overrides: Option<D3D12_BROADCASTING_LAUNCH_OVERRIDES>,
+    pub coalescing_overrides: Option<D3D12_COALESCING_LAUNCH_OVERRIDES>,
+    pub thread_overrides: Option<D3D12_THREAD_LAUNCH_OVERRIDES>,
+    pub output_nodes: Vec<D3D12_NODE_ID>,
+    pub is_entry_point: bool,
+}
+
+impl D3D12_NODE {
+    // Create Broadcaster node descriptor
+    pub fn broadcaster(name: &str, index: u32, shader_id: [u8; 32], grid: [u32; 3], in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Broadcasting,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, 64),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: Some(D3D12_BROADCASTING_LAUNCH_OVERRIDES {
+                dispatch_grid: grid,
+                max_dispatch_grid: grid,
+            }),
+            coalescing_overrides: None,
+            thread_overrides: None,
+            output_nodes: Vec::new(),
+            is_entry_point: true,
+        }
+    }
+
+    // Create Coalescing node descriptor
+    pub fn coalescing(name: &str, index: u32, shader_id: [u8; 32], max_records: u32, in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Coalescing,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, max_records * 4),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: None,
+            coalescing_overrides: Some(D3D12_COALESCING_LAUNCH_OVERRIDES {
+                max_records_per_threadgroup: max_records,
+            }),
+            thread_overrides: None,
+            output_nodes: Vec::new(),
+            is_entry_point: false,
+        }
+    }
+
+    // Create Threadgroup node descriptor
+    pub fn thread(name: &str, index: u32, shader_id: [u8; 32], tg_size: [u32; 3], in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Threadgroup,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, 64),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: None,
+            coalescing_overrides: None,
+            thread_overrides: Some(D3D12_THREAD_LAUNCH_OVERRIDES {
+                threadgroup_size: tg_size,
+            }),
+            output_nodes: Vec::new(),
+            is_entry_point: false,
+        }
+    }
+
+    // Add downstream target node for autonomous dispatch routing
+    pub fn add_output_target(&mut self, target: D3D12_NODE_ID) -> Result<(), WorkGraphError> {
+        if self.output_nodes.len() >= MAX_OUTPUT_RECORD_TARGETS {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.output_nodes.push(target);
+        Ok(())
+    }
+
+    // Validate node configuration against Direct3D 12 constraints
+    pub fn validate(&self) -> Result<(), WorkGraphError> {
+        if self.input_record_layout.byte_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.input_record_layout.byte_stride as usize));
+        }
+        if self.output_record_layout.byte_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.output_record_layout.byte_stride as usize));
+        }
+        match self.node_type {
+            WorkGraphNodeType::Broadcasting => {
+                if let Some(ref ov) = self.broadcasting_overrides {
+                    if ov.dispatch_grid[0] == 0 || ov.dispatch_grid[1] == 0 || ov.dispatch_grid[2] == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphNodeType::Coalescing => {
+                if let Some(ref ov) = self.coalescing_overrides {
+                    if ov.max_records_per_threadgroup == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphNodeType::Threadgroup => {
+                if let Some(ref ov) = self.thread_overrides {
+                    if ov.threadgroup_size[0] == 0 || ov.threadgroup_size[1] == 0 || ov.threadgroup_size[2] == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                    let threads = ov.threadgroup_size[0].saturating_mul(ov.threadgroup_size[1]).saturating_mul(ov.threadgroup_size[2]);
+                    if threads > 1024 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+        }
+        Ok(())
+    }
+}
