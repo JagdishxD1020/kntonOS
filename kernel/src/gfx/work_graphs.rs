@@ -756,3 +756,108 @@ impl WorkGraphEngine {
         Ok(result)
     }
 }
+
+// D3D12 Work Graph subobject type for pipeline state creation
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH: u32 = 0x24;
+
+pub const D3D12_WORK_GRAPH_FLAG_NONE: u32 = 0;
+pub const D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_EXECUTION: u32 = 1 << 0;
+pub const D3D12_WORK_GRAPH_FLAG_DYNAMIC_DISPATCH: u32 = 1 << 1;
+
+// Opaque 32-byte D3D12 Work Graph program identifier
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PROGRAM_IDENTIFIER {
+    pub opaque_data: [u64; 4],
+}
+
+impl D3D12_PROGRAM_IDENTIFIER {
+    // Construct program identifier from 4 64-bit words
+    pub const fn new(id0: u64, id1: u64, id2: u64, id3: u64) -> Self {
+        Self {
+            opaque_data: [id0, id1, id2, id3],
+        }
+    }
+
+    // Whether the program identifier is non-zero
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.opaque_data != [0; 4]
+    }
+}
+
+// Direct3D 12 Work Graph state object descriptor
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_WORK_GRAPH_DESC {
+    pub program_name: &'static str,
+    pub flags: u32,
+    pub num_nodes: u32,
+    pub num_entrypoints: u32,
+}
+
+// Memory backing and scratch requirements for Work Graph program
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS {
+    pub min_backing_memory_size_in_bytes: u64,
+    pub max_backing_memory_size_in_bytes: u64,
+    pub scratch_memory_size_in_bytes: u64,
+    pub record_ring_size_in_bytes: u64,
+}
+
+impl D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS {
+    // Calculate requirements for a given number of nodes and estimated record throughput
+    pub fn calculate(num_nodes: u32, max_record_size: usize) -> Self {
+        let base_overhead = 4096u64;
+        let per_node_ring = ((max_record_size as u64 + 31) & !31) * 128;
+        let total_ring = per_node_ring * (num_nodes as u64).max(1);
+        let min_backing = (base_overhead + total_ring + 255) & !255;
+        let max_backing = min_backing * 2;
+        let scratch_mem = (min_backing / 2 + 255) & !255;
+
+        Self {
+            min_backing_memory_size_in_bytes: min_backing,
+            max_backing_memory_size_in_bytes: max_backing,
+            scratch_memory_size_in_bytes: scratch_mem,
+            record_ring_size_in_bytes: total_ring,
+        }
+    }
+}
+
+// Direct3D 12 pipeline state subobject for Work Graphs
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_STATE_SUBOBJECT_WORK_GRAPH {
+    pub subobject_type: u32,
+    pub desc: D3D12_WORK_GRAPH_DESC,
+    pub program_id: D3D12_PROGRAM_IDENTIFIER,
+    pub memory_requirements: D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS,
+}
+
+impl D3D12_STATE_SUBOBJECT_WORK_GRAPH {
+    // Create new Work Graph state subobject and compute program ID
+    pub fn new(program_name: &'static str, flags: u32, num_nodes: u32, num_entrypoints: u32) -> Self {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in program_name.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let program_id = D3D12_PROGRAM_IDENTIFIER::new(hash, flags as u64, num_nodes as u64, num_entrypoints as u64);
+        let memory_requirements = D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::calculate(num_nodes, 128);
+
+        Self {
+            subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+            desc: D3D12_WORK_GRAPH_DESC {
+                program_name,
+                flags,
+                num_nodes,
+                num_entrypoints,
+            },
+            program_id,
+            memory_requirements,
+        }
+    }
+}
