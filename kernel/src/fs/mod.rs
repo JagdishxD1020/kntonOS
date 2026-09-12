@@ -336,6 +336,51 @@ impl VfsManager {
         entry.extend_from_slice(data);
     }
 
+    /// Lists directory entries spanning mounted nodes and dynamic files.
+    pub fn list_directory(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        let mut entries = Vec::new();
+        if let Ok(inode) = self.open(path) {
+            if let Ok(dir_entries) = inode.readdir() {
+                entries.extend(dir_entries);
+            }
+        }
+        let prefix = if path == "/" {
+            alloc::string::String::from("/")
+        } else if path.ends_with('/') {
+            alloc::string::String::from(path)
+        } else {
+            alloc::format!("{}/", path)
+        };
+        for (dyn_path, _data) in self.dynamic_files.range(prefix.clone()..) {
+            if !dyn_path.starts_with(&prefix) {
+                break;
+            }
+            let sub = &dyn_path[prefix.len()..];
+            if let Some(slash_idx) = sub.find('/') {
+                let dir_name = &sub[..slash_idx];
+                if !entries.iter().any(|e| e.name == dir_name) {
+                    entries.push(DirEntry {
+                        name: alloc::string::String::from(dir_name),
+                        inode_id: 0,
+                        file_type: FileType::Directory,
+                    });
+                }
+            } else if !sub.is_empty() {
+                if !entries.iter().any(|e| e.name == sub) {
+                    entries.push(DirEntry {
+                        name: alloc::string::String::from(sub),
+                        inode_id: 0,
+                        file_type: FileType::File,
+                    });
+                }
+            }
+        }
+        if entries.is_empty() && self.open(path).is_err() && !self.dynamic_files.iter().any(|(k, _)| k.starts_with(&prefix)) {
+            return Err(FsError::NotFound);
+        }
+        Ok(entries)
+    }
+
     /// Creates a new file with explicit owner, POSIX permissions, and optional ACL.
     pub fn create_file_with_perm(
         &mut self,
