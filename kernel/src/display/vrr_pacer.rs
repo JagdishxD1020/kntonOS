@@ -335,3 +335,82 @@ pub fn verify_frame_pacing_smoother() -> bool {
 
     true
 }
+
+/// OLED gamma flicker mitigation lookup table and hardware brightness stabilizer.
+#[derive(Debug, Clone)]
+pub struct OledGammaFlickerMitigator {
+    pub base_luminance_nits: u16,
+    pub current_refresh_hz: u32,
+    pub gamma_lut: [u16; 16],
+    pub compensation_gain_q8: u16,
+}
+
+impl OledGammaFlickerMitigator {
+    /// Creates a new OLED gamma flicker mitigator.
+    pub const fn new() -> Self {
+        // Pre-computed inverse luminance decay compensation curve indexed by (Hz - 40) / 8
+        // Expressed in Q8 fixed-point (256 = 1.0x gain)
+        let mut lut = [256u16; 16];
+        let mut i = 0;
+        while i < 16 {
+            // At lower refresh rates, OLED pixel emission window elongates causing luminance surge.
+            // Gain scales down slightly from 256 to stabilize perceived nits.
+            lut[i] = (256 - ((15 - i) as u16 * 4)) as u16; // e.g. 196 at 40Hz to 256 at 160Hz+
+            i += 1;
+        }
+
+        Self {
+            base_luminance_nits: 500,
+            current_refresh_hz: 60,
+            gamma_lut: lut,
+            compensation_gain_q8: 256,
+        }
+    }
+
+    /// Updates current refresh rate and recalculates stabilized compensation gain.
+    pub fn update_refresh_hz(&mut self, refresh_hz: u32) -> u16 {
+        self.current_refresh_hz = refresh_hz;
+        let clamped_hz = if refresh_hz < VRR_MIN_REFRESH_HZ {
+            VRR_MIN_REFRESH_HZ
+        } else if refresh_hz > VRR_MAX_REFRESH_HZ {
+            VRR_MAX_REFRESH_HZ
+        } else {
+            refresh_hz
+        };
+
+        let bucket = ((clamped_hz - VRR_MIN_REFRESH_HZ) / 8).min(15) as usize;
+        self.compensation_gain_q8 = self.gamma_lut[bucket];
+        self.compensation_gain_q8
+    }
+
+    /// Applies gamma flicker compensation gain to input RGB color channels.
+    pub fn compensate_color_rgb(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let cr = ((r as u32 * self.compensation_gain_q8 as u32) / 256) as u8;
+        let cg = ((g as u32 * self.compensation_gain_q8 as u32) / 256) as u8;
+        let cb = ((b as u32 * self.compensation_gain_q8 as u32) / 256) as u8;
+        (cr, cg, cb)
+    }
+}
+
+/// Unit verification for OLED gamma flicker mitigation.
+pub fn verify_oled_gamma_flicker_mitigator() -> bool {
+    let mut mitigator = OledGammaFlickerMitigator::new();
+
+    let gain_160 = mitigator.update_refresh_hz(160);
+    if gain_160 != 256 {
+        return false;
+    }
+
+    // Drop to 40Hz: gain must scale down to counteract OLED emission surge
+    let gain_40 = mitigator.update_refresh_hz(40);
+    if gain_40 >= 256 || gain_40 != 196 {
+        return false;
+    }
+
+    let (r, g, b) = mitigator.compensate_color_rgb(200, 200, 200);
+    if r >= 200 || g >= 200 || b >= 200 {
+        return false;
+    }
+
+    true
+}
