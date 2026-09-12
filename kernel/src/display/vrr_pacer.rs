@@ -414,3 +414,28 @@ pub fn verify_oled_gamma_flicker_mitigator() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld OLED VRR and LFC Frame Pacer Service.
+pub fn test_vrr_pacer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DISP] Testing Handheld OLED VRR & LFC Frame Pacer Service...\r\n");
+
+    if !verify_vrr_timing_model() {
+        crate::serial_write_str("[KNT-PANIC] VRR timing model verification failed!\r\n");
+        return false;
+    }
+    if !verify_low_framerate_compensation() {
+        crate::serial_write_str("[KNT-PANIC] Low Framerate Compensation (LFC) verification failed!\r\n");
+        return false;
+    }
+    if !verify_frame_pacing_smoother() {
+        crate::serial_write_str("[KNT-PANIC] Frame pacing smoother verification failed!\r\n");
+        return false;
+    }
+    if !verify_oled_gamma_flicker_mitigator() {
+        crate::serial_write_str("[KNT-PANIC] OLED gamma flicker mitigation verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-DISP-VRR-PASS] Handheld OLED VRR and LFC frame pacer verified\r\n");
+    true
+}

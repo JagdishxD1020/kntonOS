@@ -646,6 +646,12 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] USB-C DisplayPort Alternate Mode and hot-plug daemon self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Display OLED Variable Refresh Rate (VRR) & LFC Frame Pacer Service (TASK-KNT-168)
+    if !display::test_vrr_pacer_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld OLED VRR and LFC frame pacer self-test failed!\r\n");
+    }
+
+
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)
     if !drivers::power::test_dual_battery_balance_subsystem() {
         serial_write_str("[KNT-PANIC] Dual-battery balance manager and USB-PD 3.1 EPR engine self-test failed!\r\n");
