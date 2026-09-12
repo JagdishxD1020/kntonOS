@@ -143,7 +143,6 @@ pub fn win32_get_proc_address(h_module: HMODULE, proc_name: &str) -> FARPROC {
 }
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use super::ntdll::*;
 use crate::syscall::NT_CURRENT_PROCESS;
 
 pub const ERROR_SUCCESS: u32 = 0;
