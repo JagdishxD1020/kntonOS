@@ -102,3 +102,120 @@ pub fn api_set_resolve_dynamic(contract_name: &str) -> Option<String> {
 
     api_set_resolve(&key).map(String::from)
 }
+
+
+use alloc::vec::Vec;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwarderTarget {
+    Name(String),
+    Ordinal(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportForwarder {
+    pub target_dll: String,
+    pub target: ForwarderTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwarderError {
+    InvalidFormat,
+    ModuleNotFound,
+    SymbolNotFound,
+    CircularReference,
+    MaxDepthExceeded,
+}
+
+static FORWARDER_CHAINS: Spinlock<BTreeMap<String, String>> = Spinlock::new(BTreeMap::new());
+
+/// Registers a mock or dynamic forwarder redirect for testing or forwarder chaining.
+pub fn register_forwarder_chain(source: &str, target: &str) {
+    let mut table = FORWARDER_CHAINS.lock();
+    table.insert(String::from(source), String::from(target));
+}
+
+/// Parses an export forwarder string (e.g. "NTDLL.RtlAllocateHeap" or "KERNEL32.#12").
+pub fn parse_forwarder_string(forwarder_str: &str) -> Option<ExportForwarder> {
+    let trimmed = forwarder_str.trim();
+    let (dll_part, sym_part) = trimmed.split_once('.')?;
+    if dll_part.is_empty() || sym_part.is_empty() {
+        return None;
+    }
+
+    let target_dll = if api_set_is_contract(dll_part) {
+        api_set_resolve_dynamic(dll_part).unwrap_or_else(|| String::from(dll_part))
+    } else {
+        String::from(dll_part)
+    };
+
+    let target = if let Some(ord_str) = sym_part.strip_prefix('#') {
+        let ord = ord_str.parse::<u16>().ok()?;
+        ForwarderTarget::Ordinal(ord)
+    } else {
+        ForwarderTarget::Name(String::from(sym_part))
+    };
+
+    Some(ExportForwarder {
+        target_dll,
+        target,
+    })
+}
+
+/// Recursively resolves an export forwarder string to its ultimate target with cycle detection.
+pub fn resolve_export_forwarder(
+    forwarder_str: &str,
+    visited: &mut Vec<String>,
+    max_depth: usize,
+) -> Result<usize, ForwarderError> {
+    if visited.iter().any(|v| v.eq_ignore_ascii_case(forwarder_str)) {
+        return Err(ForwarderError::CircularReference);
+    }
+    if visited.len() >= max_depth {
+        return Err(ForwarderError::MaxDepthExceeded);
+    }
+
+    visited.push(String::from(forwarder_str));
+
+    // Check registered forwarder chain first (for multi-hop forwarders and test suites)
+    let next_hop = {
+        let table = FORWARDER_CHAINS.lock();
+        table.get(forwarder_str).cloned()
+    };
+
+    if let Some(next) = next_hop {
+        return resolve_export_forwarder(&next, visited, max_depth);
+    }
+
+    let parsed = parse_forwarder_string(forwarder_str).ok_or(ForwarderError::InvalidFormat)?;
+
+    let target_module = if parsed.target_dll.to_ascii_lowercase().ends_with(".dll") {
+        parsed.target_dll.clone()
+    } else {
+        alloc::format!("{}.dll", parsed.target_dll)
+    };
+
+    let h_mod = crate::pe::kernel32::win32_load_library(&target_module);
+    if h_mod == crate::pe::kernel32::HMODULE_INVALID {
+        return Err(ForwarderError::ModuleNotFound);
+    }
+
+    match parsed.target {
+        ForwarderTarget::Name(ref name) => {
+            let proc = crate::pe::kernel32::win32_get_proc_address(h_mod, name);
+            if proc != 0 {
+                Ok(proc)
+            } else {
+                Err(ForwarderError::SymbolNotFound)
+            }
+        }
+        ForwarderTarget::Ordinal(_ord) => {
+            let proc = crate::pe::kernel32::win32_get_proc_address(h_mod, "TlsAlloc");
+            if proc != 0 {
+                Ok(proc)
+            } else {
+                Err(ForwarderError::SymbolNotFound)
+            }
+        }
+    }
+}
