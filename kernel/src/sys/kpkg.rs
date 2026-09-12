@@ -781,3 +781,28 @@ pub fn verify_gaming_profile_switcher() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Native Package Manager (kpkg) Manifest, Merkle Tree CAS & Profile Switcher.
+pub fn test_kpkg_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SYS] Testing Native Package Manager (kpkg) & Merkle Tree CAS...\r\n");
+
+    if !verify_kpkg_manifest_and_dependencies() {
+        crate::serial_write_str("[KNT-PANIC] Package manifest and dependency resolver verification failed!\r\n");
+        return false;
+    }
+    if !verify_merkle_tree_cas() {
+        crate::serial_write_str("[KNT-PANIC] Merkle tree and CAS object store verification failed!\r\n");
+        return false;
+    }
+    if !verify_package_staging_and_overlayfs() {
+        crate::serial_write_str("[KNT-PANIC] OverlayFS staging and sandbox mount verification failed!\r\n");
+        return false;
+    }
+    if !verify_gaming_profile_switcher() {
+        crate::serial_write_str("[KNT-PANIC] Gaming profile switcher verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-SYS-KPKG-PASS] Native kpkg package manager and CAS profile switcher verified\r\n");
+    true
+}

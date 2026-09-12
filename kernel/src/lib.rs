@@ -769,6 +769,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Micro-checkpoint state snapshot and instant resumption self-test failed!\r\n");
     }
 
+    // Initialize and verify Native Package Manager (kpkg) Manifest, Merkle Tree CAS & Profile Switcher (TASK-KNT-166)
+    if !sys::test_kpkg_subsystem() {
+        serial_write_str("[KNT-PANIC] Native kpkg package manager and CAS profile switcher self-test failed!\r\n");
+    }
+
     // Verify Win32 Userland Runtime & NTDLL Emulation Layer (TASK-KNT-134)
     if !pe::test_ntdll_emulation_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 NTDLL emulation layer self-test failed!\r\n");
