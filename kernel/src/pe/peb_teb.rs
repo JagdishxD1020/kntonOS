@@ -782,3 +782,169 @@ pub fn win32_get_current_peb() -> *mut PEB {
 pub fn win32_destroy_thread_teb(tid: u64) -> bool {
     with_teb_manager(|mgr| mgr.destroy_teb(tid))
 }
+
+// Comprehensive verification test suite for Win32 PEB, TEB and environment variables
+pub fn test_peb_teb_subsystem() -> bool {
+    crate::serial_write_str("[KNT-PEB-TEB] Initializing Win32 PEB, TEB and environment variable self-test...\r\n");
+
+    // 1. Structure sizing, alignments and standard offsets
+    if core::mem::size_of::<NT_TIB>() != 56 {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] NT_TIB size mismatch\r\n");
+        return false;
+    }
+    if core::mem::size_of::<CLIENT_ID>() != 16 {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] CLIENT_ID size mismatch\r\n");
+        return false;
+    }
+    let dummy_params = RTL_USER_PROCESS_PARAMETERS::new();
+    if dummy_params.maximum_length < core::mem::size_of::<RTL_USER_PROCESS_PARAMETERS>() as u32 {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] RTL_USER_PROCESS_PARAMETERS invalid length\r\n");
+        return false;
+    }
+    let dummy_peb = PEB::new(0x0040_0000, 0x0100_0000, 4);
+    if dummy_peb.image_base_address != 0x0040_0000 || dummy_peb.number_of_processors != 4 {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] PEB initialization field mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Win32 PEB, TEB, NT_TIB, CLIENT_ID, and RTL_USER_PROCESS_PARAMETERS structures verified\r\n");
+
+    // 2. Process environment variables engine and double-null block parser
+    let synthetic_block = [
+        'F' as u16, 'O' as u16, 'O' as u16, '=' as u16, 'B' as u16, 'A' as u16, 'R' as u16, 0,
+        'K' as u16, 'E' as u16, 'Y' as u16, '=' as u16, '1' as u16, '2' as u16, '3' as u16, 0,
+        0,
+    ];
+    let parsed = ProcessEnvironment::parse_block_w(&synthetic_block);
+    if parsed.len() != 2 || parsed[0].0 != "FOO" || parsed[0].1 != "BAR" || parsed[1].0 != "KEY" || parsed[1].1 != "123" {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Environment block parser mismatch\r\n");
+        return false;
+    }
+
+    let var_name = str_to_utf16_null("TEST_ENV_VAR");
+    let var_val = str_to_utf16_null("VALUE_KNT_167");
+    unsafe {
+        if !win32_set_environment_variable_w(var_name.as_ptr(), var_val.as_ptr()) {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] SetEnvironmentVariableW failed\r\n");
+            return false;
+        }
+
+        let mut read_buf = [0u16; 64];
+        let req_len = win32_get_environment_variable_w(var_name.as_ptr(), core::ptr::null_mut(), 0);
+        if req_len != (var_val.len() as u32) {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Sizing query mismatch\r\n");
+            return false;
+        }
+
+        let copied = win32_get_environment_variable_w(var_name.as_ptr(), read_buf.as_mut_ptr(), 64);
+        if copied != (var_val.len() as u32 - 1) {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] GetEnvironmentVariableW length mismatch\r\n");
+            return false;
+        }
+        let read_str = utf16_ptr_to_string(read_buf.as_ptr()).unwrap_or_default();
+        if read_str != "VALUE_KNT_167" {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Variable value mismatch\r\n");
+            return false;
+        }
+
+        // Case-insensitivity check
+        let var_name_lower = str_to_utf16_null("test_env_var");
+        let copied_lower = win32_get_environment_variable_w(var_name_lower.as_ptr(), read_buf.as_mut_ptr(), 64);
+        if copied_lower != copied {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Case-insensitive lookup failed\r\n");
+            return false;
+        }
+
+        // Deletion with null value
+        if !win32_set_environment_variable_w(var_name.as_ptr(), core::ptr::null()) {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Delete variable failed\r\n");
+            return false;
+        }
+        if win32_get_environment_variable_w(var_name.as_ptr(), read_buf.as_mut_ptr(), 64) != 0 {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Deleted variable was still found\r\n");
+            return false;
+        }
+    }
+
+    let env_strings = win32_get_environment_strings_w();
+    if env_strings.is_null() || !win32_free_environment_strings_w(env_strings) {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Environment strings block invalid\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Process environment block parser and variable management engine verified\r\n");
+
+    // 3. Command line parameters provider
+    win32_set_command_line("init.exe -v --benchmark");
+    let cmd_str = win32_get_command_line_str();
+    if cmd_str != "init.exe -v --benchmark" {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Command line string mismatch\r\n");
+        return false;
+    }
+    let cmd_a = win32_get_command_line_a();
+    let cmd_w = win32_get_command_line_w();
+    if cmd_a.is_null() || cmd_w.is_null() {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Null command line pointer\r\n");
+        return false;
+    }
+    unsafe {
+        let w_str = utf16_ptr_to_string(cmd_w).unwrap_or_default();
+        if w_str != "init.exe -v --benchmark" {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] UTF-16 command line mismatch\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Command line parameters provider (UTF-16 & UTF-8) verified\r\n");
+
+    // 4. Per-thread TEB lifecycle, stack boundary registration, and GS base
+    let stack_base = 0x0000_7FFF_FFFF_0000u64;
+    let stack_limit = 0x0000_7FFF_FFFE_0000u64;
+    let teb_addr = win32_init_current_thread_teb(42, 101, stack_base, stack_limit);
+    if teb_addr == 0 {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Failed to allocate thread TEB\r\n");
+        return false;
+    }
+
+    let cur_teb = win32_get_current_teb();
+    if cur_teb.is_null() || (cur_teb as u64) != teb_addr {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Current TEB pointer mismatch\r\n");
+        return false;
+    }
+    unsafe {
+        if (*cur_teb).tib.self_ptr != teb_addr
+            || (*cur_teb).tib.stack_base != stack_base
+            || (*cur_teb).tib.stack_limit != stack_limit
+            || (*cur_teb).client_id.unique_process != 42
+            || (*cur_teb).client_id.unique_thread != 101
+        {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] TEB fields corrupted\r\n");
+            return false;
+        }
+    }
+
+    let new_limit = 0x0000_7FFF_FFFD_0000u64;
+    if !win32_register_thread_stack(101, stack_base, new_limit) {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Register thread stack failed\r\n");
+        return false;
+    }
+    unsafe {
+        if (*cur_teb).tib.stack_limit != new_limit {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] Stack limit was not updated\r\n");
+            return false;
+        }
+    }
+
+    let cur_peb = win32_get_current_peb();
+    if cur_peb.is_null() {
+        crate::serial_write_str("[KNT-PEB-TEB-FAIL] Failed to retrieve current PEB\r\n");
+        return false;
+    }
+    unsafe {
+        if (*cur_peb).image_subsystem != 3 {
+            crate::serial_write_str("[KNT-PEB-TEB-FAIL] PEB image subsystem mismatch\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Per-thread TEB lifecycle, stack bounds, and GS base initialization verified\r\n");
+
+    crate::serial_write_str("[KNT-PE-PEB-TEB-PASS] Win32 PEB, TEB and environment variable subsystem verified\r\n");
+    true
+}

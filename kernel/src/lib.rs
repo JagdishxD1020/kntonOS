@@ -824,6 +824,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 high-resolution performance counter engine self-test failed!\r\n");
     }
 
+    // Verify Win32 PEB, TEB and Environment Variable Subsystem (TASK-KNT-167)
+    if !pe::test_peb_teb_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 PEB, TEB and environment variable subsystem self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
