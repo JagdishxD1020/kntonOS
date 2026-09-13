@@ -41,6 +41,9 @@ pub enum WorkGraphError {
     RecordRingEmpty,
     /// Invalid threadgroup or dispatch grid dimensions.
     InvalidGridDimensions,
+    NoProgramBound,
+    InvalidProgramIdentifier,
+    InvalidDispatchMode,
 }
 
 /// Direct3D 12 Work Graph node execution and scheduling types.
@@ -755,4 +758,760 @@ impl WorkGraphEngine {
         result.status = WorkGraphStatus::Completed;
         Ok(result)
     }
+}
+
+// D3D12 Work Graph subobject type for pipeline state creation
+pub const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH: u32 = 0x24;
+
+pub const D3D12_WORK_GRAPH_FLAG_NONE: u32 = 0;
+pub const D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_EXECUTION: u32 = 1 << 0;
+pub const D3D12_WORK_GRAPH_FLAG_DYNAMIC_DISPATCH: u32 = 1 << 1;
+
+// Opaque 32-byte D3D12 Work Graph program identifier
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PROGRAM_IDENTIFIER {
+    pub opaque_data: [u64; 4],
+}
+
+impl D3D12_PROGRAM_IDENTIFIER {
+    // Construct program identifier from 4 64-bit words
+    pub const fn new(id0: u64, id1: u64, id2: u64, id3: u64) -> Self {
+        Self {
+            opaque_data: [id0, id1, id2, id3],
+        }
+    }
+
+    // Whether the program identifier is non-zero
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.opaque_data != [0; 4]
+    }
+}
+
+// Direct3D 12 Work Graph state object descriptor
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_WORK_GRAPH_DESC {
+    pub program_name: &'static str,
+    pub flags: u32,
+    pub num_nodes: u32,
+    pub num_entrypoints: u32,
+}
+
+// Memory backing and scratch requirements for Work Graph program
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS {
+    pub min_backing_memory_size_in_bytes: u64,
+    pub max_backing_memory_size_in_bytes: u64,
+    pub scratch_memory_size_in_bytes: u64,
+    pub record_ring_size_in_bytes: u64,
+}
+
+impl D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS {
+    // Calculate requirements for a given number of nodes and estimated record throughput
+    pub fn calculate(num_nodes: u32, max_record_size: usize) -> Self {
+        let base_overhead = 4096u64;
+        let per_node_ring = ((max_record_size as u64 + 31) & !31) * 128;
+        let total_ring = per_node_ring * (num_nodes as u64).max(1);
+        let min_backing = (base_overhead + total_ring + 255) & !255;
+        let max_backing = min_backing * 2;
+        let scratch_mem = (min_backing / 2 + 255) & !255;
+
+        Self {
+            min_backing_memory_size_in_bytes: min_backing,
+            max_backing_memory_size_in_bytes: max_backing,
+            scratch_memory_size_in_bytes: scratch_mem,
+            record_ring_size_in_bytes: total_ring,
+        }
+    }
+}
+
+// Direct3D 12 pipeline state subobject for Work Graphs
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_STATE_SUBOBJECT_WORK_GRAPH {
+    pub subobject_type: u32,
+    pub desc: D3D12_WORK_GRAPH_DESC,
+    pub program_id: D3D12_PROGRAM_IDENTIFIER,
+    pub memory_requirements: D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS,
+}
+
+impl D3D12_STATE_SUBOBJECT_WORK_GRAPH {
+    // Create new Work Graph state subobject and compute program ID
+    pub fn new(program_name: &'static str, flags: u32, num_nodes: u32, num_entrypoints: u32) -> Self {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in program_name.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let program_id = D3D12_PROGRAM_IDENTIFIER::new(hash, flags as u64, num_nodes as u64, num_entrypoints as u64);
+        let memory_requirements = D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS::calculate(num_nodes, 128);
+
+        Self {
+            subobject_type: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH,
+            desc: D3D12_WORK_GRAPH_DESC {
+                program_name,
+                flags,
+                num_nodes,
+                num_entrypoints,
+            },
+            program_id,
+            memory_requirements,
+        }
+    }
+}
+
+// D3D12 Node ID pairing a 32-bit name hash and array index
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE_ID {
+    pub name_hash: u32,
+    pub index: u32,
+}
+
+impl D3D12_NODE_ID {
+    // Construct a node identifier from string name and index
+    pub fn new(name: &str, index: u32) -> Self {
+        let mut hash: u32 = 0x811c9dc5;
+        for b in name.as_bytes() {
+            hash ^= *b as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        Self { name_hash: hash, index }
+    }
+}
+
+// Memory layout specification for node input and output records
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE_RECORD_LAYOUT {
+    pub byte_stride: u32,
+    pub alignment: u32,
+    pub max_records: u32,
+}
+
+impl D3D12_NODE_RECORD_LAYOUT {
+    // Construct a record layout specification
+    pub fn new(byte_stride: u32, alignment: u32, max_records: u32) -> Self {
+        Self {
+            byte_stride,
+            alignment: alignment.max(4),
+            max_records,
+        }
+    }
+}
+
+// Broadcasting node launch parameters and dispatch grid dimensions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_BROADCASTING_LAUNCH_OVERRIDES {
+    pub dispatch_grid: [u32; 3],
+    pub max_dispatch_grid: [u32; 3],
+}
+
+// Coalescing node launch parameters and record grouping threshold
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_COALESCING_LAUNCH_OVERRIDES {
+    pub max_records_per_threadgroup: u32,
+}
+
+// Threadgroup node launch parameters
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_THREAD_LAUNCH_OVERRIDES {
+    pub threadgroup_size: [u32; 3],
+}
+
+// Complete D3D12 node descriptor supporting Broadcaster, Coalescing, and Thread nodes
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_NODE {
+    pub node_id: D3D12_NODE_ID,
+    pub node_type: WorkGraphNodeType,
+    pub shader_id: [u8; 32],
+    pub input_record_layout: D3D12_NODE_RECORD_LAYOUT,
+    pub output_record_layout: D3D12_NODE_RECORD_LAYOUT,
+    pub broadcasting_overrides: Option<D3D12_BROADCASTING_LAUNCH_OVERRIDES>,
+    pub coalescing_overrides: Option<D3D12_COALESCING_LAUNCH_OVERRIDES>,
+    pub thread_overrides: Option<D3D12_THREAD_LAUNCH_OVERRIDES>,
+    pub output_nodes: Vec<D3D12_NODE_ID>,
+    pub is_entry_point: bool,
+}
+
+impl D3D12_NODE {
+    // Create Broadcaster node descriptor
+    pub fn broadcaster(name: &str, index: u32, shader_id: [u8; 32], grid: [u32; 3], in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Broadcasting,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, 64),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: Some(D3D12_BROADCASTING_LAUNCH_OVERRIDES {
+                dispatch_grid: grid,
+                max_dispatch_grid: grid,
+            }),
+            coalescing_overrides: None,
+            thread_overrides: None,
+            output_nodes: Vec::new(),
+            is_entry_point: true,
+        }
+    }
+
+    // Create Coalescing node descriptor
+    pub fn coalescing(name: &str, index: u32, shader_id: [u8; 32], max_records: u32, in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Coalescing,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, max_records * 4),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: None,
+            coalescing_overrides: Some(D3D12_COALESCING_LAUNCH_OVERRIDES {
+                max_records_per_threadgroup: max_records,
+            }),
+            thread_overrides: None,
+            output_nodes: Vec::new(),
+            is_entry_point: false,
+        }
+    }
+
+    // Create Threadgroup node descriptor
+    pub fn thread(name: &str, index: u32, shader_id: [u8; 32], tg_size: [u32; 3], in_stride: u32, out_stride: u32) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphNodeType::Threadgroup,
+            shader_id,
+            input_record_layout: D3D12_NODE_RECORD_LAYOUT::new(in_stride, 4, 64),
+            output_record_layout: D3D12_NODE_RECORD_LAYOUT::new(out_stride, 4, 64),
+            broadcasting_overrides: None,
+            coalescing_overrides: None,
+            thread_overrides: Some(D3D12_THREAD_LAUNCH_OVERRIDES {
+                threadgroup_size: tg_size,
+            }),
+            output_nodes: Vec::new(),
+            is_entry_point: false,
+        }
+    }
+
+    // Add downstream target node for autonomous dispatch routing
+    pub fn add_output_target(&mut self, target: D3D12_NODE_ID) -> Result<(), WorkGraphError> {
+        if self.output_nodes.len() >= MAX_OUTPUT_RECORD_TARGETS {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.output_nodes.push(target);
+        Ok(())
+    }
+
+    // Validate node configuration against Direct3D 12 constraints
+    pub fn validate(&self) -> Result<(), WorkGraphError> {
+        if self.input_record_layout.byte_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.input_record_layout.byte_stride as usize));
+        }
+        if self.output_record_layout.byte_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.output_record_layout.byte_stride as usize));
+        }
+        match self.node_type {
+            WorkGraphNodeType::Broadcasting => {
+                if let Some(ref ov) = self.broadcasting_overrides {
+                    if ov.dispatch_grid[0] == 0 || ov.dispatch_grid[1] == 0 || ov.dispatch_grid[2] == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphNodeType::Coalescing => {
+                if let Some(ref ov) = self.coalescing_overrides {
+                    if ov.max_records_per_threadgroup == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphNodeType::Threadgroup => {
+                if let Some(ref ov) = self.thread_overrides {
+                    if ov.threadgroup_size[0] == 0 || ov.threadgroup_size[1] == 0 || ov.threadgroup_size[2] == 0 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                    let threads = ov.threadgroup_size[0].saturating_mul(ov.threadgroup_size[1]).saturating_mul(ov.threadgroup_size[2]);
+                    if threads > 1024 {
+                        return Err(WorkGraphError::InvalidGridDimensions);
+                    }
+                } else {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// Program type enumeration for SetProgram command
+pub const D3D12_PROGRAM_TYPE_GENERIC_PIPELINE: u32 = 1;
+pub const D3D12_PROGRAM_TYPE_WORK_GRAPH: u32 = 2;
+
+// Dispatch graph mode enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_DISPATCH_GRAPH_MODE {
+    NodeCPUInput,
+    NodeGPUInput,
+    MultiNodeCPUInput,
+}
+
+use crate::gfx::dispatch_rays::D3D12_GPU_VIRTUAL_ADDRESS_RANGE;
+
+// Parameter descriptor for SetProgram command list recording
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SET_PROGRAM_DESC {
+    pub program_type: u32,
+    pub program_id: D3D12_PROGRAM_IDENTIFIER,
+    pub backing_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    pub scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+}
+
+// Parameter descriptor for DispatchGraph command list recording
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DISPATCH_GRAPH_DESC {
+    pub mode: D3D12_DISPATCH_GRAPH_MODE,
+    pub node_id: D3D12_NODE_ID,
+    pub num_records: u32,
+    pub records: Vec<NodeRecord>,
+}
+
+// Command stream token for Work Graph operations
+#[derive(Debug, Clone)]
+pub enum WorkGraphCommand {
+    SetProgram(D3D12_SET_PROGRAM_DESC),
+    DispatchGraph(D3D12_DISPATCH_GRAPH_DESC),
+}
+
+// Command list recorder for Direct3D 12 Work Graphs
+#[derive(Debug, Default)]
+pub struct WorkGraphCommandRecorder {
+    commands: Vec<WorkGraphCommand>,
+    active_program: Option<D3D12_PROGRAM_IDENTIFIER>,
+}
+
+impl WorkGraphCommandRecorder {
+    // Construct new empty command recorder
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+            active_program: None,
+        }
+    }
+
+    // Record SetProgram command into command stream with validation
+    pub fn set_program(&mut self, desc: &D3D12_SET_PROGRAM_DESC) -> Result<(), WorkGraphError> {
+        if !desc.program_id.is_valid() {
+            return Err(WorkGraphError::InvalidProgramIdentifier);
+        }
+        if (desc.backing_memory.start_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(desc.backing_memory.start_address));
+        }
+        if desc.backing_memory.size_in_bytes == 0 || (desc.backing_memory.size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT,
+                provided: desc.backing_memory.size_in_bytes,
+            });
+        }
+        if desc.scratch_memory.start_address != 0 && (desc.scratch_memory.start_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(desc.scratch_memory.start_address));
+        }
+
+        self.active_program = Some(desc.program_id);
+        self.commands.push(WorkGraphCommand::SetProgram(desc.clone()));
+        Ok(())
+    }
+
+    // Record DispatchGraph command into command stream with validation
+    pub fn dispatch_graph(&mut self, desc: &D3D12_DISPATCH_GRAPH_DESC) -> Result<(), WorkGraphError> {
+        if self.active_program.is_none() {
+            return Err(WorkGraphError::NoProgramBound);
+        }
+        if desc.mode == D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput && desc.num_records == 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        for rec in &desc.records {
+            if rec.payload_size as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+                return Err(WorkGraphError::PayloadSizeTooLarge(rec.payload_size as usize));
+            }
+        }
+
+        self.commands.push(WorkGraphCommand::DispatchGraph(desc.clone()));
+        Ok(())
+    }
+
+    // Slice of recorded commands in submission order
+    #[inline]
+    pub fn commands(&self) -> &[WorkGraphCommand] {
+        &self.commands
+    }
+
+    // Number of recorded commands
+    #[inline]
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    // Currently bound program identifier
+    #[inline]
+    pub fn active_program(&self) -> Option<D3D12_PROGRAM_IDENTIFIER> {
+        self.active_program
+    }
+
+    // Reset command recorder state
+    pub fn reset(&mut self) {
+        self.commands.clear();
+        self.active_program = None;
+    }
+}
+
+// Unified memory pool managing backing store and scratch memory partitions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkGraphBackingMemoryPool {
+    pub base_address: u64,
+    pub total_size: u64,
+    pub backing_store: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    pub scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+}
+
+impl WorkGraphBackingMemoryPool {
+    // Partition memory pool into backing store and scratch memory with 256-byte alignment
+    pub fn allocate(base_address: u64, total_size: u64, reqs: &D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS) -> Result<Self, WorkGraphError> {
+        if (base_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_address));
+        }
+        let needed = reqs.min_backing_memory_size_in_bytes + reqs.scratch_memory_size_in_bytes;
+        if total_size < needed {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: needed,
+                provided: total_size,
+            });
+        }
+
+        let backing_size = reqs.min_backing_memory_size_in_bytes;
+        let scratch_start = (base_address + backing_size + 255) & !255;
+        let scratch_size = total_size.saturating_sub(scratch_start.saturating_sub(base_address));
+
+        Ok(Self {
+            base_address,
+            total_size,
+            backing_store: D3D12_GPU_VIRTUAL_ADDRESS_RANGE::new(base_address, backing_size),
+            scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE::new(scratch_start, scratch_size),
+        })
+    }
+}
+
+// Autonomous queue scheduling descriptor for hardware work queue dispatch
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR {
+    pub queue_id: u32,
+    pub target_node: D3D12_NODE_ID,
+    pub ring_virtual_address: u64,
+    pub ring_capacity: u32,
+    pub head_index: u32,
+    pub tail_index: u32,
+    pub is_active: bool,
+}
+
+// Execution statistics for autonomous queue scheduler
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutonomousSchedulerStats {
+    pub total_dispatches: u64,
+    pub records_routed: u64,
+    pub broadcasting_launches: u64,
+    pub coalescing_launches: u64,
+    pub thread_launches: u64,
+}
+
+// Autonomous GPU queue scheduler managing hardware node queues and record flow
+#[derive(Debug)]
+pub struct AutonomousQueueScheduler {
+    nodes: Vec<D3D12_NODE>,
+    queue_descriptors: Vec<D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR>,
+    node_records: Vec<(D3D12_NODE_ID, Vec<NodeRecord>)>,
+    stats: AutonomousSchedulerStats,
+}
+
+impl AutonomousQueueScheduler {
+    // Construct new autonomous queue scheduler
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            queue_descriptors: Vec::new(),
+            node_records: Vec::new(),
+            stats: AutonomousSchedulerStats::default(),
+        }
+    }
+
+    // Register node and configure its autonomous queue descriptor
+    pub fn register_node(&mut self, node: D3D12_NODE, base_gpu_va: u64) -> Result<(), WorkGraphError> {
+        node.validate()?;
+        let queue_id = self.queue_descriptors.len() as u32;
+        let ring_va = base_gpu_va + (queue_id as u64 * 4096);
+        let q_desc = D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR {
+            queue_id,
+            target_node: node.node_id,
+            ring_virtual_address: ring_va,
+            ring_capacity: 64,
+            head_index: 0,
+            tail_index: 0,
+            is_active: true,
+        };
+        self.node_records.push((node.node_id, Vec::new()));
+        self.queue_descriptors.push(q_desc);
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    // Enqueue record to destination node queue
+    pub fn enqueue_record(&mut self, target: D3D12_NODE_ID, record: NodeRecord) -> Result<(), WorkGraphError> {
+        if let Some((_, list)) = self.node_records.iter_mut().find(|(id, _)| *id == target) {
+            list.push(record);
+            self.stats.records_routed += 1;
+            Ok(())
+        } else {
+            Err(WorkGraphError::NodeNotFound(target.name_hash))
+        }
+    }
+
+    // Execute autonomous dispatch loop across all active queues
+    pub fn execute_autonomous_dispatch(&mut self, max_iterations: u32) -> Result<AutonomousSchedulerStats, WorkGraphError> {
+        for _ in 0..max_iterations {
+            let mut work_done = false;
+
+            for i in 0..self.nodes.len() {
+                let node = self.nodes[i].clone();
+                let pending: Vec<NodeRecord> = {
+                    let entry = &mut self.node_records[i];
+                    core::mem::take(&mut entry.1)
+                };
+
+                if pending.is_empty() {
+                    continue;
+                }
+
+                work_done = true;
+                match node.node_type {
+                    WorkGraphNodeType::Broadcasting => {
+                        self.stats.broadcasting_launches += pending.len() as u64;
+                        self.stats.total_dispatches += pending.len() as u64;
+                        for rec in pending {
+                            for target in &node.output_nodes {
+                                let child = NodeRecord::new(NodeId(target.name_hash), rec.payload_slice(), rec.priority)?;
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                    WorkGraphNodeType::Coalescing => {
+                        let threshold = node.coalescing_overrides.map(|o| o.max_records_per_threadgroup).unwrap_or(4) as usize;
+                        let batches = (pending.len() + threshold - 1) / threshold.max(1);
+                        self.stats.coalescing_launches += batches as u64;
+                        self.stats.total_dispatches += batches as u64;
+                        for target in &node.output_nodes {
+                            for b in 0..batches {
+                                let mut payload = [0u8; MAX_NODE_RECORD_PAYLOAD_BYTES];
+                                payload[0] = (b + 1) as u8;
+                                let child = NodeRecord {
+                                    target_node: NodeId(target.name_hash),
+                                    payload_size: 16,
+                                    priority: 0,
+                                    flags: 0,
+                                    payload,
+                                };
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                    WorkGraphNodeType::Threadgroup => {
+                        self.stats.thread_launches += pending.len() as u64;
+                        self.stats.total_dispatches += pending.len() as u64;
+                        for rec in pending {
+                            for target in &node.output_nodes {
+                                let child = NodeRecord::new(NodeId(target.name_hash), rec.payload_slice(), rec.priority)?;
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !work_done {
+                break;
+            }
+        }
+
+        Ok(self.stats)
+    }
+
+    // Access scheduler execution statistics
+    #[inline]
+    pub fn stats(&self) -> &AutonomousSchedulerStats {
+        &self.stats
+    }
+
+    // Number of registered hardware queues
+    #[inline]
+    pub fn queue_count(&self) -> usize {
+        self.queue_descriptors.len()
+    }
+}
+
+// Comprehensive verification test suite for Direct3D 12 Work Graphs and Autonomous GPU Execution
+pub fn test_d3d12_work_graphs_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WORK-GRAPHS] Initializing Direct3D 12 Work Graphs & Autonomous GPU Execution self-test...\r\n");
+
+    // 1. Work Graph state object, program identifier, and memory requirements
+    let state_obj = D3D12_STATE_SUBOBJECT_WORK_GRAPH::new("AutonomousCullingGraph", D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_EXECUTION, 3, 1);
+    if state_obj.subobject_type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Subobject type mismatch\r\n");
+        return false;
+    }
+    if !state_obj.program_id.is_valid() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Program identifier is invalid\r\n");
+        return false;
+    }
+    if state_obj.memory_requirements.min_backing_memory_size_in_bytes == 0
+        || (state_obj.memory_requirements.min_backing_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0
+        || (state_obj.memory_requirements.scratch_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0
+    {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Memory requirements unaligned\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Work Graph state object, program identifier and memory requirements verified\r\n");
+
+    // 2. Broadcaster, Coalescing, and Thread node descriptors with input/output record layouts
+    let mut broadcaster = D3D12_NODE::broadcaster("CullBroadcaster", 0, [1u8; 32], [4, 1, 1], 16, 16);
+    let mut coalescer = D3D12_NODE::coalescing("BatchCoalescer", 1, [2u8; 32], 4, 16, 16);
+    let worker = D3D12_NODE::thread("DrawWorker", 2, [3u8; 32], [32, 1, 1], 16, 16);
+
+    if broadcaster.add_output_target(coalescer.node_id).is_err() {
+        return false;
+    }
+    if coalescer.add_output_target(worker.node_id).is_err() {
+        return false;
+    }
+
+    if broadcaster.validate().is_err() || coalescer.validate().is_err() || worker.validate().is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Node validation failed\r\n");
+        return false;
+    }
+
+    let invalid_broadcaster = D3D12_NODE::broadcaster("BadNode", 99, [0u8; 32], [0, 1, 1], 16, 16);
+    if invalid_broadcaster.validate() != Err(WorkGraphError::InvalidGridDimensions) {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Invalid broadcaster grid was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Broadcaster, Coalescing, and Thread node descriptors and record layouts verified\r\n");
+
+    // 3. Command list recording: SetProgram and DispatchGraph validation
+    let pool = match WorkGraphBackingMemoryPool::allocate(0x0000_8000_0000, 131072, &state_obj.memory_requirements) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Memory pool allocation failed\r\n");
+            return false;
+        }
+    };
+
+    let mut cmd_recorder = WorkGraphCommandRecorder::new();
+    let set_prog_desc = D3D12_SET_PROGRAM_DESC {
+        program_type: D3D12_PROGRAM_TYPE_WORK_GRAPH,
+        program_id: state_obj.program_id,
+        backing_memory: pool.backing_store,
+        scratch_memory: pool.scratch_memory,
+    };
+
+    // Test rejection of DispatchGraph before SetProgram
+    let unrecorded_dispatch = D3D12_DISPATCH_GRAPH_DESC {
+        mode: D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput,
+        node_id: broadcaster.node_id,
+        num_records: 1,
+        records: alloc::vec![NodeRecord::default()],
+    };
+    if cmd_recorder.dispatch_graph(&unrecorded_dispatch) != Err(WorkGraphError::NoProgramBound) {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Dispatch without SetProgram was not rejected\r\n");
+        return false;
+    }
+
+    if cmd_recorder.set_program(&set_prog_desc).is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] SetProgram recording failed\r\n");
+        return false;
+    }
+
+    let mut input_records = alloc::vec::Vec::new();
+    for i in 0..4 {
+        let rec = match NodeRecord::new(NodeId(broadcaster.node_id.name_hash), &[i as u8; 16], 1) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        input_records.push(rec);
+    }
+
+    let dispatch_desc = D3D12_DISPATCH_GRAPH_DESC {
+        mode: D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput,
+        node_id: broadcaster.node_id,
+        num_records: 4,
+        records: input_records.clone(),
+    };
+    if cmd_recorder.dispatch_graph(&dispatch_desc).is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] DispatchGraph recording failed\r\n");
+        return false;
+    }
+
+    if cmd_recorder.command_count() != 2 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Recorded command count mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command list SetProgram and DispatchGraph recording and parameter validation verified\r\n");
+
+    // 4. Backing store memory pool, scratch partitions, and autonomous queue scheduling
+    let mut autonomous_scheduler = AutonomousQueueScheduler::new();
+    if autonomous_scheduler.register_node(broadcaster.clone(), pool.backing_store.start_address).is_err()
+        || autonomous_scheduler.register_node(coalescer.clone(), pool.backing_store.start_address).is_err()
+        || autonomous_scheduler.register_node(worker.clone(), pool.backing_store.start_address).is_err()
+    {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Queue registration failed\r\n");
+        return false;
+    }
+
+    if autonomous_scheduler.queue_count() != 3 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Queue count mismatch\r\n");
+        return false;
+    }
+
+    for rec in input_records {
+        if autonomous_scheduler.enqueue_record(broadcaster.node_id, rec).is_err() {
+            return false;
+        }
+    }
+
+    let stats = match autonomous_scheduler.execute_autonomous_dispatch(16) {
+        Ok(s) => s,
+        Err(_) => {
+            crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Autonomous dispatch execution failed\r\n");
+            return false;
+        }
+    };
+
+    if stats.broadcasting_launches != 4 || stats.coalescing_launches < 1 || stats.thread_launches < 1 || stats.total_dispatches < 6 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Autonomous dispatch statistics mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Backing store memory pool, scratch partitions, and autonomous queue scheduling verified\r\n");
+
+    crate::serial_write_str("[KNT-GFX-WORK-GRAPHS-PASS] Direct3D 12 work graphs autonomous GPU execution engine verified\r\n");
+    true
 }
