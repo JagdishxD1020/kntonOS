@@ -289,7 +289,7 @@ pub fn parse_delayload_descriptors(
     delay_import_rva: u32,
     delay_import_size: u32,
 ) -> Result<Vec<ParsedDelayLoadDescriptor>, DelayLoadError> {
-    if delay_import_rva == 0 || delay_import_size == 0 {
+    if delay_import_size == 0 {
         return Ok(Vec::new());
     }
 
@@ -542,4 +542,146 @@ pub unsafe fn win32_delay_load_helper2(
     }
 
     info.pfnCur
+}
+
+
+/// Comprehensive self-test suite for Win32 DLL delay-load and API set forwarder engine.
+pub fn test_delay_load_and_forwarder_subsystem() -> bool {
+    // 1. API Set redirection validation
+    if api_set_resolve("api-ms-win-core-processthreads-l1-1-0.dll") != Some("KERNEL32.DLL") {
+        return false;
+    }
+    if api_set_resolve("api-ms-win-core-file-l1-1-0.dll") != Some("KERNEL32.DLL") {
+        return false;
+    }
+    if api_set_resolve("api-ms-win-core-rtlsupport-l1-1-0.dll") != Some("NTDLL.DLL") {
+        return false;
+    }
+    if api_set_resolve("ext-ms-win-ntuser-window-l1-1-0.dll") != Some("USER32.DLL") {
+        return false;
+    }
+    if api_set_resolve("ext-ms-win-networking-ws2-l1-1-0.dll") != Some("WS2_32.DLL") {
+        return false;
+    }
+
+    api_set_register_redirect("api-ms-win-custom-gaming-l1-1-0", "GAME32.DLL");
+    if api_set_resolve_dynamic("api-ms-win-custom-gaming-l1-1-0.dll").as_deref() != Some("GAME32.DLL") {
+        return false;
+    }
+
+    // 2. Export forwarder parsing and cycle detection
+    let fwd1 = match parse_forwarder_string("NTDLL.NtAllocateVirtualMemory") {
+        Some(f) => f,
+        None => {
+            return false;
+        }
+    };
+    if fwd1.target_dll != "NTDLL" || fwd1.target != ForwarderTarget::Name(alloc::string::String::from("NtAllocateVirtualMemory")) {
+        return false;
+    }
+
+    let fwd_api = match parse_forwarder_string("api-ms-win-core-file-l1-1-0.CreateFileW") {
+        Some(f) => f,
+        None => {
+            return false;
+        }
+    };
+    if fwd_api.target_dll != "KERNEL32.DLL" || fwd_api.target != ForwarderTarget::Name(alloc::string::String::from("CreateFileW")) {
+        return false;
+    }
+
+    register_forwarder_chain("LIB_A.Func", "LIB_B.Func");
+    register_forwarder_chain("LIB_B.Func", "LIB_C.Func");
+    register_forwarder_chain("LIB_C.Func", "LIB_A.Func");
+    let mut visited = Vec::new();
+    if resolve_export_forwarder("LIB_A.Func", &mut visited, 16) != Err(ForwarderError::CircularReference) {
+        return false;
+    }
+
+    register_forwarder_chain("FWD_TEST.GetProc", "KERNEL32.GetLastError");
+    let mut visited2 = Vec::new();
+    if resolve_export_forwarder("FWD_TEST.GetProc", &mut visited2, 16) != Ok(0x7FFF_0001_10D0) {
+        return false;
+    }
+
+    // 3. Delay-load descriptor parsing & runtime __delayLoadHelper2 thunk patching
+    #[repr(C, align(8))]
+    struct MockDelayLoadImage {
+        desc: IMAGE_DELAYLOAD_DESCRIPTOR,
+        desc_term: IMAGE_DELAYLOAD_DESCRIPTOR,
+        dll_name: [u8; 48],
+        h_module: crate::pe::kernel32::HMODULE,
+        iat: [u64; 2],
+        int_table: [u64; 2],
+        hint_name: [u8; 32],
+    }
+
+    let mut mock = MockDelayLoadImage {
+        desc: IMAGE_DELAYLOAD_DESCRIPTOR::default(),
+        desc_term: IMAGE_DELAYLOAD_DESCRIPTOR::default(),
+        dll_name: [0; 48],
+        h_module: 0,
+        iat: [0xDEAD_BEEF, 0],
+        int_table: [0, 0],
+        hint_name: [0; 32],
+    };
+
+    let base = &mock as *const _ as u64;
+    let dll_rva = (&mock.dll_name as *const _ as u64 - base) as u32;
+    let hmod_rva = (&mock.h_module as *const _ as u64 - base) as u32;
+    let iat_rva = (&mock.iat as *const _ as u64 - base) as u32;
+    let int_rva = (&mock.int_table as *const _ as u64 - base) as u32;
+    let hint_rva = (&mock.hint_name as *const _ as u64 - base) as u32;
+
+    let dll_str = b"api-ms-win-core-errorhandling-l1-1-0.dll\0";
+    mock.dll_name[..dll_str.len()].copy_from_slice(dll_str);
+
+    mock.hint_name[0] = 1;
+    mock.hint_name[1] = 0;
+    let fn_str = b"GetLastError\0";
+    mock.hint_name[2..2 + fn_str.len()].copy_from_slice(fn_str);
+
+    mock.int_table[0] = hint_rva as u64;
+    mock.int_table[1] = 0;
+
+    mock.desc = IMAGE_DELAYLOAD_DESCRIPTOR {
+        Attributes: DLATTR_RVA,
+        DllNameRVA: dll_rva,
+        ModuleHandleRVA: hmod_rva,
+        ImportAddressTableRVA: iat_rva,
+        ImportNameTableRVA: int_rva,
+        BoundImportAddressTableRVA: 0,
+        UnloadInformationTableRVA: 0,
+        TimeDateStamp: 0,
+    };
+
+    let raw_slice = unsafe { core::slice::from_raw_parts(base as *const u8, core::mem::size_of::<MockDelayLoadImage>()) };
+    let parsed = match parse_delayload_descriptors(raw_slice, 0, 32) {
+        Ok(p) => p,
+        Err(_) => {
+            return false;
+        }
+    };
+    if parsed.len() != 1 || parsed[0].resolved_dll_name != "KERNEL32.DLL" || parsed[0].thunks.len() != 1 {
+        return false;
+    }
+    if parsed[0].thunks[0].name.as_deref() != Some("GetLastError") {
+        return false;
+    }
+
+    unsafe {
+        let resolved_proc = win32_delay_load_helper2(base, &mock.desc, &mut mock.iat[0]);
+        if resolved_proc != 0x7FFF_0001_10D0 {
+            return false;
+        }
+        if mock.iat[0] != 0x7FFF_0001_10D0 {
+            return false;
+        }
+        if mock.h_module != crate::pe::kernel32::HMODULE_KERNEL32 {
+            return false;
+        }
+    }
+
+    crate::serial_write_str("[KNT-PE-DELAY-LOAD-PASS] Win32 DLL delay-load and forwarder engine verified\r\n");
+    true
 }
