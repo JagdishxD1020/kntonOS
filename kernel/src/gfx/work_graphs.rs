@@ -1177,3 +1177,195 @@ impl WorkGraphCommandRecorder {
         self.active_program = None;
     }
 }
+
+// Unified memory pool managing backing store and scratch memory partitions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkGraphBackingMemoryPool {
+    pub base_address: u64,
+    pub total_size: u64,
+    pub backing_store: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    pub scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+}
+
+impl WorkGraphBackingMemoryPool {
+    // Partition memory pool into backing store and scratch memory with 256-byte alignment
+    pub fn allocate(base_address: u64, total_size: u64, reqs: &D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS) -> Result<Self, WorkGraphError> {
+        if (base_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_address));
+        }
+        let needed = reqs.min_backing_memory_size_in_bytes + reqs.scratch_memory_size_in_bytes;
+        if total_size < needed {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: needed,
+                provided: total_size,
+            });
+        }
+
+        let backing_size = reqs.min_backing_memory_size_in_bytes;
+        let scratch_start = (base_address + backing_size + 255) & !255;
+        let scratch_size = total_size.saturating_sub(scratch_start.saturating_sub(base_address));
+
+        Ok(Self {
+            base_address,
+            total_size,
+            backing_store: D3D12_GPU_VIRTUAL_ADDRESS_RANGE::new(base_address, backing_size),
+            scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE::new(scratch_start, scratch_size),
+        })
+    }
+}
+
+// Autonomous queue scheduling descriptor for hardware work queue dispatch
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR {
+    pub queue_id: u32,
+    pub target_node: D3D12_NODE_ID,
+    pub ring_virtual_address: u64,
+    pub ring_capacity: u32,
+    pub head_index: u32,
+    pub tail_index: u32,
+    pub is_active: bool,
+}
+
+// Execution statistics for autonomous queue scheduler
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutonomousSchedulerStats {
+    pub total_dispatches: u64,
+    pub records_routed: u64,
+    pub broadcasting_launches: u64,
+    pub coalescing_launches: u64,
+    pub thread_launches: u64,
+}
+
+// Autonomous GPU queue scheduler managing hardware node queues and record flow
+#[derive(Debug)]
+pub struct AutonomousQueueScheduler {
+    nodes: Vec<D3D12_NODE>,
+    queue_descriptors: Vec<D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR>,
+    node_records: Vec<(D3D12_NODE_ID, Vec<NodeRecord>)>,
+    stats: AutonomousSchedulerStats,
+}
+
+impl AutonomousQueueScheduler {
+    // Construct new autonomous queue scheduler
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            queue_descriptors: Vec::new(),
+            node_records: Vec::new(),
+            stats: AutonomousSchedulerStats::default(),
+        }
+    }
+
+    // Register node and configure its autonomous queue descriptor
+    pub fn register_node(&mut self, node: D3D12_NODE, base_gpu_va: u64) -> Result<(), WorkGraphError> {
+        node.validate()?;
+        let queue_id = self.queue_descriptors.len() as u32;
+        let ring_va = base_gpu_va + (queue_id as u64 * 4096);
+        let q_desc = D3D12_AUTONOMOUS_QUEUE_DESCRIPTOR {
+            queue_id,
+            target_node: node.node_id,
+            ring_virtual_address: ring_va,
+            ring_capacity: 64,
+            head_index: 0,
+            tail_index: 0,
+            is_active: true,
+        };
+        self.node_records.push((node.node_id, Vec::new()));
+        self.queue_descriptors.push(q_desc);
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    // Enqueue record to destination node queue
+    pub fn enqueue_record(&mut self, target: D3D12_NODE_ID, record: NodeRecord) -> Result<(), WorkGraphError> {
+        if let Some((_, list)) = self.node_records.iter_mut().find(|(id, _)| *id == target) {
+            list.push(record);
+            self.stats.records_routed += 1;
+            Ok(())
+        } else {
+            Err(WorkGraphError::NodeNotFound(target.name_hash))
+        }
+    }
+
+    // Execute autonomous dispatch loop across all active queues
+    pub fn execute_autonomous_dispatch(&mut self, max_iterations: u32) -> Result<AutonomousSchedulerStats, WorkGraphError> {
+        for _ in 0..max_iterations {
+            let mut work_done = false;
+
+            for i in 0..self.nodes.len() {
+                let node = self.nodes[i].clone();
+                let pending: Vec<NodeRecord> = {
+                    let entry = &mut self.node_records[i];
+                    core::mem::take(&mut entry.1)
+                };
+
+                if pending.is_empty() {
+                    continue;
+                }
+
+                work_done = true;
+                match node.node_type {
+                    WorkGraphNodeType::Broadcasting => {
+                        self.stats.broadcasting_launches += pending.len() as u64;
+                        self.stats.total_dispatches += pending.len() as u64;
+                        for rec in pending {
+                            for target in &node.output_nodes {
+                                let child = NodeRecord::new(NodeId(target.name_hash), rec.payload_slice(), rec.priority)?;
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                    WorkGraphNodeType::Coalescing => {
+                        let threshold = node.coalescing_overrides.map(|o| o.max_records_per_threadgroup).unwrap_or(4) as usize;
+                        let batches = (pending.len() + threshold - 1) / threshold.max(1);
+                        self.stats.coalescing_launches += batches as u64;
+                        self.stats.total_dispatches += batches as u64;
+                        for target in &node.output_nodes {
+                            for b in 0..batches {
+                                let mut payload = [0u8; MAX_NODE_RECORD_PAYLOAD_BYTES];
+                                payload[0] = (b + 1) as u8;
+                                let child = NodeRecord {
+                                    target_node: NodeId(target.name_hash),
+                                    payload_size: 16,
+                                    priority: 0,
+                                    flags: 0,
+                                    payload,
+                                };
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                    WorkGraphNodeType::Threadgroup => {
+                        self.stats.thread_launches += pending.len() as u64;
+                        self.stats.total_dispatches += pending.len() as u64;
+                        for rec in pending {
+                            for target in &node.output_nodes {
+                                let child = NodeRecord::new(NodeId(target.name_hash), rec.payload_slice(), rec.priority)?;
+                                self.enqueue_record(*target, child)?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !work_done {
+                break;
+            }
+        }
+
+        Ok(self.stats)
+    }
+
+    // Access scheduler execution statistics
+    #[inline]
+    pub fn stats(&self) -> &AutonomousSchedulerStats {
+        &self.stats
+    }
+
+    // Number of registered hardware queues
+    #[inline]
+    pub fn queue_count(&self) -> usize {
+        self.queue_descriptors.len()
+    }
+}
