@@ -41,6 +41,9 @@ pub enum WorkGraphError {
     RecordRingEmpty,
     /// Invalid threadgroup or dispatch grid dimensions.
     InvalidGridDimensions,
+    NoProgramBound,
+    InvalidProgramIdentifier,
+    InvalidDispatchMode,
 }
 
 /// Direct3D 12 Work Graph node execution and scheduling types.
@@ -1048,5 +1051,129 @@ impl D3D12_NODE {
             }
         }
         Ok(())
+    }
+}
+
+// Program type enumeration for SetProgram command
+pub const D3D12_PROGRAM_TYPE_GENERIC_PIPELINE: u32 = 1;
+pub const D3D12_PROGRAM_TYPE_WORK_GRAPH: u32 = 2;
+
+// Dispatch graph mode enumeration
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_DISPATCH_GRAPH_MODE {
+    NodeCPUInput,
+    NodeGPUInput,
+    MultiNodeCPUInput,
+}
+
+use crate::gfx::dispatch_rays::D3D12_GPU_VIRTUAL_ADDRESS_RANGE;
+
+// Parameter descriptor for SetProgram command list recording
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SET_PROGRAM_DESC {
+    pub program_type: u32,
+    pub program_id: D3D12_PROGRAM_IDENTIFIER,
+    pub backing_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    pub scratch_memory: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+}
+
+// Parameter descriptor for DispatchGraph command list recording
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DISPATCH_GRAPH_DESC {
+    pub mode: D3D12_DISPATCH_GRAPH_MODE,
+    pub node_id: D3D12_NODE_ID,
+    pub num_records: u32,
+    pub records: Vec<NodeRecord>,
+}
+
+// Command stream token for Work Graph operations
+#[derive(Debug, Clone)]
+pub enum WorkGraphCommand {
+    SetProgram(D3D12_SET_PROGRAM_DESC),
+    DispatchGraph(D3D12_DISPATCH_GRAPH_DESC),
+}
+
+// Command list recorder for Direct3D 12 Work Graphs
+#[derive(Debug, Default)]
+pub struct WorkGraphCommandRecorder {
+    commands: Vec<WorkGraphCommand>,
+    active_program: Option<D3D12_PROGRAM_IDENTIFIER>,
+}
+
+impl WorkGraphCommandRecorder {
+    // Construct new empty command recorder
+    pub fn new() -> Self {
+        Self {
+            commands: Vec::new(),
+            active_program: None,
+        }
+    }
+
+    // Record SetProgram command into command stream with validation
+    pub fn set_program(&mut self, desc: &D3D12_SET_PROGRAM_DESC) -> Result<(), WorkGraphError> {
+        if !desc.program_id.is_valid() {
+            return Err(WorkGraphError::InvalidProgramIdentifier);
+        }
+        if (desc.backing_memory.start_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(desc.backing_memory.start_address));
+        }
+        if desc.backing_memory.size_in_bytes == 0 || (desc.backing_memory.size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT,
+                provided: desc.backing_memory.size_in_bytes,
+            });
+        }
+        if desc.scratch_memory.start_address != 0 && (desc.scratch_memory.start_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(desc.scratch_memory.start_address));
+        }
+
+        self.active_program = Some(desc.program_id);
+        self.commands.push(WorkGraphCommand::SetProgram(desc.clone()));
+        Ok(())
+    }
+
+    // Record DispatchGraph command into command stream with validation
+    pub fn dispatch_graph(&mut self, desc: &D3D12_DISPATCH_GRAPH_DESC) -> Result<(), WorkGraphError> {
+        if self.active_program.is_none() {
+            return Err(WorkGraphError::NoProgramBound);
+        }
+        if desc.mode == D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput && desc.num_records == 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        for rec in &desc.records {
+            if rec.payload_size as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+                return Err(WorkGraphError::PayloadSizeTooLarge(rec.payload_size as usize));
+            }
+        }
+
+        self.commands.push(WorkGraphCommand::DispatchGraph(desc.clone()));
+        Ok(())
+    }
+
+    // Slice of recorded commands in submission order
+    #[inline]
+    pub fn commands(&self) -> &[WorkGraphCommand] {
+        &self.commands
+    }
+
+    // Number of recorded commands
+    #[inline]
+    pub fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    // Currently bound program identifier
+    #[inline]
+    pub fn active_program(&self) -> Option<D3D12_PROGRAM_IDENTIFIER> {
+        self.active_program
+    }
+
+    // Reset command recorder state
+    pub fn reset(&mut self) {
+        self.commands.clear();
+        self.active_program = None;
     }
 }
