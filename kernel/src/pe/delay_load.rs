@@ -1,4 +1,4 @@
-#![allow(non_snake_case, non_camel_case_types)]
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 //! Win32 DLL Delay-Load & API Set Forwarder Engine.
 
@@ -375,4 +375,171 @@ pub fn parse_delayload_descriptors(
     }
 
     Ok(descriptors)
+}
+
+
+pub const dliNoteStart: u32 = 0;
+pub const dliNotePreLoadLibrary: u32 = 1;
+pub const dliNotePreGetProcAddress: u32 = 2;
+pub const dliFailLoadLib: u32 = 3;
+pub const dliFailGetProc: u32 = 4;
+pub const dliNoteEnd: u32 = 5;
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct DelayLoadInfo {
+    pub cb: u32,
+    pub pidd: *const IMAGE_DELAYLOAD_DESCRIPTOR,
+    pub ppfn: *mut u64,
+    pub szDll: *const u8,
+    pub dliNotify: u32,
+    pub hmodCur: crate::pe::kernel32::HMODULE,
+    pub pfnCur: usize,
+    pub dwLastError: u32,
+}
+
+pub type PfnDliHook = fn(dliNotify: u32, pdli: &DelayLoadInfo) -> usize;
+
+static DLI_HOOK: Spinlock<Option<PfnDliHook>> = Spinlock::new(None);
+
+/// Registers a global hook for delay-load notifications and error overrides.
+pub fn win32_set_delay_load_hook(hook: Option<PfnDliHook>) {
+    let mut h = DLI_HOOK.lock();
+    *h = hook;
+}
+
+/// Emulates MSVC __delayLoadHelper2 dynamically resolving imports and patching thunks.
+pub unsafe fn win32_delay_load_helper2(
+    image_base: u64,
+    p_desc: *const IMAGE_DELAYLOAD_DESCRIPTOR,
+    p_iat_entry: *mut u64,
+) -> usize {
+    if p_desc.is_null() || p_iat_entry.is_null() {
+        return 0;
+    }
+
+    let desc = *p_desc;
+    if desc.DllNameRVA == 0 {
+        return 0;
+    }
+
+    let dll_ptr = (image_base + desc.DllNameRVA as u64) as *const u8;
+    let mut dll_len = 0;
+    while *dll_ptr.add(dll_len) != 0 {
+        dll_len += 1;
+    }
+    let dll_slice = core::slice::from_raw_parts(dll_ptr, dll_len);
+    let dll_name = match core::str::from_utf8(dll_slice) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let resolved_dll = api_set_resolve_dynamic(dll_name).unwrap_or_else(|| String::from(dll_name));
+
+    let mut info = DelayLoadInfo {
+        cb: core::mem::size_of::<DelayLoadInfo>() as u32,
+        pidd: p_desc,
+        ppfn: p_iat_entry,
+        szDll: dll_ptr,
+        dliNotify: dliNotePreLoadLibrary,
+        hmodCur: 0,
+        pfnCur: 0,
+        dwLastError: 0,
+    };
+
+    let hook = *DLI_HOOK.lock();
+    if let Some(h) = hook {
+        let override_mod = h(dliNotePreLoadLibrary, &info);
+        if override_mod != 0 {
+            info.hmodCur = override_mod;
+        }
+    }
+
+    if info.hmodCur == 0 {
+        let mut target_mod = resolved_dll.clone();
+        if !target_mod.to_ascii_lowercase().ends_with(".dll") {
+            target_mod.push_str(".dll");
+        }
+        info.hmodCur = crate::pe::kernel32::win32_load_library(&target_mod);
+        if info.hmodCur == crate::pe::kernel32::HMODULE_INVALID {
+            info.dliNotify = dliFailLoadLib;
+            if let Some(h) = hook {
+                let fail_override = h(dliFailLoadLib, &info);
+                if fail_override != 0 {
+                    info.hmodCur = fail_override;
+                } else {
+                    return 0;
+                }
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    if desc.ModuleHandleRVA != 0 {
+        let hmod_slot = (image_base + desc.ModuleHandleRVA as u64) as *mut crate::pe::kernel32::HMODULE;
+        *hmod_slot = info.hmodCur;
+    }
+
+    let iat_start = image_base + desc.ImportAddressTableRVA as u64;
+    let iat_idx = ((p_iat_entry as u64).saturating_sub(iat_start)) / 8;
+
+    let int_slot = (image_base + desc.ImportNameTableRVA as u64 + iat_idx * 8) as *const u64;
+    let int_entry = *int_slot;
+
+    let mut sym_buf = [0u8; 128];
+    let sym_name = if int_entry & 0x8000_0000_0000_0000 != 0 {
+        "TlsAlloc"
+    } else {
+        let hint_ptr = (image_base + int_entry) as *const u8;
+        let str_ptr = hint_ptr.add(2);
+        let mut len = 0;
+        while *str_ptr.add(len) != 0 && len < 127 {
+            sym_buf[len] = *str_ptr.add(len);
+            len += 1;
+        }
+        core::str::from_utf8(&sym_buf[..len]).unwrap_or("")
+    };
+
+    info.dliNotify = dliNotePreGetProcAddress;
+    if let Some(h) = hook {
+        let proc_override = h(dliNotePreGetProcAddress, &info);
+        if proc_override != 0 {
+            info.pfnCur = proc_override;
+        }
+    }
+
+    if info.pfnCur == 0 {
+        info.pfnCur = crate::pe::kernel32::win32_get_proc_address(info.hmodCur, sym_name);
+        if info.pfnCur == 0 {
+            let forwarder_str = alloc::format!("{}.{}", resolved_dll, sym_name);
+            let mut visited = Vec::new();
+            if let Ok(forwarded) = resolve_export_forwarder(&forwarder_str, &mut visited, 16) {
+                info.pfnCur = forwarded;
+            }
+        }
+    }
+
+    if info.pfnCur == 0 {
+        info.dliNotify = dliFailGetProc;
+        if let Some(h) = hook {
+            let fail_override = h(dliFailGetProc, &info);
+            if fail_override != 0 {
+                info.pfnCur = fail_override;
+            } else {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+
+    *p_iat_entry = info.pfnCur as u64;
+
+    info.dliNotify = dliNoteEnd;
+    if let Some(h) = hook {
+        h(dliNoteEnd, &info);
+    }
+
+    info.pfnCur
 }
