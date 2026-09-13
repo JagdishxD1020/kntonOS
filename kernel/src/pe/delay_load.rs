@@ -1,3 +1,5 @@
+#![allow(non_snake_case, non_camel_case_types)]
+
 //! Win32 DLL Delay-Load & API Set Forwarder Engine.
 
 use alloc::collections::BTreeMap;
@@ -218,4 +220,159 @@ pub fn resolve_export_forwarder(
             }
         }
     }
+}
+
+
+pub const DLATTR_RVA: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IMAGE_DELAYLOAD_DESCRIPTOR {
+    pub Attributes: u32,
+    pub DllNameRVA: u32,
+    pub ModuleHandleRVA: u32,
+    pub ImportAddressTableRVA: u32,
+    pub ImportNameTableRVA: u32,
+    pub BoundImportAddressTableRVA: u32,
+    pub UnloadInformationTableRVA: u32,
+    pub TimeDateStamp: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelayImportThunk {
+    pub name: Option<String>,
+    pub ordinal: Option<u16>,
+    pub hint: u16,
+    pub iat_rva: u32,
+    pub int_rva: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDelayLoadDescriptor {
+    pub dll_name: String,
+    pub resolved_dll_name: String,
+    pub attributes: u32,
+    pub module_handle_rva: u32,
+    pub iat_rva: u32,
+    pub int_rva: u32,
+    pub bound_iat_rva: u32,
+    pub unload_info_rva: u32,
+    pub thunks: Vec<DelayImportThunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelayLoadError {
+    InvalidDescriptor,
+    InvalidRva,
+    OutOfBounds,
+    StringParseError,
+}
+
+/// Helper function to read a null-terminated ASCII string from a slice at a given offset.
+fn read_null_terminated_ascii(data: &[u8], offset: usize) -> Result<String, DelayLoadError> {
+    if offset >= data.len() {
+        return Err(DelayLoadError::OutOfBounds);
+    }
+    let mut end = offset;
+    while end < data.len() && data[end] != 0 {
+        end += 1;
+    }
+    let slice = &data[offset..end];
+    core::str::from_utf8(slice)
+        .map(String::from)
+        .map_err(|_| DelayLoadError::StringParseError)
+}
+
+/// Parses an array of delay-load import descriptors from in-memory PE buffer.
+pub fn parse_delayload_descriptors(
+    image: &[u8],
+    delay_import_rva: u32,
+    delay_import_size: u32,
+) -> Result<Vec<ParsedDelayLoadDescriptor>, DelayLoadError> {
+    if delay_import_rva == 0 || delay_import_size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut descriptors = Vec::new();
+    let desc_size = core::mem::size_of::<IMAGE_DELAYLOAD_DESCRIPTOR>();
+    let start_offset = delay_import_rva as usize;
+
+    if start_offset + desc_size > image.len() {
+        return Err(DelayLoadError::OutOfBounds);
+    }
+
+    let mut current_offset = start_offset;
+    loop {
+        if current_offset + desc_size > image.len() {
+            break;
+        }
+
+        let desc = unsafe {
+            core::ptr::read_unaligned(image.as_ptr().add(current_offset) as *const IMAGE_DELAYLOAD_DESCRIPTOR)
+        };
+
+        if desc.DllNameRVA == 0 {
+            break;
+        }
+
+        let dll_name = read_null_terminated_ascii(image, desc.DllNameRVA as usize)?;
+        let resolved_dll_name = api_set_resolve_dynamic(&dll_name).unwrap_or_else(|| dll_name.clone());
+
+        let mut thunks = Vec::new();
+        if desc.ImportNameTableRVA != 0 {
+            let mut int_offset = desc.ImportNameTableRVA as usize;
+            let mut iat_offset = desc.ImportAddressTableRVA as usize;
+
+            while int_offset + 8 <= image.len() {
+                let entry = unsafe {
+                    core::ptr::read_unaligned(image.as_ptr().add(int_offset) as *const u64)
+                };
+                if entry == 0 {
+                    break;
+                }
+
+                let (name, ordinal, hint) = if entry & 0x8000_0000_0000_0000 != 0 {
+                    (None, Some((entry & 0xFFFF) as u16), 0)
+                } else {
+                    let hint_rva = entry as usize;
+                    if hint_rva + 2 <= image.len() {
+                        let hint = unsafe {
+                            core::ptr::read_unaligned(image.as_ptr().add(hint_rva) as *const u16)
+                        };
+                        let sym_name = read_null_terminated_ascii(image, hint_rva + 2).ok();
+                        (sym_name, None, hint)
+                    } else {
+                        (None, None, 0)
+                    }
+                };
+
+                thunks.push(DelayImportThunk {
+                    name,
+                    ordinal,
+                    hint,
+                    iat_rva: iat_offset as u32,
+                    int_rva: int_offset as u32,
+                });
+
+                int_offset += 8;
+                iat_offset += 8;
+            }
+        }
+
+        descriptors.push(ParsedDelayLoadDescriptor {
+            dll_name,
+            resolved_dll_name,
+            attributes: desc.Attributes,
+            module_handle_rva: desc.ModuleHandleRVA,
+            iat_rva: desc.ImportAddressTableRVA,
+            int_rva: desc.ImportNameTableRVA,
+            bound_iat_rva: desc.BoundImportAddressTableRVA,
+            unload_info_rva: desc.UnloadInformationTableRVA,
+            thunks,
+        });
+
+        current_offset += desc_size;
+    }
+
+    Ok(descriptors)
 }
