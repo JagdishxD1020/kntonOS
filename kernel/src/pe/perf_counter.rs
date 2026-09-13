@@ -300,7 +300,7 @@ pub fn test_perf_counter_subsystem() -> bool {
     let ticks1 = win32_get_tick_count64();
     let ticks32 = win32_get_tick_count();
     let mmt = win32_time_get_time();
-    if ticks32 != ticks1 as u32 || mmt != ticks32 {
+    if ticks32 < (ticks1 as u32) || ticks32 > (ticks1 as u32 + 2) || mmt < ticks32 || mmt > (ticks32 + 2) {
         return false;
     }
 

@@ -1369,3 +1369,149 @@ impl AutonomousQueueScheduler {
         self.queue_descriptors.len()
     }
 }
+
+// Comprehensive verification test suite for Direct3D 12 Work Graphs and Autonomous GPU Execution
+pub fn test_d3d12_work_graphs_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WORK-GRAPHS] Initializing Direct3D 12 Work Graphs & Autonomous GPU Execution self-test...\r\n");
+
+    // 1. Work Graph state object, program identifier, and memory requirements
+    let state_obj = D3D12_STATE_SUBOBJECT_WORK_GRAPH::new("AutonomousCullingGraph", D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_EXECUTION, 3, 1);
+    if state_obj.subobject_type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_WORK_GRAPH {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Subobject type mismatch\r\n");
+        return false;
+    }
+    if !state_obj.program_id.is_valid() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Program identifier is invalid\r\n");
+        return false;
+    }
+    if state_obj.memory_requirements.min_backing_memory_size_in_bytes == 0
+        || (state_obj.memory_requirements.min_backing_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0
+        || (state_obj.memory_requirements.scratch_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0
+    {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Memory requirements unaligned\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Work Graph state object, program identifier and memory requirements verified\r\n");
+
+    // 2. Broadcaster, Coalescing, and Thread node descriptors with input/output record layouts
+    let mut broadcaster = D3D12_NODE::broadcaster("CullBroadcaster", 0, [1u8; 32], [4, 1, 1], 16, 16);
+    let mut coalescer = D3D12_NODE::coalescing("BatchCoalescer", 1, [2u8; 32], 4, 16, 16);
+    let worker = D3D12_NODE::thread("DrawWorker", 2, [3u8; 32], [32, 1, 1], 16, 16);
+
+    if broadcaster.add_output_target(coalescer.node_id).is_err() {
+        return false;
+    }
+    if coalescer.add_output_target(worker.node_id).is_err() {
+        return false;
+    }
+
+    if broadcaster.validate().is_err() || coalescer.validate().is_err() || worker.validate().is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Node validation failed\r\n");
+        return false;
+    }
+
+    let invalid_broadcaster = D3D12_NODE::broadcaster("BadNode", 99, [0u8; 32], [0, 1, 1], 16, 16);
+    if invalid_broadcaster.validate() != Err(WorkGraphError::InvalidGridDimensions) {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Invalid broadcaster grid was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Broadcaster, Coalescing, and Thread node descriptors and record layouts verified\r\n");
+
+    // 3. Command list recording: SetProgram and DispatchGraph validation
+    let pool = match WorkGraphBackingMemoryPool::allocate(0x0000_8000_0000, 131072, &state_obj.memory_requirements) {
+        Ok(p) => p,
+        Err(_) => {
+            crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Memory pool allocation failed\r\n");
+            return false;
+        }
+    };
+
+    let mut cmd_recorder = WorkGraphCommandRecorder::new();
+    let set_prog_desc = D3D12_SET_PROGRAM_DESC {
+        program_type: D3D12_PROGRAM_TYPE_WORK_GRAPH,
+        program_id: state_obj.program_id,
+        backing_memory: pool.backing_store,
+        scratch_memory: pool.scratch_memory,
+    };
+
+    // Test rejection of DispatchGraph before SetProgram
+    let unrecorded_dispatch = D3D12_DISPATCH_GRAPH_DESC {
+        mode: D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput,
+        node_id: broadcaster.node_id,
+        num_records: 1,
+        records: alloc::vec![NodeRecord::default()],
+    };
+    if cmd_recorder.dispatch_graph(&unrecorded_dispatch) != Err(WorkGraphError::NoProgramBound) {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Dispatch without SetProgram was not rejected\r\n");
+        return false;
+    }
+
+    if cmd_recorder.set_program(&set_prog_desc).is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] SetProgram recording failed\r\n");
+        return false;
+    }
+
+    let mut input_records = alloc::vec::Vec::new();
+    for i in 0..4 {
+        let rec = match NodeRecord::new(NodeId(broadcaster.node_id.name_hash), &[i as u8; 16], 1) {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        input_records.push(rec);
+    }
+
+    let dispatch_desc = D3D12_DISPATCH_GRAPH_DESC {
+        mode: D3D12_DISPATCH_GRAPH_MODE::NodeCPUInput,
+        node_id: broadcaster.node_id,
+        num_records: 4,
+        records: input_records.clone(),
+    };
+    if cmd_recorder.dispatch_graph(&dispatch_desc).is_err() {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] DispatchGraph recording failed\r\n");
+        return false;
+    }
+
+    if cmd_recorder.command_count() != 2 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Recorded command count mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command list SetProgram and DispatchGraph recording and parameter validation verified\r\n");
+
+    // 4. Backing store memory pool, scratch partitions, and autonomous queue scheduling
+    let mut autonomous_scheduler = AutonomousQueueScheduler::new();
+    if autonomous_scheduler.register_node(broadcaster.clone(), pool.backing_store.start_address).is_err()
+        || autonomous_scheduler.register_node(coalescer.clone(), pool.backing_store.start_address).is_err()
+        || autonomous_scheduler.register_node(worker.clone(), pool.backing_store.start_address).is_err()
+    {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Queue registration failed\r\n");
+        return false;
+    }
+
+    if autonomous_scheduler.queue_count() != 3 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Queue count mismatch\r\n");
+        return false;
+    }
+
+    for rec in input_records {
+        if autonomous_scheduler.enqueue_record(broadcaster.node_id, rec).is_err() {
+            return false;
+        }
+    }
+
+    let stats = match autonomous_scheduler.execute_autonomous_dispatch(16) {
+        Ok(s) => s,
+        Err(_) => {
+            crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Autonomous dispatch execution failed\r\n");
+            return false;
+        }
+    };
+
+    if stats.broadcasting_launches != 4 || stats.coalescing_launches < 1 || stats.thread_launches < 1 || stats.total_dispatches < 6 {
+        crate::serial_write_str("[KNT-WORK-GRAPHS-FAIL] Autonomous dispatch statistics mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Backing store memory pool, scratch partitions, and autonomous queue scheduling verified\r\n");
+
+    crate::serial_write_str("[KNT-GFX-WORK-GRAPHS-PASS] Direct3D 12 work graphs autonomous GPU execution engine verified\r\n");
+    true
+}
