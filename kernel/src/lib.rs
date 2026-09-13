@@ -661,6 +661,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::power::test_dual_battery_balance_subsystem() {
         serial_write_str("[KNT-PANIC] Dual-battery balance manager and USB-PD 3.1 EPR engine self-test failed!\r\n");
     }
+    // Initialize and verify Handheld Battery Gauge Fuel Coulomb Counter & Dynamic Charge Limiter Service (TASK-KNT-172)
+    if !drivers::power::test_battery_gauge_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld battery fuel gauge and dynamic charge limiter self-test failed!\r\n");
+    }
+
 
     // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
     if !drivers::power::test_thermal_governor_subsystem() {
