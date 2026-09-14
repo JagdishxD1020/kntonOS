@@ -164,3 +164,90 @@ pub fn verify_acoustic_noise_estimator() -> bool {
 
     true
 }
+
+/// Transient thermal spike damper and PID filter.
+/// Prevents sudden high-pitch fan spin-ups during short (<3s) shader compilation bursts.
+#[derive(Debug, Clone, Copy)]
+pub struct ThermalSpikeDamper {
+    pub burst_filter_window_ms: u32,
+    pub accumulated_heat_energy: i32,
+    pub target_temp_c: i16,
+    pub filtered_temp_c: i16,
+    pub kp_q8: i32, // Proportional gain
+    pub ki_q8: i32, // Integral gain
+    pub kd_q8: i32, // Derivative gain
+    pub integral_error: i32,
+    pub last_error: i32,
+    pub damped_fan_rpm: u16,
+}
+
+impl ThermalSpikeDamper {
+    /// Creates a new thermal spike damper with 3000ms low-pass thermal inertia window.
+    pub const fn new() -> Self {
+        Self {
+            burst_filter_window_ms: 3000,
+            accumulated_heat_energy: 0,
+            target_temp_c: 70, // 70°C target steady-state temperature
+            filtered_temp_c: 45,
+            kp_q8: 256, // 1.0
+            ki_q8: 32,  // 0.125
+            kd_q8: 64,  // 0.25
+            integral_error: 0,
+            last_error: 0,
+            damped_fan_rpm: 0,
+        }
+    }
+
+    /// Evaluates raw instantaneous APU temperature and applies PID thermal inertia damping.
+    /// Returns the filtered and damped fan RPM recommendation bounded by max_rpm_limit.
+    pub fn step_damping(&mut self, raw_temp_c: i16, delta_ms: u32, max_rpm_limit: u16) -> u16 {
+        // First order exponential moving average for temperature (thermal capacity inertia)
+        // alpha ~ delta_ms / burst_filter_window_ms
+        let alpha_q8 = ((delta_ms as i32 * 256) / self.burst_filter_window_ms as i32).min(256);
+        let temp_diff = raw_temp_c as i32 - self.filtered_temp_c as i32;
+        self.filtered_temp_c += ((temp_diff * alpha_q8) / 256) as i16;
+
+        // PID calculation against target_temp_c
+        let error = self.filtered_temp_c as i32 - self.target_temp_c as i32;
+        self.integral_error = (self.integral_error + error).clamp(-1000, 1000);
+        let derivative = error - self.last_error;
+        self.last_error = error;
+
+        // Only increase RPM if above target temp or experiencing prolonged load
+        if error > 0 {
+            let p_term = (error * self.kp_q8) / 256;
+            let i_term = (self.integral_error * self.ki_q8) / 256;
+            let d_term = (derivative * self.kd_q8) / 256;
+            let rpm_add = (p_term + i_term + d_term) * 50; // 50 RPM per °C error
+            let target_rpm = (1200 + rpm_add).max(0) as u16;
+            self.damped_fan_rpm = target_rpm.min(max_rpm_limit);
+        } else {
+            // Under target temperature: maintain low or silent RPM
+            self.damped_fan_rpm = self.damped_fan_rpm.saturating_sub(50);
+        }
+
+        self.damped_fan_rpm
+    }
+}
+
+/// Unit verification for transient thermal spike damper.
+pub fn verify_thermal_spike_damper() -> bool {
+    let mut damper = ThermalSpikeDamper::new();
+    damper.filtered_temp_c = 45;
+
+    // Simulate 500ms sudden temperature spike to 85°C (shader compile burst)
+    let rpm_after_spike = damper.step_damping(85, 500, 1800);
+    // Thermal inertia prevents jumping straight to 1800 RPM immediately
+    if rpm_after_spike > 1400 {
+        return false;
+    }
+
+    // Steady state below target 70°C (e.g. 60°C): fan remains quiet
+    damper.filtered_temp_c = 60;
+    let rpm_quiet = damper.step_damping(60, 1000, 1800);
+    if rpm_quiet > 500 {
+        return false;
+    }
+
+    true
+}
