@@ -389,3 +389,250 @@ impl D3D12_COMMAND_SIGNATURE {
         Self::create(desc, None)
     }
 }
+
+// Parsed concrete value of an individual indirect argument
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_PARSED_INDIRECT_ARGUMENT {
+    Draw(D3D12_DRAW_ARGUMENTS),
+    DrawIndexed(D3D12_DRAW_INDEXED_ARGUMENTS),
+    Dispatch(D3D12_DISPATCH_ARGUMENTS),
+    DispatchMesh(D3D12_DISPATCH_MESH_ARGUMENTS),
+    VertexBufferView {
+        slot: u32,
+        view: D3D12_VERTEX_BUFFER_VIEW_ARGUMENT,
+    },
+    IndexBufferView(D3D12_INDEX_BUFFER_VIEW_ARGUMENT),
+    Constant {
+        root_parameter_index: u32,
+        offset: u32,
+        values: Vec<u32>,
+    },
+    ConstantBufferView {
+        root_parameter_index: u32,
+        gpu_va: u64,
+    },
+    ShaderResourceView {
+        root_parameter_index: u32,
+        gpu_va: u64,
+    },
+    UnorderedAccessView {
+        root_parameter_index: u32,
+        gpu_va: u64,
+    },
+}
+
+// Complete set of parsed arguments for a single indirect command invocation
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PARSED_COMMAND {
+    pub command_index: u32,
+    pub arguments: Vec<D3D12_PARSED_INDIRECT_ARGUMENT>,
+}
+
+// Indirect argument buffer parser with GPU count buffer evaluation
+#[allow(non_camel_case_types)]
+pub struct D3D12_INDIRECT_ARGUMENT_PARSER;
+
+impl D3D12_INDIRECT_ARGUMENT_PARSER {
+    // Parse indirect argument buffer and resolve autonomous GPU count buffer clamping
+    pub fn parse(
+        signature: &D3D12_COMMAND_SIGNATURE,
+        arg_buffer: &[u8],
+        arg_buffer_offset: usize,
+        max_command_count: u32,
+        count_buffer_data: Option<(&[u8], usize)>,
+    ) -> Result<Vec<D3D12_PARSED_COMMAND>, IndirectError> {
+        if arg_buffer_offset % 4 != 0 {
+            return Err(IndirectError::InvalidBufferOffset(arg_buffer_offset as u64));
+        }
+
+        // 1. Evaluate GPU count buffer with max_command_count clamping
+        let effective_command_count = match count_buffer_data {
+            Some((buf, offset)) => {
+                if offset % 4 != 0 {
+                    return Err(IndirectError::InvalidBufferOffset(offset as u64));
+                }
+                if buf.len() < offset + 4 {
+                    return Err(IndirectError::BufferTooSmall {
+                        required: offset + 4,
+                        provided: buf.len(),
+                    });
+                }
+                let count_bytes: [u8; 4] = buf[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                let gpu_count = u32::from_le_bytes(count_bytes);
+                core::cmp::min(gpu_count, max_command_count)
+            }
+            None => max_command_count,
+        };
+
+        if effective_command_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 2. Validate total argument buffer bounds
+        let total_required_bytes = arg_buffer_offset
+            + (effective_command_count as usize * signature.byte_stride as usize);
+        if arg_buffer.len() < total_required_bytes {
+            return Err(IndirectError::BufferTooSmall {
+                required: total_required_bytes,
+                provided: arg_buffer.len(),
+            });
+        }
+
+        // 3. Unpack commands sequentially across the buffer stride
+        let mut parsed_commands = Vec::with_capacity(effective_command_count as usize);
+
+        for cmd_idx in 0..effective_command_count {
+            let cmd_base = arg_buffer_offset + (cmd_idx as usize * signature.byte_stride as usize);
+            let mut arg_cursor = cmd_base;
+            let mut cmd_args = Vec::with_capacity(signature.desc.argument_descs.len());
+
+            for arg_desc in &signature.desc.argument_descs {
+                let parsed_arg = match arg_desc.arg_type {
+                    D3D12_INDIRECT_ARGUMENT_TYPE::Draw => {
+                        let b: [u8; 16] = arg_buffer[arg_cursor..arg_cursor + 16]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let draw_args = D3D12_DRAW_ARGUMENTS {
+                            vertex_count_per_instance: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            instance_count: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            start_vertex_location: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            start_instance_location: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                        };
+                        arg_cursor += 16;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::Draw(draw_args)
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::DrawIndexed => {
+                        let b: [u8; 20] = arg_buffer[arg_cursor..arg_cursor + 20]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let draw_indexed_args = D3D12_DRAW_INDEXED_ARGUMENTS {
+                            index_count_per_instance: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            instance_count: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            start_index_location: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            base_vertex_location: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                            start_instance_location: u32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+                        };
+                        arg_cursor += 20;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::DrawIndexed(draw_indexed_args)
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::Dispatch => {
+                        let b: [u8; 12] = arg_buffer[arg_cursor..arg_cursor + 12]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let dispatch_args = D3D12_DISPATCH_ARGUMENTS {
+                            thread_group_count_x: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            thread_group_count_y: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            thread_group_count_z: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                        };
+                        arg_cursor += 12;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::Dispatch(dispatch_args)
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::DispatchMesh => {
+                        let b: [u8; 12] = arg_buffer[arg_cursor..arg_cursor + 12]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let mesh_args = D3D12_DISPATCH_MESH_ARGUMENTS::new(
+                            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                        );
+                        arg_cursor += 12;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::DispatchMesh(mesh_args)
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::VertexBufferView => {
+                        let b: [u8; 16] = arg_buffer[arg_cursor..arg_cursor + 16]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let view = D3D12_VERTEX_BUFFER_VIEW_ARGUMENT {
+                            buffer_location: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                            size_in_bytes: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+                            stride_in_bytes: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+                        };
+                        arg_cursor += 16;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::VertexBufferView {
+                            slot: arg_desc.vertex_buffer_slot,
+                            view,
+                        }
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::IndexBufferView => {
+                        let b: [u8; 16] = arg_buffer[arg_cursor..arg_cursor + 16]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let view = D3D12_INDEX_BUFFER_VIEW_ARGUMENT {
+                            buffer_location: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+                            size_in_bytes: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+                            format: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+                        };
+                        arg_cursor += 16;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::IndexBufferView(view)
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::Constant => {
+                        let num_vals = arg_desc.num_32bit_values_to_set as usize;
+                        let mut vals = Vec::with_capacity(num_vals);
+                        for _ in 0..num_vals {
+                            let val_bytes: [u8; 4] = arg_buffer[arg_cursor..arg_cursor + 4]
+                                .try_into()
+                                .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                            vals.push(u32::from_le_bytes(val_bytes));
+                            arg_cursor += 4;
+                        }
+                        D3D12_PARSED_INDIRECT_ARGUMENT::Constant {
+                            root_parameter_index: arg_desc.root_parameter_index,
+                            offset: arg_desc.dest_offset_in_32bit_values,
+                            values: vals,
+                        }
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::ConstantBufferView => {
+                        let b: [u8; 8] = arg_buffer[arg_cursor..arg_cursor + 8]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let gpu_va = u64::from_le_bytes(b);
+                        arg_cursor += 8;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::ConstantBufferView {
+                            root_parameter_index: arg_desc.root_parameter_index,
+                            gpu_va,
+                        }
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::ShaderResourceView => {
+                        let b: [u8; 8] = arg_buffer[arg_cursor..arg_cursor + 8]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let gpu_va = u64::from_le_bytes(b);
+                        arg_cursor += 8;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::ShaderResourceView {
+                            root_parameter_index: arg_desc.root_parameter_index,
+                            gpu_va,
+                        }
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::UnorderedAccessView => {
+                        let b: [u8; 8] = arg_buffer[arg_cursor..arg_cursor + 8]
+                            .try_into()
+                            .map_err(|_| IndirectError::ArgumentUnpackError)?;
+                        let gpu_va = u64::from_le_bytes(b);
+                        arg_cursor += 8;
+                        D3D12_PARSED_INDIRECT_ARGUMENT::UnorderedAccessView {
+                            root_parameter_index: arg_desc.root_parameter_index,
+                            gpu_va,
+                        }
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE::DispatchRays => {
+                        arg_cursor += 32;
+                        continue;
+                    }
+                };
+                cmd_args.push(parsed_arg);
+            }
+
+            parsed_commands.push(D3D12_PARSED_COMMAND {
+                command_index: cmd_idx,
+                arguments: cmd_args,
+            });
+        }
+
+        Ok(parsed_commands)
+    }
+}
