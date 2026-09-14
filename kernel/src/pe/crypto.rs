@@ -534,3 +534,74 @@ pub unsafe fn CryptReleaseContext(h_prov: HCRYPTPROV, _dw_flags: u32) -> bool {
         false
     }
 }
+
+/// Anti-cheat session verification token containing HMAC signature and cycle nonce.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntiCheatToken {
+    pub signature: [u8; 32],
+    pub timestamp: u64,
+    pub nonce: u64,
+}
+
+/// Computes SHA-256 digest over in-memory PE section or memory region.
+pub fn win32_compute_pe_section_digest(section_bytes: &[u8]) -> [u8; 32] {
+    crate::crypto::sha256::Sha256::digest(section_bytes)
+}
+
+/// Verifies memory region matches expected SHA-256 digest.
+pub fn win32_verify_module_integrity(module_bytes: &[u8], expected_digest: &[u8; 32]) -> bool {
+    let digest = crate::crypto::sha256::Sha256::digest(module_bytes);
+    &digest == expected_digest
+}
+
+/// Generates signed anti-cheat integrity token bound to module state and timestamp.
+pub unsafe fn win32_generate_anticheat_token(
+    session_seed: &[u8],
+    module_base: *const u8,
+    module_len: usize,
+    nonce: u64,
+) -> AntiCheatToken {
+    let timestamp = crate::crypto::rng::rdtsc();
+    let module_hash = if !module_base.is_null() && module_len > 0 {
+        let slice = core::slice::from_raw_parts(module_base, module_len);
+        crate::crypto::sha256::Sha256::digest(slice)
+    } else {
+        crate::crypto::sha256::Sha256::digest(&[])
+    };
+
+    let mut msg = [0u8; 48];
+    msg[0..8].copy_from_slice(&timestamp.to_le_bytes());
+    msg[8..16].copy_from_slice(&nonce.to_le_bytes());
+    msg[16..48].copy_from_slice(&module_hash);
+
+    let signature = crate::crypto::sha256::hmac_sha256(session_seed, &msg);
+    AntiCheatToken {
+        signature,
+        timestamp,
+        nonce,
+    }
+}
+
+/// Validates signed anti-cheat integrity token against module state and session seed.
+pub unsafe fn win32_validate_anticheat_token(
+    token: &AntiCheatToken,
+    session_seed: &[u8],
+    module_base: *const u8,
+    module_len: usize,
+) -> bool {
+    let module_hash = if !module_base.is_null() && module_len > 0 {
+        let slice = core::slice::from_raw_parts(module_base, module_len);
+        crate::crypto::sha256::Sha256::digest(slice)
+    } else {
+        crate::crypto::sha256::Sha256::digest(&[])
+    };
+
+    let mut msg = [0u8; 48];
+    msg[0..8].copy_from_slice(&token.timestamp.to_le_bytes());
+    msg[8..16].copy_from_slice(&token.nonce.to_le_bytes());
+    msg[16..48].copy_from_slice(&module_hash);
+
+    let expected_sig = crate::crypto::sha256::hmac_sha256(session_seed, &msg);
+    token.signature == expected_sig
+}
