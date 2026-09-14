@@ -936,3 +936,169 @@ impl D3D12_HIT_OBJECT_SORTER {
         }
     }
 }
+
+// Coherent execution wave bundle of reordered HitObjects
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_BUNDLE {
+    pub shader_index: u32,
+    pub hit_type: D3D12_HIT_OBJECT_TYPE,
+    pub wave_size: u32,
+    pub hits: Vec<D3D12_HIT_OBJECT>,
+    pub lane_mask: u64,
+}
+
+impl D3D12_HIT_OBJECT_BUNDLE {
+    // Create an empty bundle for a specific shader index and hit type
+    pub fn new(shader_index: u32, hit_type: D3D12_HIT_OBJECT_TYPE, wave_size: u32) -> Self {
+        Self {
+            shader_index,
+            hit_type,
+            wave_size,
+            hits: Vec::with_capacity(wave_size as usize),
+            lane_mask: 0,
+        }
+    }
+
+    // Attempt to push a HitObject into the bundle
+    pub fn push_hit(&mut self, hit: D3D12_HIT_OBJECT) -> bool {
+        if self.hits.len() >= self.wave_size as usize {
+            return false;
+        }
+        let lane_idx = self.hits.len();
+        self.lane_mask |= 1u64 << lane_idx;
+        self.hits.push(hit);
+        true
+    }
+
+    // Check if the bundle has reached full SIMD wave capacity
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.hits.len() >= self.wave_size as usize
+    }
+
+    // Number of active rays in the bundle
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    // Whether the bundle contains no rays
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+}
+
+// Direct3D 12 Secondary ray tracing dispatch queue for reordered bundles
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SECONDARY_RAY_DISPATCH_QUEUE {
+    pub max_bundles: usize,
+    pub bundles: Vec<D3D12_HIT_OBJECT_BUNDLE>,
+    pub total_rays_queued: usize,
+    pub total_rays_dispatched: usize,
+}
+
+impl D3D12_SECONDARY_RAY_DISPATCH_QUEUE {
+    // Create a new secondary ray dispatch queue
+    pub fn new(max_bundles: usize) -> Self {
+        Self {
+            max_bundles,
+            bundles: Vec::new(),
+            total_rays_queued: 0,
+            total_rays_dispatched: 0,
+        }
+    }
+
+    // Enqueue a completed bundle into the secondary dispatch queue
+    pub fn enqueue_bundle(&mut self, bundle: D3D12_HIT_OBJECT_BUNDLE) -> Result<(), &'static str> {
+        if self.bundles.len() >= self.max_bundles {
+            return Err("Secondary ray queue capacity exceeded");
+        }
+        self.total_rays_queued += bundle.len();
+        self.bundles.push(bundle);
+        Ok(())
+    }
+
+    // Drain and dispatch all queued bundles
+    pub fn drain_bundles(&mut self) -> Vec<D3D12_HIT_OBJECT_BUNDLE> {
+        let drained = core::mem::take(&mut self.bundles);
+        self.total_rays_dispatched += drained.iter().map(|b| b.len()).sum::<usize>();
+        drained
+    }
+
+    // Pending bundle count
+    #[inline]
+    pub fn pending_bundle_count(&self) -> usize {
+        self.bundles.len()
+    }
+}
+
+// Reordering execution dispatcher routing reordered HitObjects to secondary ray queues
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_EXECUTION_DISPATCHER {
+    pub sorter: D3D12_HIT_OBJECT_SORTER,
+    pub queue: D3D12_SECONDARY_RAY_DISPATCH_QUEUE,
+    pub wave_size: u32,
+}
+
+impl D3D12_SER_EXECUTION_DISPATCHER {
+    // Create a new execution dispatcher
+    pub fn new(wave_size: u32, max_bundles: usize) -> Self {
+        Self {
+            sorter: D3D12_HIT_OBJECT_SORTER::default(),
+            queue: D3D12_SECONDARY_RAY_DISPATCH_QUEUE::new(max_bundles),
+            wave_size,
+        }
+    }
+
+    // Sort, assemble coherent bundles, and dispatch to secondary ray queue
+    pub fn reorder_and_dispatch(&mut self, hits: &mut [D3D12_HIT_OBJECT]) -> Result<usize, &'static str> {
+        if hits.is_empty() {
+            return Ok(0);
+        }
+
+        // 1. Spatially sort divergent ray HitObjects
+        self.sorter.sort_hit_objects(hits);
+
+        // 2. Assemble coherent bundles grouped by shader index and hit type
+        let mut dispatched_bundles = 0usize;
+        let mut current_bundle: Option<D3D12_HIT_OBJECT_BUNDLE> = None;
+
+        for &hit in hits.iter() {
+            if hit.is_nop() {
+                continue;
+            }
+
+            let matches = match &current_bundle {
+                Some(b) => b.shader_index == hit.hit_group_shader_index && b.hit_type == hit.hit_type,
+                None => false,
+            };
+
+            if !matches || current_bundle.as_ref().map_or(false, |b| b.is_full()) {
+                if let Some(b) = current_bundle.take() {
+                    self.queue.enqueue_bundle(b)?;
+                    dispatched_bundles += 1;
+                }
+                current_bundle = Some(D3D12_HIT_OBJECT_BUNDLE::new(
+                    hit.hit_group_shader_index,
+                    hit.hit_type,
+                    self.wave_size,
+                ));
+            }
+
+            if let Some(ref mut b) = current_bundle {
+                b.push_hit(hit);
+            }
+        }
+
+        if let Some(b) = current_bundle.take() {
+            self.queue.enqueue_bundle(b)?;
+            dispatched_bundles += 1;
+        }
+
+        Ok(dispatched_bundles)
+    }
+}
