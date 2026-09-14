@@ -646,3 +646,149 @@ pub fn test_ser_subsystem() -> bool {
 
     true
 }
+
+// Direct3D 12 HitObject classification type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_HIT_OBJECT_TYPE {
+    #[default]
+    Nop = 0,
+    Miss = 1,
+    TriangleHit = 2,
+    ProceduralHit = 3,
+}
+
+// Direct3D 12 HitObject encapsulating ray candidate, shader index, and payload
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT {
+    pub hit_type: D3D12_HIT_OBJECT_TYPE,
+    pub ray_id: u32,
+    pub origin: [f32; 3],
+    pub direction: [f32; 3],
+    pub t_min: f32,
+    pub t_max: f32,
+    pub hit_group_shader_index: u32,
+    pub instance_index: u32,
+    pub geometry_index: u32,
+    pub primitive_index: u32,
+    pub barycentrics: [f32; 2],
+    pub payload_ptr: u64,
+    pub payload_size: u32,
+}
+
+impl Default for D3D12_HIT_OBJECT {
+    fn default() -> Self {
+        Self::make_nop()
+    }
+}
+
+impl D3D12_HIT_OBJECT {
+    // Construct a Nop HitObject
+    pub const fn make_nop() -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::Nop,
+            ray_id: 0,
+            origin: [0.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            t_min: 0.0,
+            t_max: 0.0,
+            hit_group_shader_index: 0,
+            instance_index: 0,
+            geometry_index: 0,
+            primitive_index: 0,
+            barycentrics: [0.0, 0.0],
+            payload_ptr: 0,
+            payload_size: 0,
+        }
+    }
+
+    // Construct a Miss HitObject
+    pub fn make_miss(
+        ray_id: u32,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        t_min: f32,
+        t_max: f32,
+        payload_ptr: u64,
+        payload_size: u32,
+    ) -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::Miss,
+            ray_id,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            hit_group_shader_index: 0xFFFF_FFFF,
+            instance_index: 0,
+            geometry_index: 0,
+            primitive_index: 0,
+            barycentrics: [0.0, 0.0],
+            payload_ptr,
+            payload_size,
+        }
+    }
+
+    // Construct a Triangle HitObject
+    pub fn make_triangle_hit(
+        ray_id: u32,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        t_min: f32,
+        t_max: f32,
+        shader_index: u32,
+        instance_idx: u32,
+        geom_idx: u32,
+        prim_idx: u32,
+        barycentrics: [f32; 2],
+        payload_ptr: u64,
+        payload_size: u32,
+    ) -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::TriangleHit,
+            ray_id,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            hit_group_shader_index: shader_index,
+            instance_index: instance_idx,
+            geometry_index: geom_idx,
+            primitive_index: prim_idx,
+            barycentrics,
+            payload_ptr,
+            payload_size,
+        }
+    }
+
+    // Whether this HitObject represents a valid surface intersection
+    #[inline(always)]
+    pub fn is_hit(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::TriangleHit || self.hit_type == D3D12_HIT_OBJECT_TYPE::ProceduralHit
+    }
+
+    // Whether this HitObject represents a ray miss
+    #[inline(always)]
+    pub fn is_miss(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::Miss
+    }
+
+    // Whether this HitObject is a Nop
+    #[inline(always)]
+    pub fn is_nop(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::Nop
+    }
+
+    // World position of the intersection point
+    #[inline]
+    pub fn world_hit_position(&self) -> [f32; 3] {
+        [
+            self.origin[0] + self.t_max * self.direction[0],
+            self.origin[1] + self.t_max * self.direction[1],
+            self.origin[2] + self.t_max * self.direction[2],
+        ]
+    }
+}
