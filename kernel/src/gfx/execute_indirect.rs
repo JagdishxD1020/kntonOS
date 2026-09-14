@@ -242,3 +242,150 @@ impl D3D12_COMMAND_SIGNATURE_DESC {
         self.argument_descs.iter().map(|arg| arg.byte_size()).sum()
     }
 }
+
+// Maximum permitted byte stride for a D3D12 command signature (2048 bytes)
+pub const D3D12_MAX_COMMAND_SIGNATURE_BYTE_STRIDE: u32 = 2048;
+
+// Error conditions encountered during command signature compilation or indirect dispatch
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndirectError {
+    EmptyArgumentList,
+    InvalidByteStride { stride: u32, min_stride: u32 },
+    StrideNotMultipleOfFour(u32),
+    StrideExceedsMaximum(u32),
+    MultipleDrawOrDispatch,
+    DrawOrDispatchNotFinalArgument,
+    MissingRootSignature,
+    InvalidRootParameter { index: u32, available: u32 },
+    BufferTooSmall { required: usize, provided: usize },
+    InvalidBufferOffset(u64),
+    ArgumentUnpackError,
+}
+
+// Compiled Direct3D 12 Command Signature object ready for GPU indirect execution
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_COMMAND_SIGNATURE {
+    pub desc: D3D12_COMMAND_SIGNATURE_DESC,
+    pub byte_stride: u32,
+    pub requires_root_signature: bool,
+    pub is_draw: bool,
+    pub is_draw_indexed: bool,
+    pub is_dispatch: bool,
+    pub is_dispatch_mesh: bool,
+}
+
+impl D3D12_COMMAND_SIGNATURE {
+    // Compile and validate a command signature descriptor
+    pub fn create(
+        desc: D3D12_COMMAND_SIGNATURE_DESC,
+        root_sig_param_count: Option<u32>,
+    ) -> Result<Self, IndirectError> {
+        if desc.argument_descs.is_empty() {
+            return Err(IndirectError::EmptyArgumentList);
+        }
+
+        if desc.byte_stride % 4 != 0 {
+            return Err(IndirectError::StrideNotMultipleOfFour(desc.byte_stride));
+        }
+
+        if desc.byte_stride > D3D12_MAX_COMMAND_SIGNATURE_BYTE_STRIDE {
+            return Err(IndirectError::StrideExceedsMaximum(desc.byte_stride));
+        }
+
+        let min_stride = desc.minimum_byte_stride();
+        if desc.byte_stride < min_stride {
+            return Err(IndirectError::InvalidByteStride {
+                stride: desc.byte_stride,
+                min_stride,
+            });
+        }
+
+        let mut draw_or_dispatch_count = 0u32;
+        let mut requires_root_signature = false;
+        let num_args = desc.argument_descs.len();
+
+        for (idx, arg) in desc.argument_descs.iter().enumerate() {
+            match arg.arg_type {
+                D3D12_INDIRECT_ARGUMENT_TYPE::Draw
+                | D3D12_INDIRECT_ARGUMENT_TYPE::DrawIndexed
+                | D3D12_INDIRECT_ARGUMENT_TYPE::Dispatch
+                | D3D12_INDIRECT_ARGUMENT_TYPE::DispatchMesh
+                | D3D12_INDIRECT_ARGUMENT_TYPE::DispatchRays => {
+                    draw_or_dispatch_count += 1;
+                    if draw_or_dispatch_count > 1 {
+                        return Err(IndirectError::MultipleDrawOrDispatch);
+                    }
+                    if idx != num_args - 1 {
+                        return Err(IndirectError::DrawOrDispatchNotFinalArgument);
+                    }
+                }
+                D3D12_INDIRECT_ARGUMENT_TYPE::Constant
+                | D3D12_INDIRECT_ARGUMENT_TYPE::ConstantBufferView
+                | D3D12_INDIRECT_ARGUMENT_TYPE::ShaderResourceView
+                | D3D12_INDIRECT_ARGUMENT_TYPE::UnorderedAccessView => {
+                    requires_root_signature = true;
+                    match root_sig_param_count {
+                        None => return Err(IndirectError::MissingRootSignature),
+                        Some(count) => {
+                            if arg.root_parameter_index >= count {
+                                return Err(IndirectError::InvalidRootParameter {
+                                    index: arg.root_parameter_index,
+                                    available: count,
+                                });
+                            }
+                        }
+                    }
+                }
+                D3D12_INDIRECT_ARGUMENT_TYPE::VertexBufferView
+                | D3D12_INDIRECT_ARGUMENT_TYPE::IndexBufferView => {}
+            }
+        }
+
+        let last_arg = desc.argument_descs.last().unwrap();
+        let is_draw = last_arg.arg_type == D3D12_INDIRECT_ARGUMENT_TYPE::Draw;
+        let is_draw_indexed = last_arg.arg_type == D3D12_INDIRECT_ARGUMENT_TYPE::DrawIndexed;
+        let is_dispatch = last_arg.arg_type == D3D12_INDIRECT_ARGUMENT_TYPE::Dispatch;
+        let is_dispatch_mesh = last_arg.arg_type == D3D12_INDIRECT_ARGUMENT_TYPE::DispatchMesh;
+
+        Ok(Self {
+            byte_stride: desc.byte_stride,
+            desc,
+            requires_root_signature,
+            is_draw,
+            is_draw_indexed,
+            is_dispatch,
+            is_dispatch_mesh,
+        })
+    }
+
+    // Standard Draw signature constructor (16-byte stride)
+    pub fn create_draw() -> Result<Self, IndirectError> {
+        let desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+            core::mem::size_of::<D3D12_DRAW_ARGUMENTS>() as u32,
+            alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_draw()],
+            0,
+        );
+        Self::create(desc, None)
+    }
+
+    // Standard DrawIndexed signature constructor (20-byte stride)
+    pub fn create_draw_indexed() -> Result<Self, IndirectError> {
+        let desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+            core::mem::size_of::<D3D12_DRAW_INDEXED_ARGUMENTS>() as u32,
+            alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_draw_indexed()],
+            0,
+        );
+        Self::create(desc, None)
+    }
+
+    // Standard Dispatch signature constructor (12-byte stride)
+    pub fn create_dispatch() -> Result<Self, IndirectError> {
+        let desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+            core::mem::size_of::<D3D12_DISPATCH_ARGUMENTS>() as u32,
+            alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_dispatch()],
+            0,
+        );
+        Self::create(desc, None)
+    }
+}
