@@ -341,3 +341,28 @@ pub fn verify_dynamic_tdp_governor() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld Fanless Whisper Mode & Acoustic Noise-Constrained Frequency Governor.
+pub fn test_whisper_mode_governor() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld Fanless Whisper Mode & Acoustic Governor...\r\n");
+
+    if !verify_operating_profiles() {
+        crate::serial_write_str("[KNT-PANIC] Operating profiles verification failed!\r\n");
+        return false;
+    }
+    if !verify_acoustic_noise_estimator() {
+        crate::serial_write_str("[KNT-PANIC] Acoustic noise estimator verification failed!\r\n");
+        return false;
+    }
+    if !verify_thermal_spike_damper() {
+        crate::serial_write_str("[KNT-PANIC] Thermal spike damper verification failed!\r\n");
+        return false;
+    }
+    if !verify_dynamic_tdp_governor() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic TDP governor verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WHISPER-MODE-PASS] Handheld fanless whisper mode and acoustic governor verified\r\n");
+    true
+}
