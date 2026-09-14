@@ -605,3 +605,163 @@ pub unsafe fn win32_validate_anticheat_token(
     let expected_sig = crate::crypto::sha256::hmac_sha256(session_seed, &msg);
     token.signature == expected_sig
 }
+
+/// Comprehensive self-test verifying Win32 crypto subsystem, RNG entropy, CNG, CryptoAPI, and anti-cheat engine.
+pub fn test_win32_crypto_subsystem() -> bool {
+    let mut rng_buf = [0u8; 128];
+    win32_crypto_get_random(&mut rng_buf);
+    let mut ones = 0usize;
+    for &b in &rng_buf {
+        ones += b.count_ones() as usize;
+    }
+    if ones < 300 || ones > 724 {
+        return false;
+    }
+
+    let mut h_alg: BCRYPT_ALG_HANDLE = 0;
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(&mut h_alg, BCRYPT_RNG_ALGORITHM, None, 0)
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+    let mut cng_buf = [0u8; 32];
+    let status = unsafe { BCryptGenRandom(h_alg, cng_buf.as_mut_ptr(), 32, 0) };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+    let status = unsafe { BCryptCloseAlgorithmProvider(h_alg, 0) };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let mut pref_buf = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            0,
+            pref_buf.as_mut_ptr(),
+            16,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let mut h_hash_alg: BCRYPT_ALG_HANDLE = 0;
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
+            &mut h_hash_alg,
+            BCRYPT_SHA256_ALGORITHM,
+            None,
+            BCRYPT_HMAC_SHA256_FLAG,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let key = b"key";
+    let mut h_hash: BCRYPT_HASH_HANDLE = 0;
+    let status = unsafe {
+        BCryptCreateHash(
+            h_hash_alg,
+            &mut h_hash,
+            core::ptr::null_mut(),
+            0,
+            key.as_ptr() as *mut u8,
+            key.len() as u32,
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let msg = b"The quick brown fox jumps over the lazy dog";
+    let status = unsafe {
+        BCryptHashData(
+            h_hash,
+            msg.as_ptr() as *mut u8,
+            msg.len() as u32,
+            0,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let mut out_hmac = [0u8; 32];
+    let status = unsafe { BCryptFinishHash(h_hash, out_hmac.as_mut_ptr(), 32, 0) };
+    if status != STATUS_SUCCESS {
+        return false;
+    }
+
+    let expected_hmac: [u8; 32] = [
+        0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
+        0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
+        0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59,
+        0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8,
+    ];
+    if out_hmac != expected_hmac {
+        return false;
+    }
+
+    let _ = unsafe { BCryptDestroyHash(h_hash) };
+    let _ = unsafe { BCryptCloseAlgorithmProvider(h_hash_alg, 0) };
+
+    let mut h_prov: HCRYPTPROV = 0;
+    let ok = unsafe {
+        CryptAcquireContextA(
+            &mut h_prov,
+            core::ptr::null(),
+            core::ptr::null(),
+            PROV_RSA_FULL,
+            CRYPT_VERIFYCONTEXT,
+        )
+    };
+    if !ok || h_prov == 0 {
+        return false;
+    }
+
+    let mut capi_buf = [0u8; 64];
+    let ok = unsafe { CryptGenRandom(h_prov, 64, capi_buf.as_mut_ptr()) };
+    if !ok {
+        return false;
+    }
+
+    let ok = unsafe { CryptReleaseContext(h_prov, 0) };
+    if !ok {
+        return false;
+    }
+
+    let session_seed = b"knton_anticheat_session_seed_test";
+    let module_code = [0x48, 0x89, 0x5c, 0x24, 0x08, 0x57, 0x48, 0x83, 0xec, 0x20, 0xc3];
+    let token = unsafe {
+        win32_generate_anticheat_token(session_seed, module_code.as_ptr(), module_code.len(), 0xdeadbeef)
+    };
+    let valid = unsafe {
+        win32_validate_anticheat_token(&token, session_seed, module_code.as_ptr(), module_code.len())
+    };
+    if !valid {
+        return false;
+    }
+
+    let mut tampered = module_code;
+    tampered[0] ^= 0x90;
+    let invalid = unsafe {
+        win32_validate_anticheat_token(&token, session_seed, tampered.as_ptr(), tampered.len())
+    };
+    if invalid {
+        return false;
+    }
+
+    let digest = win32_compute_pe_section_digest(&module_code);
+    if !win32_verify_module_integrity(&module_code, &digest) {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-CRYPTO-OK] Win32 crypto and anti-cheat entropy provider verified
+");
+    true
+}
