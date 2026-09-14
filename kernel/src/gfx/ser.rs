@@ -1203,3 +1203,146 @@ impl D3D12_SER_COHERENCE_METRICS {
         1.0 - self.divergent_ratio()
     }
 }
+
+// Self-test suite verifying D3D12 HitObjects, spatial sorting, bundle dispatch, and coherence metrics
+pub fn test_d3d12_ser_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX-SER] Initializing Direct3D 12 Shader Execution Reordering (SER) self-test...\r\n");
+
+    // 1. Verify HitObject constructors and classification
+    let nop = D3D12_HIT_OBJECT::make_nop();
+    if !nop.is_nop() || nop.is_hit() || nop.is_miss() {
+        crate::serial_write_str("[KNT-SER-FAIL] Nop HitObject state invalid\r\n");
+        return false;
+    }
+
+    let miss = D3D12_HIT_OBJECT::make_miss(1, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.1, 100.0, 0x1000, 32);
+    if !miss.is_miss() || miss.is_hit() || miss.hit_group_shader_index != 0xFFFF_FFFF {
+        crate::serial_write_str("[KNT-SER-FAIL] Miss HitObject state invalid\r\n");
+        return false;
+    }
+
+    let tri = D3D12_HIT_OBJECT::make_triangle_hit(
+        2,
+        [10.0, 20.0, 30.0],
+        [0.0, 1.0, 0.0],
+        0.0,
+        5.0,
+        7,
+        1,
+        2,
+        3,
+        [0.25, 0.75],
+        0x2000,
+        64,
+    );
+    if !tri.is_hit() || tri.is_miss() || tri.hit_group_shader_index != 7 {
+        crate::serial_write_str("[KNT-SER-FAIL] Triangle HitObject state invalid\r\n");
+        return false;
+    }
+    let hit_pos = tri.world_hit_position();
+    if (hit_pos[0] - 10.0).abs() > 1e-4 || (hit_pos[1] - 25.0).abs() > 1e-4 || (hit_pos[2] - 30.0).abs() > 1e-4 {
+        crate::serial_write_str("[KNT-SER-FAIL] World hit position computation incorrect\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * HitObject data structures, payload pointers and miss indicators verified\r\n");
+
+    // 2. Verify spatial sorting and material cache-line affinity reordering
+    let sorter = D3D12_HIT_OBJECT_SORTER::new([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]);
+    let mut divergent_hits = Vec::new();
+    for i in 0..128 {
+        let shader_idx = (i % 4) as u32; // Alternating 4 shader indices to simulate warp divergence
+        let pos = [(i as f32) * 0.75, (127 - i) as f32 * 0.5, (i % 16) as f32 * 5.0];
+        let payload_ptr = 0x80000000 + ((shader_idx as u64) << 12) + (i as u64 * 64);
+        divergent_hits.push(D3D12_HIT_OBJECT::make_triangle_hit(
+            i as u32,
+            pos,
+            [0.0, 0.0, 1.0],
+            0.0,
+            1.0,
+            shader_idx,
+            1,
+            0,
+            i as u32,
+            [0.3, 0.3],
+            payload_ptr,
+            64,
+        ));
+    }
+
+    let pre_sort_copy = divergent_hits.clone();
+    sorter.sort_hit_objects(&mut divergent_hits);
+
+    // Verify sorted ordering: shader indices should be monotonically non-decreasing
+    for window in divergent_hits.windows(2) {
+        if window[0].hit_group_shader_index > window[1].hit_group_shader_index {
+            crate::serial_write_str("[KNT-SER-FAIL] HitObject sorting failed to group by shader index\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Spatial sorting and material cache-line affinity reordering verified\r\n");
+
+    // 3. Verify bundle execution dispatcher and secondary ray queues
+    let mut dispatcher = D3D12_SER_EXECUTION_DISPATCHER::new(32, 16);
+    let mut hits_for_dispatch = pre_sort_copy.clone();
+    let bundle_count = match dispatcher.reorder_and_dispatch(&mut hits_for_dispatch) {
+        Ok(c) => c,
+        Err(_) => {
+            crate::serial_write_str("[KNT-SER-FAIL] Reorder and dispatch execution failed\r\n");
+            return false;
+        }
+    };
+
+    if bundle_count != 4 {
+        crate::serial_write_str("[KNT-SER-FAIL] Expected 4 coherent bundles\r\n");
+        return false;
+    }
+
+    let drained_bundles = dispatcher.queue.drain_bundles();
+    if drained_bundles.len() != 4 || dispatcher.queue.total_rays_dispatched != 128 {
+        crate::serial_write_str("[KNT-SER-FAIL] Secondary ray dispatch queue tracking mismatch\r\n");
+        return false;
+    }
+
+    // Verify 100% shader coherence per bundle
+    for (expected_shader, bundle) in drained_bundles.iter().enumerate() {
+        if bundle.shader_index != expected_shader as u32 || bundle.len() != 32 {
+            crate::serial_write_str("[KNT-SER-FAIL] Bundle shader index or lane count mismatch\r\n");
+            return false;
+        }
+        if bundle.lane_mask != 0xFFFF_FFFF {
+            crate::serial_write_str("[KNT-SER-FAIL] Bundle lane mask did not achieve full SIMD occupancy\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Reordered HitObject bundle dispatcher and secondary queues verified\r\n");
+
+    // 4. Verify coherence performance metrics
+    let mut metrics = D3D12_SER_COHERENCE_METRICS::new();
+    metrics.analyze_batch(&pre_sort_copy, &drained_bundles, 32);
+
+    if metrics.total_rays_submitted != 128 {
+        crate::serial_write_str("[KNT-SER-FAIL] Metrics total rays submitted mismatch\r\n");
+        return false;
+    }
+    if metrics.divergent_rays_detected == 0 || metrics.pre_reorder_shader_switches == 0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Divergent rays were not properly detected\r\n");
+        return false;
+    }
+    if metrics.pipeline_stalls_avoided == 0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Pipeline stalls avoided was 0\r\n");
+        return false;
+    }
+    if (metrics.simd_lane_occupancy_ratio - 1.0).abs() > 0.001 {
+        crate::serial_write_str("[KNT-SER-FAIL] SIMD lane occupancy ratio was not 1.0\r\n");
+        return false;
+    }
+    if metrics.coherence_efficiency_gain <= 1.0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Coherence efficiency gain not greater than 1.0\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Coherence metrics, dispatch ratios and pipeline stall reduction verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GFX-SER-PASS] Direct3D 12 shader execution reordering engine verified\r\n");
+    true
+}
