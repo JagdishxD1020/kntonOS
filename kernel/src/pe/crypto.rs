@@ -358,3 +358,179 @@ pub unsafe fn BCryptDestroyHash(h_hash: BCRYPT_HASH_HANDLE) -> u32 {
         STATUS_INVALID_HANDLE
     }
 }
+
+
+pub type HCRYPTPROV = usize;
+pub type HCRYPTKEY = usize;
+pub type HCRYPTHASH = usize;
+
+pub const PROV_RSA_FULL: u32 = 1;
+pub const PROV_RSA_AES: u32 = 24;
+
+pub const CRYPT_VERIFYCONTEXT: u32 = 0xF000_0000;
+pub const CRYPT_NEWKEYSET: u32 = 0x0000_0008;
+pub const CRYPT_DELETEKEYSET: u32 = 0x0000_0010;
+pub const CRYPT_MACHINE_KEYSET: u32 = 0x0000_0020;
+pub const CRYPT_SILENT: u32 = 0x0000_0040;
+
+pub const NTE_BAD_KEYSET: u32 = 0x8009_0016;
+pub const NTE_BAD_FLAGS: u32 = 0x8009_0009;
+pub const NTE_BAD_PROV_TYPE: u32 = 0x8009_0014;
+pub const NTE_INVALID_HANDLE: u32 = 0x8009_0026;
+pub const NTE_INVALID_PARAMETER: u32 = 0x8009_0027;
+
+#[derive(Debug, Clone)]
+pub struct CryptoContext {
+    pub container_name: Option<alloc::string::String>,
+    pub provider_name: Option<alloc::string::String>,
+    pub prov_type: u32,
+    pub flags: u32,
+}
+
+static CRYPTO_PROV_TABLE: Spinlock<BTreeMap<HCRYPTPROV, CryptoContext>> = Spinlock::new(BTreeMap::new());
+static NEXT_HCRYPTPROV: Spinlock<HCRYPTPROV> = Spinlock::new(0x000E_0001);
+
+/// Emulates Win32 CryptAcquireContextA acquiring a cryptographic service provider handle.
+pub unsafe fn CryptAcquireContextA(
+    ph_prov: *mut HCRYPTPROV,
+    psz_container: *const u8,
+    psz_provider: *const u8,
+    dw_prov_type: u32,
+    dw_flags: u32,
+) -> bool {
+    if ph_prov.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let container_name = if !psz_container.is_null() {
+        let mut len = 0;
+        while *psz_container.add(len) != 0 && len < 260 {
+            len += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(psz_container, len)).ok().map(alloc::string::String::from)
+    } else {
+        None
+    };
+
+    let provider_name = if !psz_provider.is_null() {
+        let mut len = 0;
+        while *psz_provider.add(len) != 0 && len < 260 {
+            len += 1;
+        }
+        core::str::from_utf8(core::slice::from_raw_parts(psz_provider, len)).ok().map(alloc::string::String::from)
+    } else {
+        None
+    };
+
+    let mut gen = NEXT_HCRYPTPROV.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let ctx = CryptoContext {
+        container_name,
+        provider_name,
+        prov_type: dw_prov_type,
+        flags: dw_flags,
+    };
+
+    let mut table = CRYPTO_PROV_TABLE.lock();
+    table.insert(handle, ctx);
+
+    *ph_prov = handle;
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 CryptAcquireContextW acquiring a cryptographic provider handle (UTF-16).
+pub unsafe fn CryptAcquireContextW(
+    ph_prov: *mut HCRYPTPROV,
+    sz_container: *const u16,
+    sz_provider: *const u16,
+    dw_prov_type: u32,
+    dw_flags: u32,
+) -> bool {
+    if ph_prov.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let container_name = if !sz_container.is_null() {
+        let mut len = 0;
+        while *sz_container.add(len) != 0 && len < 260 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(sz_container, len);
+        let chars: alloc::vec::Vec<char> = slice.iter().map(|&c| c as u8 as char).collect();
+        Some(chars.into_iter().collect())
+    } else {
+        None
+    };
+
+    let provider_name = if !sz_provider.is_null() {
+        let mut len = 0;
+        while *sz_provider.add(len) != 0 && len < 260 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(sz_provider, len);
+        let chars: alloc::vec::Vec<char> = slice.iter().map(|&c| c as u8 as char).collect();
+        Some(chars.into_iter().collect())
+    } else {
+        None
+    };
+
+    let mut gen = NEXT_HCRYPTPROV.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let ctx = CryptoContext {
+        container_name,
+        provider_name,
+        prov_type: dw_prov_type,
+        flags: dw_flags,
+    };
+
+    let mut table = CRYPTO_PROV_TABLE.lock();
+    table.insert(handle, ctx);
+
+    *ph_prov = handle;
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 CryptGenRandom filling buffer with cryptographically secure random bytes.
+pub unsafe fn CryptGenRandom(h_prov: HCRYPTPROV, dw_len: u32, pb_buffer: *mut u8) -> bool {
+    if pb_buffer.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    if dw_len == 0 {
+        return true;
+    }
+
+    let table = CRYPTO_PROV_TABLE.lock();
+    if !table.contains_key(&h_prov) {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    let slice = core::slice::from_raw_parts_mut(pb_buffer, dw_len as usize);
+    win32_crypto_get_random(slice);
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 CryptReleaseContext releasing a cryptographic service provider handle.
+pub unsafe fn CryptReleaseContext(h_prov: HCRYPTPROV, _dw_flags: u32) -> bool {
+    let mut table = CRYPTO_PROV_TABLE.lock();
+    if table.remove(&h_prov).is_some() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        false
+    }
+}
