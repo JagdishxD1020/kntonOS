@@ -5,9 +5,11 @@ pub mod thermal_gov;
 pub use thermal_gov::*;
 pub use thermal_gov::test_thermal_governor_subsystem;
 pub mod battery_gauge;
+pub mod whisper_mode;
 
 pub use battery_balance::*;
 pub use battery_gauge::*;
+pub use whisper_mode::*;
 
 /// Verification self-test suite for Handheld PC Dual-Battery Balance Manager & USB-PD 3.1 Extended Power Profile Engine.
 pub fn test_dual_battery_balance_subsystem() -> bool {
