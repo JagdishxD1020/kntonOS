@@ -251,3 +251,93 @@ pub fn verify_thermal_spike_damper() -> bool {
 
     true
 }
+
+/// Dynamic RAPL/cTDP power governor matching acoustic budget and battery state.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicTdpGovernor {
+    pub current_profile: WhisperOperatingProfile,
+    pub battery_percent: u8,
+    pub ac_connected: bool,
+    pub active_tdp_limit_watts: u8,
+}
+
+impl DynamicTdpGovernor {
+    /// Creates a new dynamic TDP governor initialized in Whisper mode.
+    pub const fn new() -> Self {
+        Self {
+            current_profile: WhisperOperatingProfile::Whisper,
+            battery_percent: 80,
+            ac_connected: false,
+            active_tdp_limit_watts: 12,
+        }
+    }
+
+    /// Evaluates operating profile, battery level, and AC power status to assign dynamic TDP ceiling.
+    pub fn evaluate_tdp_limit(&mut self, profile: WhisperOperatingProfile, battery_pct: u8, ac_connected: bool) -> u8 {
+        self.current_profile = profile;
+        self.battery_percent = battery_pct;
+        self.ac_connected = ac_connected;
+
+        let base_tdp = profile.tdp_ceiling_watts();
+
+        let tdp = match profile {
+            WhisperOperatingProfile::Silent => {
+                // Strict 6W ceiling regardless of power state
+                6
+            }
+            WhisperOperatingProfile::Whisper => {
+                // On battery < 30%: throttle down to 8W; on battery >= 30%: 12W; on AC: 15W
+                if !ac_connected {
+                    if battery_pct < 30 { 8 } else { 12 }
+                } else {
+                    15
+                }
+            }
+            WhisperOperatingProfile::Balanced => {
+                // On battery: 15W; on AC: 22W
+                if !ac_connected { 15 } else { base_tdp }
+            }
+            WhisperOperatingProfile::Turbo => {
+                // On battery: capped at 25W; on AC: full 35W
+                if !ac_connected { 25 } else { base_tdp }
+            }
+        };
+
+        self.active_tdp_limit_watts = tdp;
+        self.active_tdp_limit_watts
+    }
+}
+
+/// Unit verification for dynamic TDP governor.
+pub fn verify_dynamic_tdp_governor() -> bool {
+    let mut gov = DynamicTdpGovernor::new();
+
+    // Silent mode: always 6W
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Silent, 100, true) != 6 {
+        return false;
+    }
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Silent, 10, false) != 6 {
+        return false;
+    }
+
+    // Whisper mode: 15W on AC, 12W on battery, 8W on low battery
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Whisper, 80, true) != 15 {
+        return false;
+    }
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Whisper, 80, false) != 12 {
+        return false;
+    }
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Whisper, 20, false) != 8 {
+        return false;
+    }
+
+    // Turbo mode: 35W on AC, 25W on battery
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Turbo, 90, true) != 35 {
+        return false;
+    }
+    if gov.evaluate_tdp_limit(WhisperOperatingProfile::Turbo, 90, false) != 25 {
+        return false;
+    }
+
+    true
+}
