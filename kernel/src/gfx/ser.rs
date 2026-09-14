@@ -1102,3 +1102,104 @@ impl D3D12_SER_EXECUTION_DISPATCHER {
         Ok(dispatched_bundles)
     }
 }
+
+// Performance and coherence metrics for Shader Execution Reordering
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_COHERENCE_METRICS {
+    pub total_rays_submitted: u64,
+    pub divergent_rays_detected: u64,
+    pub coherent_bundles_formed: u64,
+    pub pre_reorder_shader_switches: u64,
+    pub post_reorder_shader_switches: u64,
+    pub pipeline_stalls_avoided: u64,
+    pub simd_lane_occupancy_ratio: f32,
+    pub coherence_efficiency_gain: f32,
+}
+
+impl D3D12_SER_COHERENCE_METRICS {
+    // Construct new zeroed coherence metrics tracker
+    pub const fn new() -> Self {
+        Self {
+            total_rays_submitted: 0,
+            divergent_rays_detected: 0,
+            coherent_bundles_formed: 0,
+            pre_reorder_shader_switches: 0,
+            post_reorder_shader_switches: 0,
+            pipeline_stalls_avoided: 0,
+            simd_lane_occupancy_ratio: 0.0,
+            coherence_efficiency_gain: 1.0,
+        }
+    }
+
+    // Analyze ray batch divergence and reordering performance improvements
+    pub fn analyze_batch(
+        &mut self,
+        pre_reorder_hits: &[D3D12_HIT_OBJECT],
+        bundles: &[D3D12_HIT_OBJECT_BUNDLE],
+        wave_size: u32,
+    ) {
+        if pre_reorder_hits.is_empty() {
+            return;
+        }
+
+        let total_rays = pre_reorder_hits.len() as u64;
+        self.total_rays_submitted += total_rays;
+        self.coherent_bundles_formed += bundles.len() as u64;
+
+        // Count pre-reorder shader switches across adjacent rays in input order
+        let mut pre_switches = 0u64;
+        let mut divergent_count = 0u64;
+        for window in pre_reorder_hits.windows(2) {
+            if window[0].hit_group_shader_index != window[1].hit_group_shader_index
+                || window[0].hit_type != window[1].hit_type
+            {
+                pre_switches += 1;
+                divergent_count += 1;
+            }
+        }
+        self.pre_reorder_shader_switches += pre_switches;
+        self.divergent_rays_detected += divergent_count;
+
+        // Post-reorder switches: bundle count - 1 (since all rays in bundle share shader index)
+        let post_switches = if bundles.is_empty() { 0 } else { (bundles.len() - 1) as u64 };
+        self.post_reorder_shader_switches += post_switches;
+
+        // Pipeline stalls avoided: each eliminated shader switch saves ~16 instruction cycles
+        let stalls_saved = pre_switches.saturating_sub(post_switches) * 16;
+        self.pipeline_stalls_avoided += stalls_saved;
+
+        // Calculate SIMD lane occupancy
+        let total_lanes = (bundles.len() as u32 * wave_size) as f32;
+        if total_lanes > 0.0 {
+            self.simd_lane_occupancy_ratio = (total_rays as f32) / total_lanes;
+        } else {
+            self.simd_lane_occupancy_ratio = 1.0;
+        }
+
+        // Efficiency gain factor: ratio of pre-reorder to post-reorder pipeline switch cost
+        if post_switches > 0 {
+            self.coherence_efficiency_gain = (pre_switches as f32 + 1.0) / (post_switches as f32 + 1.0);
+        } else if pre_switches > 0 {
+            self.coherence_efficiency_gain = pre_switches as f32 + 1.0;
+        } else {
+            self.coherence_efficiency_gain = 1.0;
+        }
+    }
+
+    // Ratio of divergent rays detected in the batch
+    #[inline]
+    pub fn divergent_ratio(&self) -> f32 {
+        if self.total_rays_submitted == 0 {
+            0.0
+        } else {
+            self.divergent_rays_detected as f32 / self.total_rays_submitted as f32
+        }
+    }
+
+    // Ratio of coherent rays in the batch
+    #[inline]
+    pub fn coherent_ratio(&self) -> f32 {
+        1.0 - self.divergent_ratio()
+    }
+}
