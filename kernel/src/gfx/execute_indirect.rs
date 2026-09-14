@@ -636,3 +636,126 @@ impl D3D12_INDIRECT_ARGUMENT_PARSER {
         Ok(parsed_commands)
     }
 }
+
+// Opcode token identifying an ExecuteIndirect command packet in the graphics recorder stream
+pub const D3D12_TOKEN_EXECUTE_INDIRECT: u32 = 0x4558_4944; // 'EXID'
+
+// Command recorder token packet for ExecuteIndirect dispatch
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_EXECUTE_INDIRECT_COMMAND_PACKET {
+    pub opcode: u32,
+    pub command_signature_id: u32,
+    pub max_command_count: u32,
+    pub argument_buffer_gpu_va: u64,
+    pub argument_buffer_offset: u64,
+    pub count_buffer_gpu_va: u64,
+    pub count_buffer_offset: u64,
+}
+
+impl D3D12_EXECUTE_INDIRECT_COMMAND_PACKET {
+    // Construct and validate indirect execution command token packet
+    pub fn new(
+        command_signature_id: u32,
+        max_command_count: u32,
+        arg_va: u64,
+        arg_offset: u64,
+        count_va: u64,
+        count_offset: u64,
+    ) -> Result<Self, IndirectError> {
+        if arg_offset % 4 != 0 {
+            return Err(IndirectError::InvalidBufferOffset(arg_offset));
+        }
+        if count_va != 0 && count_offset % 4 != 0 {
+            return Err(IndirectError::InvalidBufferOffset(count_offset));
+        }
+
+        Ok(Self {
+            opcode: D3D12_TOKEN_EXECUTE_INDIRECT,
+            command_signature_id,
+            max_command_count,
+            argument_buffer_gpu_va: arg_va,
+            argument_buffer_offset: arg_offset,
+            count_buffer_gpu_va: count_va,
+            count_buffer_offset: count_offset,
+        })
+    }
+
+    // Has valid GPU count buffer binding
+    #[inline]
+    pub fn has_count_buffer(&self) -> bool {
+        self.count_buffer_gpu_va != 0
+    }
+}
+
+// Command list recorder token stream encoder for indirect graphics & compute dispatches
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_INDIRECT_COMMAND_RECORDER {
+    pub packets: Vec<D3D12_EXECUTE_INDIRECT_COMMAND_PACKET>,
+    pub total_indirect_dispatches: u64,
+    pub total_max_commands_scheduled: u64,
+}
+
+impl D3D12_INDIRECT_COMMAND_RECORDER {
+    // Create new indirect command recorder
+    pub fn new() -> Self {
+        Self {
+            packets: Vec::new(),
+            total_indirect_dispatches: 0,
+            total_max_commands_scheduled: 0,
+        }
+    }
+
+    // Record an ExecuteIndirect token into the command list stream
+    pub fn record_execute_indirect(
+        &mut self,
+        _signature: &D3D12_COMMAND_SIGNATURE,
+        signature_id: u32,
+        max_command_count: u32,
+        arg_va: u64,
+        arg_offset: u64,
+        count_va: u64,
+        count_offset: u64,
+    ) -> Result<&D3D12_EXECUTE_INDIRECT_COMMAND_PACKET, IndirectError> {
+        let packet = D3D12_EXECUTE_INDIRECT_COMMAND_PACKET::new(
+            signature_id,
+            max_command_count,
+            arg_va,
+            arg_offset,
+            count_va,
+            count_offset,
+        )?;
+
+        self.total_indirect_dispatches += 1;
+        self.total_max_commands_scheduled += max_command_count as u64;
+        self.packets.push(packet);
+        Ok(self.packets.last().unwrap())
+    }
+
+    // Serialize all recorded indirect commands into a linear byte token stream
+    pub fn serialize_to_token_stream(&self, stream: &mut Vec<u8>) {
+        for packet in &self.packets {
+            stream.extend_from_slice(&packet.opcode.to_le_bytes());
+            stream.extend_from_slice(&packet.command_signature_id.to_le_bytes());
+            stream.extend_from_slice(&packet.max_command_count.to_le_bytes());
+            stream.extend_from_slice(&packet.argument_buffer_gpu_va.to_le_bytes());
+            stream.extend_from_slice(&packet.argument_buffer_offset.to_le_bytes());
+            stream.extend_from_slice(&packet.count_buffer_gpu_va.to_le_bytes());
+            stream.extend_from_slice(&packet.count_buffer_offset.to_le_bytes());
+        }
+    }
+
+    // Number of recorded packets
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    // Whether no packets have been recorded
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+}
