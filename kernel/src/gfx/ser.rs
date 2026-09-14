@@ -792,3 +792,147 @@ impl D3D12_HIT_OBJECT {
         ]
     }
 }
+
+// Direct3D 12 64-bit composite reorder key for spatial and material sorting
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(transparent)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_REORDER_KEY(pub u64);
+
+impl D3D12_SER_REORDER_KEY {
+    // Pack hit classification, shader index, material cache-line affinity, and spatial Morton code
+    #[inline]
+    pub fn new(hit_type: D3D12_HIT_OBJECT_TYPE, shader_idx: u32, material_tag: u16, morton_24: u32) -> Self {
+        let type_val = (hit_type as u64 & 0xFF) << 56;
+        let shader_val = ((shader_idx as u64) & 0xFFFF) << 40;
+        let mat_val = ((material_tag as u64) & 0xFFFF) << 24;
+        let morton_val = (morton_24 as u64) & 0x00FF_FFFF;
+        Self(type_val | shader_val | mat_val | morton_val)
+    }
+
+    // Extract hit classification type
+    #[inline]
+    pub fn hit_type(&self) -> u8 {
+        ((self.0 >> 56) & 0xFF) as u8
+    }
+
+    // Extract shader table index
+    #[inline]
+    pub fn shader_index(&self) -> u16 {
+        ((self.0 >> 40) & 0xFFFF) as u16
+    }
+
+    // Extract material cache-line affinity tag
+    #[inline]
+    pub fn material_tag(&self) -> u16 {
+        ((self.0 >> 24) & 0xFFFF) as u16
+    }
+
+    // Extract 24-bit spatial Morton code
+    #[inline]
+    pub fn morton_code(&self) -> u32 {
+        (self.0 & 0x00FF_FFFF) as u32
+    }
+}
+
+// Interleaved HitObject entry paired with its 64-bit reorder sort key
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_ENTRY {
+    pub key: D3D12_SER_REORDER_KEY,
+    pub hit: D3D12_HIT_OBJECT,
+}
+
+// Spatial sorting and material cache-line affinity reordering engine
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_SORTER {
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
+}
+
+impl Default for D3D12_HIT_OBJECT_SORTER {
+    fn default() -> Self {
+        Self {
+            aabb_min: [-1000.0, -1000.0, -1000.0],
+            aabb_max: [1000.0, 1000.0, 1000.0],
+        }
+    }
+}
+
+impl D3D12_HIT_OBJECT_SORTER {
+    // Construct sorter with spatial scene bounding box
+    pub fn new(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> Self {
+        Self { aabb_min, aabb_max }
+    }
+
+    // Interleave 8-bit coordinates into a 24-bit 3D Morton code
+    #[inline]
+    pub fn morton_3d_24(x: u8, y: u8, z: u8) -> u32 {
+        let mut m = 0u32;
+        for i in 0..8 {
+            let bit_x = ((x as u32 >> i) & 1) << (3 * i);
+            let bit_y = ((y as u32 >> i) & 1) << (3 * i + 1);
+            let bit_z = ((z as u32 >> i) & 1) << (3 * i + 2);
+            m |= bit_x | bit_y | bit_z;
+        }
+        m
+    }
+
+    // Quantize 3D position into 24-bit Morton code within bounding box
+    pub fn quantize_morton(&self, pos: [f32; 3]) -> u32 {
+        let q = |val: f32, min_val: f32, max_val: f32| -> u8 {
+            let span = max_val - min_val;
+            if span <= 1e-6 {
+                return 0;
+            }
+            let clamped = ((val - min_val) / span).clamp(0.0, 0.99999);
+            (clamped * 256.0) as u8
+        };
+        let qx = q(pos[0], self.aabb_min[0], self.aabb_max[0]);
+        let qy = q(pos[1], self.aabb_min[1], self.aabb_max[1]);
+        let qz = q(pos[2], self.aabb_min[2], self.aabb_max[2]);
+        Self::morton_3d_24(qx, qy, qz)
+    }
+
+    // Compute composite reorder key for a HitObject
+    pub fn compute_key(&self, hit: &D3D12_HIT_OBJECT) -> D3D12_SER_REORDER_KEY {
+        if hit.is_nop() {
+            return D3D12_SER_REORDER_KEY::new(D3D12_HIT_OBJECT_TYPE::Nop, 0, 0, 0);
+        }
+        if hit.is_miss() {
+            let m = self.quantize_morton(hit.origin);
+            return D3D12_SER_REORDER_KEY::new(D3D12_HIT_OBJECT_TYPE::Miss, 0xFFFF, 0, m);
+        }
+        let pos = hit.world_hit_position();
+        let morton = self.quantize_morton(pos);
+        // Extract 64-byte cache line tag from payload pointer or primitive index
+        let cache_tag = if hit.payload_ptr != 0 {
+            ((hit.payload_ptr >> 6) & 0xFFFF) as u16
+        } else {
+            (hit.instance_index ^ hit.geometry_index) as u16
+        };
+        D3D12_SER_REORDER_KEY::new(hit.hit_type, hit.hit_group_shader_index, cache_tag, morton)
+    }
+
+    // Sort divergent HitObjects by composite reorder key into coherent order
+    pub fn sort_hit_objects(&self, hits: &mut [D3D12_HIT_OBJECT]) {
+        if hits.len() <= 1 {
+            return;
+        }
+        let mut entries: Vec<D3D12_HIT_OBJECT_ENTRY> = hits
+            .iter()
+            .map(|h| D3D12_HIT_OBJECT_ENTRY {
+                key: self.compute_key(h),
+                hit: *h,
+            })
+            .collect();
+
+        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+
+        for (i, entry) in entries.into_iter().enumerate() {
+            hits[i] = entry.hit;
+        }
+    }
+}
