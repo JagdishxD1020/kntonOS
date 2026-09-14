@@ -680,6 +680,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::power::test_battery_gauge_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld battery fuel gauge and dynamic charge limiter self-test failed!\r\n");
     }
+    // Initialize and verify Handheld Fanless Whisper Mode & Acoustic Governor (TASK-KNT-176)
+    if !drivers::power::test_whisper_mode_governor() {
+        serial_write_str("[KNT-PANIC] Handheld fanless whisper mode and acoustic governor self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
