@@ -646,3 +646,703 @@ pub fn test_ser_subsystem() -> bool {
 
     true
 }
+
+// Direct3D 12 HitObject classification type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_HIT_OBJECT_TYPE {
+    #[default]
+    Nop = 0,
+    Miss = 1,
+    TriangleHit = 2,
+    ProceduralHit = 3,
+}
+
+// Direct3D 12 HitObject encapsulating ray candidate, shader index, and payload
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT {
+    pub hit_type: D3D12_HIT_OBJECT_TYPE,
+    pub ray_id: u32,
+    pub origin: [f32; 3],
+    pub direction: [f32; 3],
+    pub t_min: f32,
+    pub t_max: f32,
+    pub hit_group_shader_index: u32,
+    pub instance_index: u32,
+    pub geometry_index: u32,
+    pub primitive_index: u32,
+    pub barycentrics: [f32; 2],
+    pub payload_ptr: u64,
+    pub payload_size: u32,
+}
+
+impl Default for D3D12_HIT_OBJECT {
+    fn default() -> Self {
+        Self::make_nop()
+    }
+}
+
+impl D3D12_HIT_OBJECT {
+    // Construct a Nop HitObject
+    pub const fn make_nop() -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::Nop,
+            ray_id: 0,
+            origin: [0.0; 3],
+            direction: [0.0, 0.0, 1.0],
+            t_min: 0.0,
+            t_max: 0.0,
+            hit_group_shader_index: 0,
+            instance_index: 0,
+            geometry_index: 0,
+            primitive_index: 0,
+            barycentrics: [0.0, 0.0],
+            payload_ptr: 0,
+            payload_size: 0,
+        }
+    }
+
+    // Construct a Miss HitObject
+    pub fn make_miss(
+        ray_id: u32,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        t_min: f32,
+        t_max: f32,
+        payload_ptr: u64,
+        payload_size: u32,
+    ) -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::Miss,
+            ray_id,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            hit_group_shader_index: 0xFFFF_FFFF,
+            instance_index: 0,
+            geometry_index: 0,
+            primitive_index: 0,
+            barycentrics: [0.0, 0.0],
+            payload_ptr,
+            payload_size,
+        }
+    }
+
+    // Construct a Triangle HitObject
+    pub fn make_triangle_hit(
+        ray_id: u32,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        t_min: f32,
+        t_max: f32,
+        shader_index: u32,
+        instance_idx: u32,
+        geom_idx: u32,
+        prim_idx: u32,
+        barycentrics: [f32; 2],
+        payload_ptr: u64,
+        payload_size: u32,
+    ) -> Self {
+        Self {
+            hit_type: D3D12_HIT_OBJECT_TYPE::TriangleHit,
+            ray_id,
+            origin,
+            direction,
+            t_min,
+            t_max,
+            hit_group_shader_index: shader_index,
+            instance_index: instance_idx,
+            geometry_index: geom_idx,
+            primitive_index: prim_idx,
+            barycentrics,
+            payload_ptr,
+            payload_size,
+        }
+    }
+
+    // Whether this HitObject represents a valid surface intersection
+    #[inline(always)]
+    pub fn is_hit(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::TriangleHit || self.hit_type == D3D12_HIT_OBJECT_TYPE::ProceduralHit
+    }
+
+    // Whether this HitObject represents a ray miss
+    #[inline(always)]
+    pub fn is_miss(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::Miss
+    }
+
+    // Whether this HitObject is a Nop
+    #[inline(always)]
+    pub fn is_nop(&self) -> bool {
+        self.hit_type == D3D12_HIT_OBJECT_TYPE::Nop
+    }
+
+    // World position of the intersection point
+    #[inline]
+    pub fn world_hit_position(&self) -> [f32; 3] {
+        [
+            self.origin[0] + self.t_max * self.direction[0],
+            self.origin[1] + self.t_max * self.direction[1],
+            self.origin[2] + self.t_max * self.direction[2],
+        ]
+    }
+}
+
+// Direct3D 12 64-bit composite reorder key for spatial and material sorting
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(transparent)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_REORDER_KEY(pub u64);
+
+impl D3D12_SER_REORDER_KEY {
+    // Pack hit classification, shader index, material cache-line affinity, and spatial Morton code
+    #[inline]
+    pub fn new(hit_type: D3D12_HIT_OBJECT_TYPE, shader_idx: u32, material_tag: u16, morton_24: u32) -> Self {
+        let type_val = (hit_type as u64 & 0xFF) << 56;
+        let shader_val = ((shader_idx as u64) & 0xFFFF) << 40;
+        let mat_val = ((material_tag as u64) & 0xFFFF) << 24;
+        let morton_val = (morton_24 as u64) & 0x00FF_FFFF;
+        Self(type_val | shader_val | mat_val | morton_val)
+    }
+
+    // Extract hit classification type
+    #[inline]
+    pub fn hit_type(&self) -> u8 {
+        ((self.0 >> 56) & 0xFF) as u8
+    }
+
+    // Extract shader table index
+    #[inline]
+    pub fn shader_index(&self) -> u16 {
+        ((self.0 >> 40) & 0xFFFF) as u16
+    }
+
+    // Extract material cache-line affinity tag
+    #[inline]
+    pub fn material_tag(&self) -> u16 {
+        ((self.0 >> 24) & 0xFFFF) as u16
+    }
+
+    // Extract 24-bit spatial Morton code
+    #[inline]
+    pub fn morton_code(&self) -> u32 {
+        (self.0 & 0x00FF_FFFF) as u32
+    }
+}
+
+// Interleaved HitObject entry paired with its 64-bit reorder sort key
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_ENTRY {
+    pub key: D3D12_SER_REORDER_KEY,
+    pub hit: D3D12_HIT_OBJECT,
+}
+
+// Spatial sorting and material cache-line affinity reordering engine
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_SORTER {
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
+}
+
+impl Default for D3D12_HIT_OBJECT_SORTER {
+    fn default() -> Self {
+        Self {
+            aabb_min: [-1000.0, -1000.0, -1000.0],
+            aabb_max: [1000.0, 1000.0, 1000.0],
+        }
+    }
+}
+
+impl D3D12_HIT_OBJECT_SORTER {
+    // Construct sorter with spatial scene bounding box
+    pub fn new(aabb_min: [f32; 3], aabb_max: [f32; 3]) -> Self {
+        Self { aabb_min, aabb_max }
+    }
+
+    // Interleave 8-bit coordinates into a 24-bit 3D Morton code
+    #[inline]
+    pub fn morton_3d_24(x: u8, y: u8, z: u8) -> u32 {
+        let mut m = 0u32;
+        for i in 0..8 {
+            let bit_x = ((x as u32 >> i) & 1) << (3 * i);
+            let bit_y = ((y as u32 >> i) & 1) << (3 * i + 1);
+            let bit_z = ((z as u32 >> i) & 1) << (3 * i + 2);
+            m |= bit_x | bit_y | bit_z;
+        }
+        m
+    }
+
+    // Quantize 3D position into 24-bit Morton code within bounding box
+    pub fn quantize_morton(&self, pos: [f32; 3]) -> u32 {
+        let q = |val: f32, min_val: f32, max_val: f32| -> u8 {
+            let span = max_val - min_val;
+            if span <= 1e-6 {
+                return 0;
+            }
+            let clamped = ((val - min_val) / span).clamp(0.0, 0.99999);
+            (clamped * 256.0) as u8
+        };
+        let qx = q(pos[0], self.aabb_min[0], self.aabb_max[0]);
+        let qy = q(pos[1], self.aabb_min[1], self.aabb_max[1]);
+        let qz = q(pos[2], self.aabb_min[2], self.aabb_max[2]);
+        Self::morton_3d_24(qx, qy, qz)
+    }
+
+    // Compute composite reorder key for a HitObject
+    pub fn compute_key(&self, hit: &D3D12_HIT_OBJECT) -> D3D12_SER_REORDER_KEY {
+        if hit.is_nop() {
+            return D3D12_SER_REORDER_KEY::new(D3D12_HIT_OBJECT_TYPE::Nop, 0, 0, 0);
+        }
+        if hit.is_miss() {
+            let m = self.quantize_morton(hit.origin);
+            return D3D12_SER_REORDER_KEY::new(D3D12_HIT_OBJECT_TYPE::Miss, 0xFFFF, 0, m);
+        }
+        let pos = hit.world_hit_position();
+        let morton = self.quantize_morton(pos);
+        // Extract 64-byte cache line tag from payload pointer or primitive index
+        let cache_tag = if hit.payload_ptr != 0 {
+            ((hit.payload_ptr >> 6) & 0xFFFF) as u16
+        } else {
+            (hit.instance_index ^ hit.geometry_index) as u16
+        };
+        D3D12_SER_REORDER_KEY::new(hit.hit_type, hit.hit_group_shader_index, cache_tag, morton)
+    }
+
+    // Sort divergent HitObjects by composite reorder key into coherent order
+    pub fn sort_hit_objects(&self, hits: &mut [D3D12_HIT_OBJECT]) {
+        if hits.len() <= 1 {
+            return;
+        }
+        let mut entries: Vec<D3D12_HIT_OBJECT_ENTRY> = hits
+            .iter()
+            .map(|h| D3D12_HIT_OBJECT_ENTRY {
+                key: self.compute_key(h),
+                hit: *h,
+            })
+            .collect();
+
+        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+
+        for (i, entry) in entries.into_iter().enumerate() {
+            hits[i] = entry.hit;
+        }
+    }
+}
+
+// Coherent execution wave bundle of reordered HitObjects
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_HIT_OBJECT_BUNDLE {
+    pub shader_index: u32,
+    pub hit_type: D3D12_HIT_OBJECT_TYPE,
+    pub wave_size: u32,
+    pub hits: Vec<D3D12_HIT_OBJECT>,
+    pub lane_mask: u64,
+}
+
+impl D3D12_HIT_OBJECT_BUNDLE {
+    // Create an empty bundle for a specific shader index and hit type
+    pub fn new(shader_index: u32, hit_type: D3D12_HIT_OBJECT_TYPE, wave_size: u32) -> Self {
+        Self {
+            shader_index,
+            hit_type,
+            wave_size,
+            hits: Vec::with_capacity(wave_size as usize),
+            lane_mask: 0,
+        }
+    }
+
+    // Attempt to push a HitObject into the bundle
+    pub fn push_hit(&mut self, hit: D3D12_HIT_OBJECT) -> bool {
+        if self.hits.len() >= self.wave_size as usize {
+            return false;
+        }
+        let lane_idx = self.hits.len();
+        self.lane_mask |= 1u64 << lane_idx;
+        self.hits.push(hit);
+        true
+    }
+
+    // Check if the bundle has reached full SIMD wave capacity
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.hits.len() >= self.wave_size as usize
+    }
+
+    // Number of active rays in the bundle
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    // Whether the bundle contains no rays
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+}
+
+// Direct3D 12 Secondary ray tracing dispatch queue for reordered bundles
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SECONDARY_RAY_DISPATCH_QUEUE {
+    pub max_bundles: usize,
+    pub bundles: Vec<D3D12_HIT_OBJECT_BUNDLE>,
+    pub total_rays_queued: usize,
+    pub total_rays_dispatched: usize,
+}
+
+impl D3D12_SECONDARY_RAY_DISPATCH_QUEUE {
+    // Create a new secondary ray dispatch queue
+    pub fn new(max_bundles: usize) -> Self {
+        Self {
+            max_bundles,
+            bundles: Vec::new(),
+            total_rays_queued: 0,
+            total_rays_dispatched: 0,
+        }
+    }
+
+    // Enqueue a completed bundle into the secondary dispatch queue
+    pub fn enqueue_bundle(&mut self, bundle: D3D12_HIT_OBJECT_BUNDLE) -> Result<(), &'static str> {
+        if self.bundles.len() >= self.max_bundles {
+            return Err("Secondary ray queue capacity exceeded");
+        }
+        self.total_rays_queued += bundle.len();
+        self.bundles.push(bundle);
+        Ok(())
+    }
+
+    // Drain and dispatch all queued bundles
+    pub fn drain_bundles(&mut self) -> Vec<D3D12_HIT_OBJECT_BUNDLE> {
+        let drained = core::mem::take(&mut self.bundles);
+        self.total_rays_dispatched += drained.iter().map(|b| b.len()).sum::<usize>();
+        drained
+    }
+
+    // Pending bundle count
+    #[inline]
+    pub fn pending_bundle_count(&self) -> usize {
+        self.bundles.len()
+    }
+}
+
+// Reordering execution dispatcher routing reordered HitObjects to secondary ray queues
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_EXECUTION_DISPATCHER {
+    pub sorter: D3D12_HIT_OBJECT_SORTER,
+    pub queue: D3D12_SECONDARY_RAY_DISPATCH_QUEUE,
+    pub wave_size: u32,
+}
+
+impl D3D12_SER_EXECUTION_DISPATCHER {
+    // Create a new execution dispatcher
+    pub fn new(wave_size: u32, max_bundles: usize) -> Self {
+        Self {
+            sorter: D3D12_HIT_OBJECT_SORTER::default(),
+            queue: D3D12_SECONDARY_RAY_DISPATCH_QUEUE::new(max_bundles),
+            wave_size,
+        }
+    }
+
+    // Sort, assemble coherent bundles, and dispatch to secondary ray queue
+    pub fn reorder_and_dispatch(&mut self, hits: &mut [D3D12_HIT_OBJECT]) -> Result<usize, &'static str> {
+        if hits.is_empty() {
+            return Ok(0);
+        }
+
+        // 1. Spatially sort divergent ray HitObjects
+        self.sorter.sort_hit_objects(hits);
+
+        // 2. Assemble coherent bundles grouped by shader index and hit type
+        let mut dispatched_bundles = 0usize;
+        let mut current_bundle: Option<D3D12_HIT_OBJECT_BUNDLE> = None;
+
+        for &hit in hits.iter() {
+            if hit.is_nop() {
+                continue;
+            }
+
+            let matches = match &current_bundle {
+                Some(b) => b.shader_index == hit.hit_group_shader_index && b.hit_type == hit.hit_type,
+                None => false,
+            };
+
+            if !matches || current_bundle.as_ref().map_or(false, |b| b.is_full()) {
+                if let Some(b) = current_bundle.take() {
+                    self.queue.enqueue_bundle(b)?;
+                    dispatched_bundles += 1;
+                }
+                current_bundle = Some(D3D12_HIT_OBJECT_BUNDLE::new(
+                    hit.hit_group_shader_index,
+                    hit.hit_type,
+                    self.wave_size,
+                ));
+            }
+
+            if let Some(ref mut b) = current_bundle {
+                b.push_hit(hit);
+            }
+        }
+
+        if let Some(b) = current_bundle.take() {
+            self.queue.enqueue_bundle(b)?;
+            dispatched_bundles += 1;
+        }
+
+        Ok(dispatched_bundles)
+    }
+}
+
+// Performance and coherence metrics for Shader Execution Reordering
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SER_COHERENCE_METRICS {
+    pub total_rays_submitted: u64,
+    pub divergent_rays_detected: u64,
+    pub coherent_bundles_formed: u64,
+    pub pre_reorder_shader_switches: u64,
+    pub post_reorder_shader_switches: u64,
+    pub pipeline_stalls_avoided: u64,
+    pub simd_lane_occupancy_ratio: f32,
+    pub coherence_efficiency_gain: f32,
+}
+
+impl D3D12_SER_COHERENCE_METRICS {
+    // Construct new zeroed coherence metrics tracker
+    pub const fn new() -> Self {
+        Self {
+            total_rays_submitted: 0,
+            divergent_rays_detected: 0,
+            coherent_bundles_formed: 0,
+            pre_reorder_shader_switches: 0,
+            post_reorder_shader_switches: 0,
+            pipeline_stalls_avoided: 0,
+            simd_lane_occupancy_ratio: 0.0,
+            coherence_efficiency_gain: 1.0,
+        }
+    }
+
+    // Analyze ray batch divergence and reordering performance improvements
+    pub fn analyze_batch(
+        &mut self,
+        pre_reorder_hits: &[D3D12_HIT_OBJECT],
+        bundles: &[D3D12_HIT_OBJECT_BUNDLE],
+        wave_size: u32,
+    ) {
+        if pre_reorder_hits.is_empty() {
+            return;
+        }
+
+        let total_rays = pre_reorder_hits.len() as u64;
+        self.total_rays_submitted += total_rays;
+        self.coherent_bundles_formed += bundles.len() as u64;
+
+        // Count pre-reorder shader switches across adjacent rays in input order
+        let mut pre_switches = 0u64;
+        let mut divergent_count = 0u64;
+        for window in pre_reorder_hits.windows(2) {
+            if window[0].hit_group_shader_index != window[1].hit_group_shader_index
+                || window[0].hit_type != window[1].hit_type
+            {
+                pre_switches += 1;
+                divergent_count += 1;
+            }
+        }
+        self.pre_reorder_shader_switches += pre_switches;
+        self.divergent_rays_detected += divergent_count;
+
+        // Post-reorder switches: bundle count - 1 (since all rays in bundle share shader index)
+        let post_switches = if bundles.is_empty() { 0 } else { (bundles.len() - 1) as u64 };
+        self.post_reorder_shader_switches += post_switches;
+
+        // Pipeline stalls avoided: each eliminated shader switch saves ~16 instruction cycles
+        let stalls_saved = pre_switches.saturating_sub(post_switches) * 16;
+        self.pipeline_stalls_avoided += stalls_saved;
+
+        // Calculate SIMD lane occupancy
+        let total_lanes = (bundles.len() as u32 * wave_size) as f32;
+        if total_lanes > 0.0 {
+            self.simd_lane_occupancy_ratio = (total_rays as f32) / total_lanes;
+        } else {
+            self.simd_lane_occupancy_ratio = 1.0;
+        }
+
+        // Efficiency gain factor: ratio of pre-reorder to post-reorder pipeline switch cost
+        if post_switches > 0 {
+            self.coherence_efficiency_gain = (pre_switches as f32 + 1.0) / (post_switches as f32 + 1.0);
+        } else if pre_switches > 0 {
+            self.coherence_efficiency_gain = pre_switches as f32 + 1.0;
+        } else {
+            self.coherence_efficiency_gain = 1.0;
+        }
+    }
+
+    // Ratio of divergent rays detected in the batch
+    #[inline]
+    pub fn divergent_ratio(&self) -> f32 {
+        if self.total_rays_submitted == 0 {
+            0.0
+        } else {
+            self.divergent_rays_detected as f32 / self.total_rays_submitted as f32
+        }
+    }
+
+    // Ratio of coherent rays in the batch
+    #[inline]
+    pub fn coherent_ratio(&self) -> f32 {
+        1.0 - self.divergent_ratio()
+    }
+}
+
+// Self-test suite verifying D3D12 HitObjects, spatial sorting, bundle dispatch, and coherence metrics
+pub fn test_d3d12_ser_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX-SER] Initializing Direct3D 12 Shader Execution Reordering (SER) self-test...\r\n");
+
+    // 1. Verify HitObject constructors and classification
+    let nop = D3D12_HIT_OBJECT::make_nop();
+    if !nop.is_nop() || nop.is_hit() || nop.is_miss() {
+        crate::serial_write_str("[KNT-SER-FAIL] Nop HitObject state invalid\r\n");
+        return false;
+    }
+
+    let miss = D3D12_HIT_OBJECT::make_miss(1, [0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.1, 100.0, 0x1000, 32);
+    if !miss.is_miss() || miss.is_hit() || miss.hit_group_shader_index != 0xFFFF_FFFF {
+        crate::serial_write_str("[KNT-SER-FAIL] Miss HitObject state invalid\r\n");
+        return false;
+    }
+
+    let tri = D3D12_HIT_OBJECT::make_triangle_hit(
+        2,
+        [10.0, 20.0, 30.0],
+        [0.0, 1.0, 0.0],
+        0.0,
+        5.0,
+        7,
+        1,
+        2,
+        3,
+        [0.25, 0.75],
+        0x2000,
+        64,
+    );
+    if !tri.is_hit() || tri.is_miss() || tri.hit_group_shader_index != 7 {
+        crate::serial_write_str("[KNT-SER-FAIL] Triangle HitObject state invalid\r\n");
+        return false;
+    }
+    let hit_pos = tri.world_hit_position();
+    if (hit_pos[0] - 10.0).abs() > 1e-4 || (hit_pos[1] - 25.0).abs() > 1e-4 || (hit_pos[2] - 30.0).abs() > 1e-4 {
+        crate::serial_write_str("[KNT-SER-FAIL] World hit position computation incorrect\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * HitObject data structures, payload pointers and miss indicators verified\r\n");
+
+    // 2. Verify spatial sorting and material cache-line affinity reordering
+    let sorter = D3D12_HIT_OBJECT_SORTER::new([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]);
+    let mut divergent_hits = Vec::new();
+    for i in 0..128 {
+        let shader_idx = (i % 4) as u32; // Alternating 4 shader indices to simulate warp divergence
+        let pos = [(i as f32) * 0.75, (127 - i) as f32 * 0.5, (i % 16) as f32 * 5.0];
+        let payload_ptr = 0x80000000 + ((shader_idx as u64) << 12) + (i as u64 * 64);
+        divergent_hits.push(D3D12_HIT_OBJECT::make_triangle_hit(
+            i as u32,
+            pos,
+            [0.0, 0.0, 1.0],
+            0.0,
+            1.0,
+            shader_idx,
+            1,
+            0,
+            i as u32,
+            [0.3, 0.3],
+            payload_ptr,
+            64,
+        ));
+    }
+
+    let pre_sort_copy = divergent_hits.clone();
+    sorter.sort_hit_objects(&mut divergent_hits);
+
+    // Verify sorted ordering: shader indices should be monotonically non-decreasing
+    for window in divergent_hits.windows(2) {
+        if window[0].hit_group_shader_index > window[1].hit_group_shader_index {
+            crate::serial_write_str("[KNT-SER-FAIL] HitObject sorting failed to group by shader index\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Spatial sorting and material cache-line affinity reordering verified\r\n");
+
+    // 3. Verify bundle execution dispatcher and secondary ray queues
+    let mut dispatcher = D3D12_SER_EXECUTION_DISPATCHER::new(32, 16);
+    let mut hits_for_dispatch = pre_sort_copy.clone();
+    let bundle_count = match dispatcher.reorder_and_dispatch(&mut hits_for_dispatch) {
+        Ok(c) => c,
+        Err(_) => {
+            crate::serial_write_str("[KNT-SER-FAIL] Reorder and dispatch execution failed\r\n");
+            return false;
+        }
+    };
+
+    if bundle_count != 4 {
+        crate::serial_write_str("[KNT-SER-FAIL] Expected 4 coherent bundles\r\n");
+        return false;
+    }
+
+    let drained_bundles = dispatcher.queue.drain_bundles();
+    if drained_bundles.len() != 4 || dispatcher.queue.total_rays_dispatched != 128 {
+        crate::serial_write_str("[KNT-SER-FAIL] Secondary ray dispatch queue tracking mismatch\r\n");
+        return false;
+    }
+
+    // Verify 100% shader coherence per bundle
+    for (expected_shader, bundle) in drained_bundles.iter().enumerate() {
+        if bundle.shader_index != expected_shader as u32 || bundle.len() != 32 {
+            crate::serial_write_str("[KNT-SER-FAIL] Bundle shader index or lane count mismatch\r\n");
+            return false;
+        }
+        if bundle.lane_mask != 0xFFFF_FFFF {
+            crate::serial_write_str("[KNT-SER-FAIL] Bundle lane mask did not achieve full SIMD occupancy\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Reordered HitObject bundle dispatcher and secondary queues verified\r\n");
+
+    // 4. Verify coherence performance metrics
+    let mut metrics = D3D12_SER_COHERENCE_METRICS::new();
+    metrics.analyze_batch(&pre_sort_copy, &drained_bundles, 32);
+
+    if metrics.total_rays_submitted != 128 {
+        crate::serial_write_str("[KNT-SER-FAIL] Metrics total rays submitted mismatch\r\n");
+        return false;
+    }
+    if metrics.divergent_rays_detected == 0 || metrics.pre_reorder_shader_switches == 0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Divergent rays were not properly detected\r\n");
+        return false;
+    }
+    if metrics.pipeline_stalls_avoided == 0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Pipeline stalls avoided was 0\r\n");
+        return false;
+    }
+    if (metrics.simd_lane_occupancy_ratio - 1.0).abs() > 0.001 {
+        crate::serial_write_str("[KNT-SER-FAIL] SIMD lane occupancy ratio was not 1.0\r\n");
+        return false;
+    }
+    if metrics.coherence_efficiency_gain <= 1.0 {
+        crate::serial_write_str("[KNT-SER-FAIL] Coherence efficiency gain not greater than 1.0\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Coherence metrics, dispatch ratios and pipeline stall reduction verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GFX-SER-PASS] Direct3D 12 shader execution reordering engine verified\r\n");
+    true
+}
