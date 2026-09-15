@@ -99,3 +99,98 @@ impl D3D12_CONSERVATIVE_RASTERIZER_DESC {
         }
     }
 }
+
+// Sub-pixel snapping engine quantizing floating-point vertices onto fixed-point grids
+#[allow(non_camel_case_types)]
+pub struct D3D12_SUBPIXEL_SNAPPER;
+
+impl D3D12_SUBPIXEL_SNAPPER {
+    // Snap a 2D vertex coordinate to the specified sub-pixel precision grid
+    #[inline]
+    pub fn snap_vertex(coord: [f32; 2], precision: D3D12_SUBPIXEL_SNAP_PRECISION) -> [f32; 2] {
+        let grid_scale = match precision {
+            D3D12_SUBPIXEL_SNAP_PRECISION::Bits4 => 16.0f32,
+            D3D12_SUBPIXEL_SNAP_PRECISION::Bits8 => 256.0f32,
+        };
+
+        let snap_axis = |val: f32| -> f32 {
+            let scaled = val * grid_scale;
+            let rounded = if scaled >= 0.0 {
+                (scaled + 0.5) as i32 as f32
+            } else {
+                (scaled - 0.5) as i32 as f32
+            };
+            rounded / grid_scale
+        };
+
+        [snap_axis(coord[0]), snap_axis(coord[1])]
+    }
+}
+
+// Geometric degenerate state classification of post-snap primitives
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_DEGENERATE_STATUS {
+    NonDegenerate,
+    PointDegenerate,
+    CollinearDegenerate,
+}
+
+// Conservative rasterization triangle representation with sub-pixel snap and AABB dilation
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_CONSERVATIVE_TRIANGLE {
+    pub v0: [f32; 2],
+    pub v1: [f32; 2],
+    pub v2: [f32; 2],
+    pub signed_area: f32,
+    pub degenerate_status: D3D12_DEGENERATE_STATUS,
+    pub should_cull: bool,
+    pub dilated_aabb: [f32; 4], // [min_x, min_y, max_x, max_y]
+}
+
+impl D3D12_CONSERVATIVE_TRIANGLE {
+    // Construct and snap triangle vertices according to conservative rasterizer state
+    pub fn new(
+        raw_v0: [f32; 2],
+        raw_v1: [f32; 2],
+        raw_v2: [f32; 2],
+        desc: &D3D12_CONSERVATIVE_RASTERIZER_DESC,
+    ) -> Self {
+        let v0 = D3D12_SUBPIXEL_SNAPPER::snap_vertex(raw_v0, desc.subpixel_snap_bits);
+        let v1 = D3D12_SUBPIXEL_SNAPPER::snap_vertex(raw_v1, desc.subpixel_snap_bits);
+        let v2 = D3D12_SUBPIXEL_SNAPPER::snap_vertex(raw_v2, desc.subpixel_snap_bits);
+
+        // 2D cross product for signed area: 0.5 * ((v1.x - v0.x)*(v2.y - v0.y) - (v2.x - v0.x)*(v1.y - v0.y))
+        let signed_area = 0.5 * ((v1[0] - v0[0]) * (v2[1] - v0[1]) - (v2[0] - v0[0]) * (v1[1] - v0[1]));
+
+        let degenerate_status = if (v0[0] == v1[0] && v0[1] == v1[1]) && (v1[0] == v2[0] && v1[1] == v2[1]) {
+            D3D12_DEGENERATE_STATUS::PointDegenerate
+        } else if signed_area.abs() <= 1e-6 {
+            D3D12_DEGENERATE_STATUS::CollinearDegenerate
+        } else {
+            D3D12_DEGENERATE_STATUS::NonDegenerate
+        };
+
+        // Determine if degenerate primitive is preserved (Tier 2/3) or culled (Tier 1 default)
+        let is_degenerate = degenerate_status != D3D12_DEGENERATE_STATUS::NonDegenerate;
+        let should_cull = is_degenerate && !desc.preserve_degenerate_primitives;
+
+        // Compute conservative bounding box dilated by uncertainty region
+        let uncertainty = desc.uncertainty_region();
+        let min_x = v0[0].min(v1[0]).min(v2[0]) - uncertainty;
+        let min_y = v0[1].min(v1[1]).min(v2[1]) - uncertainty;
+        let max_x = v0[0].max(v1[0]).max(v2[0]) + uncertainty;
+        let max_y = v0[1].max(v1[1]).max(v2[1]) + uncertainty;
+
+        Self {
+            v0,
+            v1,
+            v2,
+            signed_area,
+            degenerate_status,
+            should_cull,
+            dilated_aabb: [min_x, min_y, max_x, max_y],
+        }
+    }
+}
