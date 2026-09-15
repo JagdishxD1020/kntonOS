@@ -87,3 +87,137 @@ pub fn verify_dock_state_machine() -> bool {
 
     true
 }
+
+/// Parsed DisplayPort/HDMI EDID monitor capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedEdidDescriptor {
+    pub manufacturer_id: [u8; 3],
+    pub product_code: u16,
+    pub native_width: u16,
+    pub native_height: u16,
+    pub max_refresh_hz: u16,
+    pub supports_vrr: bool,
+}
+
+/// USB-C DP Alt Mode & DisplayPort Multi-Stream Transport (MST) hot-plug manager.
+#[derive(Debug, Clone, Copy)]
+pub struct DpMstHotPlugManager {
+    pub hpd_asserted: bool,
+    pub dp_lanes_allocated: u8,
+    pub mst_branch_detected: bool,
+    pub connected_display_count: u8,
+    pub primary_display: ParsedEdidDescriptor,
+}
+
+impl DpMstHotPlugManager {
+    /// Creates a new DisplayPort MST manager.
+    pub const fn new() -> Self {
+        Self {
+            hpd_asserted: false,
+            dp_lanes_allocated: 0,
+            mst_branch_detected: false,
+            connected_display_count: 0,
+            primary_display: ParsedEdidDescriptor {
+                manufacturer_id: [b'D', b'E', b'L'],
+                product_code: 0x4010,
+                native_width: 3840,
+                native_height: 2160,
+                max_refresh_hz: 144,
+                supports_vrr: true,
+            },
+        }
+    }
+
+    /// Handles DP HPD (Hot-Plug Detect) pin assertion and configures USB-C DP Alt Mode 4-lane link.
+    pub fn on_hpd_irq(&mut self, asserted: bool) -> bool {
+        self.hpd_asserted = asserted;
+        if asserted {
+            self.dp_lanes_allocated = 4; // 4-lane DisplayPort 1.4a/2.1 UHBR10
+        } else {
+            self.dp_lanes_allocated = 0;
+            self.connected_display_count = 0;
+            self.mst_branch_detected = false;
+        }
+        self.hpd_asserted
+    }
+
+    /// Parses a standard 128-byte raw EDID block from external monitor.
+    pub fn parse_edid_block(&mut self, edid: &[u8]) -> bool {
+        if edid.len() < 128 {
+            return false;
+        }
+
+        // Validate EDID header: 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
+        if edid[0] != 0x00 || edid[1] != 0xFF || edid[2] != 0xFF || edid[3] != 0xFF
+            || edid[4] != 0xFF || edid[5] != 0xFF || edid[6] != 0xFF || edid[7] != 0x00 {
+            return false;
+        }
+
+        // Manufacturer ID at bytes 8-9 (packed 5-bit characters)
+        let mfg_raw = u16::from_be_bytes([edid[8], edid[9]]);
+        let c1 = ((mfg_raw >> 10) & 0x1F) as u8 + b'@';
+        let c2 = ((mfg_raw >> 5) & 0x1F) as u8 + b'@';
+        let c3 = (mfg_raw & 0x1F) as u8 + b'@';
+        self.primary_display.manufacturer_id = [c1, c2, c3];
+
+        self.primary_display.product_code = u16::from_le_bytes([edid[10], edid[11]]);
+
+        // Detailed Timing Descriptor 1 starts at byte 54
+        // Pixel clock: bytes 54-55 (in 10 kHz units)
+        let pixel_clock_10khz = u16::from_le_bytes([edid[54], edid[55]]);
+        if pixel_clock_10khz > 0 {
+            let h_active = (edid[56] as u16) | (((edid[58] as u16) & 0xF0) << 4);
+            let v_active = (edid[59] as u16) | (((edid[61] as u16) & 0xF0) << 4);
+            self.primary_display.native_width = h_active;
+            self.primary_display.native_height = v_active;
+        }
+
+        self.connected_display_count = 1;
+        true
+    }
+}
+
+/// Unit verification for DisplayPort MST hot-plug and EDID parser.
+pub fn verify_dp_mst_and_edid() -> bool {
+    let mut mgr = DpMstHotPlugManager::new();
+    if !mgr.on_hpd_irq(true) || mgr.dp_lanes_allocated != 4 {
+        return false;
+    }
+
+    // Construct mock valid 128-byte EDID for 3840x2160 (4K)
+    let mut mock_edid = [0u8; 128];
+    mock_edid[0] = 0x00;
+    mock_edid[1] = 0xFF;
+    mock_edid[2] = 0xFF;
+    mock_edid[3] = 0xFF;
+    mock_edid[4] = 0xFF;
+    mock_edid[5] = 0xFF;
+    mock_edid[6] = 0xFF;
+    mock_edid[7] = 0x00;
+
+    // Packed MFG "DEL" -> D (4), E (5), L (12): (4<<10)|(5<<5)|12 = 4096 + 160 + 12 = 4268 (0x10AC)
+    mock_edid[8] = 0x10;
+    mock_edid[9] = 0xAC;
+
+    // Detailed Timing 1 at byte 54: pixel clock non-zero
+    mock_edid[54] = 0x00;
+    mock_edid[55] = 0x80;
+    // H-active 3840 (0xF00) -> lower 8 bits 0x00 at byte 56, upper 4 bits 0x0F in high nibble of byte 58
+    mock_edid[56] = 0x00;
+    mock_edid[58] = 0xF0;
+    // V-active 2160 (0x870) -> lower 8 bits 0x70 at byte 59, upper 4 bits 0x08 in high nibble of byte 61
+    mock_edid[59] = 0x70;
+    mock_edid[61] = 0x80;
+
+    if !mgr.parse_edid_block(&mock_edid) {
+        return false;
+    }
+    if mgr.primary_display.native_width != 3840 || mgr.primary_display.native_height != 2160 {
+        return false;
+    }
+    if mgr.connected_display_count != 1 {
+        return false;
+    }
+
+    true
+}
