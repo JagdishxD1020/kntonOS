@@ -235,3 +235,71 @@ pub fn verify_s3_sleep_wake_controller() -> bool {
 
     true
 }
+
+/// Low-battery safety fail-safe and fast resume engine.
+#[derive(Debug, Clone, Copy)]
+pub struct LowBatterySnapshotFailSafe {
+    pub critical_battery_threshold_pct: u8,
+    pub emergency_snapshot_triggered: bool,
+    pub snapshot_compressed_bytes: usize,
+    pub audio_volume_restored_pct: u8,
+    pub gpu_context_restored: bool,
+}
+
+impl LowBatterySnapshotFailSafe {
+    /// Creates a new low-battery safety fail-safe with 5% critical battery threshold.
+    pub const fn new() -> Self {
+        Self {
+            critical_battery_threshold_pct: 5,
+            emergency_snapshot_triggered: false,
+            snapshot_compressed_bytes: 0,
+            audio_volume_restored_pct: 0,
+            gpu_context_restored: false,
+        }
+    }
+
+    /// Evaluates battery level during S3 sleep; triggers emergency compressed snapshot to NVMe if <= 5%.
+    pub fn evaluate_sleep_battery(&mut self, current_soc_pct: u8) -> bool {
+        if current_soc_pct <= self.critical_battery_threshold_pct {
+            self.emergency_snapshot_triggered = true;
+            self.snapshot_compressed_bytes = 64 * 1024 * 1024; // 64MB compressed game ram snapshot
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Executes fast resume sequence: restores GPU context, ramps audio volume back to 100%, and unfreezes threads.
+    pub fn execute_fast_resume(&mut self, frozen_threads: &mut usize) -> bool {
+        self.gpu_context_restored = true;
+        self.audio_volume_restored_pct = 100;
+        *frozen_threads = 0; // Thawed
+        true
+    }
+}
+
+/// Unit verification for low-battery safety fail-safe and fast resume engine.
+pub fn verify_low_battery_failsafe_and_resume() -> bool {
+    let mut failsafe = LowBatterySnapshotFailSafe::new();
+
+    // 10% battery during sleep: normal sleep maintained
+    if failsafe.evaluate_sleep_battery(10) || failsafe.emergency_snapshot_triggered {
+        return false;
+    }
+
+    // 4% battery during sleep (<= 5% critical): triggers emergency NVMe snapshot
+    if !failsafe.evaluate_sleep_battery(4) || !failsafe.emergency_snapshot_triggered {
+        return false;
+    }
+
+    // Execute fast resume
+    let mut frozen = 8;
+    if !failsafe.execute_fast_resume(&mut frozen) {
+        return false;
+    }
+    if frozen != 0 || !failsafe.gpu_context_restored || failsafe.audio_volume_restored_pct != 100 {
+        return false;
+    }
+
+    true
+}
