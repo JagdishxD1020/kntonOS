@@ -211,6 +211,10 @@ pub unsafe fn win32_create_file(
         return INVALID_HANDLE_VALUE;
     }
 
+    if lp_file_name.starts_with(r"\\.\pipe\\") || lp_file_name.starts_with("//./pipe/") {
+        return crate::pe::pipe::win32_connect_client_pipe(lp_file_name, dw_desired_access);
+    }
+
     let is_console = lp_file_name == "CONOUT$" || lp_file_name == "CONIN$";
     let vfs_path = win32_dos_to_vfs_path(lp_file_name);
 

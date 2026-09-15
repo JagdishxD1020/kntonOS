@@ -3,6 +3,8 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::vec::Vec;
 type HANDLE = u64;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -187,10 +189,31 @@ pub struct AnonymousPipeChannel {
     pub has_writer: bool,
 }
 
+/// State machine lifecycle for a named pipe instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedPipeState {
+    Listening,
+    Connected,
+    Disconnected,
+}
+
+/// Instance state for a bidirectional or unidirectional named pipe.
+pub struct NamedPipeInstance {
+    pub name: String,
+    pub open_mode: u32,
+    pub pipe_mode: u32,
+    pub state: NamedPipeState,
+    pub server_to_client: PipeBuffer,
+    pub client_to_server: PipeBuffer,
+    pub server_handle: Option<HANDLE>,
+    pub client_handle: Option<HANDLE>,
+}
+
 /// Endpoint encapsulation for anonymous and named pipe handles.
 #[derive(Clone)]
 pub enum PipeEndpoint {
     Anonymous(Arc<Spinlock<AnonymousPipeChannel>>, PipeHandleRole),
+    Named(Arc<Spinlock<NamedPipeInstance>>, PipeHandleRole),
 }
 
 static NEXT_PIPE_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x000E_0001);
@@ -246,6 +269,20 @@ pub fn win32_close_pipe(h_object: HANDLE) -> bool {
                 match role {
                     PipeHandleRole::AnonymousReader => chan.has_reader = false,
                     PipeHandleRole::AnonymousWriter => chan.has_writer = false,
+                    _ => {}
+                }
+            }
+            PipeEndpoint::Named(instance, role) => {
+                let mut inst = instance.lock();
+                match role {
+                    PipeHandleRole::Server => {
+                        inst.server_handle = None;
+                        inst.state = NamedPipeState::Disconnected;
+                    }
+                    PipeHandleRole::Client => {
+                        inst.client_handle = None;
+                        inst.state = NamedPipeState::Disconnected;
+                    }
                     _ => {}
                 }
             }
@@ -322,6 +359,41 @@ pub unsafe fn win32_read_pipe(
                 }
             }
         }
+        PipeEndpoint::Named(instance, role) => {
+            let mut inst = instance.lock();
+            if inst.state != NamedPipeState::Connected {
+                crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_NOT_CONNECTED);
+                return false;
+            }
+
+            let is_msg = (inst.pipe_mode & PIPE_READMODE_MESSAGE) != 0;
+            let dest = core::slice::from_raw_parts_mut(lp_buffer, n_number_of_bytes_to_read as usize);
+            let res = match role {
+                PipeHandleRole::Server => inst.client_to_server.read(dest, is_msg),
+                PipeHandleRole::Client => inst.server_to_client.read(dest, is_msg),
+                _ => {
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                    return false;
+                }
+            };
+
+            match res {
+                Ok(bytes) => {
+                    if !lp_number_of_bytes_read.is_null() {
+                        *lp_number_of_bytes_read = bytes as u32;
+                    }
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+                    true
+                }
+                Err((bytes, err)) => {
+                    if !lp_number_of_bytes_read.is_null() {
+                        *lp_number_of_bytes_read = bytes as u32;
+                    }
+                    crate::pe::kernel32::win32_set_last_error(err);
+                    false
+                }
+            }
+        }
     }
 }
 
@@ -368,6 +440,309 @@ pub unsafe fn win32_write_pipe(
             }
             crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
             true
+        }
+        PipeEndpoint::Named(instance, role) => {
+            let mut inst = instance.lock();
+            if inst.state != NamedPipeState::Connected {
+                crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_NOT_CONNECTED);
+                return false;
+            }
+
+            let is_msg = (inst.pipe_mode & PIPE_TYPE_MESSAGE) != 0;
+            let src = core::slice::from_raw_parts(lp_buffer, n_number_of_bytes_to_write as usize);
+            let written = match role {
+                PipeHandleRole::Server => inst.server_to_client.write(src, is_msg),
+                PipeHandleRole::Client => inst.client_to_server.write(src, is_msg),
+                _ => {
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                    return false;
+                }
+            };
+
+            if !lp_number_of_bytes_written.is_null() {
+                *lp_number_of_bytes_written = written as u32;
+            }
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+            true
+        }
+    }
+}
+
+static NAMED_PIPES: Spinlock<BTreeMap<String, Vec<Arc<Spinlock<NamedPipeInstance>>>>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Normalizes pipe name to canonical format (e.g. \\.\pipe\name in lowercase).
+pub fn canonicalize_pipe_name(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let lower = s.to_lowercase();
+    let name_part = if lower.starts_with(r"\\.\pipe\\") {
+        &lower[9..]
+    } else if lower.starts_with("//./pipe/") {
+        &lower[9..]
+    } else {
+        return None;
+    };
+    if name_part.is_empty() {
+        return None;
+    }
+    let mut out = String::from(r"\\.\pipe\\");
+    out.push_str(name_part);
+    Some(out)
+}
+
+/// Emulates Win32 CreateNamedPipeA creating an instance of a named pipe (ANSI).
+pub unsafe fn CreateNamedPipeA(
+    lp_name: *const u8,
+    dw_open_mode: u32,
+    dw_pipe_mode: u32,
+    n_max_instances: u32,
+    n_out_buffer_size: u32,
+    n_in_buffer_size: u32,
+    _n_default_time_out: u32,
+    _lp_security_attributes: *const u8,
+) -> HANDLE {
+    if lp_name.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    let mut len = 0;
+    while *lp_name.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(lp_name, len);
+    let s = match core::str::from_utf8(slice) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+
+    create_named_pipe_internal(
+        s,
+        dw_open_mode,
+        dw_pipe_mode,
+        n_max_instances,
+        n_out_buffer_size,
+        n_in_buffer_size,
+    )
+}
+
+/// Emulates Win32 CreateNamedPipeW creating an instance of a named pipe (UTF-16).
+pub unsafe fn CreateNamedPipeW(
+    lp_name: *const u16,
+    dw_open_mode: u32,
+    dw_pipe_mode: u32,
+    n_max_instances: u32,
+    n_out_buffer_size: u32,
+    n_in_buffer_size: u32,
+    _n_default_time_out: u32,
+    _lp_security_attributes: *const u8,
+) -> HANDLE {
+    if lp_name.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    let mut len = 0;
+    while *lp_name.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(lp_name, len);
+    let chars: Vec<char> = slice.iter().map(|&c| c as u8 as char).collect();
+    let s: String = chars.into_iter().collect();
+
+    create_named_pipe_internal(
+        &s,
+        dw_open_mode,
+        dw_pipe_mode,
+        n_max_instances,
+        n_out_buffer_size,
+        n_in_buffer_size,
+    )
+}
+
+fn create_named_pipe_internal(
+    raw_name: &str,
+    dw_open_mode: u32,
+    dw_pipe_mode: u32,
+    n_max_instances: u32,
+    n_out_buffer_size: u32,
+    n_in_buffer_size: u32,
+) -> HANDLE {
+    let canonical = match canonicalize_pipe_name(raw_name) {
+        Some(c) => c,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+
+    let max_inst = if n_max_instances == 0 || n_max_instances >= PIPE_UNLIMITED_INSTANCES {
+        PIPE_UNLIMITED_INSTANCES
+    } else {
+        n_max_instances
+    };
+
+    let mut registry = NAMED_PIPES.lock();
+    let instances = registry.entry(canonical.clone()).or_insert_with(Vec::new);
+
+    if instances.len() >= max_inst as usize {
+        crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_BUSY);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    let mut gen = NEXT_PIPE_HANDLE.lock();
+    let h_server = *gen;
+    *gen = h_server.saturating_add(1);
+    drop(gen);
+
+    let instance = Arc::new(Spinlock::new(NamedPipeInstance {
+        name: canonical,
+        open_mode: dw_open_mode,
+        pipe_mode: dw_pipe_mode,
+        state: NamedPipeState::Listening,
+        server_to_client: PipeBuffer::new(n_out_buffer_size as usize),
+        client_to_server: PipeBuffer::new(n_in_buffer_size as usize),
+        server_handle: Some(h_server),
+        client_handle: None,
+    }));
+
+    instances.push(Arc::clone(&instance));
+
+    let mut table = PIPE_HANDLE_TABLE.lock();
+    table.insert(h_server, PipeEndpoint::Named(instance, PipeHandleRole::Server));
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    h_server
+}
+
+/// Connects a client to an existing listening named pipe instance.
+pub fn win32_connect_client_pipe(raw_name: &str, _desired_access: u32) -> HANDLE {
+    let canonical = match canonicalize_pipe_name(raw_name) {
+        Some(c) => c,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+
+    let registry = NAMED_PIPES.lock();
+    let instances = match registry.get(&canonical) {
+        Some(list) => list,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+
+    let target_instance = instances.iter().find(|inst| {
+        let guard = inst.lock();
+        guard.state == NamedPipeState::Listening
+    });
+
+    let target = match target_instance {
+        Some(inst) => Arc::clone(inst),
+        None => {
+            crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_BUSY);
+            return INVALID_HANDLE_VALUE;
+        }
+    };
+    drop(registry);
+
+    let mut gen = NEXT_PIPE_HANDLE.lock();
+    let h_client = *gen;
+    *gen = h_client.saturating_add(1);
+    drop(gen);
+
+    {
+        let mut inst = target.lock();
+        inst.state = NamedPipeState::Connected;
+        inst.client_handle = Some(h_client);
+    }
+
+    let mut table = PIPE_HANDLE_TABLE.lock();
+    table.insert(h_client, PipeEndpoint::Named(target, PipeHandleRole::Client));
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    h_client
+}
+
+/// Emulates Win32 ConnectNamedPipe waiting for or acknowledging a client connection.
+pub unsafe fn ConnectNamedPipe(h_named_pipe: HANDLE, _lp_overlapped: *const u8) -> bool {
+    let endpoint = {
+        let table = PIPE_HANDLE_TABLE.lock();
+        match table.get(&h_named_pipe).cloned() {
+            Some(e) => e,
+            None => {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+    };
+
+    match endpoint {
+        PipeEndpoint::Named(instance, role) => {
+            if role != PipeHandleRole::Server {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                return false;
+            }
+            let inst = instance.lock();
+            match inst.state {
+                NamedPipeState::Connected => {
+                    crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_CONNECTED);
+                    false
+                }
+                NamedPipeState::Listening => {
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+                    true
+                }
+                NamedPipeState::Disconnected => {
+                    crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_NOT_CONNECTED);
+                    false
+                }
+            }
+        }
+        _ => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            false
+        }
+    }
+}
+
+/// Emulates Win32 DisconnectNamedPipe disconnecting a server pipe instance from its client.
+pub unsafe fn DisconnectNamedPipe(h_named_pipe: HANDLE) -> bool {
+    let endpoint = {
+        let table = PIPE_HANDLE_TABLE.lock();
+        match table.get(&h_named_pipe).cloned() {
+            Some(e) => e,
+            None => {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+    };
+
+    match endpoint {
+        PipeEndpoint::Named(instance, role) => {
+            if role != PipeHandleRole::Server {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                return false;
+            }
+            let mut inst = instance.lock();
+            inst.state = NamedPipeState::Disconnected;
+            if let Some(client_h) = inst.client_handle.take() {
+                drop(inst);
+                let mut table = PIPE_HANDLE_TABLE.lock();
+                table.remove(&client_h);
+            }
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+            true
+        }
+        _ => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+            false
         }
     }
 }
