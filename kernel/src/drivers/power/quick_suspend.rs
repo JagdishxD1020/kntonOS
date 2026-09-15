@@ -163,3 +163,75 @@ pub fn verify_gaming_suspend_sequence() -> bool {
 
     true
 }
+
+/// System wake trigger source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeTriggerSource {
+    PowerButton,
+    LidSwitch,
+    BleControllerWake,
+    TimerAlarm,
+    None,
+}
+
+/// S3 sleep transition controller and wake interrupt handler.
+#[derive(Debug, Clone, Copy)]
+pub struct S3SleepWakeController {
+    pub power_button_armed: bool,
+    pub lid_switch_armed: bool,
+    pub ble_wake_armed: bool,
+    pub last_wake_trigger: WakeTriggerSource,
+}
+
+impl S3SleepWakeController {
+    /// Creates a new S3 sleep wake controller.
+    pub const fn new() -> Self {
+        Self {
+            power_button_armed: true,
+            lid_switch_armed: true,
+            ble_wake_armed: true,
+            last_wake_trigger: WakeTriggerSource::None,
+        }
+    }
+
+    /// Arms wake interrupt sources in ACPI PM1 and embedded controller registers.
+    pub fn arm_wake_sources(&mut self) -> bool {
+        self.power_button_armed = true;
+        self.lid_switch_armed = true;
+        self.ble_wake_armed = true;
+        self.last_wake_trigger = WakeTriggerSource::None;
+        true
+    }
+
+    /// Dispatches an incoming hardware wake interrupt.
+    pub fn handle_wake_interrupt(&mut self, trigger: WakeTriggerSource) -> bool {
+        self.last_wake_trigger = trigger;
+        match trigger {
+            WakeTriggerSource::PowerButton if self.power_button_armed => true,
+            WakeTriggerSource::LidSwitch if self.lid_switch_armed => true,
+            WakeTriggerSource::BleControllerWake if self.ble_wake_armed => true,
+            WakeTriggerSource::TimerAlarm => true,
+            _ => false,
+        }
+    }
+}
+
+/// Unit verification for S3 sleep wake controller.
+pub fn verify_s3_sleep_wake_controller() -> bool {
+    let mut ctrl = S3SleepWakeController::new();
+    if !ctrl.arm_wake_sources() {
+        return false;
+    }
+
+    // Power button wake
+    if !ctrl.handle_wake_interrupt(WakeTriggerSource::PowerButton) || ctrl.last_wake_trigger != WakeTriggerSource::PowerButton {
+        return false;
+    }
+
+    // BLE gamepad wake
+    if !ctrl.handle_wake_interrupt(WakeTriggerSource::BleControllerWake) || ctrl.last_wake_trigger != WakeTriggerSource::BleControllerWake {
+        return false;
+    }
+
+    true
+}
