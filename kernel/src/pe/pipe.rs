@@ -3,7 +3,10 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 use alloc::collections::VecDeque;
-use crate::pe::synch::HANDLE;
+type HANDLE = u64;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use crate::memory::spinlock::Spinlock;
 
 // Pipe open modes
 pub const PIPE_ACCESS_INBOUND: u32 = 0x00000001;
@@ -173,5 +176,198 @@ impl PipeBuffer {
     pub fn clear(&mut self) {
         self.data.clear();
         self.messages.clear();
+    }
+}
+
+/// Unidirectional anonymous pipe channel state.
+#[derive(Debug)]
+pub struct AnonymousPipeChannel {
+    pub buffer: PipeBuffer,
+    pub has_reader: bool,
+    pub has_writer: bool,
+}
+
+/// Endpoint encapsulation for anonymous and named pipe handles.
+#[derive(Clone)]
+pub enum PipeEndpoint {
+    Anonymous(Arc<Spinlock<AnonymousPipeChannel>>, PipeHandleRole),
+}
+
+static NEXT_PIPE_HANDLE: Spinlock<HANDLE> = Spinlock::new(0x000E_0001);
+static PIPE_HANDLE_TABLE: Spinlock<BTreeMap<HANDLE, PipeEndpoint>> = Spinlock::new(BTreeMap::new());
+
+/// Emulates Win32 CreatePipe creating an anonymous unidirectional pipe.
+pub unsafe fn CreatePipe(
+    ph_read_pipe: *mut HANDLE,
+    ph_write_pipe: *mut HANDLE,
+    _lp_pipe_attributes: *const u8,
+    n_size: u32,
+) -> bool {
+    if ph_read_pipe.is_null() || ph_write_pipe.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let mut gen = NEXT_PIPE_HANDLE.lock();
+    let h_read = *gen;
+    let h_write = h_read.saturating_add(1);
+    *gen = h_write.saturating_add(1);
+    drop(gen);
+
+    let channel = Arc::new(Spinlock::new(AnonymousPipeChannel {
+        buffer: PipeBuffer::new(n_size as usize),
+        has_reader: true,
+        has_writer: true,
+    }));
+
+    let mut table = PIPE_HANDLE_TABLE.lock();
+    table.insert(h_read, PipeEndpoint::Anonymous(Arc::clone(&channel), PipeHandleRole::AnonymousReader));
+    table.insert(h_write, PipeEndpoint::Anonymous(channel, PipeHandleRole::AnonymousWriter));
+
+    *ph_read_pipe = h_read;
+    *ph_write_pipe = h_write;
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Checks whether the given handle refers to a registered pipe object.
+pub fn is_pipe_handle(h_object: HANDLE) -> bool {
+    let table = PIPE_HANDLE_TABLE.lock();
+    table.contains_key(&h_object)
+}
+
+/// Closes a pipe handle, adjusting channel lifecycle state.
+pub fn win32_close_pipe(h_object: HANDLE) -> bool {
+    let mut table = PIPE_HANDLE_TABLE.lock();
+    if let Some(endpoint) = table.remove(&h_object) {
+        match endpoint {
+            PipeEndpoint::Anonymous(channel, role) => {
+                let mut chan = channel.lock();
+                match role {
+                    PipeHandleRole::AnonymousReader => chan.has_reader = false,
+                    PipeHandleRole::AnonymousWriter => chan.has_writer = false,
+                    _ => {}
+                }
+            }
+        }
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Reads bytes from a pipe handle.
+pub unsafe fn win32_read_pipe(
+    h_pipe: HANDLE,
+    lp_buffer: *mut u8,
+    n_number_of_bytes_to_read: u32,
+    lp_number_of_bytes_read: *mut u32,
+) -> bool {
+    if lp_buffer.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let endpoint = {
+        let table = PIPE_HANDLE_TABLE.lock();
+        match table.get(&h_pipe).cloned() {
+            Some(e) => e,
+            None => {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+    };
+
+    match endpoint {
+        PipeEndpoint::Anonymous(channel, role) => {
+            if role != PipeHandleRole::AnonymousReader {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                return false;
+            }
+
+            let mut chan = channel.lock();
+            let dest = core::slice::from_raw_parts_mut(lp_buffer, n_number_of_bytes_to_read as usize);
+            if chan.buffer.is_empty() {
+                if !chan.has_writer {
+                    if !lp_number_of_bytes_read.is_null() {
+                        *lp_number_of_bytes_read = 0;
+                    }
+                    crate::pe::kernel32::win32_set_last_error(ERROR_BROKEN_PIPE);
+                    return false;
+                }
+                if !lp_number_of_bytes_read.is_null() {
+                    *lp_number_of_bytes_read = 0;
+                }
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+                return true;
+            }
+
+            match chan.buffer.read(dest, false) {
+                Ok(bytes) => {
+                    if !lp_number_of_bytes_read.is_null() {
+                        *lp_number_of_bytes_read = bytes as u32;
+                    }
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+                    true
+                }
+                Err((bytes, err)) => {
+                    if !lp_number_of_bytes_read.is_null() {
+                        *lp_number_of_bytes_read = bytes as u32;
+                    }
+                    crate::pe::kernel32::win32_set_last_error(err);
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Writes bytes to a pipe handle.
+pub unsafe fn win32_write_pipe(
+    h_pipe: HANDLE,
+    lp_buffer: *const u8,
+    n_number_of_bytes_to_write: u32,
+    lp_number_of_bytes_written: *mut u32,
+) -> bool {
+    if lp_buffer.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let endpoint = {
+        let table = PIPE_HANDLE_TABLE.lock();
+        match table.get(&h_pipe).cloned() {
+            Some(e) => e,
+            None => {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+    };
+
+    match endpoint {
+        PipeEndpoint::Anonymous(channel, role) => {
+            if role != PipeHandleRole::AnonymousWriter {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                return false;
+            }
+
+            let mut chan = channel.lock();
+            if !chan.has_reader {
+                crate::pe::kernel32::win32_set_last_error(ERROR_BROKEN_PIPE);
+                return false;
+            }
+
+            let src = core::slice::from_raw_parts(lp_buffer, n_number_of_bytes_to_write as usize);
+            let written = chan.buffer.write(src, false);
+            if !lp_number_of_bytes_written.is_null() {
+                *lp_number_of_bytes_written = written as u32;
+            }
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+            true
+        }
     }
 }
