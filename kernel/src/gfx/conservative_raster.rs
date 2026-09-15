@@ -320,3 +320,147 @@ impl D3D12_CONSERVATIVE_COVERAGE_EVALUATOR {
         mask
     }
 }
+
+// Complete conservative rasterization output descriptor for a single pixel
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_CONSERVATIVE_PIXEL_RESULT {
+    pub pixel_x: i32,
+    pub pixel_y: i32,
+    pub is_conservatively_covered: bool,
+    pub sv_coverage: u32,
+    pub sv_inner_coverage: bool,
+}
+
+// Inner input coverage evaluator for Tier 2/3 high-precision shadow mapping and visibility buffers
+#[allow(non_camel_case_types)]
+pub struct D3D12_INNER_COVERAGE_EVALUATOR;
+
+impl D3D12_INNER_COVERAGE_EVALUATOR {
+    // Determine whether a pixel is completely and unconditionally interior to the triangle
+    pub fn evaluates_inner_coverage(
+        triangle: &D3D12_CONSERVATIVE_TRIANGLE,
+        px: i32,
+        py: i32,
+        desc: &D3D12_CONSERVATIVE_RASTERIZER_DESC,
+    ) -> bool {
+        // Inner coverage requires hardware Tier 2 or Tier 3
+        if !desc.supports_inner_coverage() || triangle.should_cull {
+            return false;
+        }
+
+        if triangle.degenerate_status != D3D12_DEGENERATE_STATUS::NonDegenerate {
+            return false;
+        }
+
+        let u = desc.uncertainty_region();
+        // The 4 corners of the pixel expanded outwards by the uncertainty region
+        let corners = [
+            [px as f32 - u, py as f32 - u],
+            [px as f32 + 1.0 + u, py as f32 - u],
+            [px as f32 + 1.0 + u, py as f32 + 1.0 + u],
+            [px as f32 - u, py as f32 + 1.0 + u],
+        ];
+
+        let verts = [triangle.v0, triangle.v1, triangle.v2];
+
+        // All 4 corners must be strictly on the interior side of every triangle edge
+        for i in 0..3 {
+            let v_curr = verts[i];
+            let v_next = verts[(i + 1) % 3];
+            let edge = [v_next[0] - v_curr[0], v_next[1] - v_curr[1]];
+
+            for &corner in &corners {
+                let cross = (corner[0] - v_curr[0]) * edge[1] - (corner[1] - v_curr[1]) * edge[0];
+                if triangle.signed_area >= 0.0 {
+                    if cross <= 1e-5 {
+                        return false;
+                    }
+                } else {
+                    if cross >= -1e-5 {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+}
+
+// Conservative rasterizer execution pipeline rasterizing triangles into pixel coverage buffers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_CONSERVATIVE_RASTER_PIPELINE {
+    pub desc: D3D12_CONSERVATIVE_RASTERIZER_DESC,
+}
+
+impl D3D12_CONSERVATIVE_RASTER_PIPELINE {
+    // Construct new conservative rasterizer pipeline with descriptor
+    pub fn new(desc: D3D12_CONSERVATIVE_RASTERIZER_DESC) -> Self {
+        Self { desc }
+    }
+
+    // Rasterize a conservative triangle and return all covered pixels with SV_Coverage and SV_InnerCoverage
+    pub fn rasterize_triangle(
+        &self,
+        triangle: &D3D12_CONSERVATIVE_TRIANGLE,
+        sample_count: u32,
+    ) -> Vec<D3D12_CONSERVATIVE_PIXEL_RESULT> {
+        let mut results = Vec::new();
+        if triangle.should_cull {
+            return results;
+        }
+
+        let uncertainty = self.desc.uncertainty_region();
+        let floor_i = |v: f32| -> i32 {
+            let i = v as i32;
+            if v < (i as f32) { i - 1 } else { i }
+        };
+        let ceil_i = |v: f32| -> i32 {
+            let i = v as i32;
+            if v > (i as f32) { i + 1 } else { i }
+        };
+        let min_px = floor_i(triangle.dilated_aabb[0]);
+        let min_py = floor_i(triangle.dilated_aabb[1]);
+        let max_px = ceil_i(triangle.dilated_aabb[2]);
+        let max_py = ceil_i(triangle.dilated_aabb[3]);
+
+        for py in min_py..=max_py {
+            for px in min_px..=max_px {
+                let covered = D3D12_CONSERVATIVE_COVERAGE_EVALUATOR::pixel_intersects_triangle(
+                    triangle,
+                    px,
+                    py,
+                    uncertainty,
+                );
+
+                if covered {
+                    let sv_coverage = D3D12_CONSERVATIVE_COVERAGE_EVALUATOR::compute_sv_coverage(
+                        triangle,
+                        px,
+                        py,
+                        sample_count,
+                        uncertainty,
+                    );
+                    let inner = D3D12_INNER_COVERAGE_EVALUATOR::evaluates_inner_coverage(
+                        triangle,
+                        px,
+                        py,
+                        &self.desc,
+                    );
+
+                    results.push(D3D12_CONSERVATIVE_PIXEL_RESULT {
+                        pixel_x: px,
+                        pixel_y: py,
+                        is_conservatively_covered: true,
+                        sv_coverage,
+                        sv_inner_coverage: inner,
+                    });
+                }
+            }
+        }
+
+        results
+    }
+}
