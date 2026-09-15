@@ -746,3 +746,175 @@ pub unsafe fn DisconnectNamedPipe(h_named_pipe: HANDLE) -> bool {
         }
     }
 }
+
+/// Emulates Win32 PeekNamedPipe inspecting buffered pipe contents without consuming them.
+pub unsafe fn PeekNamedPipe(
+    h_named_pipe: HANDLE,
+    lp_buffer: *mut u8,
+    n_buffer_size: u32,
+    lp_bytes_read: *mut u32,
+    lp_total_bytes_avail: *mut u32,
+    lp_bytes_left_this_message: *mut u32,
+) -> bool {
+    let endpoint = {
+        let table = PIPE_HANDLE_TABLE.lock();
+        match table.get(&h_named_pipe).cloned() {
+            Some(e) => e,
+            None => {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
+                return false;
+            }
+        }
+    };
+
+    let (copied, avail, left_msg) = match endpoint {
+        PipeEndpoint::Anonymous(channel, role) => {
+            if role != PipeHandleRole::AnonymousReader {
+                crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                return false;
+            }
+            let chan = channel.lock();
+            if !lp_buffer.is_null() && n_buffer_size > 0 {
+                let dest = core::slice::from_raw_parts_mut(lp_buffer, n_buffer_size as usize);
+                chan.buffer.peek(dest)
+            } else {
+                (0, chan.buffer.len(), 0)
+            }
+        }
+        PipeEndpoint::Named(instance, role) => {
+            let inst = instance.lock();
+            if inst.state != NamedPipeState::Connected {
+                crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_NOT_CONNECTED);
+                return false;
+            }
+            let target_buf = match role {
+                PipeHandleRole::Server => &inst.client_to_server,
+                PipeHandleRole::Client => &inst.server_to_client,
+                _ => {
+                    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_ACCESS_DENIED);
+                    return false;
+                }
+            };
+            if !lp_buffer.is_null() && n_buffer_size > 0 {
+                let dest = core::slice::from_raw_parts_mut(lp_buffer, n_buffer_size as usize);
+                target_buf.peek(dest)
+            } else {
+                (0, target_buf.len(), 0)
+            }
+        }
+    };
+
+    if !lp_bytes_read.is_null() {
+        *lp_bytes_read = copied as u32;
+    }
+    if !lp_total_bytes_avail.is_null() {
+        *lp_total_bytes_avail = avail as u32;
+    }
+    if !lp_bytes_left_this_message.is_null() {
+        *lp_bytes_left_this_message = left_msg as u32;
+    }
+
+    crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 TransactNamedPipe performing atomic message write followed by response read.
+pub unsafe fn TransactNamedPipe(
+    h_named_pipe: HANDLE,
+    lp_in_buffer: *const u8,
+    n_in_buffer_size: u32,
+    lp_out_buffer: *mut u8,
+    n_out_buffer_size: u32,
+    lp_bytes_read: *mut u32,
+    _lp_overlapped: *const u8,
+) -> bool {
+    if !lp_in_buffer.is_null() && n_in_buffer_size > 0 {
+        let mut written = 0u32;
+        if !win32_write_pipe(h_named_pipe, lp_in_buffer, n_in_buffer_size, &mut written) {
+            return false;
+        }
+    }
+
+    if !lp_out_buffer.is_null() && n_out_buffer_size > 0 {
+        win32_read_pipe(h_named_pipe, lp_out_buffer, n_out_buffer_size, lp_bytes_read)
+    } else {
+        if !lp_bytes_read.is_null() {
+            *lp_bytes_read = 0;
+        }
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    }
+}
+
+/// Emulates Win32 WaitNamedPipeA waiting for an instance of a named pipe to become available (ANSI).
+pub unsafe fn WaitNamedPipeA(lp_named_pipe_name: *const u8, _n_time_out: u32) -> bool {
+    if lp_named_pipe_name.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let mut len = 0;
+    while *lp_named_pipe_name.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(lp_named_pipe_name, len);
+    let s = match core::str::from_utf8(slice) {
+        Ok(v) => v,
+        Err(_) => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+
+    wait_named_pipe_internal(s)
+}
+
+/// Emulates Win32 WaitNamedPipeW waiting for an instance of a named pipe to become available (UTF-16).
+pub unsafe fn WaitNamedPipeW(lp_named_pipe_name: *const u16, _n_time_out: u32) -> bool {
+    if lp_named_pipe_name.is_null() {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let mut len = 0;
+    while *lp_named_pipe_name.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(lp_named_pipe_name, len);
+    let chars: Vec<char> = slice.iter().map(|&c| c as u8 as char).collect();
+    let s: String = chars.into_iter().collect();
+
+    wait_named_pipe_internal(&s)
+}
+
+fn wait_named_pipe_internal(raw_name: &str) -> bool {
+    let canonical = match canonicalize_pipe_name(raw_name) {
+        Some(c) => c,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+
+    let registry = NAMED_PIPES.lock();
+    let instances = match registry.get(&canonical) {
+        Some(list) => list,
+        None => {
+            crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_FILE_NOT_FOUND);
+            return false;
+        }
+    };
+
+    let has_listening = instances.iter().any(|inst| {
+        let guard = inst.lock();
+        guard.state == NamedPipeState::Listening
+    });
+
+    if has_listening {
+        crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
+        true
+    } else {
+        crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_BUSY);
+        false
+    }
+}
