@@ -759,3 +759,295 @@ impl D3D12_INDIRECT_COMMAND_RECORDER {
         self.packets.is_empty()
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Command Signature and GPU ExecuteIndirect engine
+pub fn test_execute_indirect_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-INDIRECT] Initializing Direct3D 12 Command Signature & ExecuteIndirect self-test...\r\n");
+
+    // 1. Verify standard command signature creation and stride validation
+    let draw_sig = match D3D12_COMMAND_SIGNATURE::create_draw() {
+        Ok(sig) => sig,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Standard Draw signature creation failed\r\n");
+            return false;
+        }
+    };
+    if draw_sig.byte_stride != 16 || !draw_sig.is_draw {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Draw signature stride or flag incorrect\r\n");
+        return false;
+    }
+
+    let draw_indexed_sig = match D3D12_COMMAND_SIGNATURE::create_draw_indexed() {
+        Ok(sig) => sig,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Standard DrawIndexed signature creation failed\r\n");
+            return false;
+        }
+    };
+    if draw_indexed_sig.byte_stride != 20 || !draw_indexed_sig.is_draw_indexed {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] DrawIndexed signature stride or flag incorrect\r\n");
+        return false;
+    }
+
+    let dispatch_sig = match D3D12_COMMAND_SIGNATURE::create_dispatch() {
+        Ok(sig) => sig,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Standard Dispatch signature creation failed\r\n");
+            return false;
+        }
+    };
+    if dispatch_sig.byte_stride != 12 || !dispatch_sig.is_dispatch {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Dispatch signature stride or flag incorrect\r\n");
+        return false;
+    }
+
+    // Verify stride validation rules: multiple of 4, minimum stride, and maximum limit
+    let unaligned_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        17,
+        alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_draw()],
+        0,
+    );
+    if D3D12_COMMAND_SIGNATURE::create(unaligned_desc, None) != Err(IndirectError::StrideNotMultipleOfFour(17)) {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Unaligned byte stride not rejected\r\n");
+        return false;
+    }
+
+    let too_small_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        12,
+        alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_draw()],
+        0,
+    );
+    if D3D12_COMMAND_SIGNATURE::create(too_small_desc, None)
+        != Err(IndirectError::InvalidByteStride {
+            stride: 12,
+            min_stride: 16,
+        })
+    {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Byte stride smaller than minimum not rejected\r\n");
+        return false;
+    }
+
+    let excessive_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        4096,
+        alloc::vec![D3D12_INDIRECT_ARGUMENT_DESC::make_draw()],
+        0,
+    );
+    if D3D12_COMMAND_SIGNATURE::create(excessive_desc, None) != Err(IndirectError::StrideExceedsMaximum(4096)) {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Byte stride exceeding 2048 not rejected\r\n");
+        return false;
+    }
+
+    // Verify root parameter bounds checking and draw argument positioning
+    let cbv_draw_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        24,
+        alloc::vec![
+            D3D12_INDIRECT_ARGUMENT_DESC::make_cbv(2),
+            D3D12_INDIRECT_ARGUMENT_DESC::make_draw(),
+        ],
+        0,
+    );
+    if D3D12_COMMAND_SIGNATURE::create(cbv_draw_desc.clone(), None) != Err(IndirectError::MissingRootSignature) {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Missing root signature not detected\r\n");
+        return false;
+    }
+    if D3D12_COMMAND_SIGNATURE::create(cbv_draw_desc.clone(), Some(2))
+        != Err(IndirectError::InvalidRootParameter {
+            index: 2,
+            available: 2,
+        })
+    {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Out-of-bounds root parameter not detected\r\n");
+        return false;
+    }
+    if D3D12_COMMAND_SIGNATURE::create(cbv_draw_desc, Some(4)).is_err() {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Valid root signature descriptor rejected\r\n");
+        return false;
+    }
+
+    let draw_first_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        24,
+        alloc::vec![
+            D3D12_INDIRECT_ARGUMENT_DESC::make_draw(),
+            D3D12_INDIRECT_ARGUMENT_DESC::make_cbv(0),
+        ],
+        0,
+    );
+    if D3D12_COMMAND_SIGNATURE::create(draw_first_desc, Some(4))
+        != Err(IndirectError::DrawOrDispatchNotFinalArgument)
+    {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Non-final draw argument not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command signature creation, byte stride, and root parameter validation verified\r\n");
+
+    // 2. Verify indirect argument buffer unpacking without count buffer
+    let mut raw_draw_indexed_buf = alloc::vec::Vec::new();
+    for i in 0..3u32 {
+        raw_draw_indexed_buf.extend_from_slice(&(100u32 * (i + 1)).to_le_bytes()); // index_count
+        raw_draw_indexed_buf.extend_from_slice(&(i + 1).to_le_bytes());            // instance_count
+        raw_draw_indexed_buf.extend_from_slice(&(i * 50).to_le_bytes());           // start_index
+        raw_draw_indexed_buf.extend_from_slice(&(i as i32 * 10).to_le_bytes());    // base_vertex
+        raw_draw_indexed_buf.extend_from_slice(&i.to_le_bytes());                  // start_instance
+    }
+
+    let parsed = match D3D12_INDIRECT_ARGUMENT_PARSER::parse(
+        &draw_indexed_sig,
+        &raw_draw_indexed_buf,
+        0,
+        3,
+        None,
+    ) {
+        Ok(cmds) => cmds,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] DrawIndexed argument parsing failed\r\n");
+            return false;
+        }
+    };
+
+    if parsed.len() != 3 {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Parsed command count mismatch\r\n");
+        return false;
+    }
+    match &parsed[1].arguments[0] {
+        D3D12_PARSED_INDIRECT_ARGUMENT::DrawIndexed(args) => {
+            if args.index_count_per_instance != 200
+                || args.instance_count != 2
+                || args.start_index_location != 50
+                || args.base_vertex_location != 10
+                || args.start_instance_location != 1
+            {
+                crate::serial_write_str("[KNT-INDIRECT-FAIL] DrawIndexed argument values mismatch\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Expected DrawIndexed argument enum\r\n");
+            return false;
+        }
+    }
+    crate::serial_write_str("  * Indirect argument buffer unpacking and structured decoding verified\r\n");
+
+    // 3. Verify autonomous GPU count buffer clamping and dynamic occlusion culling
+    let count_buf_2 = 2u32.to_le_bytes();
+    let clamped_parsed = match D3D12_INDIRECT_ARGUMENT_PARSER::parse(
+        &draw_indexed_sig,
+        &raw_draw_indexed_buf,
+        0,
+        5, // max is 5, but count buffer specifies 2
+        Some((&count_buf_2, 0)),
+    ) {
+        Ok(cmds) => cmds,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] GPU count buffer evaluation failed\r\n");
+            return false;
+        }
+    };
+    if clamped_parsed.len() != 2 {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] GPU count buffer clamping to 2 failed\r\n");
+        return false;
+    }
+
+    // Dynamic occlusion culling: GPU count buffer equals 0
+    let count_buf_zero = 0u32.to_le_bytes();
+    let culled_parsed = match D3D12_INDIRECT_ARGUMENT_PARSER::parse(
+        &draw_indexed_sig,
+        &raw_draw_indexed_buf,
+        0,
+        5,
+        Some((&count_buf_zero, 0)),
+    ) {
+        Ok(cmds) => cmds,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Zero count buffer evaluation failed\r\n");
+            return false;
+        }
+    };
+    if !culled_parsed.is_empty() {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Zero count buffer did not cull commands\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * GPU count buffer clamping and dynamic occlusion culling without stalls verified\r\n");
+
+    // 4. Verify composite multi-argument signature (CBV + VB + DrawIndexed)
+    let composite_desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        48, // 8 (CBV) + 16 (VB) + 20 (DrawIndexed) = 44 bytes minimum, padded to 48
+        alloc::vec![
+            D3D12_INDIRECT_ARGUMENT_DESC::make_cbv(0),
+            D3D12_INDIRECT_ARGUMENT_DESC::make_vertex_buffer(1),
+            D3D12_INDIRECT_ARGUMENT_DESC::make_draw_indexed(),
+        ],
+        0,
+    );
+    let composite_sig = match D3D12_COMMAND_SIGNATURE::create(composite_desc, Some(1)) {
+        Ok(sig) => sig,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Composite signature creation failed\r\n");
+            return false;
+        }
+    };
+
+    let mut composite_buf = alloc::vec::Vec::new();
+    // Command 0
+    composite_buf.extend_from_slice(&0x0000_1000_8000_0000u64.to_le_bytes()); // CBV GPU VA
+    composite_buf.extend_from_slice(&0x0000_2000_0000_0000u64.to_le_bytes()); // VB GPU VA
+    composite_buf.extend_from_slice(&4096u32.to_le_bytes());                   // VB Size
+    composite_buf.extend_from_slice(&32u32.to_le_bytes());                     // VB Stride
+    composite_buf.extend_from_slice(&64u32.to_le_bytes());                     // Index count
+    composite_buf.extend_from_slice(&1u32.to_le_bytes());                      // Instance count
+    composite_buf.extend_from_slice(&0u32.to_le_bytes());                      // Start index
+    composite_buf.extend_from_slice(&0i32.to_le_bytes());                      // Base vertex
+    composite_buf.extend_from_slice(&0u32.to_le_bytes());                      // Start instance
+    composite_buf.extend_from_slice(&[0u8; 4]);                                // 4-byte padding to 48 bytes
+
+    let parsed_composite = match D3D12_INDIRECT_ARGUMENT_PARSER::parse(
+        &composite_sig,
+        &composite_buf,
+        0,
+        1,
+        None,
+    ) {
+        Ok(cmds) => cmds,
+        Err(_) => {
+            crate::serial_write_str("[KNT-INDIRECT-FAIL] Composite signature parsing failed\r\n");
+            return false;
+        }
+    };
+    if parsed_composite.len() != 1 || parsed_composite[0].arguments.len() != 3 {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Composite parsed arguments structure mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Composite indirect argument layout (CBV + VB + DrawIndexed) verified\r\n");
+
+    // 5. Verify command recorder token stream encoder
+    let mut recorder = D3D12_INDIRECT_COMMAND_RECORDER::new();
+    let record_res = recorder.record_execute_indirect(
+        &draw_indexed_sig,
+        1,
+        100,
+        0x1000_0000,
+        0,
+        0x2000_0000,
+        0,
+    );
+    if record_res.is_err() || recorder.len() != 1 || recorder.total_max_commands_scheduled != 100 {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Indirect command recorder recording failed\r\n");
+        return false;
+    }
+
+    let mut stream = alloc::vec::Vec::new();
+    recorder.serialize_to_token_stream(&mut stream);
+    if stream.len() != 44 {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Token stream serialization length mismatch\r\n");
+        return false;
+    }
+    let opcode = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]);
+    if opcode != D3D12_TOKEN_EXECUTE_INDIRECT {
+        crate::serial_write_str("[KNT-INDIRECT-FAIL] Stream opcode mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command recorder token stream encoder for ExecuteIndirect verified\r\n");
+
+    // 6. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-INDIRECT-PASS] Direct3D 12 command signature and GPU execute indirect engine verified\r\n");
+    true
+}

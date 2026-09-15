@@ -387,6 +387,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 shader execution reordering engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Command Signature & GPU ExecuteIndirect Engine (TASK-KNT-177)
+    if !gfx::test_execute_indirect_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 command signature and execute indirect self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Dynamic Depth Bounds Testing & Conservative Rasterization Engine
     if !gfx::test_depth_bounds_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 depth bounds & conservative rasterization self-test failed!\r\n");
