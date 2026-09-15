@@ -17,6 +17,7 @@ pub mod file;
 pub mod peb_teb;
 pub mod delay_load;
 pub mod crypto;
+pub mod pipe;
 
 pub use header::*;
 pub use ntdll::*;
@@ -33,6 +34,7 @@ pub use file::*;
 pub use peb_teb::*;
 pub use delay_load::*;
 pub use crypto::*;
+pub use pipe::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
