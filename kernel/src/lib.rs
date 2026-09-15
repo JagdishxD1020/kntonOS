@@ -684,6 +684,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::power::test_whisper_mode_governor() {
         serial_write_str("[KNT-PANIC] Handheld fanless whisper mode and acoustic governor self-test failed!\r\n");
     }
+    // Initialize and verify Handheld Instant Suspend & Low-Power Fast Resume Engine (TASK-KNT-178)
+    if !drivers::power::test_quick_suspend_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld instant suspend and low-power fast resume self-test failed!\r\n");
+    }
+
 
 
 

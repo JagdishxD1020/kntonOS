@@ -303,3 +303,28 @@ pub fn verify_low_battery_failsafe_and_resume() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld Instant Suspend & Low-Power Fast Resume Engine.
+pub fn test_quick_suspend_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld Instant Suspend & Low-Power Fast Resume Engine...\r\n");
+
+    if !verify_suspend_state_machine() {
+        crate::serial_write_str("[KNT-PANIC] Suspend state machine verification failed!\r\n");
+        return false;
+    }
+    if !verify_gaming_suspend_sequence() {
+        crate::serial_write_str("[KNT-PANIC] Gaming suspend sequence verification failed!\r\n");
+        return false;
+    }
+    if !verify_s3_sleep_wake_controller() {
+        crate::serial_write_str("[KNT-PANIC] S3 sleep wake controller verification failed!\r\n");
+        return false;
+    }
+    if !verify_low_battery_failsafe_and_resume() {
+        crate::serial_write_str("[KNT-PANIC] Low battery fail-safe and fast resume verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-QUICK-SUSPEND-PASS] Handheld instant suspend and low-power fast resume engine verified\r\n");
+    true
+}
