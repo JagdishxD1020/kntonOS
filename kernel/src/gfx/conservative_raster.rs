@@ -194,3 +194,129 @@ impl D3D12_CONSERVATIVE_TRIANGLE {
         }
     }
 }
+
+// Evaluator for conservative pixel intersection and SV_Coverage sample mask computation
+#[allow(non_camel_case_types)]
+pub struct D3D12_CONSERVATIVE_COVERAGE_EVALUATOR;
+
+impl D3D12_CONSERVATIVE_COVERAGE_EVALUATOR {
+    // Test if a 2D integer pixel box [px, px+1] x [py, py+1] conservatives intersects a triangle
+    pub fn pixel_intersects_triangle(
+        triangle: &D3D12_CONSERVATIVE_TRIANGLE,
+        px: i32,
+        py: i32,
+        uncertainty: f32,
+    ) -> bool {
+        if triangle.should_cull {
+            return false;
+        }
+
+        let p_min_x = px as f32 - uncertainty;
+        let p_min_y = py as f32 - uncertainty;
+        let p_max_x = px as f32 + 1.0 + uncertainty;
+        let p_max_y = py as f32 + 1.0 + uncertainty;
+
+        // 1. AABB overlap test
+        if triangle.dilated_aabb[2] < p_min_x
+            || triangle.dilated_aabb[0] > p_max_x
+            || triangle.dilated_aabb[3] < p_min_y
+            || triangle.dilated_aabb[1] > p_max_y
+        {
+            return false;
+        }
+
+        // Handle degenerate point or collinear line
+        if triangle.degenerate_status == D3D12_DEGENERATE_STATUS::PointDegenerate {
+            return triangle.v0[0] >= p_min_x
+                && triangle.v0[0] <= p_max_x
+                && triangle.v0[1] >= p_min_y
+                && triangle.v0[1] <= p_max_y;
+        }
+
+        // 2. Separating Axis Theorem (SAT) using triangle edge normals
+        let box_center = [px as f32 + 0.5, py as f32 + 0.5];
+        let box_half = [0.5 + uncertainty, 0.5 + uncertainty];
+
+        let verts = [triangle.v0, triangle.v1, triangle.v2];
+        for i in 0..3 {
+            let v_curr = verts[i];
+            let v_next = verts[(i + 1) % 3];
+
+            // Edge vector and outward normal
+            let edge = [v_next[0] - v_curr[0], v_next[1] - v_curr[1]];
+            let normal = if triangle.signed_area >= 0.0 {
+                [-edge[1], edge[0]]
+            } else {
+                [edge[1], -edge[0]]
+            };
+
+            // Distance from box center to edge
+            let dist = (box_center[0] - v_curr[0]) * normal[0] + (box_center[1] - v_curr[1]) * normal[1];
+            // Maximum projected extent of box along normal
+            let radius = box_half[0] * normal[0].abs() + box_half[1] * normal[1].abs();
+
+            if dist > radius {
+                return false; // Box is entirely on the outside of this edge
+            }
+        }
+
+        true
+    }
+
+    // Compute SV_Coverage bitmask for a pixel (supporting 1x and 4x MSAA patterns)
+    pub fn compute_sv_coverage(
+        triangle: &D3D12_CONSERVATIVE_TRIANGLE,
+        px: i32,
+        py: i32,
+        sample_count: u32,
+        uncertainty: f32,
+    ) -> u32 {
+        let touched = Self::pixel_intersects_triangle(triangle, px, py, uncertainty);
+        if !touched {
+            return 0;
+        }
+
+        if sample_count <= 1 {
+            return 1;
+        }
+
+        // 4x MSAA standard sample pattern offsets relative to pixel top-left
+        let msaa_4x_offsets: [[f32; 2]; 4] = [
+            [0.375, 0.125],
+            [0.875, 0.375],
+            [0.125, 0.625],
+            [0.625, 0.875],
+        ];
+
+        let mut mask = 0u32;
+        let verts = [triangle.v0, triangle.v1, triangle.v2];
+
+        for (i, offset) in msaa_4x_offsets.iter().enumerate() {
+            let sx = px as f32 + offset[0];
+            let sy = py as f32 + offset[1];
+
+            let mut inside = true;
+            for j in 0..3 {
+                let v_curr = verts[j];
+                let v_next = verts[(j + 1) % 3];
+                let edge = [v_next[0] - v_curr[0], v_next[1] - v_curr[1]];
+                let cross = (sx - v_curr[0]) * edge[1] - (sy - v_curr[1]) * edge[0];
+                if (triangle.signed_area >= 0.0 && cross < -1e-5)
+                    || (triangle.signed_area < 0.0 && cross > 1e-5)
+                {
+                    inside = false;
+                    break;
+                }
+            }
+            if inside {
+                mask |= 1 << i;
+            }
+        }
+
+        // In conservative rasterization, a touched pixel must have at least one sample covered
+        if mask == 0 {
+            mask = 1;
+        }
+        mask
+    }
+}
