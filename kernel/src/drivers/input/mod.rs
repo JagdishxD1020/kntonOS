@@ -20,7 +20,9 @@ pub mod trigger_motor;
 pub mod xinput;
 pub mod haptic_dsp;
 pub mod controller_profile;
+pub mod touchscreen;
 pub use controller_profile::*;
+pub use touchscreen::*;
 
 pub use imu::*;
 pub use gamepad::*;

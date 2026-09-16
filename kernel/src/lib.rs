@@ -608,6 +608,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_touch_and_gesture_subsystem() {
         serial_write_str("[KNT-PANIC] Touch and gesture subsystem self-test failed!\r\n");
     }
+    // Initialize and verify Handheld Capacitive Touchscreen Multi-Touch & Gesture Engine (TASK-KNT-182)
+    if !drivers::input::test_touchscreen_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld capacitive touchscreen and gesture engine self-test failed!\r\n");
+    }
+
 
     // Initialize and verify Handheld PC Capacitive Touchpad & Virtual Trackball Emulation Engine
     if !drivers::input::test_touchpad_trackball_subsystem() {
