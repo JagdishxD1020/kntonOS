@@ -395,3 +395,28 @@ pub fn verify_gaming_gesture_recognizer() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld Capacitive Touchscreen Multi-Touch & Gesture Engine.
+pub fn test_touchscreen_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Capacitive Touchscreen & Gesture Engine...\r\n");
+
+    if !verify_multi_touch_tracking() {
+        crate::serial_write_str("[KNT-PANIC] Multi-touch tracking verification failed!\r\n");
+        return false;
+    }
+    if !verify_palm_rejection_filter() {
+        crate::serial_write_str("[KNT-PANIC] Palm rejection filter verification failed!\r\n");
+        return false;
+    }
+    if !verify_touch_jitter_filter() {
+        crate::serial_write_str("[KNT-PANIC] Touch jitter filter verification failed!\r\n");
+        return false;
+    }
+    if !verify_gaming_gesture_recognizer() {
+        crate::serial_write_str("[KNT-PANIC] Gaming gesture recognizer verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-TOUCHSCREEN-PASS] Handheld capacitive touchscreen and gesture engine verified\r\n");
+    true
+}
