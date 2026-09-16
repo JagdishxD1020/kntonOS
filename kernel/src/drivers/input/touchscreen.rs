@@ -287,3 +287,111 @@ pub fn verify_touch_jitter_filter() -> bool {
 
     true
 }
+
+/// Recognized gaming touchscreen gesture types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamingTouchGesture {
+    None,
+    Tap,
+    DoubleTap,
+    PinchToZoom,
+    ThreeFingerSwipeHorizontal,
+    VirtualKeyboardSwipe,
+}
+
+/// Gaming multi-touch gesture recognizer.
+#[derive(Debug, Clone, Copy)]
+pub struct GamingGestureRecognizer {
+    pub last_tap_time_ms: u32,
+    pub tap_count: u8,
+    pub initial_pinch_distance: u32,
+    pub active_gesture: GamingTouchGesture,
+}
+
+impl GamingGestureRecognizer {
+    /// Creates a new gesture recognizer.
+    pub const fn new() -> Self {
+        Self {
+            last_tap_time_ms: 0,
+            tap_count: 0,
+            initial_pinch_distance: 0,
+            active_gesture: GamingTouchGesture::None,
+        }
+    }
+
+    /// Evaluates single or double tap based on tap timestamp (within 300ms window).
+    pub fn evaluate_tap(&mut self, current_time_ms: u32) -> GamingTouchGesture {
+        if self.last_tap_time_ms > 0 && current_time_ms.saturating_sub(self.last_tap_time_ms) <= 300 {
+            self.tap_count = 0;
+            self.last_tap_time_ms = 0;
+            self.active_gesture = GamingTouchGesture::DoubleTap;
+        } else {
+            self.tap_count = 1;
+            self.last_tap_time_ms = current_time_ms;
+            self.active_gesture = GamingTouchGesture::Tap;
+        }
+        self.active_gesture
+    }
+
+    /// Evaluates 2-finger distance delta for pinch-to-zoom (game minimap zoom).
+    pub fn evaluate_pinch(&mut self, p1: (u16, u16), p2: (u16, u16)) -> GamingTouchGesture {
+        let dx = (p1.0 as i32 - p2.0 as i32).abs();
+        let dy = (p1.1 as i32 - p2.1 as i32).abs();
+        let dist = (dx * dx + dy * dy) as u32; // Squared distance
+
+        if self.initial_pinch_distance == 0 {
+            self.initial_pinch_distance = dist;
+            self.active_gesture = GamingTouchGesture::None;
+        } else {
+            let diff = if dist > self.initial_pinch_distance {
+                dist - self.initial_pinch_distance
+            } else {
+                self.initial_pinch_distance - dist
+            };
+            if diff > 100 {
+                self.active_gesture = GamingTouchGesture::PinchToZoom;
+            }
+        }
+        self.active_gesture
+    }
+
+    /// Evaluates 3-finger swipe gesture for game overlay invocation.
+    pub fn evaluate_three_finger_swipe(&mut self, active_contacts: usize, delta_x: i32) -> GamingTouchGesture {
+        if active_contacts == 3 && delta_x.abs() > 50 {
+            self.active_gesture = GamingTouchGesture::ThreeFingerSwipeHorizontal;
+        } else {
+            self.active_gesture = GamingTouchGesture::None;
+        }
+        self.active_gesture
+    }
+}
+
+/// Unit verification for gaming gesture recognizer.
+pub fn verify_gaming_gesture_recognizer() -> bool {
+    let mut rec = GamingGestureRecognizer::new();
+
+    // Tap and double-tap within 150ms
+    let g1 = rec.evaluate_tap(1000);
+    if g1 != GamingTouchGesture::Tap {
+        return false;
+    }
+    let g2 = rec.evaluate_tap(1150);
+    if g2 != GamingTouchGesture::DoubleTap {
+        return false;
+    }
+
+    // 2-finger pinch
+    rec.evaluate_pinch((100, 100), (200, 200));
+    let g_pinch = rec.evaluate_pinch((50, 50), (300, 300));
+    if g_pinch != GamingTouchGesture::PinchToZoom {
+        return false;
+    }
+
+    // 3-finger swipe
+    let g_swipe = rec.evaluate_three_finger_swipe(3, 80);
+    if g_swipe != GamingTouchGesture::ThreeFingerSwipeHorizontal {
+        return false;
+    }
+
+    true
+}
