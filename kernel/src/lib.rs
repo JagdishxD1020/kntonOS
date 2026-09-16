@@ -675,6 +675,11 @@ pub extern "C" fn kmain() -> ! {
     if !display::test_vrr_pacer_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld OLED VRR and LFC frame pacer self-test failed!\r\n");
     }
+    // Initialize and verify Handheld USB-C Docking Station & DisplayPort MST Manager (TASK-KNT-181)
+    if !display::test_dock_manager_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld USB-C docking station and DP MST manager self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)
