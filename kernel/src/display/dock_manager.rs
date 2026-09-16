@@ -221,3 +221,99 @@ pub fn verify_dp_mst_and_edid() -> bool {
 
     true
 }
+
+/// Display target configuration mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveDisplayMode {
+    InternalHandheldPanel, // 1080p (1920x1080), 120Hz VRR
+    ExternalMonitor4K,     // 4K (3840x2160), 144Hz
+    ExternalMonitor1440p,  // 1440p (2560x1440), 165Hz
+}
+
+/// Dynamic display mode and resolution switcher.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicDisplayModeSwitcher {
+    pub current_mode: ActiveDisplayMode,
+    pub active_width: u16,
+    pub active_height: u16,
+    pub active_refresh_hz: u16,
+    pub vrr_active: bool,
+}
+
+impl DynamicDisplayModeSwitcher {
+    /// Creates a new display mode switcher defaulted to internal handheld panel.
+    pub const fn new() -> Self {
+        Self {
+            current_mode: ActiveDisplayMode::InternalHandheldPanel,
+            active_width: 1920,
+            active_height: 1080,
+            active_refresh_hz: 120,
+            vrr_active: true,
+        }
+    }
+
+    /// Switches display configuration based on docked status and EDID capabilities.
+    pub fn switch_display_mode(&mut self, docked: bool, edid: Option<&ParsedEdidDescriptor>) -> ActiveDisplayMode {
+        if !docked || edid.is_none() {
+            // Revert to internal handheld panel
+            self.current_mode = ActiveDisplayMode::InternalHandheldPanel;
+            self.active_width = 1920;
+            self.active_height = 1080;
+            self.active_refresh_hz = 120;
+            self.vrr_active = true;
+            return self.current_mode;
+        }
+
+        let desc = edid.unwrap();
+        if desc.native_width >= 3840 {
+            self.current_mode = ActiveDisplayMode::ExternalMonitor4K;
+            self.active_width = 3840;
+            self.active_height = 2160;
+            self.active_refresh_hz = desc.max_refresh_hz.min(144);
+            self.vrr_active = desc.supports_vrr;
+        } else {
+            self.current_mode = ActiveDisplayMode::ExternalMonitor1440p;
+            self.active_width = 2560;
+            self.active_height = 1440;
+            self.active_refresh_hz = desc.max_refresh_hz.min(165);
+            self.vrr_active = desc.supports_vrr;
+        }
+
+        self.current_mode
+    }
+}
+
+/// Unit verification for dynamic display mode switcher.
+pub fn verify_dynamic_display_mode_switcher() -> bool {
+    let mut switcher = DynamicDisplayModeSwitcher::new();
+    if switcher.current_mode != ActiveDisplayMode::InternalHandheldPanel {
+        return false;
+    }
+
+    // Dock with 4K external monitor
+    let edid_4k = ParsedEdidDescriptor {
+        manufacturer_id: [b'D', b'E', b'L'],
+        product_code: 0x4010,
+        native_width: 3840,
+        native_height: 2160,
+        max_refresh_hz: 144,
+        supports_vrr: true,
+    };
+
+    if switcher.switch_display_mode(true, Some(&edid_4k)) != ActiveDisplayMode::ExternalMonitor4K {
+        return false;
+    }
+    if switcher.active_width != 3840 || switcher.active_height != 2160 || switcher.active_refresh_hz != 144 {
+        return false;
+    }
+
+    // Undock: reverts to internal 1080p 120Hz
+    if switcher.switch_display_mode(false, None) != ActiveDisplayMode::InternalHandheldPanel {
+        return false;
+    }
+    if switcher.active_width != 1920 || switcher.active_height != 1080 || switcher.active_refresh_hz != 120 {
+        return false;
+    }
+
+    true
+}
