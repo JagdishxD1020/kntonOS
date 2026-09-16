@@ -222,3 +222,68 @@ pub fn verify_palm_rejection_filter() -> bool {
 
     true
 }
+
+/// Exponential moving average (EMA) jitter filter for touch contact coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct TouchCoordinateJitterFilter {
+    pub smoothed_x_q8: u32,
+    pub smoothed_y_q8: u32,
+    pub alpha_q8: u32, // Smoothing factor in Q8 (e.g. 192 = 0.75 weight to new sample)
+    pub initialized: bool,
+}
+
+impl TouchCoordinateJitterFilter {
+    /// Creates a new touch jitter filter with alpha=0.75 for low-latency touch aiming.
+    pub const fn new() -> Self {
+        Self {
+            smoothed_x_q8: 0,
+            smoothed_y_q8: 0,
+            alpha_q8: 192, // 0.75
+            initialized: false,
+        }
+    }
+
+    /// Resets the filter state when a new contact begins.
+    pub fn reset(&mut self, initial_x: u16, initial_y: u16) {
+        self.smoothed_x_q8 = (initial_x as u32) << 8;
+        self.smoothed_y_q8 = (initial_y as u32) << 8;
+        self.initialized = true;
+    }
+
+    /// Filters a new coordinate sample, returning smoothed integer coordinates.
+    pub fn filter_sample(&mut self, raw_x: u16, raw_y: u16) -> (u16, u16) {
+        if !self.initialized {
+            self.reset(raw_x, raw_y);
+            return (raw_x, raw_y);
+        }
+
+        // EMA: smoothed = alpha * raw + (1 - alpha) * smoothed
+        let target_x = (raw_x as u32) << 8;
+        let target_y = (raw_y as u32) << 8;
+
+        self.smoothed_x_q8 = ((self.smoothed_x_q8 * (256 - self.alpha_q8)) + (target_x * self.alpha_q8)) >> 8;
+        self.smoothed_y_q8 = ((self.smoothed_y_q8 * (256 - self.alpha_q8)) + (target_y * self.alpha_q8)) >> 8;
+
+        ((self.smoothed_x_q8 >> 8) as u16, (self.smoothed_y_q8 >> 8) as u16)
+    }
+}
+
+/// Unit verification for touch coordinate jitter filter.
+pub fn verify_touch_jitter_filter() -> bool {
+    let mut filter = TouchCoordinateJitterFilter::new();
+
+    // Initial touch at (100, 100)
+    let (x0, y0) = filter.filter_sample(100, 100);
+    if x0 != 100 || y0 != 100 {
+        return false;
+    }
+
+    // High frequency 1-pixel noise spike: (101, 99)
+    let (x1, y1) = filter.filter_sample(101, 99);
+    // 0.75 * 101 + 0.25 * 100 = 75.75 + 25 = 100.75 -> 100
+    if x1 != 100 || y1 != 99 {
+        return false;
+    }
+
+    true
+}
