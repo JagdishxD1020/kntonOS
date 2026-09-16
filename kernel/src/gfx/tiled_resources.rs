@@ -232,3 +232,188 @@ impl D3D12_TILED_RESOURCE_DESC {
         Some(current_start + local_idx)
     }
 }
+
+// Bitmask flags configuring tile mapping operations
+pub const D3D12_TILE_MAPPING_FLAG_NONE: u32 = 0x0;
+pub const D3D12_TILE_MAPPING_FLAG_NO_HAZARD: u32 = 0x1;
+pub const D3D12_TILE_MAPPING_FLAG_UNMAP: u32 = 0x2;
+
+// Physical memory storage pool holding contiguous 64 KiB tiles
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILE_POOL {
+    pub pool_id: u32,
+    pub tile_count: u32,
+    pub allocated_mask: Vec<bool>,
+    pub active_mappings: usize,
+}
+
+impl D3D12_TILE_POOL {
+    // Construct new 64 KiB physical tile pool
+    pub fn new(pool_id: u32, tile_count: u32) -> Self {
+        Self {
+            pool_id,
+            tile_count,
+            allocated_mask: alloc::vec![false; tile_count as usize],
+            active_mappings: 0,
+        }
+    }
+
+    // Allocate an unused physical tile index
+    pub fn allocate_tile(&mut self) -> Option<u32> {
+        for (idx, alloc) in self.allocated_mask.iter_mut().enumerate() {
+            if !*alloc {
+                *alloc = true;
+                return Some(idx as u32);
+            }
+        }
+        None
+    }
+
+    // Release an allocated physical tile back to the pool
+    pub fn free_tile(&mut self, tile_idx: u32) -> bool {
+        if (tile_idx as usize) < self.allocated_mask.len() && self.allocated_mask[tile_idx as usize] {
+            self.allocated_mask[tile_idx as usize] = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Whether a physical tile index is valid within pool bounds
+    #[inline]
+    pub fn is_valid_tile(&self, tile_idx: u32) -> bool {
+        tile_idx < self.tile_count
+    }
+}
+
+// Sparse virtual texture page table manager with unmapped null-tile fallback
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILED_RESOURCE_MAPPING_MANAGER {
+    pub resource_id: u32,
+    pub total_virtual_tiles: u32,
+    pub tile_table: Vec<Option<u32>>,
+    pub null_tile_reads: u64,
+    pub null_tile_writes_discarded: u64,
+}
+
+impl D3D12_TILED_RESOURCE_MAPPING_MANAGER {
+    // Construct new sparse mapping manager initialized to fully unmapped (null) state
+    pub fn new(resource_id: u32, total_virtual_tiles: u32) -> Self {
+        Self {
+            resource_id,
+            total_virtual_tiles,
+            tile_table: alloc::vec![None; total_virtual_tiles as usize],
+            null_tile_reads: 0,
+            null_tile_writes_discarded: 0,
+        }
+    }
+
+    // Update range of virtual tiles with physical pool tiles or unmap
+    pub fn update_tile_mappings(
+        &mut self,
+        start_virtual_tile: u32,
+        tile_count: u32,
+        pool_start_tile: Option<u32>,
+        flags: u32,
+    ) -> Result<(), &'static str> {
+        let end_tile = start_virtual_tile + tile_count;
+        if end_tile > self.total_virtual_tiles {
+            return Err("Tile mapping range exceeds resource virtual tile count");
+        }
+
+        let is_unmap = (flags & D3D12_TILE_MAPPING_FLAG_UNMAP) != 0 || pool_start_tile.is_none();
+
+        for i in 0..tile_count {
+            let virt_idx = (start_virtual_tile + i) as usize;
+            if is_unmap {
+                self.tile_table[virt_idx] = None;
+            } else {
+                let phys_idx = pool_start_tile.unwrap() + i;
+                self.tile_table[virt_idx] = Some(phys_idx);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Copy tile mappings from source sparse resource
+    pub fn copy_tile_mappings(
+        &mut self,
+        dst_start: u32,
+        src_manager: &D3D12_TILED_RESOURCE_MAPPING_MANAGER,
+        src_start: u32,
+        tile_count: u32,
+    ) -> Result<(), &'static str> {
+        if dst_start + tile_count > self.total_virtual_tiles {
+            return Err("Destination tile range exceeds resource bounds");
+        }
+        if src_start + tile_count > src_manager.total_virtual_tiles {
+            return Err("Source tile range exceeds source resource bounds");
+        }
+
+        for i in 0..tile_count {
+            let src_idx = (src_start + i) as usize;
+            let dst_idx = (dst_start + i) as usize;
+            self.tile_table[dst_idx] = src_manager.tile_table[src_idx];
+        }
+
+        Ok(())
+    }
+
+    // Read 64 KiB tile with null-tile fallback (unmapped reads return 0 without faulting)
+    pub fn read_tile(&mut self, virtual_tile: u32, out_buffer: &mut [u8]) -> bool {
+        if (virtual_tile as usize) >= self.tile_table.len() {
+            out_buffer.fill(0);
+            self.null_tile_reads += 1;
+            return false;
+        }
+
+        match self.tile_table[virtual_tile as usize] {
+            Some(phys_tile) => {
+                // Mapped tile: populate with deterministic simulated physical tile pattern
+                let pattern = (phys_tile as u8).wrapping_add(0x5A);
+                out_buffer.fill(pattern);
+                true
+            }
+            None => {
+                // Tier 2 null-tile fallback: read returns zero/clear color without page fault
+                out_buffer.fill(0);
+                self.null_tile_reads += 1;
+                false
+            }
+        }
+    }
+
+    // Write 64 KiB tile with null-tile fallback (unmapped writes safely discarded)
+    pub fn write_tile(&mut self, virtual_tile: u32, _in_buffer: &[u8]) -> bool {
+        if (virtual_tile as usize) >= self.tile_table.len() {
+            self.null_tile_writes_discarded += 1;
+            return false;
+        }
+
+        match self.tile_table[virtual_tile as usize] {
+            Some(_) => true,
+            None => {
+                // Writing to an unmapped tile is safely dropped
+                self.null_tile_writes_discarded += 1;
+                false
+            }
+        }
+    }
+
+    // Check if a range of virtual tiles is fully resident (SV_IsFullyMapped)
+    pub fn is_fully_mapped(&self, start_virtual_tile: u32, tile_count: u32) -> bool {
+        let end_tile = (start_virtual_tile + tile_count) as usize;
+        if end_tile > self.tile_table.len() {
+            return false;
+        }
+        for i in (start_virtual_tile as usize)..end_tile {
+            if self.tile_table[i].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+}
