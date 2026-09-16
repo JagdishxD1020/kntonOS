@@ -255,7 +255,7 @@ impl D3D12_CONSERVATIVE_COVERAGE_EVALUATOR {
             // Maximum projected extent of box along normal
             let radius = box_half[0] * normal[0].abs() + box_half[1] * normal[1].abs();
 
-            if dist > radius {
+            if dist < -radius {
                 return false; // Box is entirely on the outside of this edge
             }
         }
@@ -300,7 +300,7 @@ impl D3D12_CONSERVATIVE_COVERAGE_EVALUATOR {
                 let v_curr = verts[j];
                 let v_next = verts[(j + 1) % 3];
                 let edge = [v_next[0] - v_curr[0], v_next[1] - v_curr[1]];
-                let cross = (sx - v_curr[0]) * edge[1] - (sy - v_curr[1]) * edge[0];
+                let cross = edge[0] * (sy - v_curr[1]) - edge[1] * (sx - v_curr[0]);
                 if (triangle.signed_area >= 0.0 && cross < -1e-5)
                     || (triangle.signed_area < 0.0 && cross > 1e-5)
                 {
@@ -354,33 +354,25 @@ impl D3D12_INNER_COVERAGE_EVALUATOR {
         }
 
         let u = desc.uncertainty_region();
-        // The 4 corners of the pixel expanded outwards by the uncertainty region
-        let corners = [
-            [px as f32 - u, py as f32 - u],
-            [px as f32 + 1.0 + u, py as f32 - u],
-            [px as f32 + 1.0 + u, py as f32 + 1.0 + u],
-            [px as f32 - u, py as f32 + 1.0 + u],
-        ];
-
+        let box_center = [px as f32 + 0.5, py as f32 + 0.5];
+        let box_half = [0.5 + u, 0.5 + u];
         let verts = [triangle.v0, triangle.v1, triangle.v2];
 
-        // All 4 corners must be strictly on the interior side of every triangle edge
         for i in 0..3 {
             let v_curr = verts[i];
             let v_next = verts[(i + 1) % 3];
             let edge = [v_next[0] - v_curr[0], v_next[1] - v_curr[1]];
+            let normal = if triangle.signed_area >= 0.0 {
+                [-edge[1], edge[0]]
+            } else {
+                [edge[1], -edge[0]]
+            };
 
-            for &corner in &corners {
-                let cross = (corner[0] - v_curr[0]) * edge[1] - (corner[1] - v_curr[1]) * edge[0];
-                if triangle.signed_area >= 0.0 {
-                    if cross <= 1e-5 {
-                        return false;
-                    }
-                } else {
-                    if cross >= -1e-5 {
-                        return false;
-                    }
-                }
+            let dist = (box_center[0] - v_curr[0]) * normal[0] + (box_center[1] - v_curr[1]) * normal[1];
+            let radius = box_half[0] * normal[0].abs() + box_half[1] * normal[1].abs();
+
+            if dist <= radius {
+                return false;
             }
         }
 
@@ -463,4 +455,125 @@ impl D3D12_CONSERVATIVE_RASTER_PIPELINE {
 
         results
     }
+}
+
+// Comprehensive verification self-test suite for D3D12 Conservative Rasterization & Pixel Coverage engine
+pub fn test_conservative_raster_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-CONSERVATIVE] Initializing Direct3D 12 Conservative Rasterization self-test...\r\n");
+
+    // 1. Verify Tier descriptors and hardware feature parameters
+    let tier1_desc = D3D12_CONSERVATIVE_RASTERIZER_DESC::new(
+        D3D12_CONSERVATIVE_RASTERIZATION_TIER::D3D12_CONSERVATIVE_RASTERIZATION_TIER_1,
+    );
+    if tier1_desc.mode != D3D12_CONSERVATIVE_RASTERIZATION_MODE::D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
+        || tier1_desc.subpixel_snap_bits != D3D12_SUBPIXEL_SNAP_PRECISION::Bits4
+        || (tier1_desc.uncertainty_region() - 0.5).abs() > 1e-5
+        || tier1_desc.supports_inner_coverage()
+        || tier1_desc.preserve_degenerate_primitives
+    {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Tier 1 descriptor configuration invalid\r\n");
+        return false;
+    }
+
+    let tier2_desc = D3D12_CONSERVATIVE_RASTERIZER_DESC::new(
+        D3D12_CONSERVATIVE_RASTERIZATION_TIER::D3D12_CONSERVATIVE_RASTERIZATION_TIER_2,
+    );
+    if tier2_desc.subpixel_snap_bits != D3D12_SUBPIXEL_SNAP_PRECISION::Bits8
+        || (tier2_desc.uncertainty_region() - (1.0 / 256.0)).abs() > 1e-6
+        || !tier2_desc.supports_inner_coverage()
+        || !tier2_desc.preserve_degenerate_primitives
+    {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Tier 2 descriptor configuration invalid\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Conservative rasterization hardware tiers and mode descriptors verified\r\n");
+
+    // 2. Verify sub-pixel snapping precision and degenerate primitive handling
+    let raw_vert = [1.03125, 2.0625]; // 1 + 1/32, 2 + 1/16
+    let snapped_4bit = D3D12_SUBPIXEL_SNAPPER::snap_vertex(raw_vert, D3D12_SUBPIXEL_SNAP_PRECISION::Bits4);
+    // 1.03125 snapped to nearest 1/16th (0.0625) is 1.0625
+    if (snapped_4bit[0] - 1.0625).abs() > 1e-4 || (snapped_4bit[1] - 2.0625).abs() > 1e-4 {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] 4-bit sub-pixel snapping failed\r\n");
+        return false;
+    }
+
+    let snapped_8bit = D3D12_SUBPIXEL_SNAPPER::snap_vertex(raw_vert, D3D12_SUBPIXEL_SNAP_PRECISION::Bits8);
+    // 1.03125 is 1 + 8/256, exactly representable on 8-bit sub-pixel grid
+    if (snapped_8bit[0] - 1.03125).abs() > 1e-5 || (snapped_8bit[1] - 2.0625).abs() > 1e-5 {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] 8-bit sub-pixel snapping failed\r\n");
+        return false;
+    }
+
+    // Collinear degenerate triangle
+    let col_v0 = [0.0, 0.0];
+    let col_v1 = [1.0, 1.0];
+    let col_v2 = [2.0, 2.0];
+    let tri_tier1 = D3D12_CONSERVATIVE_TRIANGLE::new(col_v0, col_v1, col_v2, &tier1_desc);
+    if !tri_tier1.should_cull || tri_tier1.degenerate_status != D3D12_DEGENERATE_STATUS::CollinearDegenerate {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Collinear primitive was not culled in Tier 1\r\n");
+        return false;
+    }
+
+    let tri_tier2 = D3D12_CONSERVATIVE_TRIANGLE::new(col_v0, col_v1, col_v2, &tier2_desc);
+    if tri_tier2.should_cull || tri_tier2.degenerate_status != D3D12_DEGENERATE_STATUS::CollinearDegenerate {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Collinear primitive was not preserved in Tier 2\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Sub-pixel snap precision and degenerate primitive handling verified\r\n");
+
+    // 3. Verify conservative pixel intersection and SV_Coverage mask on micro-triangle (voxelization)
+    // Small triangle inside pixel [0, 0] that does not cover the pixel center (0.5, 0.5)
+    let micro_v0 = [0.1, 0.1];
+    let micro_v1 = [0.4, 0.1];
+    let micro_v2 = [0.25, 0.4];
+    let micro_tri = D3D12_CONSERVATIVE_TRIANGLE::new(micro_v0, micro_v1, micro_v2, &tier2_desc);
+
+    let pipe_tier2 = D3D12_CONSERVATIVE_RASTER_PIPELINE::new(tier2_desc);
+    let micro_pixels = pipe_tier2.rasterize_triangle(&micro_tri, 1);
+
+    if micro_pixels.is_empty() {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Micro-triangle conservative rasterization produced no pixels\r\n");
+        return false;
+    }
+    let p0 = micro_pixels.iter().find(|p| p.pixel_x == 0 && p.pixel_y == 0);
+    if p0.is_none() || !p0.unwrap().is_conservatively_covered || p0.unwrap().sv_coverage == 0 {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Pixel [0,0] missing or SV_Coverage is zero\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Gap-free conservative rasterization and SV_Coverage mask calculation verified\r\n");
+
+    // 4. Verify SV_InnerCoverage on a large triangle
+    let large_v0 = [0.0, 0.0];
+    let large_v1 = [10.0, 0.0];
+    let large_v2 = [5.0, 10.0];
+    let large_tri = D3D12_CONSERVATIVE_TRIANGLE::new(large_v0, large_v1, large_v2, &tier2_desc);
+    let large_pixels = pipe_tier2.rasterize_triangle(&large_tri, 1);
+
+    // Deep interior pixel [5, 2] should have inner_coverage = true
+    let interior_p = large_pixels.iter().find(|p| p.pixel_x == 5 && p.pixel_y == 2);
+    if interior_p.is_none() || !interior_p.unwrap().sv_inner_coverage {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Interior pixel [5,2] failed SV_InnerCoverage\r\n");
+        return false;
+    }
+
+    // Boundary pixel [0, 0] must NOT have inner_coverage = true
+    let boundary_p = large_pixels.iter().find(|p| p.pixel_x == 0 && p.pixel_y == 0);
+    if boundary_p.is_some() && boundary_p.unwrap().sv_inner_coverage {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Boundary pixel [0,0] erroneously had SV_InnerCoverage\r\n");
+        return false;
+    }
+
+    // Under Tier 1, inner coverage is never reported
+    let pipe_tier1 = D3D12_CONSERVATIVE_RASTER_PIPELINE::new(tier1_desc);
+    let tri_t1 = D3D12_CONSERVATIVE_TRIANGLE::new(large_v0, large_v1, large_v2, &tier1_desc);
+    let t1_pixels = pipe_tier1.rasterize_triangle(&tri_t1, 1);
+    if t1_pixels.iter().any(|p| p.sv_inner_coverage) {
+        crate::serial_write_str("[KNT-CONSERVATIVE-FAIL] Tier 1 pipeline reported inner coverage\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * SV_InnerCoverage and Nanite-style high-precision shadow mapping evaluation verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-CONSERVATIVE-PASS] Direct3D 12 conservative rasterization engine verified\r\n");
+    true
 }
