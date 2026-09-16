@@ -392,3 +392,28 @@ pub fn verify_docked_power_policy_booster() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld USB-C Docking Station & DisplayPort MST Manager.
+pub fn test_dock_manager_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DISP] Testing Handheld USB-C Docking Station & DisplayPort MST Manager...\r\n");
+
+    if !verify_dock_state_machine() {
+        crate::serial_write_str("[KNT-PANIC] Dock state machine verification failed!\r\n");
+        return false;
+    }
+    if !verify_dp_mst_and_edid() {
+        crate::serial_write_str("[KNT-PANIC] DisplayPort MST and EDID parser verification failed!\r\n");
+        return false;
+    }
+    if !verify_dynamic_display_mode_switcher() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic display mode switcher verification failed!\r\n");
+        return false;
+    }
+    if !verify_docked_power_policy_booster() {
+        crate::serial_write_str("[KNT-PANIC] Docked power policy booster verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-DOCK-MGR-PASS] Handheld USB-C docking station and DP MST manager verified\r\n");
+    true
+}
