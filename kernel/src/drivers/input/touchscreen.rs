@@ -123,3 +123,102 @@ pub fn verify_multi_touch_tracking() -> bool {
 
     true
 }
+
+/// Screen bezel deadzone margin in pixels.
+pub const BEZEL_DEADZONE_PX: u16 = 40;
+/// Large contact area threshold indicative of palm resting (major axis in px).
+pub const PALM_MAJOR_AXIS_THRESHOLD_PX: u16 = 60;
+
+/// Handheld palm rejection filter preventing accidental touches while holding grips.
+#[derive(Debug, Clone, Copy)]
+pub struct HandheldPalmRejectionFilter {
+    pub display_width: u16,
+    pub display_height: u16,
+    pub bezel_margin_px: u16,
+    pub rejected_palm_events: u32,
+}
+
+impl HandheldPalmRejectionFilter {
+    /// Creates a new palm rejection filter for a 1920x1080 handheld screen.
+    pub const fn new(width: u16, height: u16) -> Self {
+        Self {
+            display_width: width,
+            display_height: height,
+            bezel_margin_px: BEZEL_DEADZONE_PX,
+            rejected_palm_events: 0,
+        }
+    }
+
+    /// Evaluates whether a contact point is an accidental palm or thumb touch.
+    pub fn is_palm_contact(&mut self, contact: &TsContactPoint) -> bool {
+        if !contact.active {
+            return false;
+        }
+
+        // Rule 1: Large contact surface area (major axis >= 60px) characteristic of palm resting
+        if contact.major_axis >= PALM_MAJOR_AXIS_THRESHOLD_PX {
+            self.rejected_palm_events += 1;
+            return true;
+        }
+
+        // Rule 2: Contact within left/right bezel grip zones while also having significant contact area
+        let in_left_bezel = contact.x < self.bezel_margin_px;
+        let in_right_bezel = contact.x > self.display_width.saturating_sub(self.bezel_margin_px);
+
+        if (in_left_bezel || in_right_bezel) && contact.major_axis > 25 {
+            self.rejected_palm_events += 1;
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Unit verification for handheld palm rejection filter.
+pub fn verify_palm_rejection_filter() -> bool {
+    let mut filter = HandheldPalmRejectionFilter::new(1920, 1080);
+
+    // Normal finger tap: x=500, y=500, major=15px -> valid touch
+    let finger = TsContactPoint {
+        contact_id: 1,
+        x: 500,
+        y: 500,
+        pressure: 400,
+        major_axis: 15,
+        minor_axis: 12,
+        active: true,
+    };
+    if filter.is_palm_contact(&finger) {
+        return false;
+    }
+
+    // Large palm resting: major=80px -> rejected
+    let palm = TsContactPoint {
+        contact_id: 2,
+        x: 800,
+        y: 600,
+        pressure: 800,
+        major_axis: 80,
+        minor_axis: 50,
+        active: true,
+    };
+    if !filter.is_palm_contact(&palm) {
+        return false;
+    }
+
+    // Thumb resting on bezel edge: x=20 (< 40), major=30px -> rejected
+    let bezel_thumb = TsContactPoint {
+        contact_id: 3,
+        x: 20,
+        y: 540,
+        pressure: 600,
+        major_axis: 30,
+        minor_axis: 20,
+        active: true,
+    };
+    if !filter.is_palm_contact(&bezel_thumb) {
+        return false;
+    }
+
+    true
+}
