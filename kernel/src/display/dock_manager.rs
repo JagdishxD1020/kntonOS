@@ -317,3 +317,78 @@ pub fn verify_dynamic_display_mode_switcher() -> bool {
 
     true
 }
+
+/// Audio output endpoint routing target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputEndpoint {
+    InternalStereoSpeakers,
+    ExternalHdmiDisplayPort,
+}
+
+/// Docked power policy booster and audio routing controller.
+#[derive(Debug, Clone, Copy)]
+pub struct DockedPowerPolicyBooster {
+    pub active_tdp_target_watts: u8,
+    pub turbo_boost_engaged: bool,
+    pub audio_endpoint: AudioOutputEndpoint,
+}
+
+impl DockedPowerPolicyBooster {
+    /// Creates a new docked power booster in battery mode (15W base).
+    pub const fn new() -> Self {
+        Self {
+            active_tdp_target_watts: 15,
+            turbo_boost_engaged: false,
+            audio_endpoint: AudioOutputEndpoint::InternalStereoSpeakers,
+        }
+    }
+
+    /// Evaluates dock state and raises APU TDP target when connected to AC dock.
+    pub fn evaluate_dock_policy(&mut self, dock_state: DockState) -> u8 {
+        match dock_state {
+            DockState::DockedAC => {
+                // Raise from 15W battery baseline to 30W+ docked AC turbo profile
+                self.active_tdp_target_watts = 35;
+                self.turbo_boost_engaged = true;
+                self.audio_endpoint = AudioOutputEndpoint::ExternalHdmiDisplayPort;
+            }
+            DockState::DockedBattery => {
+                self.active_tdp_target_watts = 18;
+                self.turbo_boost_engaged = false;
+                self.audio_endpoint = AudioOutputEndpoint::ExternalHdmiDisplayPort;
+            }
+            DockState::Undocked | DockState::DockNegotiating | DockState::Unplugging => {
+                self.active_tdp_target_watts = 15;
+                self.turbo_boost_engaged = false;
+                self.audio_endpoint = AudioOutputEndpoint::InternalStereoSpeakers;
+            }
+        }
+        self.active_tdp_target_watts
+    }
+}
+
+/// Unit verification for docked power policy booster.
+pub fn verify_docked_power_policy_booster() -> bool {
+    let mut booster = DockedPowerPolicyBooster::new();
+    if booster.active_tdp_target_watts != 15 || booster.turbo_boost_engaged {
+        return false;
+    }
+
+    // Connect to AC dock: raises to 35W turbo and routes audio to HDMI/DP
+    if booster.evaluate_dock_policy(DockState::DockedAC) != 35 {
+        return false;
+    }
+    if !booster.turbo_boost_engaged || booster.audio_endpoint != AudioOutputEndpoint::ExternalHdmiDisplayPort {
+        return false;
+    }
+
+    // Undock: restores 15W and internal stereo speakers
+    if booster.evaluate_dock_policy(DockState::Undocked) != 15 {
+        return false;
+    }
+    if booster.turbo_boost_engaged || booster.audio_endpoint != AudioOutputEndpoint::InternalStereoSpeakers {
+        return false;
+    }
+
+    true
+}
