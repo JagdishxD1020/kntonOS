@@ -475,7 +475,7 @@ static NAMED_PIPES: Spinlock<BTreeMap<String, Vec<Arc<Spinlock<NamedPipeInstance
 pub fn canonicalize_pipe_name(raw: &str) -> Option<String> {
     let s = raw.trim();
     let lower = s.to_lowercase();
-    let name_part = if lower.starts_with(r"\\.\pipe\\") {
+    let name_part = if lower.starts_with(r#"\\.\pipe\"#) {
         &lower[9..]
     } else if lower.starts_with("//./pipe/") {
         &lower[9..]
@@ -485,7 +485,7 @@ pub fn canonicalize_pipe_name(raw: &str) -> Option<String> {
     if name_part.is_empty() {
         return None;
     }
-    let mut out = String::from(r"\\.\pipe\\");
+    let mut out = String::from(r#"\\.\pipe\"#);
     out.push_str(name_part);
     Some(out)
 }
@@ -917,4 +917,232 @@ fn wait_named_pipe_internal(raw_name: &str) -> bool {
         crate::pe::kernel32::win32_set_last_error(ERROR_PIPE_BUSY);
         false
     }
+}
+
+/// Comprehensive self-test verifying anonymous pipes, named pipe handshake, and framed message IPC.
+pub fn test_win32_pipe_subsystem() -> bool {
+    // 1. Anonymous pipe round-trip test
+    let mut h_read: HANDLE = 0;
+    let mut h_write: HANDLE = 0;
+    let ok = unsafe { CreatePipe(&mut h_read, &mut h_write, core::ptr::null(), 4096) };
+    if !ok || h_read == 0 || h_write == 0 {
+        return false;
+    }
+
+    let payload = b"KntonOS anonymous pipe IPC test packet";
+    let mut bytes_written = 0u32;
+    let ok = unsafe {
+        crate::pe::file::win32_write_file(
+            h_write,
+            payload.as_ptr(),
+            payload.len() as u32,
+            &mut bytes_written,
+        )
+    };
+    if !ok || bytes_written != payload.len() as u32 {
+        return false;
+    }
+
+    let mut peek_buf = [0u8; 64];
+    let mut peek_read = 0u32;
+    let mut total_avail = 0u32;
+    let mut left_msg = 0u32;
+    let ok = unsafe {
+        PeekNamedPipe(
+            h_read,
+            peek_buf.as_mut_ptr(),
+            64,
+            &mut peek_read,
+            &mut total_avail,
+            &mut left_msg,
+        )
+    };
+    if !ok || peek_read != payload.len() as u32 || total_avail != payload.len() as u32 {
+        return false;
+    }
+    if &peek_buf[..payload.len()] != payload {
+        return false;
+    }
+
+    let mut read_buf = [0u8; 64];
+    let mut bytes_read = 0u32;
+    let ok = unsafe {
+        crate::pe::file::win32_read_file(
+            h_read,
+            read_buf.as_mut_ptr(),
+            64,
+            &mut bytes_read,
+        )
+    };
+    if !ok || bytes_read != payload.len() as u32 || &read_buf[..payload.len()] != payload {
+        return false;
+    }
+
+    let ok = unsafe { crate::pe::file::win32_close_handle(h_write) };
+    if !ok {
+        return false;
+    }
+
+    let mut eof_buf = [0u8; 16];
+    let mut eof_read = 0u32;
+    let read_after_close = unsafe {
+        crate::pe::file::win32_read_file(
+            h_read,
+            eof_buf.as_mut_ptr(),
+            16,
+            &mut eof_read,
+        )
+    };
+    if read_after_close || crate::pe::kernel32::win32_get_last_error() != ERROR_BROKEN_PIPE {
+        return false;
+    }
+
+    let ok = unsafe { crate::pe::file::win32_close_handle(h_read) };
+    if !ok {
+        return false;
+    }
+
+    // 2. Named pipe server creation & connection handshake test
+    let pipe_name = b"\\\\.\\pipe\\knton_anticheat_ipc\0";
+    let h_server = unsafe {
+        CreateNamedPipeA(
+            pipe_name.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            core::ptr::null(),
+        )
+    };
+    if h_server == INVALID_HANDLE_VALUE || h_server == 0 {
+        return false;
+    }
+
+    let ok = unsafe { WaitNamedPipeA(pipe_name.as_ptr(), NMPWAIT_WAIT_FOREVER) };
+    if !ok {
+        return false;
+    }
+
+    let h_client = unsafe {
+        crate::pe::file::win32_create_file(
+            r#"\\.\pipe\knton_anticheat_ipc"#,
+            crate::pe::file::GENERIC_READ | crate::pe::file::GENERIC_WRITE,
+            0,
+            crate::pe::file::OPEN_EXISTING,
+            0,
+        )
+    };
+    if h_client == INVALID_HANDLE_VALUE || h_client == 0 {
+        return false;
+    }
+
+    let connected = unsafe { ConnectNamedPipe(h_server, core::ptr::null()) };
+    if !connected && crate::pe::kernel32::win32_get_last_error() != ERROR_PIPE_CONNECTED {
+        return false;
+    }
+
+    // 3. Message framing & transaction test
+    let msg_init = b"MSG_INIT_CHALLENGE";
+    let mut written = 0u32;
+    let ok = unsafe {
+        crate::pe::file::win32_write_file(
+            h_server,
+            msg_init.as_ptr(),
+            msg_init.len() as u32,
+            &mut written,
+        )
+    };
+    if !ok || written != msg_init.len() as u32 {
+        return false;
+    }
+
+    let mut msg_peek = [0u8; 32];
+    let mut peek_len = 0u32;
+    let mut msg_avail = 0u32;
+    let mut msg_left = 0u32;
+    let ok = unsafe {
+        PeekNamedPipe(
+            h_client,
+            msg_peek.as_mut_ptr(),
+            32,
+            &mut peek_len,
+            &mut msg_avail,
+            &mut msg_left,
+        )
+    };
+    if !ok || peek_len != msg_init.len() as u32 || msg_left != msg_init.len() as u32 {
+        return false;
+    }
+
+    let mut client_recv = [0u8; 32];
+    let mut client_read = 0u32;
+    let ok = unsafe {
+        crate::pe::file::win32_read_file(
+            h_client,
+            client_recv.as_mut_ptr(),
+            32,
+            &mut client_read,
+        )
+    };
+    if !ok || client_read != msg_init.len() as u32 || &client_recv[..msg_init.len()] != msg_init {
+        return false;
+    }
+
+    let req = b"REQUEST_GAME_TOKEN";
+    let ok = unsafe {
+        crate::pe::file::win32_write_file(
+            h_client,
+            req.as_ptr(),
+            req.len() as u32,
+            &mut written,
+        )
+    };
+    if !ok || written != req.len() as u32 {
+        return false;
+    }
+
+    let ack = b"ACK_TOKEN_GRANTED";
+    let mut srv_recv = [0u8; 32];
+    let mut srv_read = 0u32;
+    let ok = unsafe {
+        TransactNamedPipe(
+            h_server,
+            ack.as_ptr(),
+            ack.len() as u32,
+            srv_recv.as_mut_ptr(),
+            32,
+            &mut srv_read,
+            core::ptr::null(),
+        )
+    };
+    if !ok || srv_read != req.len() as u32 || &srv_recv[..req.len()] != req {
+        return false;
+    }
+
+    let mut ack_buf = [0u8; 32];
+    let mut ack_read = 0u32;
+    let ok = unsafe {
+        crate::pe::file::win32_read_file(
+            h_client,
+            ack_buf.as_mut_ptr(),
+            32,
+            &mut ack_read,
+        )
+    };
+    if !ok || ack_read != ack.len() as u32 || &ack_buf[..ack.len()] != ack {
+        return false;
+    }
+
+    let ok = unsafe { DisconnectNamedPipe(h_server) };
+    if !ok {
+        return false;
+    }
+
+    let _ = unsafe { crate::pe::file::win32_close_handle(h_client) };
+    let _ = unsafe { crate::pe::file::win32_close_handle(h_server) };
+
+    crate::serial_write_str("[KNT-WIN32-PIPE-OK] Win32 named pipes and anonymous IPC engine verified\r\n");
+    true
 }
