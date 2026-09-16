@@ -417,3 +417,122 @@ impl D3D12_TILED_RESOURCE_MAPPING_MANAGER {
         true
     }
 }
+
+// Information describing packed mipmap tails packed into one or more 64 KiB tiles
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PACKED_MIP_INFO {
+    pub num_standard_mips: u32,
+    pub num_packed_mips: u32,
+    pub num_tiles_for_packed_mips: u32,
+    pub start_tile_index_in_overall_resource: u32,
+}
+
+impl D3D12_PACKED_MIP_INFO {
+    // Evaluate standard versus packed mips for a tiled resource
+    pub fn calculate(desc: &D3D12_TILED_RESOURCE_DESC) -> Self {
+        let shape = desc.tile_shape();
+        let tile_texels = shape.texel_count();
+
+        let mut standard_mips = 0u32;
+        let mut packed_mips = 0u32;
+        let mut current_tile_idx = 0u32;
+        let mut packed_start_tile = 0u32;
+
+        for m in 0..desc.mip_levels {
+            let (w, h, d) = desc.mip_dimensions(m);
+            let texel_count = w * h * (d as u32);
+
+            let tiling = desc.calculate_subresource_tiling(m, current_tile_idx);
+            if tiling.total_tiles() == 1 && texel_count < tile_texels {
+                if packed_mips == 0 {
+                    packed_start_tile = current_tile_idx;
+                }
+                packed_mips += 1;
+            } else {
+                standard_mips += 1;
+                current_tile_idx += tiling.total_tiles();
+            }
+        }
+
+        let packed_tiles = if packed_mips > 0 { 1 } else { 0 };
+
+        Self {
+            num_standard_mips: standard_mips,
+            num_packed_mips: packed_mips,
+            num_tiles_for_packed_mips: packed_tiles,
+            start_tile_index_in_overall_resource: packed_start_tile,
+        }
+    }
+}
+
+// Sparse virtual texture residency tracker with dynamic mip LOD clamping
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SPARSE_RESIDENCY_TRACKER {
+    pub resource_id: u32,
+    pub mip_levels: u16,
+    pub mip_residency_mask: u32,
+    pub min_resident_mip_clamp: u16,
+}
+
+impl D3D12_SPARSE_RESIDENCY_TRACKER {
+    // Construct new residency tracker with all mips initially non-resident
+    pub fn new(resource_id: u32, mip_levels: u16) -> Self {
+        Self {
+            resource_id,
+            mip_levels,
+            mip_residency_mask: 0,
+            min_resident_mip_clamp: mip_levels,
+        }
+    }
+
+    // Set residency status for a specific mip level and update hardware clamp
+    pub fn set_mip_residency(&mut self, mip: u16, resident: bool) {
+        if mip >= self.mip_levels {
+            return;
+        }
+
+        if resident {
+            self.mip_residency_mask |= 1u32 << mip;
+        } else {
+            self.mip_residency_mask &= !(1u32 << mip);
+        }
+
+        self.update_clamp();
+    }
+
+    // Recalculate minimum resident mip clamp level
+    fn update_clamp(&mut self) {
+        let mut clamp = self.mip_levels;
+        for m in 0..self.mip_levels {
+            if (self.mip_residency_mask & (1u32 << m)) != 0 {
+                clamp = m;
+                break;
+            }
+        }
+        self.min_resident_mip_clamp = clamp;
+    }
+
+    // Clamp shader texture sample LOD to highest resident mip level
+    #[inline]
+    pub fn clamp_sample_lod(&self, requested_lod: f32) -> f32 {
+        let clamp_f = self.min_resident_mip_clamp as f32;
+        if requested_lod < clamp_f {
+            clamp_f
+        } else {
+            requested_lod
+        }
+    }
+
+    // Whether a mip level is resident
+    #[inline]
+    pub fn is_mip_resident(&self, mip: u16) -> bool {
+        if mip >= self.mip_levels {
+            false
+        } else {
+            (self.mip_residency_mask & (1u32 << mip)) != 0
+        }
+    }
+}
