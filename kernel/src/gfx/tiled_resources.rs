@@ -536,3 +536,179 @@ impl D3D12_SPARSE_RESIDENCY_TRACKER {
         }
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Tiled Resources & Sparse Virtual Textures
+pub fn test_tiled_resources_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-TILED] Initializing Direct3D 12 Tiled Resources & Sparse Virtual Texture self-test...\r\n");
+
+    // 1. Verify standard 64 KiB tile shapes across 2D and 3D surface formats
+    let shape_2d_1bpp = D3D12_TILE_SHAPE::for_2d_format(1);
+    let shape_2d_2bpp = D3D12_TILE_SHAPE::for_2d_format(2);
+    let shape_2d_4bpp = D3D12_TILE_SHAPE::for_2d_format(4);
+    let shape_2d_8bpp = D3D12_TILE_SHAPE::for_2d_format(8);
+    let shape_2d_16bpp = D3D12_TILE_SHAPE::for_2d_format(16);
+    let shape_3d_4bpp = D3D12_TILE_SHAPE::for_3d_format(4);
+
+    if shape_2d_1bpp.texel_count() * 1 != 65536
+        || shape_2d_2bpp.texel_count() * 2 != 65536
+        || shape_2d_4bpp.texel_count() * 4 != 65536
+        || shape_2d_8bpp.texel_count() * 8 != 65536
+        || shape_2d_16bpp.texel_count() * 16 != 65536
+        || shape_3d_4bpp.texel_count() * 4 != 65536
+    {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 64 KiB tile shape byte size mismatch\r\n");
+        return false;
+    }
+    if shape_2d_4bpp.width_in_texels != 128 || shape_2d_4bpp.height_in_texels != 128 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 2D 32bpp tile shape dimensions mismatch\r\n");
+        return false;
+    }
+    if shape_3d_4bpp.width_in_texels != 32 || shape_3d_4bpp.height_in_texels != 32 || shape_3d_4bpp.depth_in_texels != 16 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 3D 32bpp tile shape dimensions mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Standard 64 KiB tile shapes for 2D and 3D volume textures verified\r\n");
+
+    // 2. Verify subresource tiling calculations and tile coordinate to linear index math
+    let desc = D3D12_TILED_RESOURCE_DESC {
+        tier: D3D12_TILED_RESOURCES_TIER::D3D12_TILED_RESOURCES_TIER_2,
+        width: 1024,
+        height: 1024,
+        depth_or_array_size: 1,
+        mip_levels: 5,
+        bytes_per_texel: 4,
+        sample_count: 1,
+        is_3d: false,
+    };
+
+    let tiling_mip0 = desc.calculate_subresource_tiling(0, 0);
+    if tiling_mip0.width_in_tiles != 8 || tiling_mip0.height_in_tiles != 8 || tiling_mip0.total_tiles() != 64 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Mip 0 tiling dimensions mismatch\r\n");
+        return false;
+    }
+
+    let tiling_mip1 = desc.calculate_subresource_tiling(1, 64);
+    if tiling_mip1.width_in_tiles != 4 || tiling_mip1.height_in_tiles != 4 || tiling_mip1.total_tiles() != 16 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Mip 1 tiling dimensions mismatch\r\n");
+        return false;
+    }
+
+    // Coordinate (3, 2) in mip 0: index should be 2 * 8 + 3 = 19
+    let idx_m0 = match desc.coordinate_to_overall_index(&D3D12_TILED_RESOURCE_COORDINATE::new(3, 2, 0, 0)) {
+        Some(idx) => idx,
+        None => {
+            crate::serial_write_str("[KNT-TILED-FAIL] Coordinate to index conversion failed for mip 0\r\n");
+            return false;
+        }
+    };
+    if idx_m0 != 19 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Overall tile index mismatch for mip 0\r\n");
+        return false;
+    }
+
+    // Coordinate (1, 1) in mip 1: index should be 64 + (1 * 4 + 1) = 69
+    let idx_m1 = match desc.coordinate_to_overall_index(&D3D12_TILED_RESOURCE_COORDINATE::new(1, 1, 0, 1)) {
+        Some(idx) => idx,
+        None => {
+            crate::serial_write_str("[KNT-TILED-FAIL] Coordinate to index conversion failed for mip 1\r\n");
+            return false;
+        }
+    };
+    if idx_m1 != 69 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Overall tile index mismatch for mip 1\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Subresource tiling geometry and 64 KiB coordinate index math verified\r\n");
+
+    // 3. Verify tile pool allocation, UpdateTileMappings, and CopyTileMappings
+    let mut pool = D3D12_TILE_POOL::new(1, 32);
+    let t0 = pool.allocate_tile();
+    if t0 != Some(0) || !pool.is_valid_tile(0) || pool.is_valid_tile(32) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tile pool allocation or bounds check failed\r\n");
+        return false;
+    }
+    if !pool.free_tile(0) || pool.free_tile(0) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tile pool free or double free check failed\r\n");
+        return false;
+    }
+    let mut manager1 = D3D12_TILED_RESOURCE_MAPPING_MANAGER::new(10, 86);
+
+    // Map first 16 virtual tiles to physical tiles 0..16
+    if manager1.update_tile_mappings(0, 16, Some(0), D3D12_TILE_MAPPING_FLAG_NONE).is_err() {
+        crate::serial_write_str("[KNT-TILED-FAIL] UpdateTileMappings failed\r\n");
+        return false;
+    }
+    if !manager1.is_fully_mapped(0, 16) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tiles 0..16 expected to be fully mapped\r\n");
+        return false;
+    }
+    if manager1.is_fully_mapped(0, 32) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tiles 0..32 should not be fully mapped\r\n");
+        return false;
+    }
+
+    // Copy tile mappings to second resource manager
+    let mut manager2 = D3D12_TILED_RESOURCE_MAPPING_MANAGER::new(20, 86);
+    if manager2.copy_tile_mappings(10, &manager1, 0, 8).is_err() {
+        crate::serial_write_str("[KNT-TILED-FAIL] CopyTileMappings failed\r\n");
+        return false;
+    }
+    if !manager2.is_fully_mapped(10, 8) || manager2.is_fully_mapped(0, 10) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Copied tile mappings verification mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Tile pool allocator, UpdateTileMappings, and CopyTileMappings verified\r\n");
+
+    // 4. Verify unmapped tile null fallback (reading returns zero, writing discarded without fault)
+    let mut tile_buf = [0xFFu8; 64]; // Sub-slice for testing reads
+    let resident = manager1.read_tile(5, &mut tile_buf);
+    if !resident || tile_buf[0] != (5u8.wrapping_add(0x5A)) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Resident tile read failed or data pattern mismatch\r\n");
+        return false;
+    }
+
+    // Read unmapped virtual tile 20 -> should return false, zero-fill buffer, and increment null_tile_reads
+    let resident_null = manager1.read_tile(20, &mut tile_buf);
+    if resident_null || tile_buf.iter().any(|&b| b != 0) || manager1.null_tile_reads != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Unmapped tile read did not zero-fill buffer cleanly\r\n");
+        return false;
+    }
+
+    // Write to unmapped virtual tile 20 -> should return false and safely discard
+    let write_res = manager1.write_tile(20, &tile_buf);
+    if write_res || manager1.null_tile_writes_discarded != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Unmapped tile write was not cleanly discarded\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Unmapped tile null fallback and safe write discard verified\r\n");
+
+    // 5. Verify packed mipmap tail calculation and dynamic sparse residency tracker
+    let packed_info = D3D12_PACKED_MIP_INFO::calculate(&desc);
+    if packed_info.num_standard_mips != 4 || packed_info.num_packed_mips != 1 || packed_info.num_tiles_for_packed_mips != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Packed mip tail metrics calculation mismatch\r\n");
+        return false;
+    }
+
+    let mut tracker = D3D12_SPARSE_RESIDENCY_TRACKER::new(10, 5);
+    tracker.set_mip_residency(2, true);
+    tracker.set_mip_residency(3, true);
+    tracker.set_mip_residency(4, true);
+
+    if tracker.min_resident_mip_clamp != 2 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Minimum resident mip clamp should be 2\r\n");
+        return false;
+    }
+    if (tracker.clamp_sample_lod(0.5) - 2.0).abs() > 1e-5 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Requested LOD 0.5 was not clamped up to resident mip 2.0\r\n");
+        return false;
+    }
+    if (tracker.clamp_sample_lod(3.5) - 3.5).abs() > 1e-5 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Requested LOD 3.5 was improperly modified\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Packed mip tail clamping and sparse residency streamer verified\r\n");
+
+    // 6. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-TILED-PASS] Direct3D 12 tiled resources and sparse virtual texture engine verified\r\n");
+    true
+}
