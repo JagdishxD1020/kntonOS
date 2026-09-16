@@ -211,6 +211,10 @@ pub unsafe fn win32_create_file(
         return INVALID_HANDLE_VALUE;
     }
 
+    if lp_file_name.starts_with(r#"\\.\pipe\"#) || lp_file_name.starts_with("//./pipe/") {
+        return crate::pe::pipe::win32_connect_client_pipe(lp_file_name, dw_desired_access);
+    }
+
     let is_console = lp_file_name == "CONOUT$" || lp_file_name == "CONIN$";
     let vfs_path = win32_dos_to_vfs_path(lp_file_name);
 
@@ -296,6 +300,10 @@ pub unsafe fn win32_close_handle(h_object: HANDLE) -> bool {
         crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_SUCCESS);
         true
     } else {
+        drop(table);
+        if crate::pe::pipe::is_pipe_handle(h_object) {
+            return crate::pe::pipe::win32_close_pipe(h_object);
+        }
         crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
         false
     }
@@ -317,6 +325,15 @@ pub unsafe fn win32_read_file(
     let file_obj = match table.get_mut(&h_file) {
         Some(f) => f,
         None => {
+            drop(table);
+            if crate::pe::pipe::is_pipe_handle(h_file) {
+                return crate::pe::pipe::win32_read_pipe(
+                    h_file,
+                    lp_buffer,
+                    n_number_of_bytes_to_read,
+                    lp_number_of_bytes_read,
+                );
+            }
             crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
             return false;
         }
@@ -372,6 +389,15 @@ pub unsafe fn win32_write_file(
     let file_obj = match table.get_mut(&h_file) {
         Some(f) => f,
         None => {
+            drop(table);
+            if crate::pe::pipe::is_pipe_handle(h_file) {
+                return crate::pe::pipe::win32_write_pipe(
+                    h_file,
+                    lp_buffer,
+                    n_number_of_bytes_to_write,
+                    lp_number_of_bytes_written,
+                );
+            }
             crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
             return false;
         }
