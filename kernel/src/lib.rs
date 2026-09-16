@@ -397,6 +397,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 depth bounds & conservative rasterization self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Conservative Rasterization & Pixel Coverage Engine (TASK-KNT-179)
+    if !gfx::test_conservative_raster_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 conservative rasterization engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Low-Latency Frame Pacing & Latency Marker Engine
     if !gfx::test_frame_pacing_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 low-latency frame pacing self-test failed!\r\n");
