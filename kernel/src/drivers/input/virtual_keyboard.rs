@@ -191,3 +191,65 @@ pub fn verify_dual_trackpad_typing() -> bool {
 
     true
 }
+
+/// Haptic tactile feedback pulse profile for keystroke confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeystrokeHapticPulse {
+    pub frequency_hz: u16,   // e.g. 170Hz resonant frequency
+    pub duration_ms: u8,     // 8ms short crisp click
+    pub amplitude_pct: u8,   // 70% strength
+    pub target_actuator: DualCursorZone,
+}
+
+/// Keystroke haptic pulse coordinator.
+#[derive(Debug, Clone, Copy)]
+pub struct KeystrokeHapticTrigger {
+    pub enabled: bool,
+    pub total_pulses_fired: u32,
+    pub last_pulse: KeystrokeHapticPulse,
+}
+
+impl KeystrokeHapticTrigger {
+    /// Creates a new keystroke haptic trigger with crisp 8ms tactile pulses.
+    pub const fn new() -> Self {
+        Self {
+            enabled: true,
+            total_pulses_fired: 0,
+            last_pulse: KeystrokeHapticPulse {
+                frequency_hz: 170,
+                duration_ms: 8,
+                amplitude_pct: 70,
+                target_actuator: DualCursorZone::LeftHalf,
+            },
+        }
+    }
+
+    /// Triggers a localized tactile click on the corresponding trackpad actuator.
+    pub fn trigger_keystroke_feedback(&mut self, zone: DualCursorZone) -> KeystrokeHapticPulse {
+        self.total_pulses_fired += 1;
+        self.last_pulse = KeystrokeHapticPulse {
+            frequency_hz: 170,
+            duration_ms: 8,
+            amplitude_pct: 70,
+            target_actuator: zone,
+        };
+        self.last_pulse
+    }
+}
+
+/// Unit verification for keystroke haptic trigger.
+pub fn verify_keystroke_haptic_trigger() -> bool {
+    let mut trigger = KeystrokeHapticTrigger::new();
+
+    let p_left = trigger.trigger_keystroke_feedback(DualCursorZone::LeftHalf);
+    if p_left.target_actuator != DualCursorZone::LeftHalf || p_left.duration_ms != 8 || trigger.total_pulses_fired != 1 {
+        return false;
+    }
+
+    let p_right = trigger.trigger_keystroke_feedback(DualCursorZone::RightHalf);
+    if p_right.target_actuator != DualCursorZone::RightHalf || trigger.total_pulses_fired != 2 {
+        return false;
+    }
+
+    true
+}
