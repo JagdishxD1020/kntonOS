@@ -214,3 +214,83 @@ impl D3D12_DRS_VIEWPORT_SCALER {
         (0, 0, w as i32, h as i32)
     }
 }
+
+// Low-latency queue pacer holding CPU submission until GPU completes previous work
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_LOW_LATENCY_QUEUE_PACER {
+    pub max_queue_depth: u32,
+    pub submitted_cpu_frame: u64,
+    pub completed_gpu_frame: u64,
+    pub low_latency_mode_enabled: bool,
+    pub boost_enabled: bool,
+    pub target_frame_budget_us: u32,
+    pub total_stalls_injected: u64,
+}
+
+impl D3D12_LOW_LATENCY_QUEUE_PACER {
+    // Construct pacer with target frame budget and single-frame queue depth clamp
+    pub const fn new(target_frame_budget_us: u32) -> Self {
+        Self {
+            max_queue_depth: 1, // Reflex / Anti-Lag strict 1-frame queue depth
+            submitted_cpu_frame: 0,
+            completed_gpu_frame: 0,
+            low_latency_mode_enabled: true,
+            boost_enabled: false,
+            target_frame_budget_us,
+            total_stalls_injected: 0,
+        }
+    }
+
+    // Number of frames currently pending execution in the GPU queue
+    #[inline]
+    pub fn current_queue_depth(&self) -> u32 {
+        self.submitted_cpu_frame.saturating_sub(self.completed_gpu_frame) as u32
+    }
+
+    // Whether CPU submission should be held back to eliminate input lag buffering
+    pub fn should_hold_cpu_submission(&mut self) -> bool {
+        if !self.low_latency_mode_enabled {
+            return false;
+        }
+
+        if self.current_queue_depth() >= self.max_queue_depth {
+            self.total_stalls_injected += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Calculate microsecond pacing sleep delay before sampling input and starting render
+    pub fn compute_pacing_sleep_us(&self, estimated_gpu_remaining_us: u32) -> u32 {
+        if !self.low_latency_mode_enabled || self.boost_enabled {
+            return 0; // In boost mode or when pacing disabled, start immediately
+        }
+
+        if self.current_queue_depth() >= self.max_queue_depth {
+            // Sleep until GPU finishes remaining work on current frame
+            estimated_gpu_remaining_us.min(self.target_frame_budget_us)
+        } else {
+            0
+        }
+    }
+
+    // Notify pacer that CPU has submitted a new frame to the GPU queue
+    pub fn on_cpu_frame_submit(&mut self) {
+        self.submitted_cpu_frame += 1;
+    }
+
+    // Notify pacer that GPU timeline fence signaled completion of a frame
+    pub fn on_gpu_frame_complete(&mut self, completed_frame: u64) {
+        if completed_frame > self.completed_gpu_frame {
+            self.completed_gpu_frame = completed_frame;
+        }
+    }
+
+    // Estimate input-to-display latency reduction in microseconds compared to traditional 3-frame queue
+    pub fn estimated_latency_reduction_us(&self) -> u32 {
+        // Traditional queue buffers 2 extra frames ahead (2 * budget)
+        2 * self.target_frame_budget_us
+    }
+}
