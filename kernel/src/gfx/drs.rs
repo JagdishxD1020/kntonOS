@@ -294,3 +294,90 @@ impl D3D12_LOW_LATENCY_QUEUE_PACER {
         2 * self.target_frame_budget_us
     }
 }
+
+// Precomputed 16-phase 2D Halton (2, 3) low-discrepancy sub-pixel jitter sequence [-0.5, 0.5]
+pub const D3D12_HALTON_2_3_JITTER_16: [[f32; 2]; 16] = [
+    [0.0, -0.16666667],
+    [-0.25, 0.16666667],
+    [0.25, -0.3888889],
+    [-0.375, -0.055555552],
+    [0.125, 0.2777778],
+    [-0.125, -0.2777778],
+    [0.375, 0.055555552],
+    [-0.4375, 0.3888889],
+    [0.0625, -0.462963],
+    [-0.1875, -0.12962963],
+    [0.3125, 0.2037037],
+    [-0.3125, -0.35185185],
+    [0.1875, -0.018518519],
+    [-0.0625, 0.3148148],
+    [0.4375, -0.24074075],
+    [-0.46875, 0.09259259],
+];
+
+// Spatial upscaler reconstruction metadata payload for FSR / DLSS passes
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SPATIAL_UPSCALER_METADATA {
+    pub jitter_offset: [f32; 2],
+    pub render_scale: [f32; 2],
+    pub render_dimensions: (u32, u32),
+    pub native_dimensions: (u32, u32),
+    pub sharpness: f32,
+    pub reset_history: bool,
+    pub phase_index: u32,
+}
+
+// Spatial upscaler metadata provider coordinating DRS scale with temporal jitter sequences
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DRS_UPSCALER_PROVIDER {
+    pub scaler: D3D12_DRS_VIEWPORT_SCALER,
+    pub current_phase: u32,
+    pub sharpness: f32,
+    pub history_reset_pending: bool,
+}
+
+impl D3D12_DRS_UPSCALER_PROVIDER {
+    // Construct upscaler provider with native display dimensions
+    pub fn new(native_width: u32, native_height: u32) -> Self {
+        Self {
+            scaler: D3D12_DRS_VIEWPORT_SCALER::new(native_width, native_height),
+            current_phase: 0,
+            sharpness: 0.8,
+            history_reset_pending: false,
+        }
+    }
+
+    // Step DRS governor and generate upscaler reconstruction metadata for current frame
+    pub fn generate_frame_metadata(
+        &mut self,
+        tracker: &D3D12_GPU_TIMESTAMP_DELTA_TRACKER,
+    ) -> D3D12_SPATIAL_UPSCALER_METADATA {
+        let scale_changed = self.scaler.update(tracker);
+        if scale_changed {
+            self.history_reset_pending = true;
+        }
+
+        let jitter = D3D12_HALTON_2_3_JITTER_16[(self.current_phase % 16) as usize];
+        let (render_w, render_h) = self.scaler.scaled_dimensions();
+        let scale_factor = self.scaler.current_scale_factor();
+
+        let metadata = D3D12_SPATIAL_UPSCALER_METADATA {
+            jitter_offset: jitter,
+            render_scale: [scale_factor, scale_factor],
+            render_dimensions: (render_w, render_h),
+            native_dimensions: (self.scaler.native_width, self.scaler.native_height),
+            sharpness: self.sharpness,
+            reset_history: self.history_reset_pending,
+            phase_index: self.current_phase,
+        };
+
+        // History reset consumed for this frame
+        self.history_reset_pending = false;
+        self.current_phase = (self.current_phase + 1) % 16;
+
+        metadata
+    }
+}
