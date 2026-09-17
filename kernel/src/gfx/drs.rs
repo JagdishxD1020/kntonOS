@@ -117,3 +117,100 @@ impl D3D12_GPU_TIMESTAMP_DELTA_TRACKER {
         }
     }
 }
+
+// Discrete DRS resolution scale percentage steps (50% to 100%)
+pub const D3D12_DRS_SCALE_STEPS: [u32; 7] = [50, 58, 67, 75, 83, 91, 100];
+
+// Dynamic viewport and scissor scaler with hysteretic thresholding to prevent oscillation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DRS_VIEWPORT_SCALER {
+    pub native_width: u32,
+    pub native_height: u32,
+    pub current_step_index: usize,
+    pub consecutive_over_budget_frames: u32,
+    pub consecutive_under_budget_frames: u32,
+    pub downscale_threshold_frames: u32,
+    pub upscale_threshold_frames: u32,
+}
+
+impl D3D12_DRS_VIEWPORT_SCALER {
+    // Construct resolution scaler initialized to 100% native resolution
+    pub const fn new(native_width: u32, native_height: u32) -> Self {
+        Self {
+            native_width,
+            native_height,
+            current_step_index: 6, // 100% native
+            consecutive_over_budget_frames: 0,
+            consecutive_under_budget_frames: 0,
+            downscale_threshold_frames: 2, // Rapid downscale on sustained drop
+            upscale_threshold_frames: 10,  // Hysteretic upscale delay prevents oscillation
+        }
+    }
+
+    // Current render resolution percentage (e.g. 50, 75, 100)
+    #[inline]
+    pub fn current_scale_percentage(&self) -> u32 {
+        D3D12_DRS_SCALE_STEPS[self.current_step_index]
+    }
+
+    // Current floating-point render scale factor [0.5, 1.0]
+    #[inline]
+    pub fn current_scale_factor(&self) -> f32 {
+        self.current_scale_percentage() as f32 / 100.0
+    }
+
+    // Scaled render dimensions aligned to 2-pixel boundaries
+    pub fn scaled_dimensions(&self) -> (u32, u32) {
+        let pct = self.current_scale_percentage();
+        let w = ((self.native_width * pct) / 100) & !1;
+        let h = ((self.native_height * pct) / 100) & !1;
+        (w.max(2), h.max(2))
+    }
+
+    // Evaluate GPU timestamp telemetry and update resolution scale factor
+    pub fn update(&mut self, tracker: &D3D12_GPU_TIMESTAMP_DELTA_TRACKER) -> bool {
+        let avg_gpu = tracker.average_gpu_duration_us();
+        let upper = tracker.budget.upper_threshold_microseconds();
+        let lower = tracker.budget.lower_threshold_microseconds();
+
+        if avg_gpu > upper {
+            self.consecutive_under_budget_frames = 0;
+            self.consecutive_over_budget_frames += 1;
+            if self.consecutive_over_budget_frames >= self.downscale_threshold_frames {
+                if self.current_step_index > 0 {
+                    self.current_step_index -= 1;
+                    self.consecutive_over_budget_frames = 0;
+                    return true;
+                }
+            }
+        } else if avg_gpu < lower {
+            self.consecutive_over_budget_frames = 0;
+            self.consecutive_under_budget_frames += 1;
+            if self.consecutive_under_budget_frames >= self.upscale_threshold_frames {
+                if self.current_step_index < D3D12_DRS_SCALE_STEPS.len() - 1 {
+                    self.current_step_index += 1;
+                    self.consecutive_under_budget_frames = 0;
+                    return true;
+                }
+            }
+        } else {
+            self.consecutive_over_budget_frames = 0;
+            self.consecutive_under_budget_frames = 0;
+        }
+
+        false
+    }
+
+    // Viewport descriptor (X, Y, Width, Height, MinDepth, MaxDepth)
+    pub fn viewport(&self) -> (f32, f32, f32, f32, f32, f32) {
+        let (w, h) = self.scaled_dimensions();
+        (0.0, 0.0, w as f32, h as f32, 0.0, 1.0)
+    }
+
+    // Scissor rect descriptor (Left, Top, Right, Bottom)
+    pub fn scissor_rect(&self) -> (i32, i32, i32, i32) {
+        let (w, h) = self.scaled_dimensions();
+        (0, 0, w as i32, h as i32)
+    }
+}
