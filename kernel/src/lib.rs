@@ -407,6 +407,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 low-latency frame pacing self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Low-Latency Frame Pacing & Dynamic Resolution Scaling (DRS) Governor (TASK-KNT-186)
+    if !gfx::test_drs_governor_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 DRS governor self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Dynamic Primitive Culling & Mesh-Cluster LOD Streamer Engine
     if !gfx::test_cluster_cull_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 cluster cull & LOD streamer self-test failed!\r\n");

@@ -381,3 +381,155 @@ impl D3D12_DRS_UPSCALER_PROVIDER {
         metadata
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 DRS governor and low-latency pacing
+pub fn test_drs_governor_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-DRS] Initializing Direct3D 12 DRS Governor & Low-Latency Pacing self-test...\r\n");
+
+    // 1. Verify frame budgets and bottleneck classification
+    let budget_60 = D3D12_DRS_FRAME_BUDGET::Target60Fps;
+    if budget_60.target_microseconds() != 16666
+        || budget_60.upper_threshold_microseconds() != 15832
+        || budget_60.lower_threshold_microseconds() != 12499
+    {
+        crate::serial_write_str("[KNT-DRS-FAIL] 60fps frame budget calculations mismatch\r\n");
+        return false;
+    }
+
+    let mut tracker = D3D12_GPU_TIMESTAMP_DELTA_TRACKER::new(budget_60);
+    // Simulate GPU bound state (GPU duration 19000 us > 16666 us target)
+    for _ in 0..8 {
+        tracker.record_frame(8000, 19000);
+    }
+    if tracker.average_gpu_duration_us() != 19000
+        || tracker.average_cpu_duration_us() != 8000
+        || tracker.evaluate_bottleneck() != D3D12_DRS_PIPELINE_BOTTLENECK::GpuBound
+    {
+        crate::serial_write_str("[KNT-DRS-FAIL] GPU bound bottleneck classification failed\r\n");
+        return false;
+    }
+
+    // Simulate CPU bound state (CPU duration 20000 us > 16666 us target)
+    for _ in 0..8 {
+        tracker.record_frame(20000, 8000);
+    }
+    if tracker.evaluate_bottleneck() != D3D12_DRS_PIPELINE_BOTTLENECK::CpuBound {
+        crate::serial_write_str("[KNT-DRS-FAIL] CPU bound bottleneck classification failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Frame budget thresholds and microsecond bottleneck analysis verified\r\n");
+
+    // 2. Verify dynamic viewport scaling and hysteretic stability
+    let mut scaler = D3D12_DRS_VIEWPORT_SCALER::new(1920, 1080);
+    if scaler.current_scale_percentage() != 100 || scaler.scaled_dimensions() != (1920, 1080) {
+        crate::serial_write_str("[KNT-DRS-FAIL] Initial scaler resolution mismatch\r\n");
+        return false;
+    }
+
+    // Feed GPU bound tracker (19000 us): should require 2 consecutive frames before downscaling
+    let mut heavy_tracker = D3D12_GPU_TIMESTAMP_DELTA_TRACKER::new(budget_60);
+    for _ in 0..8 {
+        heavy_tracker.record_frame(8000, 19000);
+    }
+
+    let changed1 = scaler.update(&heavy_tracker);
+    if changed1 || scaler.current_scale_percentage() != 100 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Downscaled prematurely on single frame drop\r\n");
+        return false;
+    }
+
+    let changed2 = scaler.update(&heavy_tracker);
+    if !changed2 || scaler.current_scale_percentage() != 91 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Failed to downscale to 91% on second frame drop\r\n");
+        return false;
+    }
+    let (scaled_w, scaled_h) = scaler.scaled_dimensions();
+    if scaled_w != 1746 || scaled_h != 982 {
+        crate::serial_write_str("[KNT-DRS-FAIL] 91% scaled dimensions calculation mismatch\r\n");
+        return false;
+    }
+
+    // Fast-downscale to minimum step (50%)
+    for _ in 0..20 {
+        scaler.update(&heavy_tracker);
+    }
+    if scaler.current_scale_percentage() != 50 || scaler.scaled_dimensions() != (960, 540) {
+        crate::serial_write_str("[KNT-DRS-FAIL] Failed to clamp downscale at 50% floor\r\n");
+        return false;
+    }
+
+    // Test hysteretic upscaling: feed light GPU load (10000 us < 12499 us lower threshold)
+    let mut light_tracker = D3D12_GPU_TIMESTAMP_DELTA_TRACKER::new(budget_60);
+    for _ in 0..8 {
+        light_tracker.record_frame(8000, 10000);
+    }
+
+    // Frames 1..9 must NOT upscale (prevent oscillation)
+    for _ in 0..9 {
+        if scaler.update(&light_tracker) {
+            crate::serial_write_str("[KNT-DRS-FAIL] Upscaled prematurely before hysteresis threshold reached\r\n");
+            return false;
+        }
+    }
+    if scaler.current_scale_percentage() != 50 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Scale changed during hysteresis hold period\r\n");
+        return false;
+    }
+
+    // Frame 10 must trigger upscale to 58%
+    if !scaler.update(&light_tracker) || scaler.current_scale_percentage() != 58 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Failed to upscale to 58% after 10 stable under-budget frames\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Dynamic viewport scaling and hysteretic anti-oscillation verified\r\n");
+
+    // 3. Verify low-latency queue pacing (Reflex / Anti-Lag clamp)
+    let mut pacer = D3D12_LOW_LATENCY_QUEUE_PACER::new(16666);
+    if pacer.current_queue_depth() != 0 || pacer.should_hold_cpu_submission() {
+        crate::serial_write_str("[KNT-DRS-FAIL] Initial pacer state should not hold CPU submission\r\n");
+        return false;
+    }
+
+    // Submit frame 1 (queue depth = 1): should hold back CPU submission to prevent queue buffering
+    pacer.on_cpu_frame_submit();
+    if pacer.current_queue_depth() != 1 || !pacer.should_hold_cpu_submission() {
+        crate::serial_write_str("[KNT-DRS-FAIL] Pacer did not clamp submission at queue depth 1\r\n");
+        return false;
+    }
+    let sleep_us = pacer.compute_pacing_sleep_us(5000);
+    if sleep_us != 5000 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Computed pacing sleep duration mismatch\r\n");
+        return false;
+    }
+
+    // GPU completes frame 1 -> queue depth drops to 0, CPU unblocked
+    pacer.on_gpu_frame_complete(1);
+    if pacer.current_queue_depth() != 0 || pacer.should_hold_cpu_submission() {
+        crate::serial_write_str("[KNT-DRS-FAIL] Pacer failed to unblock CPU after GPU frame completion\r\n");
+        return false;
+    }
+    if pacer.estimated_latency_reduction_us() != 33332 {
+        crate::serial_write_str("[KNT-DRS-FAIL] Latency reduction metric mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Low-latency queue pacer and Reflex/Anti-Lag latency clamp verified\r\n");
+
+    // 4. Verify spatial upscaler metadata provider and Halton jitter sequence
+    let mut upscaler_provider = D3D12_DRS_UPSCALER_PROVIDER::new(1920, 1080);
+    let meta0 = upscaler_provider.generate_frame_metadata(&light_tracker);
+    if meta0.phase_index != 0 || meta0.render_dimensions != (1920, 1080) {
+        crate::serial_write_str("[KNT-DRS-FAIL] Upscaler metadata initial frame mismatch\r\n");
+        return false;
+    }
+
+    let meta1 = upscaler_provider.generate_frame_metadata(&light_tracker);
+    if meta1.phase_index != 1 || meta1.jitter_offset != [-0.25, 0.16666667] {
+        crate::serial_write_str("[KNT-DRS-FAIL] Halton (2, 3) jitter phase 1 mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Spatial upscaler metadata provider and Halton jitter sequence verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-DRS-PASS] Direct3D 12 low-latency frame pacing and dynamic resolution scaling governor verified\r\n");
+    true
+}
