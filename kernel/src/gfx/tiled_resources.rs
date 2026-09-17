@@ -1,0 +1,714 @@
+//! Direct3D 12 Tiled Resources & Sparse Virtual Texture Engine.
+//! Provides 64 KiB tile coordinate math, tile pool mapping, and sparse residency tracking.
+
+#![allow(dead_code)]
+
+extern crate alloc;
+#[allow(unused_imports)]
+use alloc::vec::Vec;
+#[allow(unused_imports)]
+use crate::gfx::tile_compact::D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES;
+
+// Direct3D 12 Tiled Resource Hardware Support Tiers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[repr(u32)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_TILED_RESOURCES_TIER {
+    #[default]
+    D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED = 0,
+    D3D12_TILED_RESOURCES_TIER_1 = 1,
+    D3D12_TILED_RESOURCES_TIER_2 = 2,
+    D3D12_TILED_RESOURCES_TIER_3 = 3,
+}
+
+// 64 KiB tile dimensions in texels for a specific surface format and dimension
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILE_SHAPE {
+    pub width_in_texels: u32,
+    pub height_in_texels: u32,
+    pub depth_in_texels: u32,
+}
+
+impl D3D12_TILE_SHAPE {
+    // Construct standard 64 KiB tile shape for 2D textures based on format byte size
+    pub fn for_2d_format(bytes_per_texel: u32) -> Self {
+        match bytes_per_texel {
+            1 => Self { width_in_texels: 256, height_in_texels: 256, depth_in_texels: 1 },
+            2 => Self { width_in_texels: 256, height_in_texels: 128, depth_in_texels: 1 },
+            4 => Self { width_in_texels: 128, height_in_texels: 128, depth_in_texels: 1 },
+            8 => Self { width_in_texels: 128, height_in_texels: 64, depth_in_texels: 1 },
+            16 => Self { width_in_texels: 64, height_in_texels: 64, depth_in_texels: 1 },
+            _ => Self { width_in_texels: 128, height_in_texels: 128, depth_in_texels: 1 },
+        }
+    }
+
+    // Construct standard 64 KiB tile shape for 3D volume textures based on format byte size
+    pub fn for_3d_format(bytes_per_texel: u32) -> Self {
+        match bytes_per_texel {
+            1 => Self { width_in_texels: 64, height_in_texels: 32, depth_in_texels: 32 },
+            2 => Self { width_in_texels: 32, height_in_texels: 32, depth_in_texels: 32 },
+            4 => Self { width_in_texels: 32, height_in_texels: 32, depth_in_texels: 16 },
+            8 => Self { width_in_texels: 32, height_in_texels: 16, depth_in_texels: 16 },
+            16 => Self { width_in_texels: 16, height_in_texels: 16, depth_in_texels: 16 },
+            _ => Self { width_in_texels: 32, height_in_texels: 32, depth_in_texels: 16 },
+        }
+    }
+
+    // Total number of texels contained in a single 64 KiB tile
+    #[inline]
+    pub const fn texel_count(&self) -> u32 {
+        self.width_in_texels * self.height_in_texels * self.depth_in_texels
+    }
+}
+
+// Coordinate specifying a tile within a subresource
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILED_RESOURCE_COORDINATE {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub subresource: u32,
+}
+
+impl D3D12_TILED_RESOURCE_COORDINATE {
+    // Construct new tiled resource coordinate
+    pub const fn new(x: u32, y: u32, z: u32, subresource: u32) -> Self {
+        Self { x, y, z, subresource }
+    }
+}
+
+// Region size specifying a 3D box or linear run of tiles for mapping updates
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILE_REGION_SIZE {
+    pub num_tiles: u32,
+    pub use_box: bool,
+    pub width: u32,
+    pub height: u16,
+    pub depth: u16,
+}
+
+impl D3D12_TILE_REGION_SIZE {
+    // Create a 1D linear run of tiles
+    pub const fn linear(num_tiles: u32) -> Self {
+        Self {
+            num_tiles,
+            use_box: false,
+            width: num_tiles,
+            height: 1,
+            depth: 1,
+        }
+    }
+
+    // Create a 3D rectangular box region of tiles
+    pub const fn r#box(width: u32, height: u16, depth: u16) -> Self {
+        Self {
+            num_tiles: width * height as u32 * depth as u32,
+            use_box: true,
+            width,
+            height,
+            depth,
+        }
+    }
+}
+
+// Tiling layout metrics for an individual subresource (mip level)
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SUBRESOURCE_TILING {
+    pub width_in_tiles: u32,
+    pub height_in_tiles: u16,
+    pub depth_in_tiles: u16,
+    pub start_tile_index_in_overall_resource: u32,
+}
+
+impl D3D12_SUBRESOURCE_TILING {
+    // Total number of 64 KiB tiles spanning this subresource
+    #[inline]
+    pub fn total_tiles(&self) -> u32 {
+        self.width_in_tiles * self.height_in_tiles as u32 * self.depth_in_tiles as u32
+    }
+
+    // Convert local (x, y, z) tile coordinate to linear index within this subresource
+    pub fn coord_to_local_index(&self, x: u32, y: u32, z: u32) -> Option<u32> {
+        if x >= self.width_in_tiles || y >= self.height_in_tiles as u32 || z >= self.depth_in_tiles as u32 {
+            return None;
+        }
+        let slice_tiles = self.width_in_tiles * self.height_in_tiles as u32;
+        Some(z * slice_tiles + y * self.width_in_tiles + x)
+    }
+
+    // Convert local linear index within subresource to 3D tile coordinate (x, y, z)
+    pub fn local_index_to_coord(&self, index: u32) -> Option<(u32, u32, u32)> {
+        if index >= self.total_tiles() {
+            return None;
+        }
+        let slice_tiles = self.width_in_tiles * self.height_in_tiles as u32;
+        let z = index / slice_tiles;
+        let rem = index % slice_tiles;
+        let y = rem / self.width_in_tiles;
+        let x = rem % self.width_in_tiles;
+        Some((x, y, z))
+    }
+}
+
+// Complete tiled resource descriptor specifying dimensions, format, and tiling geometry
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILED_RESOURCE_DESC {
+    pub tier: D3D12_TILED_RESOURCES_TIER,
+    pub width: u32,
+    pub height: u32,
+    pub depth_or_array_size: u16,
+    pub mip_levels: u16,
+    pub bytes_per_texel: u32,
+    pub sample_count: u32,
+    pub is_3d: bool,
+}
+
+impl D3D12_TILED_RESOURCE_DESC {
+    // Standard 64 KiB tile shape for this resource
+    pub fn tile_shape(&self) -> D3D12_TILE_SHAPE {
+        if self.is_3d {
+            D3D12_TILE_SHAPE::for_3d_format(self.bytes_per_texel)
+        } else {
+            D3D12_TILE_SHAPE::for_2d_format(self.bytes_per_texel)
+        }
+    }
+
+    // Texel dimensions for a specific mip level
+    pub fn mip_dimensions(&self, mip: u16) -> (u32, u32, u16) {
+        let w = (self.width >> mip).max(1);
+        let h = (self.height >> mip).max(1);
+        let d = if self.is_3d {
+            (self.depth_or_array_size >> mip).max(1)
+        } else {
+            self.depth_or_array_size
+        };
+        (w, h, d)
+    }
+
+    // Calculate subresource tiling metrics for a given mip level
+    pub fn calculate_subresource_tiling(&self, mip: u16, start_tile_index: u32) -> D3D12_SUBRESOURCE_TILING {
+        let (w, h, d) = self.mip_dimensions(mip);
+        let shape = self.tile_shape();
+
+        let w_tiles = (w + shape.width_in_texels - 1) / shape.width_in_texels;
+        let h_tiles = (h + shape.height_in_texels - 1) / shape.height_in_texels;
+        let d_tiles = if self.is_3d {
+            (d as u32 + shape.depth_in_texels - 1) / shape.depth_in_texels
+        } else {
+            d as u32
+        };
+
+        D3D12_SUBRESOURCE_TILING {
+            width_in_tiles: w_tiles,
+            height_in_tiles: h_tiles as u16,
+            depth_in_tiles: d_tiles as u16,
+            start_tile_index_in_overall_resource: start_tile_index,
+        }
+    }
+
+    // Convert full tiled coordinate to overall resource linear tile index
+    pub fn coordinate_to_overall_index(&self, coord: &D3D12_TILED_RESOURCE_COORDINATE) -> Option<u32> {
+        if coord.subresource >= self.mip_levels as u32 {
+            return None;
+        }
+
+        let mut current_start = 0u32;
+        for m in 0..coord.subresource as u16 {
+            let tiling = self.calculate_subresource_tiling(m, current_start);
+            current_start += tiling.total_tiles();
+        }
+
+        let tiling = self.calculate_subresource_tiling(coord.subresource as u16, current_start);
+        let local_idx = tiling.coord_to_local_index(coord.x, coord.y, coord.z)?;
+        Some(current_start + local_idx)
+    }
+}
+
+// Bitmask flags configuring tile mapping operations
+pub const D3D12_TILE_MAPPING_FLAG_NONE: u32 = 0x0;
+pub const D3D12_TILE_MAPPING_FLAG_NO_HAZARD: u32 = 0x1;
+pub const D3D12_TILE_MAPPING_FLAG_UNMAP: u32 = 0x2;
+
+// Physical memory storage pool holding contiguous 64 KiB tiles
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILE_POOL {
+    pub pool_id: u32,
+    pub tile_count: u32,
+    pub allocated_mask: Vec<bool>,
+    pub active_mappings: usize,
+}
+
+impl D3D12_TILE_POOL {
+    // Construct new 64 KiB physical tile pool
+    pub fn new(pool_id: u32, tile_count: u32) -> Self {
+        Self {
+            pool_id,
+            tile_count,
+            allocated_mask: alloc::vec![false; tile_count as usize],
+            active_mappings: 0,
+        }
+    }
+
+    // Allocate an unused physical tile index
+    pub fn allocate_tile(&mut self) -> Option<u32> {
+        for (idx, alloc) in self.allocated_mask.iter_mut().enumerate() {
+            if !*alloc {
+                *alloc = true;
+                return Some(idx as u32);
+            }
+        }
+        None
+    }
+
+    // Release an allocated physical tile back to the pool
+    pub fn free_tile(&mut self, tile_idx: u32) -> bool {
+        if (tile_idx as usize) < self.allocated_mask.len() && self.allocated_mask[tile_idx as usize] {
+            self.allocated_mask[tile_idx as usize] = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Whether a physical tile index is valid within pool bounds
+    #[inline]
+    pub fn is_valid_tile(&self, tile_idx: u32) -> bool {
+        tile_idx < self.tile_count
+    }
+}
+
+// Sparse virtual texture page table manager with unmapped null-tile fallback
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_TILED_RESOURCE_MAPPING_MANAGER {
+    pub resource_id: u32,
+    pub total_virtual_tiles: u32,
+    pub tile_table: Vec<Option<u32>>,
+    pub null_tile_reads: u64,
+    pub null_tile_writes_discarded: u64,
+}
+
+impl D3D12_TILED_RESOURCE_MAPPING_MANAGER {
+    // Construct new sparse mapping manager initialized to fully unmapped (null) state
+    pub fn new(resource_id: u32, total_virtual_tiles: u32) -> Self {
+        Self {
+            resource_id,
+            total_virtual_tiles,
+            tile_table: alloc::vec![None; total_virtual_tiles as usize],
+            null_tile_reads: 0,
+            null_tile_writes_discarded: 0,
+        }
+    }
+
+    // Update range of virtual tiles with physical pool tiles or unmap
+    pub fn update_tile_mappings(
+        &mut self,
+        start_virtual_tile: u32,
+        tile_count: u32,
+        pool_start_tile: Option<u32>,
+        flags: u32,
+    ) -> Result<(), &'static str> {
+        let end_tile = start_virtual_tile + tile_count;
+        if end_tile > self.total_virtual_tiles {
+            return Err("Tile mapping range exceeds resource virtual tile count");
+        }
+
+        let is_unmap = (flags & D3D12_TILE_MAPPING_FLAG_UNMAP) != 0 || pool_start_tile.is_none();
+
+        for i in 0..tile_count {
+            let virt_idx = (start_virtual_tile + i) as usize;
+            if is_unmap {
+                self.tile_table[virt_idx] = None;
+            } else {
+                let phys_idx = pool_start_tile.unwrap() + i;
+                self.tile_table[virt_idx] = Some(phys_idx);
+            }
+        }
+
+        Ok(())
+    }
+
+    // Copy tile mappings from source sparse resource
+    pub fn copy_tile_mappings(
+        &mut self,
+        dst_start: u32,
+        src_manager: &D3D12_TILED_RESOURCE_MAPPING_MANAGER,
+        src_start: u32,
+        tile_count: u32,
+    ) -> Result<(), &'static str> {
+        if dst_start + tile_count > self.total_virtual_tiles {
+            return Err("Destination tile range exceeds resource bounds");
+        }
+        if src_start + tile_count > src_manager.total_virtual_tiles {
+            return Err("Source tile range exceeds source resource bounds");
+        }
+
+        for i in 0..tile_count {
+            let src_idx = (src_start + i) as usize;
+            let dst_idx = (dst_start + i) as usize;
+            self.tile_table[dst_idx] = src_manager.tile_table[src_idx];
+        }
+
+        Ok(())
+    }
+
+    // Read 64 KiB tile with null-tile fallback (unmapped reads return 0 without faulting)
+    pub fn read_tile(&mut self, virtual_tile: u32, out_buffer: &mut [u8]) -> bool {
+        if (virtual_tile as usize) >= self.tile_table.len() {
+            out_buffer.fill(0);
+            self.null_tile_reads += 1;
+            return false;
+        }
+
+        match self.tile_table[virtual_tile as usize] {
+            Some(phys_tile) => {
+                // Mapped tile: populate with deterministic simulated physical tile pattern
+                let pattern = (phys_tile as u8).wrapping_add(0x5A);
+                out_buffer.fill(pattern);
+                true
+            }
+            None => {
+                // Tier 2 null-tile fallback: read returns zero/clear color without page fault
+                out_buffer.fill(0);
+                self.null_tile_reads += 1;
+                false
+            }
+        }
+    }
+
+    // Write 64 KiB tile with null-tile fallback (unmapped writes safely discarded)
+    pub fn write_tile(&mut self, virtual_tile: u32, _in_buffer: &[u8]) -> bool {
+        if (virtual_tile as usize) >= self.tile_table.len() {
+            self.null_tile_writes_discarded += 1;
+            return false;
+        }
+
+        match self.tile_table[virtual_tile as usize] {
+            Some(_) => true,
+            None => {
+                // Writing to an unmapped tile is safely dropped
+                self.null_tile_writes_discarded += 1;
+                false
+            }
+        }
+    }
+
+    // Check if a range of virtual tiles is fully resident (SV_IsFullyMapped)
+    pub fn is_fully_mapped(&self, start_virtual_tile: u32, tile_count: u32) -> bool {
+        let end_tile = (start_virtual_tile + tile_count) as usize;
+        if end_tile > self.tile_table.len() {
+            return false;
+        }
+        for i in (start_virtual_tile as usize)..end_tile {
+            if self.tile_table[i].is_none() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Information describing packed mipmap tails packed into one or more 64 KiB tiles
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PACKED_MIP_INFO {
+    pub num_standard_mips: u32,
+    pub num_packed_mips: u32,
+    pub num_tiles_for_packed_mips: u32,
+    pub start_tile_index_in_overall_resource: u32,
+}
+
+impl D3D12_PACKED_MIP_INFO {
+    // Evaluate standard versus packed mips for a tiled resource
+    pub fn calculate(desc: &D3D12_TILED_RESOURCE_DESC) -> Self {
+        let shape = desc.tile_shape();
+        let tile_texels = shape.texel_count();
+
+        let mut standard_mips = 0u32;
+        let mut packed_mips = 0u32;
+        let mut current_tile_idx = 0u32;
+        let mut packed_start_tile = 0u32;
+
+        for m in 0..desc.mip_levels {
+            let (w, h, d) = desc.mip_dimensions(m);
+            let texel_count = w * h * (d as u32);
+
+            let tiling = desc.calculate_subresource_tiling(m, current_tile_idx);
+            if tiling.total_tiles() == 1 && texel_count < tile_texels {
+                if packed_mips == 0 {
+                    packed_start_tile = current_tile_idx;
+                }
+                packed_mips += 1;
+            } else {
+                standard_mips += 1;
+                current_tile_idx += tiling.total_tiles();
+            }
+        }
+
+        let packed_tiles = if packed_mips > 0 { 1 } else { 0 };
+
+        Self {
+            num_standard_mips: standard_mips,
+            num_packed_mips: packed_mips,
+            num_tiles_for_packed_mips: packed_tiles,
+            start_tile_index_in_overall_resource: packed_start_tile,
+        }
+    }
+}
+
+// Sparse virtual texture residency tracker with dynamic mip LOD clamping
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SPARSE_RESIDENCY_TRACKER {
+    pub resource_id: u32,
+    pub mip_levels: u16,
+    pub mip_residency_mask: u32,
+    pub min_resident_mip_clamp: u16,
+}
+
+impl D3D12_SPARSE_RESIDENCY_TRACKER {
+    // Construct new residency tracker with all mips initially non-resident
+    pub fn new(resource_id: u32, mip_levels: u16) -> Self {
+        Self {
+            resource_id,
+            mip_levels,
+            mip_residency_mask: 0,
+            min_resident_mip_clamp: mip_levels,
+        }
+    }
+
+    // Set residency status for a specific mip level and update hardware clamp
+    pub fn set_mip_residency(&mut self, mip: u16, resident: bool) {
+        if mip >= self.mip_levels {
+            return;
+        }
+
+        if resident {
+            self.mip_residency_mask |= 1u32 << mip;
+        } else {
+            self.mip_residency_mask &= !(1u32 << mip);
+        }
+
+        self.update_clamp();
+    }
+
+    // Recalculate minimum resident mip clamp level
+    fn update_clamp(&mut self) {
+        let mut clamp = self.mip_levels;
+        for m in 0..self.mip_levels {
+            if (self.mip_residency_mask & (1u32 << m)) != 0 {
+                clamp = m;
+                break;
+            }
+        }
+        self.min_resident_mip_clamp = clamp;
+    }
+
+    // Clamp shader texture sample LOD to highest resident mip level
+    #[inline]
+    pub fn clamp_sample_lod(&self, requested_lod: f32) -> f32 {
+        let clamp_f = self.min_resident_mip_clamp as f32;
+        if requested_lod < clamp_f {
+            clamp_f
+        } else {
+            requested_lod
+        }
+    }
+
+    // Whether a mip level is resident
+    #[inline]
+    pub fn is_mip_resident(&self, mip: u16) -> bool {
+        if mip >= self.mip_levels {
+            false
+        } else {
+            (self.mip_residency_mask & (1u32 << mip)) != 0
+        }
+    }
+}
+
+// Comprehensive verification self-test suite for D3D12 Tiled Resources & Sparse Virtual Textures
+pub fn test_tiled_resources_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-TILED] Initializing Direct3D 12 Tiled Resources & Sparse Virtual Texture self-test...\r\n");
+
+    // 1. Verify standard 64 KiB tile shapes across 2D and 3D surface formats
+    let shape_2d_1bpp = D3D12_TILE_SHAPE::for_2d_format(1);
+    let shape_2d_2bpp = D3D12_TILE_SHAPE::for_2d_format(2);
+    let shape_2d_4bpp = D3D12_TILE_SHAPE::for_2d_format(4);
+    let shape_2d_8bpp = D3D12_TILE_SHAPE::for_2d_format(8);
+    let shape_2d_16bpp = D3D12_TILE_SHAPE::for_2d_format(16);
+    let shape_3d_4bpp = D3D12_TILE_SHAPE::for_3d_format(4);
+
+    if shape_2d_1bpp.texel_count() * 1 != 65536
+        || shape_2d_2bpp.texel_count() * 2 != 65536
+        || shape_2d_4bpp.texel_count() * 4 != 65536
+        || shape_2d_8bpp.texel_count() * 8 != 65536
+        || shape_2d_16bpp.texel_count() * 16 != 65536
+        || shape_3d_4bpp.texel_count() * 4 != 65536
+    {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 64 KiB tile shape byte size mismatch\r\n");
+        return false;
+    }
+    if shape_2d_4bpp.width_in_texels != 128 || shape_2d_4bpp.height_in_texels != 128 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 2D 32bpp tile shape dimensions mismatch\r\n");
+        return false;
+    }
+    if shape_3d_4bpp.width_in_texels != 32 || shape_3d_4bpp.height_in_texels != 32 || shape_3d_4bpp.depth_in_texels != 16 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Standard 3D 32bpp tile shape dimensions mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Standard 64 KiB tile shapes for 2D and 3D volume textures verified\r\n");
+
+    // 2. Verify subresource tiling calculations and tile coordinate to linear index math
+    let desc = D3D12_TILED_RESOURCE_DESC {
+        tier: D3D12_TILED_RESOURCES_TIER::D3D12_TILED_RESOURCES_TIER_2,
+        width: 1024,
+        height: 1024,
+        depth_or_array_size: 1,
+        mip_levels: 5,
+        bytes_per_texel: 4,
+        sample_count: 1,
+        is_3d: false,
+    };
+
+    let tiling_mip0 = desc.calculate_subresource_tiling(0, 0);
+    if tiling_mip0.width_in_tiles != 8 || tiling_mip0.height_in_tiles != 8 || tiling_mip0.total_tiles() != 64 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Mip 0 tiling dimensions mismatch\r\n");
+        return false;
+    }
+
+    let tiling_mip1 = desc.calculate_subresource_tiling(1, 64);
+    if tiling_mip1.width_in_tiles != 4 || tiling_mip1.height_in_tiles != 4 || tiling_mip1.total_tiles() != 16 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Mip 1 tiling dimensions mismatch\r\n");
+        return false;
+    }
+
+    // Coordinate (3, 2) in mip 0: index should be 2 * 8 + 3 = 19
+    let idx_m0 = match desc.coordinate_to_overall_index(&D3D12_TILED_RESOURCE_COORDINATE::new(3, 2, 0, 0)) {
+        Some(idx) => idx,
+        None => {
+            crate::serial_write_str("[KNT-TILED-FAIL] Coordinate to index conversion failed for mip 0\r\n");
+            return false;
+        }
+    };
+    if idx_m0 != 19 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Overall tile index mismatch for mip 0\r\n");
+        return false;
+    }
+
+    // Coordinate (1, 1) in mip 1: index should be 64 + (1 * 4 + 1) = 69
+    let idx_m1 = match desc.coordinate_to_overall_index(&D3D12_TILED_RESOURCE_COORDINATE::new(1, 1, 0, 1)) {
+        Some(idx) => idx,
+        None => {
+            crate::serial_write_str("[KNT-TILED-FAIL] Coordinate to index conversion failed for mip 1\r\n");
+            return false;
+        }
+    };
+    if idx_m1 != 69 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Overall tile index mismatch for mip 1\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Subresource tiling geometry and 64 KiB coordinate index math verified\r\n");
+
+    // 3. Verify tile pool allocation, UpdateTileMappings, and CopyTileMappings
+    let mut pool = D3D12_TILE_POOL::new(1, 32);
+    let t0 = pool.allocate_tile();
+    if t0 != Some(0) || !pool.is_valid_tile(0) || pool.is_valid_tile(32) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tile pool allocation or bounds check failed\r\n");
+        return false;
+    }
+    if !pool.free_tile(0) || pool.free_tile(0) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tile pool free or double free check failed\r\n");
+        return false;
+    }
+    let mut manager1 = D3D12_TILED_RESOURCE_MAPPING_MANAGER::new(10, 86);
+
+    // Map first 16 virtual tiles to physical tiles 0..16
+    if manager1.update_tile_mappings(0, 16, Some(0), D3D12_TILE_MAPPING_FLAG_NONE).is_err() {
+        crate::serial_write_str("[KNT-TILED-FAIL] UpdateTileMappings failed\r\n");
+        return false;
+    }
+    if !manager1.is_fully_mapped(0, 16) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tiles 0..16 expected to be fully mapped\r\n");
+        return false;
+    }
+    if manager1.is_fully_mapped(0, 32) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Tiles 0..32 should not be fully mapped\r\n");
+        return false;
+    }
+
+    // Copy tile mappings to second resource manager
+    let mut manager2 = D3D12_TILED_RESOURCE_MAPPING_MANAGER::new(20, 86);
+    if manager2.copy_tile_mappings(10, &manager1, 0, 8).is_err() {
+        crate::serial_write_str("[KNT-TILED-FAIL] CopyTileMappings failed\r\n");
+        return false;
+    }
+    if !manager2.is_fully_mapped(10, 8) || manager2.is_fully_mapped(0, 10) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Copied tile mappings verification mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Tile pool allocator, UpdateTileMappings, and CopyTileMappings verified\r\n");
+
+    // 4. Verify unmapped tile null fallback (reading returns zero, writing discarded without fault)
+    let mut tile_buf = [0xFFu8; 64]; // Sub-slice for testing reads
+    let resident = manager1.read_tile(5, &mut tile_buf);
+    if !resident || tile_buf[0] != (5u8.wrapping_add(0x5A)) {
+        crate::serial_write_str("[KNT-TILED-FAIL] Resident tile read failed or data pattern mismatch\r\n");
+        return false;
+    }
+
+    // Read unmapped virtual tile 20 -> should return false, zero-fill buffer, and increment null_tile_reads
+    let resident_null = manager1.read_tile(20, &mut tile_buf);
+    if resident_null || tile_buf.iter().any(|&b| b != 0) || manager1.null_tile_reads != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Unmapped tile read did not zero-fill buffer cleanly\r\n");
+        return false;
+    }
+
+    // Write to unmapped virtual tile 20 -> should return false and safely discard
+    let write_res = manager1.write_tile(20, &tile_buf);
+    if write_res || manager1.null_tile_writes_discarded != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Unmapped tile write was not cleanly discarded\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Unmapped tile null fallback and safe write discard verified\r\n");
+
+    // 5. Verify packed mipmap tail calculation and dynamic sparse residency tracker
+    let packed_info = D3D12_PACKED_MIP_INFO::calculate(&desc);
+    if packed_info.num_standard_mips != 4 || packed_info.num_packed_mips != 1 || packed_info.num_tiles_for_packed_mips != 1 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Packed mip tail metrics calculation mismatch\r\n");
+        return false;
+    }
+
+    let mut tracker = D3D12_SPARSE_RESIDENCY_TRACKER::new(10, 5);
+    tracker.set_mip_residency(2, true);
+    tracker.set_mip_residency(3, true);
+    tracker.set_mip_residency(4, true);
+
+    if tracker.min_resident_mip_clamp != 2 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Minimum resident mip clamp should be 2\r\n");
+        return false;
+    }
+    if (tracker.clamp_sample_lod(0.5) - 2.0).abs() > 1e-5 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Requested LOD 0.5 was not clamped up to resident mip 2.0\r\n");
+        return false;
+    }
+    if (tracker.clamp_sample_lod(3.5) - 3.5).abs() > 1e-5 {
+        crate::serial_write_str("[KNT-TILED-FAIL] Requested LOD 3.5 was improperly modified\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Packed mip tail clamping and sparse residency streamer verified\r\n");
+
+    // 6. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-TILED-PASS] Direct3D 12 tiled resources and sparse virtual texture engine verified\r\n");
+    true
+}
