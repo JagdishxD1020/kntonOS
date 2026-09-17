@@ -170,3 +170,51 @@ static REGISTRY_HIVES: Spinlock<BTreeMap<HKEY, RegistryKeyNode>> = Spinlock::new
 static OPEN_KEYS: Spinlock<BTreeMap<HKEY, OpenKeyHandle>> = Spinlock::new(BTreeMap::new());
 #[allow(dead_code)]
 static NEXT_HKEY: Spinlock<HKEY> = Spinlock::new(0x000F_0001);
+
+static REGISTRY_INITIALIZED: Spinlock<bool> = Spinlock::new(false);
+
+/// Populates default system and gaming configuration hives.
+pub fn ensure_registry_initialized() {
+    let mut init = REGISTRY_INITIALIZED.lock();
+    if *init {
+        return;
+    }
+
+    let mut hives = REGISTRY_HIVES.lock();
+    hives.insert(HKEY_CLASSES_ROOT, RegistryKeyNode::new("HKEY_CLASSES_ROOT"));
+    hives.insert(HKEY_CURRENT_USER, RegistryKeyNode::new("HKEY_CURRENT_USER"));
+    hives.insert(HKEY_USERS, RegistryKeyNode::new("HKEY_USERS"));
+    hives.insert(HKEY_CURRENT_CONFIG, RegistryKeyNode::new("HKEY_CURRENT_CONFIG"));
+
+    let mut hklm = RegistryKeyNode::new("HKEY_LOCAL_MACHINE");
+
+    // 1. DirectX gaming installation keys
+    let directx = hklm.create_path(&["SOFTWARE", "Microsoft", "DirectX"]);
+    directx.set_value("Version", REG_SZ, b"4.09.00.0904\0");
+    directx.set_value(
+        "InstalledVersion",
+        REG_BINARY,
+        &[0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x04, 0x09],
+    );
+
+    // 2. Windows NT version strings
+    let winnt = hklm.create_path(&["SOFTWARE", "Microsoft", "Windows NT", "CurrentVersion"]);
+    winnt.set_value("ProductName", REG_SZ, b"Windows 10 Pro\0");
+    winnt.set_value("CurrentMajorVersionNumber", REG_DWORD, &10u32.to_le_bytes());
+    winnt.set_value("CurrentMinorVersionNumber", REG_DWORD, &0u32.to_le_bytes());
+    winnt.set_value("CurrentBuildNumber", REG_SZ, b"19045\0");
+    winnt.set_value("ReleaseId", REG_SZ, b"22H2\0");
+    winnt.set_value("CurrentVersion", REG_SZ, b"6.3\0");
+
+    // 3. Display video device map
+    let video = hklm.create_path(&["HARDWARE", "DEVICEMAP", "VIDEO"]);
+    video.set_value(
+        "\\Device\\Video0",
+        REG_SZ,
+        b"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Video\\{12345678-ABCD-EF01-2345-6789ABCDEF01}\\0000\0",
+    );
+    video.set_value("MaxObjectNumber", REG_DWORD, &1u32.to_le_bytes());
+
+    hives.insert(HKEY_LOCAL_MACHINE, hklm);
+    *init = true;
+}
