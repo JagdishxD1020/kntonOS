@@ -340,3 +340,28 @@ pub fn verify_win32_key_synthesizer() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld On-Screen Virtual Keyboard & Dual-Trackpad Typing Engine.
+pub fn test_virtual_keyboard_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Virtual Keyboard & Dual-Trackpad Typing Engine...\r\n");
+
+    if !verify_keyboard_layouts() {
+        crate::serial_write_str("[KNT-PANIC] Virtual keyboard layouts verification failed!\r\n");
+        return false;
+    }
+    if !verify_dual_trackpad_typing() {
+        crate::serial_write_str("[KNT-PANIC] Dual-trackpad thumb typing verification failed!\r\n");
+        return false;
+    }
+    if !verify_keystroke_haptic_trigger() {
+        crate::serial_write_str("[KNT-PANIC] Keystroke haptic trigger verification failed!\r\n");
+        return false;
+    }
+    if !verify_win32_key_synthesizer() {
+        crate::serial_write_str("[KNT-PANIC] Win32 key synthesizer verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-VKEYBOARD-PASS] Handheld on-screen virtual keyboard and dual-trackpad typing verified\r\n");
+    true
+}
