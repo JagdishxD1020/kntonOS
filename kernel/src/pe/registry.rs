@@ -218,3 +218,293 @@ pub fn ensure_registry_initialized() {
     hives.insert(HKEY_LOCAL_MACHINE, hklm);
     *init = true;
 }
+
+/// Parses a null-terminated ANSI C-string up to 260 bytes.
+pub unsafe fn parse_cstr_a(ptr: *const u8) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(ptr, len);
+    core::str::from_utf8(slice).ok().map(String::from)
+}
+
+/// Parses a null-terminated UTF-16 C-string up to 260 code units.
+pub unsafe fn parse_cstr_w(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while *ptr.add(len) != 0 && len < 260 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(ptr, len);
+    let chars: Vec<char> = slice.iter().map(|&c| c as u8 as char).collect();
+    Some(chars.into_iter().collect())
+}
+
+/// Splits a registry key path by backslash or forward slash separators.
+pub fn split_registry_path(path: &str) -> Vec<String> {
+    path.split(|c| c == '\\' || c == '/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Resolves an open HKEY handle to its root hive and path components.
+fn resolve_hkey_context(h_key: HKEY) -> Option<(HKEY, Vec<String>)> {
+    match h_key {
+        HKEY_CLASSES_ROOT
+        | HKEY_CURRENT_USER
+        | HKEY_LOCAL_MACHINE
+        | HKEY_USERS
+        | HKEY_PERFORMANCE_DATA
+        | HKEY_CURRENT_CONFIG => Some((h_key, Vec::new())),
+        _ => {
+            let open_keys = OPEN_KEYS.lock();
+            open_keys.get(&h_key).map(|entry| (entry.root_hkey, entry.path.clone()))
+        }
+    }
+}
+
+/// Emulates Win32 RegOpenKeyExA opening a subkey (ANSI).
+pub unsafe fn RegOpenKeyExA(
+    h_key: HKEY,
+    lp_sub_key: *const u8,
+    _ul_options: u32,
+    _sam_desired: u32,
+    phk_result: *mut HKEY,
+) -> u32 {
+    if phk_result.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    let subkey_str = match parse_cstr_a(lp_sub_key) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_open_key_internal(h_key, &subkey_str, phk_result)
+}
+
+/// Emulates Win32 RegOpenKeyExW opening a subkey (UTF-16).
+pub unsafe fn RegOpenKeyExW(
+    h_key: HKEY,
+    lp_sub_key: *const u16,
+    _ul_options: u32,
+    _sam_desired: u32,
+    phk_result: *mut HKEY,
+) -> u32 {
+    if phk_result.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    let subkey_str = match parse_cstr_w(lp_sub_key) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_open_key_internal(h_key, &subkey_str, phk_result)
+}
+
+fn reg_open_key_internal(h_key: HKEY, subkey_str: &str, phk_result: *mut HKEY) -> u32 {
+    ensure_registry_initialized();
+    let (root_hkey, mut path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let sub_parts = split_registry_path(subkey_str);
+    path.extend(sub_parts);
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    if root.resolve_path(&str_parts).is_none() {
+        return ERROR_FILE_NOT_FOUND;
+    }
+    drop(hives);
+
+    let mut gen = NEXT_HKEY.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let mut open_keys = OPEN_KEYS.lock();
+    open_keys.insert(handle, OpenKeyHandle { root_hkey, path });
+
+    unsafe {
+        *phk_result = handle;
+    }
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegCreateKeyExA creating or opening a subkey (ANSI).
+pub unsafe fn RegCreateKeyExA(
+    h_key: HKEY,
+    lp_sub_key: *const u8,
+    _reserved: u32,
+    _lp_class: *const u8,
+    _dw_options: u32,
+    _sam_desired: u32,
+    _lp_security_attributes: *const u8,
+    phk_result: *mut HKEY,
+    lpdw_disposition: *mut u32,
+) -> u32 {
+    if phk_result.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    let subkey_str = match parse_cstr_a(lp_sub_key) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_create_key_internal(h_key, &subkey_str, phk_result, lpdw_disposition)
+}
+
+/// Emulates Win32 RegCreateKeyExW creating or opening a subkey (UTF-16).
+pub unsafe fn RegCreateKeyExW(
+    h_key: HKEY,
+    lp_sub_key: *const u16,
+    _reserved: u32,
+    _lp_class: *const u8,
+    _dw_options: u32,
+    _sam_desired: u32,
+    _lp_security_attributes: *const u8,
+    phk_result: *mut HKEY,
+    lpdw_disposition: *mut u32,
+) -> u32 {
+    if phk_result.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    let subkey_str = match parse_cstr_w(lp_sub_key) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_create_key_internal(h_key, &subkey_str, phk_result, lpdw_disposition)
+}
+
+fn reg_create_key_internal(
+    h_key: HKEY,
+    subkey_str: &str,
+    phk_result: *mut HKEY,
+    lpdw_disposition: *mut u32,
+) -> u32 {
+    ensure_registry_initialized();
+    let (root_hkey, mut path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let sub_parts = split_registry_path(subkey_str);
+    path.extend(sub_parts);
+
+    let mut hives = REGISTRY_HIVES.lock();
+    let root = match hives.get_mut(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let existed = root.resolve_path(&str_parts).is_some();
+    root.create_path(&str_parts);
+    drop(hives);
+
+    let disposition = if existed {
+        REG_OPENED_EXISTING_KEY
+    } else {
+        REG_CREATED_NEW_KEY
+    };
+
+    if !lpdw_disposition.is_null() {
+        unsafe {
+            *lpdw_disposition = disposition;
+        }
+    }
+
+    let mut gen = NEXT_HKEY.lock();
+    let handle = *gen;
+    *gen = handle.saturating_add(1);
+    drop(gen);
+
+    let mut open_keys = OPEN_KEYS.lock();
+    open_keys.insert(handle, OpenKeyHandle { root_hkey, path });
+
+    unsafe {
+        *phk_result = handle;
+    }
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegCloseKey releasing an open registry handle.
+pub unsafe fn RegCloseKey(h_key: HKEY) -> u32 {
+    match h_key {
+        HKEY_CLASSES_ROOT
+        | HKEY_CURRENT_USER
+        | HKEY_LOCAL_MACHINE
+        | HKEY_USERS
+        | HKEY_PERFORMANCE_DATA
+        | HKEY_CURRENT_CONFIG => ERROR_SUCCESS,
+        _ => {
+            let mut open_keys = OPEN_KEYS.lock();
+            if open_keys.remove(&h_key).is_some() {
+                ERROR_SUCCESS
+            } else {
+                ERROR_INVALID_HANDLE
+            }
+        }
+    }
+}
+
+/// Emulates Win32 RegDeleteKeyA deleting a subkey (ANSI).
+pub unsafe fn RegDeleteKeyA(h_key: HKEY, lp_sub_key: *const u8) -> u32 {
+    let subkey_str = match parse_cstr_a(lp_sub_key) {
+        Some(s) => s,
+        None => return ERROR_INVALID_PARAMETER,
+    };
+    reg_delete_key_internal(h_key, &subkey_str)
+}
+
+/// Emulates Win32 RegDeleteKeyW deleting a subkey (UTF-16).
+pub unsafe fn RegDeleteKeyW(h_key: HKEY, lp_sub_key: *const u16) -> u32 {
+    let subkey_str = match parse_cstr_w(lp_sub_key) {
+        Some(s) => s,
+        None => return ERROR_INVALID_PARAMETER,
+    };
+    reg_delete_key_internal(h_key, &subkey_str)
+}
+
+fn reg_delete_key_internal(h_key: HKEY, subkey_str: &str) -> u32 {
+    ensure_registry_initialized();
+    let (root_hkey, mut path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let sub_parts = split_registry_path(subkey_str);
+    if sub_parts.is_empty() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    path.extend(sub_parts);
+
+    let leaf_name = path.pop().unwrap();
+    let mut hives = REGISTRY_HIVES.lock();
+    let root = match hives.get_mut(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let parent_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let parent = match root.resolve_path_mut(&parent_parts) {
+        Some(p) => p,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if parent.delete_subkey(&leaf_name) {
+        ERROR_SUCCESS
+    } else {
+        ERROR_FILE_NOT_FOUND
+    }
+}
