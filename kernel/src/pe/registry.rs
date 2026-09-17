@@ -913,3 +913,260 @@ pub unsafe fn RegEnumKeyExW(
 
     ERROR_SUCCESS
 }
+
+/// Comprehensive self-test verifying registry key creation, value read/write roundtrip, enumeration, and DirectX hive detection.
+pub fn test_win32_registry_subsystem() -> bool {
+    ensure_registry_initialized();
+
+    // 1. DirectX installation keys query
+    let mut h_dx: HKEY = 0;
+    let res = unsafe {
+        RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            b"SOFTWARE\\Microsoft\\DirectX\0".as_ptr(),
+            0,
+            KEY_READ,
+            &mut h_dx,
+        )
+    };
+    if res != ERROR_SUCCESS || h_dx == 0 {
+        return false;
+    }
+
+    let mut val_type = 0u32;
+    let mut ver_buf = [0u8; 64];
+    let mut ver_len = ver_buf.len() as u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_dx,
+            b"Version\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            ver_buf.as_mut_ptr(),
+            &mut ver_len,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_SZ {
+        return false;
+    }
+    if !ver_buf.starts_with(b"4.09.00.0904") {
+        return false;
+    }
+
+    let mut inst_buf = [0u8; 16];
+    let mut inst_len = inst_buf.len() as u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_dx,
+            b"InstalledVersion\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            inst_buf.as_mut_ptr(),
+            &mut inst_len,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_BINARY || inst_len != 8 {
+        return false;
+    }
+    if &inst_buf[..8] != &[0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x04, 0x09] {
+        return false;
+    }
+
+    let _ = unsafe { RegCloseKey(h_dx) };
+
+    // 2. Windows NT CurrentVersion query
+    let mut h_nt: HKEY = 0;
+    let res = unsafe {
+        RegOpenKeyExA(
+            HKEY_LOCAL_MACHINE,
+            b"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0".as_ptr(),
+            0,
+            KEY_READ,
+            &mut h_nt,
+        )
+    };
+    if res != ERROR_SUCCESS || h_nt == 0 {
+        return false;
+    }
+
+    let mut dword_buf = [0u8; 4];
+    let mut dword_len = 4u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_nt,
+            b"CurrentMajorVersionNumber\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            dword_buf.as_mut_ptr(),
+            &mut dword_len,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_DWORD || u32::from_le_bytes(dword_buf) != 10 {
+        return false;
+    }
+
+    let mut prod_buf = [0u8; 64];
+    let mut prod_len = prod_buf.len() as u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_nt,
+            b"ProductName\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            prod_buf.as_mut_ptr(),
+            &mut prod_len,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_SZ || !prod_buf.starts_with(b"Windows 10 Pro") {
+        return false;
+    }
+
+    let _ = unsafe { RegCloseKey(h_nt) };
+
+    // 3. Custom key creation & value read/write roundtrip
+    let mut h_game: HKEY = 0;
+    let mut disposition = 0u32;
+    let res = unsafe {
+        RegCreateKeyExA(
+            HKEY_CURRENT_USER,
+            b"Software\\KntonGame\\Settings\0".as_ptr(),
+            0,
+            core::ptr::null(),
+            0,
+            KEY_ALL_ACCESS,
+            core::ptr::null(),
+            &mut h_game,
+            &mut disposition,
+        )
+    };
+    if res != ERROR_SUCCESS || h_game == 0 || disposition != REG_CREATED_NEW_KEY {
+        return false;
+    }
+
+    let res_x = 1920u32;
+    let res = unsafe {
+        RegSetValueExA(
+            h_game,
+            b"ResolutionX\0".as_ptr(),
+            0,
+            REG_DWORD,
+            res_x.to_le_bytes().as_ptr(),
+            4,
+        )
+    };
+    if res != ERROR_SUCCESS {
+        return false;
+    }
+
+    let vendor = b"V-Cache GFX\0";
+    let res = unsafe {
+        RegSetValueExA(
+            h_game,
+            b"GpuVendor\0".as_ptr(),
+            0,
+            REG_SZ,
+            vendor.as_ptr(),
+            vendor.len() as u32,
+        )
+    };
+    if res != ERROR_SUCCESS {
+        return false;
+    }
+
+    let profile_data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let res = unsafe {
+        RegSetValueExA(
+            h_game,
+            b"ProfileData\0".as_ptr(),
+            0,
+            REG_BINARY,
+            profile_data.as_ptr(),
+            profile_data.len() as u32,
+        )
+    };
+    if res != ERROR_SUCCESS {
+        return false;
+    }
+
+    // Verify roundtrip read
+    let mut q_res_x = [0u8; 4];
+    let mut q_len = 4u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_game,
+            b"ResolutionX\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            q_res_x.as_mut_ptr(),
+            &mut q_len,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_DWORD || u32::from_le_bytes(q_res_x) != 1920 {
+        return false;
+    }
+
+    let mut q_vendor = [0u8; 32];
+    let mut q_vlen = q_vendor.len() as u32;
+    let res = unsafe {
+        RegQueryValueExA(
+            h_game,
+            b"GpuVendor\0".as_ptr(),
+            core::ptr::null(),
+            &mut val_type,
+            q_vendor.as_mut_ptr(),
+            &mut q_vlen,
+        )
+    };
+    if res != ERROR_SUCCESS || val_type != REG_SZ || !q_vendor.starts_with(b"V-Cache GFX") {
+        return false;
+    }
+
+    // 4. Enumeration
+    let mut name_buf = [0u8; 64];
+    let mut name_len = name_buf.len() as u32;
+    let res = unsafe {
+        RegEnumValueA(
+            h_game,
+            0,
+            name_buf.as_mut_ptr(),
+            &mut name_len,
+            core::ptr::null(),
+            &mut val_type,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+    };
+    if res != ERROR_SUCCESS || name_len == 0 {
+        return false;
+    }
+
+    // 5. Cleanup & key deletion
+    let _ = unsafe { RegCloseKey(h_game) };
+
+    let res = unsafe {
+        RegDeleteKeyA(
+            HKEY_CURRENT_USER,
+            b"Software\\KntonGame\\Settings\0".as_ptr(),
+        )
+    };
+    if res != ERROR_SUCCESS {
+        return false;
+    }
+
+    let mut h_deleted: HKEY = 0;
+    let res = unsafe {
+        RegOpenKeyExA(
+            HKEY_CURRENT_USER,
+            b"Software\\KntonGame\\Settings\0".as_ptr(),
+            0,
+            KEY_READ,
+            &mut h_deleted,
+        )
+    };
+    if res == ERROR_SUCCESS {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-REGISTRY-OK] Win32 Windows registry subsystem and game config hive verified\r\n");
+    true
+}
