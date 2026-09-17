@@ -508,3 +508,408 @@ fn reg_delete_key_internal(h_key: HKEY, subkey_str: &str) -> u32 {
         ERROR_FILE_NOT_FOUND
     }
 }
+
+/// Emulates Win32 RegQueryValueExA querying value type and data (ANSI).
+pub unsafe fn RegQueryValueExA(
+    h_key: HKEY,
+    lp_value_name: *const u8,
+    _lp_reserved: *const u32,
+    lp_type: *mut u32,
+    lp_data: *mut u8,
+    lpcb_data: *mut u32,
+) -> u32 {
+    let name_str = match parse_cstr_a(lp_value_name) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_query_value_internal(h_key, &name_str, lp_type, lp_data, lpcb_data)
+}
+
+/// Emulates Win32 RegQueryValueExW querying value type and data (UTF-16).
+pub unsafe fn RegQueryValueExW(
+    h_key: HKEY,
+    lp_value_name: *const u16,
+    _lp_reserved: *const u32,
+    lp_type: *mut u32,
+    lp_data: *mut u8,
+    lpcb_data: *mut u32,
+) -> u32 {
+    let name_str = match parse_cstr_w(lp_value_name) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_query_value_internal(h_key, &name_str, lp_type, lp_data, lpcb_data)
+}
+
+fn reg_query_value_internal(
+    h_key: HKEY,
+    name_str: &str,
+    lp_type: *mut u32,
+    lp_data: *mut u8,
+    lpcb_data: *mut u32,
+) -> u32 {
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let val = match node.get_value(name_str) {
+        Some(v) => v,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if !lp_type.is_null() {
+        unsafe {
+            *lp_type = val.val_type;
+        }
+    }
+
+    if lpcb_data.is_null() {
+        return if lp_data.is_null() {
+            ERROR_SUCCESS
+        } else {
+            ERROR_INVALID_PARAMETER
+        };
+    }
+
+    let buf_len = unsafe { *lpcb_data as usize };
+    let req_len = val.data.len();
+
+    if lp_data.is_null() {
+        unsafe {
+            *lpcb_data = req_len as u32;
+        }
+        return ERROR_SUCCESS;
+    }
+
+    if buf_len < req_len {
+        unsafe {
+            *lpcb_data = req_len as u32;
+        }
+        return ERROR_MORE_DATA;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(val.data.as_ptr(), lp_data, req_len);
+        *lpcb_data = req_len as u32;
+    }
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegSetValueExA setting value type and data (ANSI).
+pub unsafe fn RegSetValueExA(
+    h_key: HKEY,
+    lp_value_name: *const u8,
+    _reserved: u32,
+    dw_type: u32,
+    lp_data: *const u8,
+    cb_data: u32,
+) -> u32 {
+    let name_str = match parse_cstr_a(lp_value_name) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_set_value_internal(h_key, &name_str, dw_type, lp_data, cb_data)
+}
+
+/// Emulates Win32 RegSetValueExW setting value type and data (UTF-16).
+pub unsafe fn RegSetValueExW(
+    h_key: HKEY,
+    lp_value_name: *const u16,
+    _reserved: u32,
+    dw_type: u32,
+    lp_data: *const u8,
+    cb_data: u32,
+) -> u32 {
+    let name_str = match parse_cstr_w(lp_value_name) {
+        Some(s) => s,
+        None => String::new(),
+    };
+    reg_set_value_internal(h_key, &name_str, dw_type, lp_data, cb_data)
+}
+
+fn reg_set_value_internal(
+    h_key: HKEY,
+    name_str: &str,
+    dw_type: u32,
+    lp_data: *const u8,
+    cb_data: u32,
+) -> u32 {
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let data_slice = if !lp_data.is_null() && cb_data > 0 {
+        unsafe { core::slice::from_raw_parts(lp_data, cb_data as usize) }
+    } else {
+        &[]
+    };
+
+    let mut hives = REGISTRY_HIVES.lock();
+    let root = match hives.get_mut(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path_mut(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    node.set_value(name_str, dw_type, data_slice);
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegEnumValueA enumerating values of an open key (ANSI).
+pub unsafe fn RegEnumValueA(
+    h_key: HKEY,
+    dw_index: u32,
+    lp_value_name: *mut u8,
+    lpcch_value_name: *mut u32,
+    _lp_reserved: *const u32,
+    lp_type: *mut u32,
+    lp_data: *mut u8,
+    lpcb_data: *mut u32,
+) -> u32 {
+    if lp_value_name.is_null() || lpcch_value_name.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if dw_index as usize >= node.values.len() {
+        return ERROR_NO_MORE_ITEMS;
+    }
+
+    let (_, val) = node.values.iter().nth(dw_index as usize).unwrap();
+    let max_len = *lpcch_value_name as usize;
+    let name_bytes = val.name.as_bytes();
+
+    if max_len <= name_bytes.len() {
+        *lpcch_value_name = name_bytes.len() as u32;
+        return ERROR_MORE_DATA;
+    }
+
+    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), lp_value_name, name_bytes.len());
+    *lp_value_name.add(name_bytes.len()) = 0;
+    *lpcch_value_name = name_bytes.len() as u32;
+
+    if !lp_type.is_null() {
+        *lp_type = val.val_type;
+    }
+
+    if !lp_data.is_null() && !lpcb_data.is_null() {
+        let max_data = *lpcb_data as usize;
+        let to_copy = core::cmp::min(max_data, val.data.len());
+        core::ptr::copy_nonoverlapping(val.data.as_ptr(), lp_data, to_copy);
+        *lpcb_data = val.data.len() as u32;
+    } else if !lpcb_data.is_null() {
+        *lpcb_data = val.data.len() as u32;
+    }
+
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegEnumValueW enumerating values of an open key (UTF-16).
+pub unsafe fn RegEnumValueW(
+    h_key: HKEY,
+    dw_index: u32,
+    lp_value_name: *mut u16,
+    lpcch_value_name: *mut u32,
+    _lp_reserved: *const u32,
+    lp_type: *mut u32,
+    lp_data: *mut u8,
+    lpcb_data: *mut u32,
+) -> u32 {
+    if lp_value_name.is_null() || lpcch_value_name.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if dw_index as usize >= node.values.len() {
+        return ERROR_NO_MORE_ITEMS;
+    }
+
+    let (_, val) = node.values.iter().nth(dw_index as usize).unwrap();
+    let max_len = *lpcch_value_name as usize;
+    let utf16: Vec<u16> = val.name.encode_utf16().collect();
+
+    if max_len <= utf16.len() {
+        *lpcch_value_name = utf16.len() as u32;
+        return ERROR_MORE_DATA;
+    }
+
+    core::ptr::copy_nonoverlapping(utf16.as_ptr(), lp_value_name, utf16.len());
+    *lp_value_name.add(utf16.len()) = 0;
+    *lpcch_value_name = utf16.len() as u32;
+
+    if !lp_type.is_null() {
+        *lp_type = val.val_type;
+    }
+
+    if !lp_data.is_null() && !lpcb_data.is_null() {
+        let max_data = *lpcb_data as usize;
+        let to_copy = core::cmp::min(max_data, val.data.len());
+        core::ptr::copy_nonoverlapping(val.data.as_ptr(), lp_data, to_copy);
+        *lpcb_data = val.data.len() as u32;
+    } else if !lpcb_data.is_null() {
+        *lpcb_data = val.data.len() as u32;
+    }
+
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegEnumKeyExA enumerating subkeys of an open key (ANSI).
+pub unsafe fn RegEnumKeyExA(
+    h_key: HKEY,
+    dw_index: u32,
+    lp_name: *mut u8,
+    lpcch_name: *mut u32,
+    _lp_reserved: *const u32,
+    _lp_class: *mut u8,
+    _lpcch_class: *mut u32,
+    _lpft_last_write_time: *mut u8,
+) -> u32 {
+    if lp_name.is_null() || lpcch_name.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if dw_index as usize >= node.subkeys.len() {
+        return ERROR_NO_MORE_ITEMS;
+    }
+
+    let (_, subkey) = node.subkeys.iter().nth(dw_index as usize).unwrap();
+    let max_len = *lpcch_name as usize;
+    let name_bytes = subkey.name.as_bytes();
+
+    if max_len <= name_bytes.len() {
+        *lpcch_name = name_bytes.len() as u32;
+        return ERROR_MORE_DATA;
+    }
+
+    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), lp_name, name_bytes.len());
+    *lp_name.add(name_bytes.len()) = 0;
+    *lpcch_name = name_bytes.len() as u32;
+
+    ERROR_SUCCESS
+}
+
+/// Emulates Win32 RegEnumKeyExW enumerating subkeys of an open key (UTF-16).
+pub unsafe fn RegEnumKeyExW(
+    h_key: HKEY,
+    dw_index: u32,
+    lp_name: *mut u16,
+    lpcch_name: *mut u32,
+    _lp_reserved: *const u32,
+    _lp_class: *mut u16,
+    _lpcch_class: *mut u32,
+    _lpft_last_write_time: *mut u8,
+) -> u32 {
+    if lp_name.is_null() || lpcch_name.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ensure_registry_initialized();
+    let (root_hkey, path) = match resolve_hkey_context(h_key) {
+        Some(ctx) => ctx,
+        None => return ERROR_INVALID_HANDLE,
+    };
+
+    let hives = REGISTRY_HIVES.lock();
+    let root = match hives.get(&root_hkey) {
+        Some(r) => r,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    let str_parts: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    let node = match root.resolve_path(&str_parts) {
+        Some(n) => n,
+        None => return ERROR_FILE_NOT_FOUND,
+    };
+
+    if dw_index as usize >= node.subkeys.len() {
+        return ERROR_NO_MORE_ITEMS;
+    }
+
+    let (_, subkey) = node.subkeys.iter().nth(dw_index as usize).unwrap();
+    let max_len = *lpcch_name as usize;
+    let utf16: Vec<u16> = subkey.name.encode_utf16().collect();
+
+    if max_len <= utf16.len() {
+        *lpcch_name = utf16.len() as u32;
+        return ERROR_MORE_DATA;
+    }
+
+    core::ptr::copy_nonoverlapping(utf16.as_ptr(), lp_name, utf16.len());
+    *lp_name.add(utf16.len()) = 0;
+    *lpcch_name = utf16.len() as u32;
+
+    ERROR_SUCCESS
+}
