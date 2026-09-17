@@ -617,6 +617,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_touchscreen_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld capacitive touchscreen and gesture engine self-test failed!\r\n");
     }
+    // Initialize and verify Handheld On-Screen Virtual Keyboard & Dual-Trackpad Typing Engine (TASK-KNT-184)
+    if !drivers::input::test_virtual_keyboard_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld virtual keyboard and dual-trackpad typing self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Capacitive Touchpad & Virtual Trackball Emulation Engine

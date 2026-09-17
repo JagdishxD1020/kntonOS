@@ -21,8 +21,10 @@ pub mod xinput;
 pub mod haptic_dsp;
 pub mod controller_profile;
 pub mod touchscreen;
+pub mod virtual_keyboard;
 pub use controller_profile::*;
 pub use touchscreen::*;
+pub use virtual_keyboard::*;
 
 pub use imu::*;
 pub use gamepad::*;
