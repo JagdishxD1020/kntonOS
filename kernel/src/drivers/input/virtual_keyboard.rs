@@ -253,3 +253,90 @@ pub fn verify_keystroke_haptic_trigger() -> bool {
 
     true
 }
+
+/// Synthesized Win32 window message event type.
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_CHAR: u32 = 0x0102;
+
+/// Synthesized Win32 keyboard message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Win32KeyMessage {
+    pub message: u32,
+    pub wparam: usize, // Virtual key code or UTF-16 character
+    pub lparam: isize, // Repeat count, scan code, flags
+}
+
+/// Win32 virtual keystroke event synthesizer.
+#[derive(Debug, Clone, Copy)]
+pub struct Win32KeySynthesizer {
+    pub generated_events_count: u32,
+}
+
+impl Win32KeySynthesizer {
+    /// Creates a new Win32 key synthesizer.
+    pub const fn new() -> Self {
+        Self {
+            generated_events_count: 0,
+        }
+    }
+
+    /// Synthesizes the standard sequence of WM_KEYDOWN, WM_CHAR, and WM_KEYUP for a character.
+    pub fn synthesize_keystroke(&mut self, c: char, out_events: &mut [Win32KeyMessage; 3]) -> usize {
+        let vk_code = match c {
+            'A'..='Z' => c as usize,
+            'a'..='z' => (c as u8 - b'a' + b'A') as usize,
+            '0'..='9' => c as usize,
+            ' ' => 0x20,
+            '\n' => 0x0D, // VK_RETURN
+            _ => 0,
+        };
+
+        // WM_KEYDOWN
+        out_events[0] = Win32KeyMessage {
+            message: WM_KEYDOWN,
+            wparam: vk_code,
+            lparam: 1, // Repeat 1
+        };
+
+        // WM_CHAR
+        out_events[1] = Win32KeyMessage {
+            message: WM_CHAR,
+            wparam: c as usize,
+            lparam: 1,
+        };
+
+        // WM_KEYUP
+        out_events[2] = Win32KeyMessage {
+            message: WM_KEYUP,
+            wparam: vk_code,
+            lparam: (1 << 31) | (1 << 30) | 1, // Transition state = 1, previous state = 1
+        };
+
+        self.generated_events_count += 3;
+        3
+    }
+}
+
+/// Unit verification for Win32 keystroke synthesizer.
+pub fn verify_win32_key_synthesizer() -> bool {
+    let mut synth = Win32KeySynthesizer::new();
+    let mut events = [Win32KeyMessage { message: 0, wparam: 0, lparam: 0 }; 3];
+
+    let count = synth.synthesize_keystroke('A', &mut events);
+    if count != 3 || synth.generated_events_count != 3 {
+        return false;
+    }
+
+    if events[0].message != WM_KEYDOWN || events[0].wparam != 0x41 {
+        return false;
+    }
+    if events[1].message != WM_CHAR || events[1].wparam != 0x41 {
+        return false;
+    }
+    if events[2].message != WM_KEYUP || events[2].wparam != 0x41 {
+        return false;
+    }
+
+    true
+}
