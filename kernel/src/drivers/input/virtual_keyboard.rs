@@ -94,3 +94,100 @@ pub fn verify_keyboard_layouts() -> bool {
 
     true
 }
+
+/// Active dual-cursor trackpad selection zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DualCursorZone {
+    LeftHalf,
+    RightHalf,
+}
+
+/// Dual-trackpad thumb typing cursor position and selection state.
+#[derive(Debug, Clone, Copy)]
+pub struct DualTrackpadTypingEngine {
+    pub left_cursor_x: u16,
+    pub left_cursor_y: u16,
+    pub right_cursor_x: u16,
+    pub right_cursor_y: u16,
+    pub selected_key_left: Option<char>,
+    pub selected_key_right: Option<char>,
+}
+
+impl DualTrackpadTypingEngine {
+    /// Creates a new dual-trackpad typing engine initialized for split keyboard.
+    pub const fn new() -> Self {
+        Self {
+            left_cursor_x: 400,
+            left_cursor_y: 850,
+            right_cursor_x: 1500,
+            right_cursor_y: 850,
+            selected_key_left: Some('G'),
+            selected_key_right: Some('H'),
+        }
+    }
+
+    /// Updates the left trackpad cursor position bounded to left half of screen.
+    pub fn update_left_cursor(&mut self, dx: i16, dy: i16) -> (u16, u16) {
+        let new_x = ((self.left_cursor_x as i32 + dx as i32).max(50)).min(900) as u16;
+        let new_y = ((self.left_cursor_y as i32 + dy as i32).max(700)).min(1050) as u16;
+        self.left_cursor_x = new_x;
+        self.left_cursor_y = new_y;
+
+        // Mock key mapping for left half
+        self.selected_key_left = if new_x < 300 {
+            Some('A')
+        } else if new_x < 600 {
+            Some('D')
+        } else {
+            Some('G')
+        };
+
+        (new_x, new_y)
+    }
+
+    /// Updates the right trackpad cursor position bounded to right half of screen.
+    pub fn update_right_cursor(&mut self, dx: i16, dy: i16) -> (u16, u16) {
+        let new_x = ((self.right_cursor_x as i32 + dx as i32).max(1020)).min(1870) as u16;
+        let new_y = ((self.right_cursor_y as i32 + dy as i32).max(700)).min(1050) as u16;
+        self.right_cursor_x = new_x;
+        self.right_cursor_y = new_y;
+
+        // Mock key mapping for right half
+        self.selected_key_right = if new_x < 1300 {
+            Some('H')
+        } else if new_x < 1600 {
+            Some('K')
+        } else {
+            Some('L')
+        };
+
+        (new_x, new_y)
+    }
+
+    /// Triggers trackpad physical click, returning activated key from target zone.
+    pub fn on_trackpad_click(&self, zone: DualCursorZone) -> Option<char> {
+        match zone {
+            DualCursorZone::LeftHalf => self.selected_key_left,
+            DualCursorZone::RightHalf => self.selected_key_right,
+        }
+    }
+}
+
+/// Unit verification for dual-trackpad thumb typing engine.
+pub fn verify_dual_trackpad_typing() -> bool {
+    let mut engine = DualTrackpadTypingEngine::new();
+
+    // Move left cursor leftward toward 'A'
+    engine.update_left_cursor(-200, 0); // 400 - 200 = 200 (< 300 -> 'A')
+    if engine.on_trackpad_click(DualCursorZone::LeftHalf) != Some('A') {
+        return false;
+    }
+
+    // Move right cursor rightward toward 'L'
+    engine.update_right_cursor(200, 0); // 1500 + 200 = 1700 (>= 1600 -> 'L')
+    if engine.on_trackpad_click(DualCursorZone::RightHalf) != Some('L') {
+        return false;
+    }
+
+    true
+}
