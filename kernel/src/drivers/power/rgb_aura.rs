@@ -292,3 +292,28 @@ pub fn verify_battery_conservation_governor() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test suite for Handheld RGB Lighting & Per-Game Aura Controller.
+pub fn test_rgb_aura_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld RGB Lighting & Per-Game Aura Controller...\r\n");
+
+    if !verify_lighting_zones_and_modes() {
+        crate::serial_write_str("[KNT-PANIC] RGB lighting zones and modes verification failed!\r\n");
+        return false;
+    }
+    if !verify_gamma_correction_table() {
+        crate::serial_write_str("[KNT-PANIC] Gamma correction lookup table verification failed!\r\n");
+        return false;
+    }
+    if !verify_animation_tick_progression() {
+        crate::serial_write_str("[KNT-PANIC] Animation tick progression verification failed!\r\n");
+        return false;
+    }
+    if !verify_battery_conservation_governor() {
+        crate::serial_write_str("[KNT-PANIC] Battery conservation governor verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-RGB-AURA-PASS] Handheld RGB lighting and per-game aura controller verified\r\n");
+    true
+}
