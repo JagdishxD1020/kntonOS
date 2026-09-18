@@ -295,3 +295,95 @@ impl D3D12_RENDER_PASS_VALIDATOR {
         Ok(())
     }
 }
+
+// Cross-command-list split pass sequencer and handheld APU tile cache retention manager
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_RENDER_PASS_SPLIT_SEQUENCER {
+    pub is_pass_suspended: bool,
+    pub suspended_render_target_count: usize,
+    pub tile_cache_retained: bool,
+    pub bandwidth_saved_bytes: u64,
+}
+
+impl D3D12_RENDER_PASS_SPLIT_SEQUENCER {
+    // Construct new split pass sequencer
+    pub const fn new() -> Self {
+        Self {
+            is_pass_suspended: false,
+            suspended_render_target_count: 0,
+            tile_cache_retained: false,
+            bandwidth_saved_bytes: 0,
+        }
+    }
+
+    // Validate beginning access for a pass configured with potential RESUMING_PASS flag
+    pub fn validate_begin_pass(
+        &mut self,
+        render_targets: &[D3D12_RENDER_PASS_RENDER_TARGET_DESC],
+        flags: u32,
+    ) -> Result<(), RenderPassError> {
+        let is_resuming = (flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS) != 0;
+        let is_suspending = (flags & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS) != 0;
+
+        if is_resuming && is_suspending {
+            return Err(RenderPassError::ConflictingPassFlags);
+        }
+
+        if is_resuming {
+            if !self.is_pass_suspended {
+                return Err(RenderPassError::InvalidSuspendResumeState(
+                    "Resuming pass without active suspended pass",
+                ));
+            }
+            if render_targets.len() != self.suspended_render_target_count {
+                return Err(RenderPassError::InvalidSuspendResumeState(
+                    "Resuming pass attachment count does not match suspended pass",
+                ));
+            }
+
+            // Resuming pass attachments MUST have BeginningAccess::Preserve
+            for rt in render_targets {
+                if rt.beginning_access.access_type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE::Preserve {
+                    return Err(RenderPassError::InvalidSuspendResumeState(
+                        "Resuming pass must use BeginningAccess::Preserve",
+                    ));
+                }
+            }
+
+            // Consume suspended state and accumulate tile cache bandwidth savings
+            self.is_pass_suspended = false;
+            self.tile_cache_retained = true;
+            // 8MB tile buffer writeback avoided (typical 1080p RGBA16F tile memory)
+            self.bandwidth_saved_bytes += 8 * 1024 * 1024;
+        }
+
+        Ok(())
+    }
+
+    // Validate ending access for a pass configured with potential SUSPENDING_PASS flag
+    pub fn validate_end_pass(
+        &mut self,
+        render_targets: &[D3D12_RENDER_PASS_RENDER_TARGET_DESC],
+        flags: u32,
+    ) -> Result<(), RenderPassError> {
+        let is_suspending = (flags & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS) != 0;
+
+        if is_suspending {
+            // Suspending pass attachments MUST have EndingAccess::Preserve
+            for rt in render_targets {
+                if rt.ending_access.access_type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE::Preserve {
+                    return Err(RenderPassError::InvalidSuspendResumeState(
+                        "Suspending pass must use EndingAccess::Preserve",
+                    ));
+                }
+            }
+
+            self.is_pass_suspended = true;
+            self.suspended_render_target_count = render_targets.len();
+            self.tile_cache_retained = true;
+        }
+
+        Ok(())
+    }
+}
