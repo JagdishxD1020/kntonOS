@@ -930,6 +930,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 named pipes and anonymous IPC engine self-test failed!\r\n");
     }
 
+    // Verify Win32 Windows Registry Subsystem & Game Configuration Hive (TASK-KNT-185)
+    if !pe::test_win32_registry_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Windows registry subsystem self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
