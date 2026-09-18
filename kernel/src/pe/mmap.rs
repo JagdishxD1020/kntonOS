@@ -333,3 +333,136 @@ pub unsafe fn OpenFileMappingW(
     let name = parse_pcwstr(lp_name);
     open_file_mapping_internal(dw_desired_access, name)
 }
+
+/// Represents an active mapped view of a file mapping.
+pub struct ActiveViewEntry {
+    pub base_ptr: usize,
+    pub size: usize,
+    pub offset: usize,
+    pub access: u32,
+    pub is_cow: bool,
+    pub cow_buffer: Option<*mut u8>,
+    pub mapping_obj: Arc<Spinlock<FileMappingObject>>,
+    pub storage: Arc<MappingStorage>,
+}
+
+unsafe impl Send for ActiveViewEntry {}
+unsafe impl Sync for ActiveViewEntry {}
+
+pub static ACTIVE_VIEWS: Spinlock<BTreeMap<usize, ActiveViewEntry>> =
+    Spinlock::new(BTreeMap::new());
+
+unsafe fn map_view_internal(
+    h_file_mapping: HANDLE,
+    dw_desired_access: u32,
+    dw_file_offset_high: u32,
+    dw_file_offset_low: u32,
+    dw_number_of_bytes_to_map: usize,
+    _lp_base_address: *mut u8,
+) -> *mut u8 {
+    let mapping_table = HANDLE_MAPPINGS.lock();
+    let obj_arc = match mapping_table.get(&h_file_mapping) {
+        Some(arc) => Arc::clone(arc),
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return core::ptr::null_mut();
+        }
+    };
+    drop(mapping_table);
+
+    let obj = obj_arc.lock();
+    if (obj.protect & PAGE_READONLY) != 0 && (dw_desired_access & (FILE_MAP_WRITE | FILE_MAP_ALL_ACCESS)) != 0 {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        return core::ptr::null_mut();
+    }
+
+    let offset = (((dw_file_offset_high as u64) << 32) | (dw_file_offset_low as u64)) as usize;
+    if offset >= obj.max_size {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let bytes_to_map = if dw_number_of_bytes_to_map == 0 {
+        obj.max_size - offset
+    } else {
+        if offset + dw_number_of_bytes_to_map > obj.max_size {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return core::ptr::null_mut();
+        }
+        dw_number_of_bytes_to_map
+    };
+
+    let is_cow = (dw_desired_access & FILE_MAP_COPY) != 0;
+    let (view_ptr, cow_buf) = if is_cow {
+        let layout = match Layout::from_size_align(bytes_to_map, 4096) {
+            Ok(l) => l,
+            Err(_) => {
+                win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+                return core::ptr::null_mut();
+            }
+        };
+        let replica = alloc::alloc::alloc_zeroed(layout);
+        if replica.is_null() {
+            win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return core::ptr::null_mut();
+        }
+        core::ptr::copy_nonoverlapping(obj.storage.ptr.add(offset), replica, bytes_to_map);
+        (replica, Some(replica))
+    } else {
+        (obj.storage.ptr.add(offset), None)
+    };
+
+    let base_key = view_ptr as usize;
+    let entry = ActiveViewEntry {
+        base_ptr: base_key,
+        size: bytes_to_map,
+        offset,
+        access: dw_desired_access,
+        is_cow,
+        cow_buffer: cow_buf,
+        mapping_obj: Arc::clone(&obj_arc),
+        storage: Arc::clone(&obj.storage),
+    };
+    drop(obj);
+
+    ACTIVE_VIEWS.lock().insert(base_key, entry);
+    win32_set_last_error(ERROR_SUCCESS);
+    view_ptr
+}
+
+/// Maps a view of a file mapping into the address space of a calling process.
+pub unsafe fn MapViewOfFile(
+    h_file_mapping: HANDLE,
+    dw_desired_access: u32,
+    dw_file_offset_high: u32,
+    dw_file_offset_low: u32,
+    dw_number_of_bytes_to_map: usize,
+) -> *mut u8 {
+    map_view_internal(
+        h_file_mapping,
+        dw_desired_access,
+        dw_file_offset_high,
+        dw_file_offset_low,
+        dw_number_of_bytes_to_map,
+        core::ptr::null_mut(),
+    )
+}
+
+/// Maps a view of a file mapping into the address space with an optional base address.
+pub unsafe fn MapViewOfFileEx(
+    h_file_mapping: HANDLE,
+    dw_desired_access: u32,
+    dw_file_offset_high: u32,
+    dw_file_offset_low: u32,
+    dw_number_of_bytes_to_map: usize,
+    lp_base_address: *mut u8,
+) -> *mut u8 {
+    map_view_internal(
+        h_file_mapping,
+        dw_desired_access,
+        dw_file_offset_high,
+        dw_file_offset_low,
+        dw_number_of_bytes_to_map,
+        lp_base_address,
+    )
+}
