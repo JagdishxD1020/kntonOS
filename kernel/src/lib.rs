@@ -724,6 +724,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld instant suspend and low-power fast resume self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld RGB Lighting & Per-Game Aura Controller (TASK-KNT-187)
+    if !drivers::power::test_rgb_aura_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld RGB lighting and per-game aura controller self-test failed!\r\n");
+    }
+
 
 
 
