@@ -129,3 +129,86 @@ pub fn verify_gamma_correction_table() -> bool {
 
     true
 }
+
+/// RGB animation generator with tick progression for Breathing, ColorCycle, and RainbowWave.
+#[derive(Debug, Clone, Copy)]
+pub struct RgbAnimationGenerator {
+    pub current_tick: u32,
+    pub cycle_period_ticks: u32,
+}
+
+impl RgbAnimationGenerator {
+    /// Creates a new animation generator with 100-tick default period.
+    pub const fn new() -> Self {
+        Self {
+            current_tick: 0,
+            cycle_period_ticks: 100,
+        }
+    }
+
+    /// Advances the animation clock by one tick.
+    pub fn advance_tick(&mut self) -> u32 {
+        self.current_tick = (self.current_tick + 1) % self.cycle_period_ticks;
+        self.current_tick
+    }
+
+    /// Computes the current animated color for a given mode.
+    pub fn render_color(&self, mode: RgbAnimationMode, base_color: RgbColor) -> RgbColor {
+        match mode {
+            RgbAnimationMode::Static => base_color,
+            RgbAnimationMode::Breathing => {
+                // Triangle wave modulation between 20% and 100%
+                let half = self.cycle_period_ticks / 2;
+                let phase = if self.current_tick < half {
+                    self.current_tick
+                } else {
+                    self.cycle_period_ticks - self.current_tick
+                };
+                let factor_q8 = 51 + ((phase * 205) / half); // 51 (20%) to 256 (100%)
+                RgbColor {
+                    r: ((base_color.r as u32 * factor_q8) / 256) as u8,
+                    g: ((base_color.g as u32 * factor_q8) / 256) as u8,
+                    b: ((base_color.b as u32 * factor_q8) / 256) as u8,
+                }
+            }
+            RgbAnimationMode::ColorCycle | RgbAnimationMode::RainbowWave => {
+                // 3-phase rainbow sweep across 100 ticks
+                let phase = (self.current_tick * 3) % self.cycle_period_ticks;
+                if self.current_tick < 33 {
+                    RgbColor::new(255, (phase * 7) as u8, 0)
+                } else if self.current_tick < 66 {
+                    RgbColor::new(0, 255, (phase * 7) as u8)
+                } else {
+                    RgbColor::new((phase * 7) as u8, 0, 255)
+                }
+            }
+            RgbAnimationMode::GameReactive => {
+                // Health/Shield reactive representation
+                base_color
+            }
+        }
+    }
+}
+
+/// Unit verification for animation tick progression.
+pub fn verify_animation_tick_progression() -> bool {
+    let mut gen = RgbAnimationGenerator::new();
+
+    // Advance 50 ticks
+    let mut i = 0;
+    while i < 50 {
+        gen.advance_tick();
+        i += 1;
+    }
+    if gen.current_tick != 50 {
+        return false;
+    }
+
+    // Breathing at peak (tick 50)
+    let c = gen.render_color(RgbAnimationMode::Breathing, RgbColor::new(200, 200, 200));
+    if c.r < 180 || c.g < 180 || c.b < 180 {
+        return false;
+    }
+
+    true
+}
