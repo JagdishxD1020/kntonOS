@@ -470,3 +470,183 @@ impl D3D12_RENDER_PASS_COMMAND_RECORDER {
         stream.extend_from_slice(&D3D12_TOKEN_END_RENDER_PASS.to_le_bytes());
     }
 }
+
+// Comprehensive verification self-test suite for D3D12 Render Passes and subpass optimizations
+pub fn test_render_pass_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-RENDERPASS] Initializing Direct3D 12 Render Pass self-test...\r\n");
+
+    // 1. Verify render target attachment validation and limits
+    let null_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_color(0.0, 0.0, 0.0, 1.0),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+    );
+    if D3D12_RENDER_PASS_VALIDATOR::validate_render_targets(&[null_rt]) != Err(RenderPassError::NullDescriptorHandle) {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Null descriptor handle was not rejected\r\n");
+        return false;
+    }
+
+    let excessive_rts = alloc::vec![
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+            0x1000,
+            D3D12_RENDER_PASS_BEGINNING_ACCESS::discard(),
+            D3D12_RENDER_PASS_ENDING_ACCESS::discard(),
+        );
+        9
+    ];
+    if D3D12_RENDER_PASS_VALIDATOR::validate_render_targets(&excessive_rts)
+        != Err(RenderPassError::TooManyRenderTargets(9))
+    {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Exceeding 8 render targets was not rejected\r\n");
+        return false;
+    }
+
+    // Resolve ending access without parameters
+    let invalid_resolve_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0x1000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::discard(),
+        D3D12_RENDER_PASS_ENDING_ACCESS {
+            access_type: D3D12_RENDER_PASS_ENDING_ACCESS_TYPE::Resolve,
+            resolve_parameters: None,
+        },
+    );
+    if D3D12_RENDER_PASS_VALIDATOR::validate_render_targets(&[invalid_resolve_rt])
+        != Err(RenderPassError::MissingResolveParameters)
+    {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Missing resolve parameters was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Render pass attachment descriptors and parameter bounds verified\r\n");
+
+    // 2. Verify multisample resolve bindings and subresource parameters
+    let resolve_params = D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS {
+        src_resource_ptr: 0x2000,
+        dst_resource_ptr: 0x3000,
+        resolve_mode: 2, // Average
+        format: 28,      // DXGI_FORMAT_R8G8B8A8_UNORM
+        subresources: alloc::vec![D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS {
+            src_subresource: 0,
+            dst_subresource: 0,
+            dst_x: 0,
+            dst_y: 0,
+            src_rect: [0, 0, 1920, 1080],
+        }],
+    };
+    let valid_resolve_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0x1000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_color(0.1, 0.2, 0.3, 1.0),
+        D3D12_RENDER_PASS_ENDING_ACCESS::resolve(resolve_params),
+    );
+    if D3D12_RENDER_PASS_VALIDATOR::validate_render_targets(&[valid_resolve_rt.clone()]).is_err() {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Valid multisample resolve attachment was rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Multisample resolve parameters and subresource rects verified\r\n");
+
+    // 3. Verify cross-command-list suspend and resume pass sequencing
+    let mut split_sequencer = D3D12_RENDER_PASS_SPLIT_SEQUENCER::new();
+    let suspending_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0x1000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_color(0.0, 0.0, 0.0, 1.0),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+    );
+
+    // End command list 1 with SUSPENDING_PASS
+    if split_sequencer
+        .validate_end_pass(&[suspending_rt.clone()], D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS)
+        .is_err()
+    {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Suspending pass validation failed\r\n");
+        return false;
+    }
+    if !split_sequencer.is_pass_suspended || !split_sequencer.tile_cache_retained {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Suspend state or tile cache flag not set\r\n");
+        return false;
+    }
+
+    // Begin command list 2 with RESUMING_PASS (must use BeginningAccess::Preserve)
+    let resuming_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0x1000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::preserve(),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+    );
+    if split_sequencer
+        .validate_begin_pass(&[resuming_rt.clone()], D3D12_RENDER_PASS_FLAG_RESUMING_PASS)
+        .is_err()
+    {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Resuming pass validation failed\r\n");
+        return false;
+    }
+    if split_sequencer.is_pass_suspended || split_sequencer.bandwidth_saved_bytes == 0 {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Resume pass failed to clear suspended state or track savings\r\n");
+        return false;
+    }
+
+    // Invalid resume attempt: BeginningAccess is Clear instead of Preserve
+    let invalid_resume_rt = D3D12_RENDER_PASS_RENDER_TARGET_DESC::new(
+        0x1000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_color(1.0, 0.0, 0.0, 1.0),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+    );
+    split_sequencer.is_pass_suspended = true;
+    split_sequencer.suspended_render_target_count = 1;
+    if split_sequencer.validate_begin_pass(&[invalid_resume_rt], D3D12_RENDER_PASS_FLAG_RESUMING_PASS).is_ok() {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Resuming pass with Clear was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Cross-command-list suspend/resume sequencing and APU tile cache retention verified\r\n");
+
+    // 4. Verify command recorder lifecycle and token stream encoding
+    let mut recorder = D3D12_RENDER_PASS_COMMAND_RECORDER::new();
+    let rts = alloc::vec![suspending_rt];
+    let ds = Some(D3D12_RENDER_PASS_DEPTH_STENCIL_DESC::new(
+        0x4000,
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_depth_stencil(1.0, 0),
+        D3D12_RENDER_PASS_BEGINNING_ACCESS::clear_depth_stencil(1.0, 0),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+        D3D12_RENDER_PASS_ENDING_ACCESS::preserve(),
+    ));
+
+    if recorder.begin_render_pass(rts.clone(), ds, D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES).is_err() {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] BeginRenderPass failed\r\n");
+        return false;
+    }
+    if !recorder.is_pass_active || recorder.total_passes_recorded != 1 {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Active pass state tracking mismatch\r\n");
+        return false;
+    }
+
+    // Nested begin must fail
+    if recorder.begin_render_pass(rts, None, 0) != Err(RenderPassError::RenderPassAlreadyActive) {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Nested BeginRenderPass was not rejected\r\n");
+        return false;
+    }
+
+    // End render pass
+    if recorder.end_render_pass().is_err() {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] EndRenderPass failed\r\n");
+        return false;
+    }
+    if recorder.is_pass_active {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Render pass should be inactive after EndRenderPass\r\n");
+        return false;
+    }
+
+    let mut stream = alloc::vec::Vec::new();
+    recorder.encode_pass_tokens(&mut stream);
+    if stream.len() != 16 {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Token stream encoding length mismatch\r\n");
+        return false;
+    }
+    let begin_token = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]);
+    let end_token = u32::from_le_bytes([stream[12], stream[13], stream[14], stream[15]]);
+    if begin_token != D3D12_TOKEN_BEGIN_RENDER_PASS || end_token != D3D12_TOKEN_END_RENDER_PASS {
+        crate::serial_write_str("[KNT-RENDERPASS-FAIL] Token stream opcode mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command recorder token stream encoder and lifecycle management verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-RENDERPASS-PASS] Direct3D 12 render pass and subpass optimization engine verified\r\n");
+    true
+}
