@@ -213,3 +213,85 @@ impl D3D12_RENDER_PASS_DEPTH_STENCIL_DESC {
         }
     }
 }
+
+// Maximum permitted render target attachments in a D3D12 render pass
+pub const D3D12_MAX_RENDER_PASS_RENDER_TARGETS: usize = 8;
+
+// Error conditions encountered during render pass validation and execution
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPassError {
+    TooManyRenderTargets(usize),
+    NullDescriptorHandle,
+    MissingResolveParameters,
+    InvalidResolveResource,
+    InvalidSubresourceRect,
+    ConflictingPassFlags,
+    InvalidSuspendResumeState(&'static str),
+    RenderPassAlreadyActive,
+    NoActiveRenderPass,
+}
+
+// Validation engine verifying render pass descriptors and multisample resolve bindings
+#[allow(non_camel_case_types)]
+pub struct D3D12_RENDER_PASS_VALIDATOR;
+
+impl D3D12_RENDER_PASS_VALIDATOR {
+    // Validate an array of render target attachments
+    pub fn validate_render_targets(
+        render_targets: &[D3D12_RENDER_PASS_RENDER_TARGET_DESC],
+    ) -> Result<(), RenderPassError> {
+        if render_targets.len() > D3D12_MAX_RENDER_PASS_RENDER_TARGETS {
+            return Err(RenderPassError::TooManyRenderTargets(render_targets.len()));
+        }
+
+        for rt in render_targets {
+            if rt.cpu_descriptor_handle == 0
+                && rt.beginning_access.access_type != D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE::NoAccess
+            {
+                return Err(RenderPassError::NullDescriptorHandle);
+            }
+
+            if rt.ending_access.access_type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE::Resolve {
+                let resolve_params = match &rt.ending_access.resolve_parameters {
+                    Some(p) => p,
+                    None => return Err(RenderPassError::MissingResolveParameters),
+                };
+
+                if resolve_params.src_resource_ptr == 0 || resolve_params.dst_resource_ptr == 0 {
+                    return Err(RenderPassError::InvalidResolveResource);
+                }
+
+                for sub in &resolve_params.subresources {
+                    if sub.src_rect[2] < sub.src_rect[0] || sub.src_rect[3] < sub.src_rect[1] {
+                        return Err(RenderPassError::InvalidSubresourceRect);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Validate optional depth/stencil attachment
+    pub fn validate_depth_stencil(
+        depth_stencil: Option<&D3D12_RENDER_PASS_DEPTH_STENCIL_DESC>,
+    ) -> Result<(), RenderPassError> {
+        if let Some(ds) = depth_stencil {
+            if ds.cpu_descriptor_handle == 0 {
+                return Err(RenderPassError::NullDescriptorHandle);
+            }
+
+            if ds.depth_ending_access.access_type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE::Resolve {
+                let p = match &ds.depth_ending_access.resolve_parameters {
+                    Some(p) => p,
+                    None => return Err(RenderPassError::MissingResolveParameters),
+                };
+                if p.src_resource_ptr == 0 || p.dst_resource_ptr == 0 {
+                    return Err(RenderPassError::InvalidResolveResource);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
