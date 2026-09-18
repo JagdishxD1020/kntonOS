@@ -212,3 +212,83 @@ pub fn verify_animation_tick_progression() -> bool {
 
     true
 }
+
+/// Low-battery conservation governor and alert override controller.
+#[derive(Debug, Clone, Copy)]
+pub struct RgbBatteryGovernor {
+    pub battery_percent: u8,
+    pub ac_connected: bool,
+    pub user_inactive_seconds: u32,
+    pub effective_brightness_pct: u8,
+    pub low_battery_alert_active: bool,
+}
+
+impl RgbBatteryGovernor {
+    /// Creates a new RGB battery governor.
+    pub const fn new() -> Self {
+        Self {
+            battery_percent: 100,
+            ac_connected: true,
+            user_inactive_seconds: 0,
+            effective_brightness_pct: 100,
+            low_battery_alert_active: false,
+        }
+    }
+
+    /// Evaluates battery state and inactivity to compute effective LED brightness ceiling:
+    /// - 100% on AC
+    /// - 40% on battery
+    /// - 0% (off) below 10% battery or after 30s inactivity
+    /// - Low-battery alert flashes red warning below 15%
+    pub fn evaluate_governor(&mut self, battery_pct: u8, ac_connected: bool, inactive_sec: u32) -> u8 {
+        self.battery_percent = battery_pct;
+        self.ac_connected = ac_connected;
+        self.user_inactive_seconds = inactive_sec;
+
+        // Low battery alert override: < 15%
+        self.low_battery_alert_active = !ac_connected && battery_pct < 15;
+
+        let brightness = if !ac_connected && (battery_pct < 10 || inactive_sec >= 30) {
+            0 // Conservation shutoff
+        } else if !ac_connected {
+            40 // Battery throttle
+        } else {
+            100 // AC full brightness
+        };
+
+        self.effective_brightness_pct = brightness;
+        self.effective_brightness_pct
+    }
+}
+
+/// Unit verification for low-battery conservation governor and alert override.
+pub fn verify_battery_conservation_governor() -> bool {
+    let mut gov = RgbBatteryGovernor::new();
+
+    // On AC: 100% brightness
+    if gov.evaluate_governor(80, true, 0) != 100 || gov.low_battery_alert_active {
+        return false;
+    }
+
+    // On battery: 40% brightness
+    if gov.evaluate_governor(50, false, 0) != 40 || gov.low_battery_alert_active {
+        return false;
+    }
+
+    // Battery drops to 12%: alert active, 40% brightness
+    if gov.evaluate_governor(12, false, 0) != 40 || !gov.low_battery_alert_active {
+        return false;
+    }
+
+    // Battery drops to 8% (<10%): shutoff to 0%
+    if gov.evaluate_governor(8, false, 0) != 0 {
+        return false;
+    }
+
+    // Inactivity 35s on battery: shutoff to 0%
+    if gov.evaluate_governor(50, false, 35) != 0 {
+        return false;
+    }
+
+    true
+}
