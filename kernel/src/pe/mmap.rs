@@ -466,3 +466,93 @@ pub unsafe fn MapViewOfFileEx(
         lp_base_address,
     )
 }
+
+/// Unmaps a mapped view of a file from the calling process\'s address space.
+pub unsafe fn UnmapViewOfFile(lp_base_address: *const u8) -> i32 {
+    if lp_base_address.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    let mut views = ACTIVE_VIEWS.lock();
+    let key = lp_base_address as usize;
+    if let Some(view) = views.remove(&key) {
+        if view.is_cow {
+            if let Some(buf) = view.cow_buffer {
+                if let Ok(layout) = Layout::from_size_align(view.size, 4096) {
+                    alloc::alloc::dealloc(buf, layout);
+                }
+            }
+        }
+        win32_set_last_error(ERROR_SUCCESS);
+        1
+    } else {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        0
+    }
+}
+
+/// Flushes a range within a mapped view of a file to disk.
+pub unsafe fn FlushViewOfFile(
+    lp_base_address: *const u8,
+    dw_number_of_bytes_to_flush: usize,
+) -> i32 {
+    if lp_base_address.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    let key = lp_base_address as usize;
+    let views = ACTIVE_VIEWS.lock();
+    let mut target = None;
+    for (&base, view) in views.iter() {
+        if key >= base && key < base + view.size {
+            let rel_offset = key - base;
+            let max_flush = view.size - rel_offset;
+            let flush_len = if dw_number_of_bytes_to_flush == 0 {
+                max_flush
+            } else {
+                core::cmp::min(dw_number_of_bytes_to_flush, max_flush)
+            };
+            target = Some((
+                view.is_cow,
+                view.offset + rel_offset,
+                flush_len,
+                Arc::clone(&view.mapping_obj),
+                view.storage.ptr,
+            ));
+            break;
+        }
+    }
+    drop(views);
+
+    let (is_cow, abs_offset, flush_len, mapping_arc, storage_ptr) = match target {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    };
+
+    // Copy-on-write views do not flush modifications back to the file
+    if is_cow {
+        win32_set_last_error(ERROR_SUCCESS);
+        return 1;
+    }
+
+    let obj = mapping_arc.lock();
+    if let Some(ref path) = obj.vfs_path {
+        let mut vfs = crate::fs::VFS.lock();
+        let mut file_data = vfs.read_file(path).unwrap_or_default();
+        if abs_offset + flush_len > file_data.len() {
+            file_data.resize(abs_offset + flush_len, 0);
+        }
+        let src_slice = core::slice::from_raw_parts(storage_ptr.add(abs_offset), flush_len);
+        file_data[abs_offset..abs_offset + flush_len].copy_from_slice(src_slice);
+        vfs.write_file(path, &file_data);
+    }
+    drop(obj);
+
+    win32_set_last_error(ERROR_SUCCESS);
+    1
+}
