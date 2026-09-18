@@ -387,3 +387,86 @@ impl D3D12_RENDER_PASS_SPLIT_SEQUENCER {
         Ok(())
     }
 }
+
+// Opcode tokens identifying BeginRenderPass and EndRenderPass commands in the recorder stream
+pub const D3D12_TOKEN_BEGIN_RENDER_PASS: u32 = 0x5041_5353; // 'PASS'
+pub const D3D12_TOKEN_END_RENDER_PASS: u32 = 0x454E_4450;   // 'ENDP'
+
+// Command list recorder coordinating render pass state and token stream encoding
+#[derive(Debug, Clone, PartialEq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_RENDER_PASS_COMMAND_RECORDER {
+    pub sequencer: D3D12_RENDER_PASS_SPLIT_SEQUENCER,
+    pub is_pass_active: bool,
+    pub current_pass_flags: u32,
+    pub current_render_targets: Vec<D3D12_RENDER_PASS_RENDER_TARGET_DESC>,
+    pub current_depth_stencil: Option<D3D12_RENDER_PASS_DEPTH_STENCIL_DESC>,
+    pub total_passes_recorded: u64,
+}
+
+impl D3D12_RENDER_PASS_COMMAND_RECORDER {
+    // Construct new render pass command recorder
+    pub fn new() -> Self {
+        Self {
+            sequencer: D3D12_RENDER_PASS_SPLIT_SEQUENCER::new(),
+            is_pass_active: false,
+            current_pass_flags: 0,
+            current_render_targets: Vec::new(),
+            current_depth_stencil: None,
+            total_passes_recorded: 0,
+        }
+    }
+
+    // Begin a new render pass within the command list
+    pub fn begin_render_pass(
+        &mut self,
+        render_targets: Vec<D3D12_RENDER_PASS_RENDER_TARGET_DESC>,
+        depth_stencil: Option<D3D12_RENDER_PASS_DEPTH_STENCIL_DESC>,
+        flags: u32,
+    ) -> Result<(), RenderPassError> {
+        if self.is_pass_active {
+            return Err(RenderPassError::RenderPassAlreadyActive);
+        }
+
+        // 1. Validate attachment bounds and resolve bindings
+        D3D12_RENDER_PASS_VALIDATOR::validate_render_targets(&render_targets)?;
+        D3D12_RENDER_PASS_VALIDATOR::validate_depth_stencil(depth_stencil.as_ref())?;
+
+        // 2. Validate split pass sequencing
+        self.sequencer.validate_begin_pass(&render_targets, flags)?;
+
+        // 3. Commit active pass state
+        self.is_pass_active = true;
+        self.current_pass_flags = flags;
+        self.current_render_targets = render_targets;
+        self.current_depth_stencil = depth_stencil;
+        self.total_passes_recorded += 1;
+
+        Ok(())
+    }
+
+    // Complete the active render pass
+    pub fn end_render_pass(&mut self) -> Result<(), RenderPassError> {
+        if !self.is_pass_active {
+            return Err(RenderPassError::NoActiveRenderPass);
+        }
+
+        // Validate split pass ending access rules
+        self.sequencer
+            .validate_end_pass(&self.current_render_targets, self.current_pass_flags)?;
+
+        self.is_pass_active = false;
+        self.current_render_targets.clear();
+        self.current_depth_stencil = None;
+
+        Ok(())
+    }
+
+    // Serialize begin and end tokens into graphics command recorder stream
+    pub fn encode_pass_tokens(&self, stream: &mut Vec<u8>) {
+        stream.extend_from_slice(&D3D12_TOKEN_BEGIN_RENDER_PASS.to_le_bytes());
+        stream.extend_from_slice(&(self.current_render_targets.len() as u32).to_le_bytes());
+        stream.extend_from_slice(&self.current_pass_flags.to_le_bytes());
+        stream.extend_from_slice(&D3D12_TOKEN_END_RENDER_PASS.to_le_bytes());
+    }
+}
