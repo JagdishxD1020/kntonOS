@@ -951,3 +951,116 @@ pub fn verify_raw_imu_parser_and_stream() -> bool {
 
     true
 }
+
+
+// Thermal Drift Compensation Governor for Gyro Zero-Rate Bias.
+
+/// Thermal sensitivity coefficients for 3-axis gyroscope zero-rate offset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThermalCoefficients {
+    /// Linear thermal drift slope (rad/s per °C) [X, Y, Z].
+    pub linear_slope: [f32; 3],
+    /// Quadratic thermal curvature (rad/s per °C^2) [X, Y, Z].
+    pub quadratic_curve: [f32; 3],
+    /// Reference factory calibration temperature (°C, nominally 25.0°C).
+    pub ref_temp_c: f32,
+}
+
+impl ThermalCoefficients {
+    /// Factory calibration coefficients typical for handheld gaming MEMS IMUs.
+    pub const fn default_factory() -> Self {
+        Self {
+            linear_slope: [0.00012, -0.00015, 0.00008],
+            quadratic_curve: [0.0000015, -0.0000020, 0.0000010],
+            ref_temp_c: 25.0,
+        }
+    }
+}
+
+/// Dynamic Thermal Drift Compensation Governor.
+#[derive(Debug, Clone)]
+pub struct ThermalDriftGovernor {
+    /// Baseline zero-rate bias at reference temperature [X, Y, Z] in rad/s.
+    pub base_bias_rad_s: [f32; 3],
+    /// Factory thermal drift model coefficients.
+    pub coefficients: ThermalCoefficients,
+    /// Current calculated thermal bias offset [X, Y, Z] in rad/s.
+    pub current_bias_rad_s: [f32; 3],
+    /// Filtered temperature in °C.
+    pub filtered_temp_c: f32,
+}
+
+impl ThermalDriftGovernor {
+    pub const fn new(base_bias: [f32; 3], coefficients: ThermalCoefficients) -> Self {
+        Self {
+            base_bias_rad_s: base_bias,
+            coefficients,
+            current_bias_rad_s: base_bias,
+            filtered_temp_c: 25.0,
+        }
+    }
+
+    /// Evaluates thermal drift model for die temperature T and computes active bias offsets.
+    pub fn compute_thermal_bias(&mut self, die_temp_c: f32) -> [f32; 3] {
+        // Temperature low-pass smoothing (tau ~ 0.5s)
+        self.filtered_temp_c = 0.98 * self.filtered_temp_c + 0.02 * die_temp_c;
+        let delta_t = self.filtered_temp_c - self.coefficients.ref_temp_c;
+        let delta_t_sq = delta_t * delta_t;
+
+        let mut computed = [0.0f32; 3];
+        for i in 0..3 {
+            computed[i] = self.base_bias_rad_s[i]
+                + self.coefficients.linear_slope[i] * delta_t
+                + self.coefficients.quadratic_curve[i] * delta_t_sq;
+        }
+
+        self.current_bias_rad_s = computed;
+        computed
+    }
+
+    /// Compensates raw angular rate measurement by removing active thermal bias.
+    pub fn compensate_gyro(&mut self, raw_gyro: [f32; 3], die_temp_c: f32) -> [f32; 3] {
+        let bias = self.compute_thermal_bias(die_temp_c);
+        [
+            raw_gyro[0] - bias[0],
+            raw_gyro[1] - bias[1],
+            raw_gyro[2] - bias[2],
+        ]
+    }
+}
+
+/// Unit test verifying thermal drift compensation curves and bias cancellation.
+pub fn verify_thermal_drift_compensation() -> bool {
+    let base_bias = [0.005, -0.004, 0.002];
+    let mut gov = ThermalDriftGovernor::new(base_bias, ThermalCoefficients::default_factory());
+
+    // At reference temperature (25.0C), bias should match base bias
+    for _ in 0..100 {
+        gov.compute_thermal_bias(25.0);
+    }
+    let b25 = gov.current_bias_rad_s;
+    if (b25[0] - base_bias[0]).abs() > 0.0001 || (b25[1] - base_bias[1]).abs() > 0.0001 {
+        return false;
+    }
+
+    // Warm up handheld chassis under APU load to 65.0C (delta_t = +40C)
+    for _ in 0..200 {
+        gov.compute_thermal_bias(65.0);
+    }
+    let b65 = gov.current_bias_rad_s;
+    // Bias must have shifted with temperature
+    if b65[0] <= base_bias[0] || b65[1] >= base_bias[1] {
+        return false;
+    }
+
+    // Raw stationary gyro sample exhibiting thermal drift
+    let raw_drifting = [b65[0], b65[1], b65[2]];
+    let compensated = gov.compensate_gyro(raw_drifting, 65.0);
+
+    // Compensated angular rate should be zeroed (within 0.0001 rad/s)
+    if compensated[0].abs() > 0.0001 || compensated[1].abs() > 0.0001 || compensated[2].abs() > 0.0001 {
+        return false;
+    }
+
+    true
+}
