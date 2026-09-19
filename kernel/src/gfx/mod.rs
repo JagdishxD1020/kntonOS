@@ -35,6 +35,7 @@ pub mod execute_indirect;
 pub mod conservative_raster;
 pub mod tiled_resources;
 pub mod drs;
+pub mod render_pass;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -70,6 +71,7 @@ pub use execute_indirect::*;
 pub use conservative_raster::*;
 pub use tiled_resources::*;
 pub use drs::*;
+pub use render_pass::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.

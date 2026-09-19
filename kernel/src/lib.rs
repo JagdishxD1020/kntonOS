@@ -432,6 +432,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 tiled resources engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Render Passes & Subpass Optimization Engine (TASK-KNT-188)
+    if !gfx::test_render_pass_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 render pass engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Dynamic Micro-Mesh Displacement & Sub-Triangle Geometry LOD Compressor
     if !gfx::test_micromesh_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 micro-mesh displacement & sub-triangle self-test failed!\r\n");
