@@ -443,3 +443,161 @@ impl D3D12_PREDICATION_COMMAND_RECORDER {
         (executed, skipped)
     }
 }
+
+// Comprehensive verification self-test suite for Direct3D 12 Predication & Occlusion Query Skipping
+pub fn test_predication_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-PREDICATION] Initializing Direct3D 12 Predication self-test...\r\n");
+
+    // 1. Verify buffer offset validation and 8-byte alignment verification
+    let unaligned = D3D12_PREDICATION_VALIDATOR::validate_predication(
+        0x5000,
+        4,
+        D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_NOT_EQUAL_ZERO,
+        Some(1024),
+    );
+    if unaligned != Err(PredicationError::UnalignedBufferOffset(4)) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Unaligned buffer offset was not rejected\r\n");
+        return false;
+    }
+
+    let out_of_bounds = D3D12_PREDICATION_VALIDATOR::validate_predication(
+        0x5000,
+        64,
+        D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_EQUAL_ZERO,
+        Some(64),
+    );
+    if out_of_bounds != Err(PredicationError::BufferOutOfBounds { offset: 64, buffer_size: 64 }) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Out of bounds buffer offset was not rejected\r\n");
+        return false;
+    }
+
+    let disabled_pred = D3D12_PREDICATION_VALIDATOR::validate_predication(
+        0,
+        0,
+        D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_EQUAL_ZERO,
+        None,
+    );
+    if disabled_pred != Ok(D3D12_PREDICATION_DESC::disabled()) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Disabling predication with null VA failed\r\n");
+        return false;
+    }
+
+    let query_offset = D3D12_PREDICATION_VALIDATOR::validate_occlusion_query_offset(5, 16);
+    if query_offset != Ok(40) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Occlusion query offset calculation mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Predication buffer offset validation and 8-byte alignment verified\r\n");
+
+    // 2. Verify predication evaluation engine and condition checks
+    let mut evaluator = D3D12_PREDICATION_EVALUATOR::new();
+
+    // NOT_EQUAL_ZERO condition: passes when visible (pixels > 0), skips when occluded (pixels == 0)
+    let not_equal_desc = D3D12_PREDICATION_DESC::active(
+        0x6000,
+        0,
+        D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_NOT_EQUAL_ZERO,
+    );
+    evaluator.set_predication(not_equal_desc);
+
+    if evaluator.should_execute(0) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] NOT_EQUAL_ZERO condition should skip when predicate is 0\r\n");
+        return false;
+    }
+    if !evaluator.should_execute(512) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] NOT_EQUAL_ZERO condition should execute when predicate > 0\r\n");
+        return false;
+    }
+
+    // EQUAL_ZERO condition: passes when occluded (0), skips when visible (!= 0)
+    let equal_desc = D3D12_PREDICATION_DESC::active(
+        0x6000,
+        8,
+        D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_EQUAL_ZERO,
+    );
+    evaluator.set_predication(equal_desc);
+
+    if !evaluator.should_execute(0) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] EQUAL_ZERO condition should execute when predicate is 0\r\n");
+        return false;
+    }
+    if evaluator.should_execute(1024) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] EQUAL_ZERO condition should skip when predicate != 0\r\n");
+        return false;
+    }
+
+    evaluator.clear_predication();
+    if !evaluator.should_execute(0) || !evaluator.should_execute(999) {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Disabled predication should execute unconditionally\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Predication evaluation engine and GPU zero-readback condition checks verified\r\n");
+
+    // 3. Verify command recorder token stream and occlusion query execution replay
+    let mut recorder = D3D12_PREDICATION_COMMAND_RECORDER::new();
+
+    // Object 1: Predicated on query 0 (offset 0)
+    if recorder.set_predication(0x8000, 0, D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, Some(256)).is_err() {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] SetPredication for object 1 failed\r\n");
+        return false;
+    }
+    recorder.draw_instanced(3, 1, 0, 0);
+
+    // Object 2: Predicated on query 1 (offset 8)
+    if recorder.set_predication(0x8000, 8, D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_NOT_EQUAL_ZERO, Some(256)).is_err() {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] SetPredication for object 2 failed\r\n");
+        return false;
+    }
+    recorder.draw_indexed_instanced(36, 1, 0, 0, 0);
+
+    // Unconditional compute dispatch: Predication cleared
+    if recorder.set_predication(0, 0, D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_EQUAL_ZERO, None).is_err() {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Clear predication failed\r\n");
+        return false;
+    }
+    recorder.dispatch(8, 8, 1);
+
+    if recorder.total_commands_recorded != 6 {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Command recorder total packet count mismatch\r\n");
+        return false;
+    }
+
+    // Binary token stream encoding
+    let mut stream = alloc::vec::Vec::new();
+    recorder.encode_token_stream(&mut stream);
+    if stream.is_empty() {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Token stream encoding is empty\r\n");
+        return false;
+    }
+    let first_token = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]);
+    if first_token != D3D12_TOKEN_SET_PREDICATION {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] First token opcode is not SET_PREDICATION\r\n");
+        return false;
+    }
+
+    // Replay simulation: query 0 = 0 (occluded), query 1 = 1500 (visible)
+    let mut replay_eval = D3D12_PREDICATION_EVALUATOR::new();
+    let (exec_count, skip_count) = recorder.replay_packets(&mut replay_eval, |_buf, offset| {
+        if offset == 0 {
+            0 // Occluded
+        } else if offset == 8 {
+            1500 // Visible
+        } else {
+            0
+        }
+    });
+
+    if exec_count != 2 || skip_count != 1 {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Replay execution/skip counts mismatch\r\n");
+        return false;
+    }
+    if replay_eval.zero_readback_stalls_avoided != 1 || replay_eval.bytes_bandwidth_saved == 0 {
+        crate::serial_write_str("[KNT-PREDICATION-FAIL] Zero-readback stalls avoided or bandwidth savings not tracked\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Command recorder token stream encoder and occlusion skipping replay verified\r\n");
+
+    // 4. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-PREDICATION-PASS] Direct3D 12 predication and GPU occlusion query skipping engine verified\r\n");
+    true
+}

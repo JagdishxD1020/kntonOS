@@ -437,6 +437,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 render pass engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Predication & GPU Occlusion Query Skipping Engine (TASK-KNT-191)
+    if !gfx::test_predication_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 predication engine self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Dynamic Micro-Mesh Displacement & Sub-Triangle Geometry LOD Compressor
     if !gfx::test_micromesh_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 micro-mesh displacement & sub-triangle self-test failed!\r\n");
