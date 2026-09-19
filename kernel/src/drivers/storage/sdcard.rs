@@ -1054,3 +1054,155 @@ pub fn verify_game_library_automounter() -> bool {
 
     true
 }
+
+
+// Safe Eject Flush Protocol & Write Cache Unmount Governor.
+
+/// Maximum number of cached dirty sector entries tracked by safe eject governor.
+pub const MAX_DIRTY_CACHE_ENTRIES: usize = 16;
+
+/// Dirty cache sector entry awaiting hardware write flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyCacheEntry {
+    pub lba: u64,
+    pub dirty: bool,
+    pub flush_in_progress: bool,
+}
+
+impl DirtyCacheEntry {
+    pub const fn empty() -> Self {
+        Self {
+            lba: 0,
+            dirty: false,
+            flush_in_progress: false,
+        }
+    }
+}
+
+/// Eject latch sync status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EjectSyncStatus {
+    Idle,
+    FlushRequired,
+    Flushing,
+    FlushedSafe,
+    EjectComplete,
+}
+
+/// Safe eject flush governor managing hardware unmount synchronization.
+#[derive(Debug, Clone)]
+pub struct SafeEjectGovernor {
+    pub dirty_entries: [DirtyCacheEntry; MAX_DIRTY_CACHE_ENTRIES],
+    pub dirty_count: usize,
+    pub sync_status: EjectSyncStatus,
+    pub total_flushed_sectors: u64,
+}
+
+impl SafeEjectGovernor {
+    pub const fn new() -> Self {
+        Self {
+            dirty_entries: [DirtyCacheEntry::empty(); MAX_DIRTY_CACHE_ENTRIES],
+            dirty_count: 0,
+            sync_status: EjectSyncStatus::Idle,
+            total_flushed_sectors: 0,
+        }
+    }
+
+    /// Marks a sector LBA as dirty in write-back cache.
+    pub fn mark_sector_dirty(&mut self, lba: u64) -> bool {
+        for entry in self.dirty_entries.iter_mut() {
+            if entry.dirty && entry.lba == lba {
+                return true;
+            }
+        }
+        for entry in self.dirty_entries.iter_mut() {
+            if !entry.dirty {
+                entry.lba = lba;
+                entry.dirty = true;
+                entry.flush_in_progress = false;
+                self.dirty_count += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Hardware eject latch sensor trigger: initiates synchronous write cache flush.
+    pub fn on_eject_latch_triggered(&mut self) -> EjectSyncStatus {
+        if self.dirty_count > 0 {
+            self.sync_status = EjectSyncStatus::FlushRequired;
+        } else {
+            self.sync_status = EjectSyncStatus::FlushedSafe;
+        }
+        self.sync_status
+    }
+
+    /// Performs dirty cache flush before unmounting.
+    pub fn flush_dirty_sectors(&mut self) -> usize {
+        self.sync_status = EjectSyncStatus::Flushing;
+        let mut flushed = 0;
+        for entry in self.dirty_entries.iter_mut() {
+            if entry.dirty {
+                entry.flush_in_progress = true;
+                // Hardware write flush simulation
+                entry.dirty = false;
+                entry.flush_in_progress = false;
+                flushed += 1;
+            }
+        }
+        self.total_flushed_sectors += flushed as u64;
+        self.dirty_count = 0;
+        self.sync_status = EjectSyncStatus::FlushedSafe;
+        flushed
+    }
+
+    /// Completes eject unmount synchronization.
+    pub fn complete_eject_unmount(&mut self) -> bool {
+        if self.sync_status == EjectSyncStatus::FlushedSafe {
+            self.sync_status = EjectSyncStatus::EjectComplete;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Unit test verifying safe eject flush protocol and write cache governor.
+pub fn verify_safe_eject_flush_protocol() -> bool {
+    let mut gov = SafeEjectGovernor::new();
+    if gov.sync_status != EjectSyncStatus::Idle || gov.dirty_count != 0 {
+        return false;
+    }
+
+    // 1. Mark multiple sectors dirty
+    if !gov.mark_sector_dirty(0x100) || !gov.mark_sector_dirty(0x101) || !gov.mark_sector_dirty(0x102) {
+        return false;
+    }
+    if gov.dirty_count != 3 {
+        return false;
+    }
+
+    // 2. Hardware eject latch triggered
+    let status = gov.on_eject_latch_triggered();
+    if status != EjectSyncStatus::FlushRequired {
+        return false;
+    }
+
+    // Attempting unmount before flush must fail
+    if gov.complete_eject_unmount() {
+        return false;
+    }
+
+    // 3. Flush dirty sectors
+    let flushed = gov.flush_dirty_sectors();
+    if flushed != 3 || gov.dirty_count != 0 || gov.sync_status != EjectSyncStatus::FlushedSafe {
+        return false;
+    }
+
+    // 4. Safe unmount succeeds
+    if !gov.complete_eject_unmount() || gov.sync_status != EjectSyncStatus::EjectComplete {
+        return false;
+    }
+
+    true
+}
