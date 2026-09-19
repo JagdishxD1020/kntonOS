@@ -349,8 +349,8 @@ pub struct ActiveViewEntry {
 unsafe impl Send for ActiveViewEntry {}
 unsafe impl Sync for ActiveViewEntry {}
 
-pub static ACTIVE_VIEWS: Spinlock<BTreeMap<usize, ActiveViewEntry>> =
-    Spinlock::new(BTreeMap::new());
+pub static ACTIVE_VIEWS: Spinlock<alloc::vec::Vec<ActiveViewEntry>> =
+    Spinlock::new(alloc::vec::Vec::new());
 
 unsafe fn map_view_internal(
     h_file_mapping: HANDLE,
@@ -392,7 +392,7 @@ unsafe fn map_view_internal(
         dw_number_of_bytes_to_map
     };
 
-    let is_cow = (dw_desired_access & FILE_MAP_COPY) != 0;
+    let is_cow = dw_desired_access == FILE_MAP_COPY;
     let (view_ptr, cow_buf) = if is_cow {
         let layout = match Layout::from_size_align(bytes_to_map, 4096) {
             Ok(l) => l,
@@ -425,7 +425,7 @@ unsafe fn map_view_internal(
     };
     drop(obj);
 
-    ACTIVE_VIEWS.lock().insert(base_key, entry);
+    ACTIVE_VIEWS.lock().push(entry);
     win32_set_last_error(ERROR_SUCCESS);
     view_ptr
 }
@@ -476,7 +476,9 @@ pub unsafe fn UnmapViewOfFile(lp_base_address: *const u8) -> i32 {
 
     let mut views = ACTIVE_VIEWS.lock();
     let key = lp_base_address as usize;
-    if let Some(view) = views.remove(&key) {
+    let pos = views.iter().rposition(|v| v.base_ptr == key);
+    if let Some(idx) = pos {
+        let view = views.remove(idx);
         if view.is_cow {
             if let Some(buf) = view.cow_buffer {
                 if let Ok(layout) = Layout::from_size_align(view.size, 4096) {
@@ -505,7 +507,8 @@ pub unsafe fn FlushViewOfFile(
     let key = lp_base_address as usize;
     let views = ACTIVE_VIEWS.lock();
     let mut target = None;
-    for (&base, view) in views.iter() {
+    for view in views.iter() {
+        let base = view.base_ptr;
         if key >= base && key < base + view.size {
             let rel_offset = key - base;
             let max_flush = view.size - rel_offset;
@@ -555,4 +558,169 @@ pub unsafe fn FlushViewOfFile(
 
     win32_set_last_error(ERROR_SUCCESS);
     1
+}
+
+
+/// Comprehensive self-test for Win32 memory-mapped files and shared cache.
+pub unsafe fn test_win32_mmap_subsystem() -> bool {
+    // 1. Anonymous named mapping & multi-view coherence
+    let map_name = b"Local\\KntonMmapTestShared\0";
+    let h_map1 = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        0,
+        PAGE_READWRITE,
+        0,
+        8192,
+        map_name.as_ptr(),
+    );
+    if h_map1 == 0 {
+        return false;
+    }
+    let view1 = MapViewOfFile(h_map1, FILE_MAP_WRITE, 0, 0, 4096);
+    if view1.is_null() {
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    let h_map2 = OpenFileMappingA(FILE_MAP_READ, 0, map_name.as_ptr());
+    if h_map2 == 0 {
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    let view2 = MapViewOfFile(h_map2, FILE_MAP_READ, 0, 0, 4096);
+    if view2.is_null() {
+        win32_close_mapping(h_map2);
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    let test_token = b"KNTON_MMAP_COHERENCE_TOKEN_1234";
+    core::ptr::copy_nonoverlapping(test_token.as_ptr(), view1, test_token.len());
+
+    let slice2 = core::slice::from_raw_parts(view2, test_token.len());
+    if slice2 != test_token {
+        UnmapViewOfFile(view2);
+        win32_close_mapping(h_map2);
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+
+    // 2. Copy-On-Write (COW) View Isolation
+    let view_cow = MapViewOfFile(h_map1, FILE_MAP_COPY, 0, 0, 4096);
+    if view_cow.is_null() {
+        UnmapViewOfFile(view2);
+        win32_close_mapping(h_map2);
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    let cow_slice_init = core::slice::from_raw_parts(view_cow, test_token.len());
+    if cow_slice_init != test_token {
+        UnmapViewOfFile(view_cow);
+        UnmapViewOfFile(view2);
+        win32_close_mapping(h_map2);
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    let cow_mut_token = b"OVERWRITTEN_IN_COW_VIEW_5678";
+    core::ptr::copy_nonoverlapping(cow_mut_token.as_ptr(), view_cow, cow_mut_token.len());
+
+    let slice1 = core::slice::from_raw_parts(view1, test_token.len());
+    if slice1 != test_token || slice2 != test_token {
+        UnmapViewOfFile(view_cow);
+        UnmapViewOfFile(view2);
+        win32_close_mapping(h_map2);
+        UnmapViewOfFile(view1);
+        win32_close_mapping(h_map1);
+        return false;
+    }
+    if UnmapViewOfFile(view_cow) == 0 {
+        return false;
+    }
+    if UnmapViewOfFile(view2) == 0 {
+        return false;
+    }
+    if UnmapViewOfFile(view1) == 0 {
+        return false;
+    }
+    win32_close_mapping(h_map2);
+    win32_close_mapping(h_map1);
+
+    // 3. File-backed mapping and FlushViewOfFile
+    let test_file_path = r"C:\knton_test\mmap_disk.dat";
+    let h_file = crate::pe::file::win32_create_file(
+        test_file_path,
+        crate::pe::file::GENERIC_READ | crate::pe::file::GENERIC_WRITE,
+        crate::pe::file::FILE_SHARE_READ | crate::pe::file::FILE_SHARE_WRITE,
+        crate::pe::file::CREATE_ALWAYS,
+        crate::pe::file::FILE_ATTRIBUTE_NORMAL,
+    );
+    if h_file == INVALID_HANDLE_VALUE || h_file == 0 {
+        return false;
+    }
+    let init_file_data = b"INITIAL_VFS_FILE_DATA_BLOCK";
+    let mut written = 0u32;
+    crate::pe::file::win32_write_file(
+        h_file,
+        init_file_data.as_ptr(),
+        init_file_data.len() as u32,
+        &mut written,
+    );
+    let h_file_map = CreateFileMappingA(
+        h_file,
+        0,
+        PAGE_READWRITE,
+        0,
+        4096,
+        core::ptr::null(),
+    );
+    if h_file_map == 0 {
+        crate::pe::file::win32_close_handle(h_file);
+        return false;
+    }
+    let file_view = MapViewOfFile(h_file_map, FILE_MAP_ALL_ACCESS, 0, 0, 4096);
+    if file_view.is_null() {
+        win32_close_mapping(h_file_map);
+        crate::pe::file::win32_close_handle(h_file);
+        return false;
+    }
+
+    let init_view_slice = core::slice::from_raw_parts(file_view, init_file_data.len());
+    if init_view_slice != init_file_data {
+        UnmapViewOfFile(file_view);
+        win32_close_mapping(h_file_map);
+        crate::pe::file::win32_close_handle(h_file);
+        return false;
+    }
+    let flushed_data = b"MODIFIED_MMAP_DISK_CACHE_FLUSH";
+    core::ptr::copy_nonoverlapping(flushed_data.as_ptr(), file_view, flushed_data.len());
+
+    if FlushViewOfFile(file_view, flushed_data.len()) == 0 {
+        UnmapViewOfFile(file_view);
+        win32_close_mapping(h_file_map);
+        crate::pe::file::win32_close_handle(h_file);
+        return false;
+    }
+    let vfs_path = crate::pe::file::win32_dos_to_vfs_path(test_file_path);
+    let disk_bytes = crate::fs::VFS.lock().read_file(&vfs_path).unwrap_or_default();
+    if disk_bytes.len() < flushed_data.len() || &disk_bytes[..flushed_data.len()] != flushed_data {
+        UnmapViewOfFile(file_view);
+        win32_close_mapping(h_file_map);
+        crate::pe::file::win32_close_handle(h_file);
+        return false;
+    }
+    if UnmapViewOfFile(file_view) == 0 {
+        return false;
+    }
+    if !crate::pe::file::win32_close_handle(h_file_map) {
+        return false;
+    }
+    if !crate::pe::file::win32_close_handle(h_file) {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-MMAP-OK] Win32 memory-mapped files and shared cache verified\r\n");
+    true
 }
