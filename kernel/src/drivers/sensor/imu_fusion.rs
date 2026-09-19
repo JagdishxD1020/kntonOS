@@ -777,3 +777,177 @@ pub fn verify_zupt_drift_cancellation_and_dead_reckoning() -> bool {
 
     true
 }
+
+
+// 6-Axis IMU 1 kHz Raw Data Parser & Sample Stream Processor.
+
+/// Accelerometer full-scale range configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelScale {
+    Fs2g,
+    Fs4g,
+    Fs8g,
+    Fs16g,
+}
+
+impl AccelScale {
+    /// Returns scale factor in (m/s^2) per LSB.
+    pub fn scale_factor_mss(self) -> f32 {
+        match self {
+            AccelScale::Fs2g => (2.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs4g => (4.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs8g => (8.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs16g => (16.0 * GRAVITY_MSS) / 32768.0,
+        }
+    }
+}
+
+/// Gyroscope full-scale range configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GyroScale {
+    Fs250dps,
+    Fs500dps,
+    Fs1000dps,
+    Fs2000dps,
+}
+
+impl GyroScale {
+    /// Returns scale factor in (rad/s) per LSB.
+    pub fn scale_factor_rad_s(self) -> f32 {
+        let deg_to_rad = 3.14159265 / 180.0;
+        match self {
+            GyroScale::Fs250dps => (250.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs500dps => (500.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs1000dps => (1000.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs2000dps => (2000.0 / 32768.0) * deg_to_rad,
+        }
+    }
+}
+
+/// 6-DoF IMU sample packet sampled at 1 kHz with calibrated physical units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Imu6DofSample {
+    /// Accelerometer acceleration [X, Y, Z] in m/s^2.
+    pub accel_mss: [f32; 3],
+    /// Gyroscope angular rate [X, Y, Z] in rad/s.
+    pub gyro_rad_s: [f32; 3],
+    /// Die temperature in degrees Celsius.
+    pub temp_c: f32,
+    /// Timestamp in microseconds.
+    pub timestamp_us: u64,
+}
+
+impl Imu6DofSample {
+    pub const fn zero() -> Self {
+        Self {
+            accel_mss: [0.0, 0.0, 0.0],
+            gyro_rad_s: [0.0, 0.0, 0.0],
+            temp_c: 25.0,
+            timestamp_us: 0,
+        }
+    }
+}
+
+/// 6-Axis IMU Raw Packet Parser and 1 kHz Stream Conditioner.
+#[derive(Debug, Clone)]
+pub struct ImuStreamParser {
+    pub accel_scale: AccelScale,
+    pub gyro_scale: GyroScale,
+    pub prev_sample: Imu6DofSample,
+    pub sample_count: u64,
+    pub alpha_lpf: f32,
+}
+
+impl ImuStreamParser {
+    pub const fn new(accel_scale: AccelScale, gyro_scale: GyroScale) -> Self {
+        Self {
+            accel_scale,
+            gyro_scale,
+            prev_sample: Imu6DofSample::zero(),
+            sample_count: 0,
+            alpha_lpf: 0.85,
+        }
+    }
+
+    /// Parses raw 14-byte 6-axis IMU SPI/I2C burst frame (Big Endian).
+    pub fn parse_raw_packet(&mut self, frame: &[u8; 14], timestamp_us: u64) -> Imu6DofSample {
+        let ax_raw = i16::from_be_bytes([frame[0], frame[1]]);
+        let ay_raw = i16::from_be_bytes([frame[2], frame[3]]);
+        let az_raw = i16::from_be_bytes([frame[4], frame[5]]);
+        let temp_raw = i16::from_be_bytes([frame[6], frame[7]]);
+        let gx_raw = i16::from_be_bytes([frame[8], frame[9]]);
+        let gy_raw = i16::from_be_bytes([frame[10], frame[11]]);
+        let gz_raw = i16::from_be_bytes([frame[12], frame[13]]);
+
+        let a_scale = self.accel_scale.scale_factor_mss();
+        let g_scale = self.gyro_scale.scale_factor_rad_s();
+
+        let raw_accel = [
+            (ax_raw as f32) * a_scale,
+            (ay_raw as f32) * a_scale,
+            (az_raw as f32) * a_scale,
+        ];
+        let raw_gyro = [
+            (gx_raw as f32) * g_scale,
+            (gy_raw as f32) * g_scale,
+            (gz_raw as f32) * g_scale,
+        ];
+        let temp_c = 25.0 + (temp_raw as f32) / 326.8;
+
+        // Apply low-pass filter
+        let filtered_accel = if self.sample_count == 0 {
+            raw_accel
+        } else {
+            [
+                self.alpha_lpf * raw_accel[0] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[0],
+                self.alpha_lpf * raw_accel[1] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[1],
+                self.alpha_lpf * raw_accel[2] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[2],
+            ]
+        };
+
+        let sample = Imu6DofSample {
+            accel_mss: filtered_accel,
+            gyro_rad_s: raw_gyro,
+            temp_c,
+            timestamp_us,
+        };
+
+        self.prev_sample = sample;
+        self.sample_count += 1;
+        sample
+    }
+}
+
+/// Unit test verifying 6-axis IMU raw packet parser and stream conditioner.
+pub fn verify_raw_imu_parser_and_stream() -> bool {
+    let mut parser = ImuStreamParser::new(AccelScale::Fs8g, GyroScale::Fs2000dps);
+
+    // Frame: Ax=0, Ay=0, Az=4096 (1g), Temp=0 (25.0C), Gx=0, Gy=0, Gz=0
+    let az_bytes = (4096i16).to_be_bytes();
+    let frame = [
+        0, 0,
+        0, 0,
+        az_bytes[0], az_bytes[1],
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+    ];
+
+    let sample = parser.parse_raw_packet(&frame, 1000);
+    if sample.timestamp_us != 1000 {
+        return false;
+    }
+    if sample.temp_c < 24.9 || sample.temp_c > 25.1 {
+        return false;
+    }
+    // Az should be ~GRAVITY_MSS (approx 9.8 m/s^2)
+    if sample.accel_mss[2] < 9.7 || sample.accel_mss[2] > 9.9 {
+        return false;
+    }
+    if sample.accel_mss[0].abs() > 0.001 || sample.accel_mss[1].abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
