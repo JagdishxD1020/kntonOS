@@ -23,6 +23,7 @@ pub use power::*;
 pub use thermal::*;
 pub use bus::*;
 pub use net::*;
+pub use storage::sdcard;
 
 use alloc::vec::Vec;
 use crate::memory::spinlock::Spinlock;

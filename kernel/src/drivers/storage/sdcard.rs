@@ -1206,3 +1206,36 @@ pub fn verify_safe_eject_flush_protocol() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld MicroSD UHS-I/II Game Storage & Auto-Mounter.
+pub fn test_sdcard_storage_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SDCARD] Testing handheld MicroSD UHS-I/II game storage & auto-mounter...\r\n");
+
+    // 1. Verify SDHCI Host State Machine & Card Detect Hot-Plug Engine
+    if !verify_sdhci_host_state_machine() {
+        crate::serial_write_str("[KNT-PANIC] SDHCI host state machine / CD hot-plug verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Multi-Block Scatter-Gather DMA & Hardware CRC16 Engine
+    if !verify_multiblock_dma_and_crc16() {
+        crate::serial_write_str("[KNT-PANIC] Multi-block DMA / CRC16 verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Handheld Game Library Auto-Mounter at /mnt/sdcard
+    if !verify_game_library_automounter() {
+        crate::serial_write_str("[KNT-PANIC] Game library auto-mounter verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Safe Eject Flush Protocol & Write Cache Unmount Governor
+    if !verify_safe_eject_flush_protocol() {
+        crate::serial_write_str("[KNT-PANIC] Safe eject flush protocol verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-SDCARD-PASS] Handheld MicroSD UHS-I/II game storage and auto-mounter verified\r\n");
+    true
+}
