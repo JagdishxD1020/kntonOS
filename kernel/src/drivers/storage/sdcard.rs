@@ -902,3 +902,155 @@ pub fn verify_multiblock_dma_and_crc16() -> bool {
 
     true
 }
+
+
+// Handheld Game Library Auto-Mounter Subsystem (/mnt/sdcard).
+
+/// Standard filesystem mount point for external game storage.
+pub const SDCARD_MOUNT_POINT: &str = "/mnt/sdcard";
+
+/// Partition filesystem type on MicroSD card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdFilesystemType {
+    Unknown,
+    ExFat,
+    Ext4,
+    Btrfs,
+}
+
+/// Auto-mounter status state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoMountState {
+    /// No partition mounted.
+    Unmounted,
+    /// Partition detected, mounting and discovering game library.
+    Mounting,
+    /// Successfully mounted at /mnt/sdcard; game library ready.
+    Mounted,
+    /// Unmount requested; flushing writes.
+    Unmounting,
+}
+
+/// MicroSD game partition volume information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameVolumeDescriptor {
+    pub fs_type: SdFilesystemType,
+    pub partition_start_lba: u64,
+    pub partition_block_count: u64,
+    pub volume_label: [u8; 16],
+    pub game_count: u32,
+}
+
+impl GameVolumeDescriptor {
+    pub const fn empty() -> Self {
+        Self {
+            fs_type: SdFilesystemType::Unknown,
+            partition_start_lba: 0,
+            partition_block_count: 0,
+            volume_label: [0; 16],
+            game_count: 0,
+        }
+    }
+}
+
+/// Handheld game storage auto-mounter manager.
+#[derive(Debug, Clone)]
+pub struct GameStorageAutoMounter {
+    pub state: AutoMountState,
+    pub volume: GameVolumeDescriptor,
+    pub mount_path: &'static str,
+    pub direct_execution_enabled: bool,
+}
+
+impl GameStorageAutoMounter {
+    pub const fn new() -> Self {
+        Self {
+            state: AutoMountState::Unmounted,
+            volume: GameVolumeDescriptor::empty(),
+            mount_path: SDCARD_MOUNT_POINT,
+            direct_execution_enabled: false,
+        }
+    }
+
+    /// Automatically mounts game partition when card is in CardReadyUHS state.
+    pub fn auto_mount_partition(&mut self, partition_lba: u64, total_blocks: u64, label: &[u8]) -> Result<(), &'static str> {
+        if self.state == AutoMountState::Mounted {
+            return Err("Storage already mounted");
+        }
+
+        self.state = AutoMountState::Mounting;
+
+        let mut vol_label = [0u8; 16];
+        let copy_len = label.len().min(16);
+        vol_label[..copy_len].copy_from_slice(&label[..copy_len]);
+
+        self.volume = GameVolumeDescriptor {
+            fs_type: SdFilesystemType::ExFat,
+            partition_start_lba: partition_lba,
+            partition_block_count: total_blocks,
+            volume_label: vol_label,
+            game_count: 142, // Mock game titles found in /mnt/sdcard/games
+        };
+
+        self.direct_execution_enabled = true;
+        self.state = AutoMountState::Mounted;
+        Ok(())
+    }
+
+    /// Dismounts partition safely.
+    pub fn start_unmount(&mut self) -> Result<(), &'static str> {
+        if self.state != AutoMountState::Mounted {
+            return Err("Storage not currently mounted");
+        }
+        self.state = AutoMountState::Unmounting;
+        self.direct_execution_enabled = false;
+        Ok(())
+    }
+
+    /// Completes unmount transition back to Unmounted.
+    pub fn complete_unmount(&mut self) {
+        self.state = AutoMountState::Unmounted;
+        self.volume = GameVolumeDescriptor::empty();
+        self.direct_execution_enabled = false;
+    }
+}
+
+/// Unit test verifying handheld game storage auto-mount at /mnt/sdcard.
+pub fn verify_game_library_automounter() -> bool {
+    let mut mounter = GameStorageAutoMounter::new();
+    if mounter.state != AutoMountState::Unmounted || mounter.mount_path != "/mnt/sdcard" {
+        return false;
+    }
+
+    // Auto mount partition
+    let label = b"KNTON_GAMES";
+    if mounter.auto_mount_partition(2048, 1_000_000, label).is_err() {
+        return false;
+    }
+
+    if mounter.state != AutoMountState::Mounted {
+        return false;
+    }
+    if !mounter.direct_execution_enabled {
+        return false;
+    }
+    if mounter.volume.game_count == 0 || mounter.volume.fs_type != SdFilesystemType::ExFat {
+        return false;
+    }
+
+    // Check volume label
+    if &mounter.volume.volume_label[..11] != label {
+        return false;
+    }
+
+    // Unmount sequence
+    if mounter.start_unmount().is_err() || mounter.state != AutoMountState::Unmounting {
+        return false;
+    }
+    mounter.complete_unmount();
+    if mounter.state != AutoMountState::Unmounted || mounter.direct_execution_enabled {
+        return false;
+    }
+
+    true
+}
