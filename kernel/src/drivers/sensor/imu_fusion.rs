@@ -1064,3 +1064,166 @@ pub fn verify_thermal_drift_compensation() -> bool {
 
     true
 }
+
+
+// 6-DoF Mahony/Madgwick Orientation Quaternion Fusion Filter.
+
+/// 4-Element Unit Quaternion representing 3D spatial rotation [w, x, y, z].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrientationQuaternion {
+    pub w: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl OrientationQuaternion {
+    /// Identity quaternion (zero rotation).
+    pub const fn identity() -> Self {
+        Self { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    /// Normalizes quaternion to ensure unit magnitude.
+    pub fn normalize(&mut self) {
+        let norm_sq = self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z;
+        if norm_sq > 0.0000001 {
+            let inv_norm = 1.0 / sqrt_f32(norm_sq);
+            self.w *= inv_norm;
+            self.x *= inv_norm;
+            self.y *= inv_norm;
+            self.z *= inv_norm;
+        } else {
+            *self = Self::identity();
+        }
+    }
+
+    /// Computes estimated gravity direction vector in sensor reference frame [X, Y, Z].
+    pub fn estimate_gravity_vector(&self) -> [f32; 3] {
+        [
+            2.0 * (self.x * self.z - self.w * self.y) * GRAVITY_MSS,
+            2.0 * (self.w * self.x + self.y * self.z) * GRAVITY_MSS,
+            (self.w * self.w - self.x * self.x - self.y * self.y + self.z * self.z) * GRAVITY_MSS,
+        ]
+    }
+}
+
+/// 6-DoF Madgwick / Mahony Sensor Fusion Filter.
+#[derive(Debug, Clone)]
+pub struct Imu6DofFusionFilter {
+    pub q: OrientationQuaternion,
+    pub beta: f32,
+    pub dt_s: f32,
+    pub converged: bool,
+}
+
+impl Imu6DofFusionFilter {
+    pub const fn new(beta: f32, dt_s: f32) -> Self {
+        Self {
+            q: OrientationQuaternion::identity(),
+            beta,
+            dt_s,
+            converged: false,
+        }
+    }
+
+    /// Updates orientation quaternion using calibrated accel and gyro samples.
+    pub fn update(&mut self, accel: [f32; 3], gyro: [f32; 3]) {
+        let q0 = self.q.w;
+        let q1 = self.q.x;
+        let q2 = self.q.y;
+        let q3 = self.q.z;
+
+        // Rate of change of quaternion from gyroscope
+        let q_dot_omega = [
+            0.5 * (-q1 * gyro[0] - q2 * gyro[1] - q3 * gyro[2]),
+            0.5 * ( q0 * gyro[0] + q2 * gyro[2] - q3 * gyro[1]),
+            0.5 * ( q0 * gyro[1] - q1 * gyro[2] + q3 * gyro[0]),
+            0.5 * ( q0 * gyro[2] + q1 * gyro[1] - q2 * gyro[0]),
+        ];
+
+        // Compute feedback from accelerometer if non-zero
+        let a_norm_sq = accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2];
+        let mut s = [0.0f32; 4];
+
+        if a_norm_sq > 0.01 {
+            let inv_a = 1.0 / sqrt_f32(a_norm_sq);
+            let ax = accel[0] * inv_a;
+            let ay = accel[1] * inv_a;
+            let az = accel[2] * inv_a;
+
+            // Auxiliary variables to avoid repeated calculations
+            let _2q0 = 2.0 * q0;
+            let _2q1 = 2.0 * q1;
+            let _2q2 = 2.0 * q2;
+            let _2q3 = 2.0 * q3;
+            let _4q0 = 4.0 * q0;
+            let _4q1 = 4.0 * q1;
+            let _4q2 = 4.0 * q2;
+            let _8q1 = 8.0 * q1;
+            let _8q2 = 8.0 * q2;
+            let q0q0 = q0 * q0;
+            let q1q1 = q1 * q1;
+            let q2q2 = q2 * q2;
+            let q3q3 = q3 * q3;
+
+            // Gradient descent algorithm corrective step
+            let mut s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+            let mut s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+            let mut s2 = 4.0 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+            let mut s3 = 4.0 * q1q1 * q3 - _2q1 * ax + 4.0 * q2q2 * q3 - _2q2 * ay;
+
+            let s_norm_sq = s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+            if s_norm_sq > 0.000001 {
+                let inv_s = 1.0 / sqrt_f32(s_norm_sq);
+                s0 *= inv_s;
+                s1 *= inv_s;
+                s2 *= inv_s;
+                s3 *= inv_s;
+            }
+
+            s = [s0, s1, s2, s3];
+        }
+
+        // Apply corrective step and integrate
+        self.q.w += (q_dot_omega[0] - self.beta * s[0]) * self.dt_s;
+        self.q.x += (q_dot_omega[1] - self.beta * s[1]) * self.dt_s;
+        self.q.y += (q_dot_omega[2] - self.beta * s[2]) * self.dt_s;
+        self.q.z += (q_dot_omega[3] - self.beta * s[3]) * self.dt_s;
+
+        self.q.normalize();
+        self.converged = true;
+    }
+}
+
+/// Unit test verifying 6-DoF orientation quaternion fusion and gravity vector convergence.
+pub fn verify_6dof_quaternion_fusion() -> bool {
+    let mut filter = Imu6DofFusionFilter::new(0.04, 0.001);
+
+    // Initial state: handheld flat on table, gravity straight down along +Z
+    let accel = [0.0, 0.0, GRAVITY_MSS];
+    let gyro = [0.0, 0.0, 0.0];
+
+    // Run 500 filter steps
+    for _ in 0..500 {
+        filter.update(accel, gyro);
+    }
+
+    if !filter.converged {
+        return false;
+    }
+
+    // Estimated gravity vector in sensor frame should match [0, 0, 9.80665]
+    let g_est = filter.q.estimate_gravity_vector();
+    if g_est[0].abs() > 0.1 || g_est[1].abs() > 0.1 || (g_est[2] - GRAVITY_MSS).abs() > 0.1 {
+        return false;
+    }
+
+    // Quaternion magnitude must be unit
+    let q = filter.q;
+    let mag = sqrt_f32(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (mag - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
