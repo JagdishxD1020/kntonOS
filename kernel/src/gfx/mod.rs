@@ -36,6 +36,7 @@ pub mod conservative_raster;
 pub mod tiled_resources;
 pub mod drs;
 pub mod render_pass;
+pub mod predication;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -72,6 +73,7 @@ pub use conservative_raster::*;
 pub use tiled_resources::*;
 pub use drs::*;
 pub use render_pass::*;
+pub use predication::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
