@@ -202,3 +202,244 @@ impl D3D12_PREDICATION_EVALUATOR {
         execute
     }
 }
+
+/// Token stream opcodes for predicated command buffer recording.
+pub const D3D12_TOKEN_SET_PREDICATION: u32 = 0x5052_4544; // 'PRED'
+pub const D3D12_TOKEN_DRAW_INSTANCED: u32 = 0x4452_574E; // 'DRWN'
+pub const D3D12_TOKEN_DRAW_INDEXED_INSTANCED: u32 = 0x4452_5749; // 'DRWI'
+pub const D3D12_TOKEN_DISPATCH: u32 = 0x4453_5054; // 'DSPT'
+
+/// Concrete predicated packet recorded into GPU command stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredicatedCommandPacket {
+    SetPredication {
+        buffer_gpu_va: u64,
+        aligned_buffer_offset: u64,
+        operation: D3D12_PREDICATION_OP,
+    },
+    DrawInstanced {
+        vertex_count_per_instance: u32,
+        instance_count: u32,
+        start_vertex_location: u32,
+        start_instance_location: u32,
+        predicate: D3D12_PREDICATION_DESC,
+    },
+    DrawIndexedInstanced {
+        index_count_per_instance: u32,
+        instance_count: u32,
+        start_index_location: u32,
+        base_vertex_location: i32,
+        start_instance_location: u32,
+        predicate: D3D12_PREDICATION_DESC,
+    },
+    Dispatch {
+        thread_group_count_x: u32,
+        thread_group_count_y: u32,
+        thread_group_count_z: u32,
+        predicate: D3D12_PREDICATION_DESC,
+    },
+}
+
+/// Command recorder token stream encoder for predicated draw and dispatch commands.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PREDICATION_COMMAND_RECORDER {
+    pub current_predication: D3D12_PREDICATION_DESC,
+    pub total_commands_recorded: u32,
+    pub packets: alloc::vec::Vec<PredicatedCommandPacket>,
+}
+
+impl D3D12_PREDICATION_COMMAND_RECORDER {
+    /// Creates a new command recorder with predication initially disabled.
+    pub fn new() -> Self {
+        Self {
+            current_predication: D3D12_PREDICATION_DESC::disabled(),
+            total_commands_recorded: 0,
+            packets: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Sets or clears predication on the command list.
+    pub fn set_predication(
+        &mut self,
+        buffer_gpu_va: u64,
+        aligned_buffer_offset: u64,
+        operation: D3D12_PREDICATION_OP,
+        buffer_size: Option<u64>,
+    ) -> Result<(), PredicationError> {
+        let desc = D3D12_PREDICATION_VALIDATOR::validate_predication(
+            buffer_gpu_va,
+            aligned_buffer_offset,
+            operation,
+            buffer_size,
+        )?;
+
+        self.current_predication = desc;
+        self.packets.push(PredicatedCommandPacket::SetPredication {
+            buffer_gpu_va,
+            aligned_buffer_offset,
+            operation,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records an instanced draw call subject to current predication state.
+    pub fn draw_instanced(
+        &mut self,
+        vertex_count_per_instance: u32,
+        instance_count: u32,
+        start_vertex_location: u32,
+        start_instance_location: u32,
+    ) {
+        self.packets.push(PredicatedCommandPacket::DrawInstanced {
+            vertex_count_per_instance,
+            instance_count,
+            start_vertex_location,
+            start_instance_location,
+            predicate: self.current_predication,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Records an indexed instanced draw call subject to current predication state.
+    pub fn draw_indexed_instanced(
+        &mut self,
+        index_count_per_instance: u32,
+        instance_count: u32,
+        start_index_location: u32,
+        base_vertex_location: i32,
+        start_instance_location: u32,
+    ) {
+        self.packets.push(PredicatedCommandPacket::DrawIndexedInstanced {
+            index_count_per_instance,
+            instance_count,
+            start_index_location,
+            base_vertex_location,
+            start_instance_location,
+            predicate: self.current_predication,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Records a compute dispatch command subject to current predication state.
+    pub fn dispatch(&mut self, thread_group_count_x: u32, thread_group_count_y: u32, thread_group_count_z: u32) {
+        self.packets.push(PredicatedCommandPacket::Dispatch {
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+            predicate: self.current_predication,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Encodes all recorded packets into a binary token stream.
+    pub fn encode_token_stream(&self, stream: &mut alloc::vec::Vec<u8>) {
+        for packet in &self.packets {
+            match packet {
+                PredicatedCommandPacket::SetPredication {
+                    buffer_gpu_va,
+                    aligned_buffer_offset,
+                    operation,
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_SET_PREDICATION.to_le_bytes());
+                    stream.extend_from_slice(&buffer_gpu_va.to_le_bytes());
+                    stream.extend_from_slice(&aligned_buffer_offset.to_le_bytes());
+                    stream.extend_from_slice(&(*operation as u32).to_le_bytes());
+                }
+                PredicatedCommandPacket::DrawInstanced {
+                    vertex_count_per_instance,
+                    instance_count,
+                    start_vertex_location,
+                    start_instance_location,
+                    ..
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_DRAW_INSTANCED.to_le_bytes());
+                    stream.extend_from_slice(&vertex_count_per_instance.to_le_bytes());
+                    stream.extend_from_slice(&instance_count.to_le_bytes());
+                    stream.extend_from_slice(&start_vertex_location.to_le_bytes());
+                    stream.extend_from_slice(&start_instance_location.to_le_bytes());
+                }
+                PredicatedCommandPacket::DrawIndexedInstanced {
+                    index_count_per_instance,
+                    instance_count,
+                    start_index_location,
+                    base_vertex_location,
+                    start_instance_location,
+                    ..
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_DRAW_INDEXED_INSTANCED.to_le_bytes());
+                    stream.extend_from_slice(&index_count_per_instance.to_le_bytes());
+                    stream.extend_from_slice(&instance_count.to_le_bytes());
+                    stream.extend_from_slice(&start_index_location.to_le_bytes());
+                    stream.extend_from_slice(&base_vertex_location.to_le_bytes());
+                    stream.extend_from_slice(&start_instance_location.to_le_bytes());
+                }
+                PredicatedCommandPacket::Dispatch {
+                    thread_group_count_x,
+                    thread_group_count_y,
+                    thread_group_count_z,
+                    ..
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_DISPATCH.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_x.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_y.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_z.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// Replays recorded packets through an evaluator simulating zero-readback GPU occlusion skipping.
+    pub fn replay_packets<F>(&self, evaluator: &mut D3D12_PREDICATION_EVALUATOR, read_predicate_val: F) -> (u32, u32)
+    where
+        F: Fn(u64, u64) -> u64,
+    {
+        let mut executed = 0u32;
+        let mut skipped = 0u32;
+
+        for packet in &self.packets {
+            match packet {
+                PredicatedCommandPacket::SetPredication {
+                    buffer_gpu_va,
+                    aligned_buffer_offset,
+                    operation,
+                } => {
+                    let desc = if *buffer_gpu_va == 0 {
+                        D3D12_PREDICATION_DESC::disabled()
+                    } else {
+                        D3D12_PREDICATION_DESC::active(*buffer_gpu_va, *aligned_buffer_offset, *operation)
+                    };
+                    evaluator.set_predication(desc);
+                }
+                PredicatedCommandPacket::DrawInstanced { predicate, .. }
+                | PredicatedCommandPacket::DrawIndexedInstanced { predicate, .. } => {
+                    let val = if predicate.is_active {
+                        Some(read_predicate_val(predicate.buffer_gpu_va, predicate.aligned_buffer_offset))
+                    } else {
+                        None
+                    };
+                    if evaluator.evaluate_draw(val) {
+                        executed = executed.saturating_add(1);
+                    } else {
+                        skipped = skipped.saturating_add(1);
+                    }
+                }
+                PredicatedCommandPacket::Dispatch { predicate, .. } => {
+                    let val = if predicate.is_active {
+                        Some(read_predicate_val(predicate.buffer_gpu_va, predicate.aligned_buffer_offset))
+                    } else {
+                        None
+                    };
+                    if evaluator.evaluate_dispatch(val) {
+                        executed = executed.saturating_add(1);
+                    } else {
+                        skipped = skipped.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        (executed, skipped)
+    }
+}
