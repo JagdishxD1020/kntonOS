@@ -107,3 +107,98 @@ impl D3D12_PREDICATION_VALIDATOR {
         Ok((query_index as u64) * 8)
     }
 }
+
+/// GPU-side predication evaluation engine simulating zero-readback occlusion skipping.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_PREDICATION_EVALUATOR {
+    pub current_desc: D3D12_PREDICATION_DESC,
+    pub draws_evaluated: u64,
+    pub draws_executed: u64,
+    pub draws_skipped: u64,
+    pub dispatches_evaluated: u64,
+    pub dispatches_executed: u64,
+    pub dispatches_skipped: u64,
+    pub zero_readback_stalls_avoided: u64,
+    pub bytes_bandwidth_saved: u64,
+}
+
+impl D3D12_PREDICATION_EVALUATOR {
+    /// Creates a new predication evaluator with predication initially disabled.
+    pub const fn new() -> Self {
+        Self {
+            current_desc: D3D12_PREDICATION_DESC::disabled(),
+            draws_evaluated: 0,
+            draws_executed: 0,
+            draws_skipped: 0,
+            dispatches_evaluated: 0,
+            dispatches_executed: 0,
+            dispatches_skipped: 0,
+            zero_readback_stalls_avoided: 0,
+            bytes_bandwidth_saved: 0,
+        }
+    }
+
+    /// Sets or updates active predication state.
+    pub fn set_predication(&mut self, desc: D3D12_PREDICATION_DESC) {
+        self.current_desc = desc;
+    }
+
+    /// Clears and disables current predication.
+    pub fn clear_predication(&mut self) {
+        self.current_desc = D3D12_PREDICATION_DESC::disabled();
+    }
+
+    /// Evaluates if commands should execute given the 64-bit predicate value.
+    pub fn should_execute(&self, predicate_value: u64) -> bool {
+        if !self.current_desc.is_active {
+            return true;
+        }
+
+        match self.current_desc.operation {
+            D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_EQUAL_ZERO => predicate_value == 0,
+            D3D12_PREDICATION_OP::D3D12_PREDICATION_OP_NOT_EQUAL_ZERO => predicate_value != 0,
+        }
+    }
+
+    /// Evaluates a draw command and updates metrics.
+    pub fn evaluate_draw(&mut self, predicate_value: Option<u64>) -> bool {
+        self.draws_evaluated = self.draws_evaluated.saturating_add(1);
+
+        let execute = match predicate_value {
+            Some(val) => self.should_execute(val),
+            None => !self.current_desc.is_active,
+        };
+
+        if execute {
+            self.draws_executed = self.draws_executed.saturating_add(1);
+        } else {
+            self.draws_skipped = self.draws_skipped.saturating_add(1);
+            self.zero_readback_stalls_avoided = self.zero_readback_stalls_avoided.saturating_add(1);
+            // Estimate GPU vertex fetch and rasterization bandwidth saved per skipped draw
+            self.bytes_bandwidth_saved = self.bytes_bandwidth_saved.saturating_add(65536);
+        }
+
+        execute
+    }
+
+    /// Evaluates a compute dispatch command and updates metrics.
+    pub fn evaluate_dispatch(&mut self, predicate_value: Option<u64>) -> bool {
+        self.dispatches_evaluated = self.dispatches_evaluated.saturating_add(1);
+
+        let execute = match predicate_value {
+            Some(val) => self.should_execute(val),
+            None => !self.current_desc.is_active,
+        };
+
+        if execute {
+            self.dispatches_executed = self.dispatches_executed.saturating_add(1);
+        } else {
+            self.dispatches_skipped = self.dispatches_skipped.saturating_add(1);
+            self.zero_readback_stalls_avoided = self.zero_readback_stalls_avoided.saturating_add(1);
+            self.bytes_bandwidth_saved = self.bytes_bandwidth_saved.saturating_add(131072);
+        }
+
+        execute
+    }
+}
