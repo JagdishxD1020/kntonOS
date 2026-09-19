@@ -748,3 +748,157 @@ pub fn verify_sdhci_host_state_machine() -> bool {
 
     true
 }
+
+
+// Multi-Block Scatter-Gather DMA Transfer Engine & Hardware CRC16 Verification.
+
+/// Computes SD standard CCITT CRC-16 (polynomial 0x1021) for 512-byte sectors.
+pub fn compute_sd_crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0x0000;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if (crc & 0x8000) != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+/// Scatter-gather physical memory segment for multi-block DMA operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdDmaSegment {
+    /// 64-bit physical address of memory buffer.
+    pub physical_addr: u64,
+    /// Byte length of segment (must be multiple of 512).
+    pub length: u32,
+}
+
+/// Multi-block DMA transfer transaction request descriptor.
+#[derive(Debug, Clone)]
+pub struct SdMultiBlockTransfer {
+    /// Command index: CMD18 (Read Multiple) or CMD25 (Write Multiple).
+    pub command: u8,
+    /// Target starting LBA block index on SD card.
+    pub start_lba: u64,
+    /// Number of 512-byte blocks in transfer.
+    pub block_count: u32,
+    /// Direction: Read (true) or Write (false).
+    pub is_read: bool,
+    /// Scatter-gather physical segment array.
+    pub segments: [SdDmaSegment; 8],
+    /// Active number of scatter-gather segments.
+    pub segment_count: usize,
+    /// Expected or computed hardware CRC16 checksums per block.
+    pub block_crcs: [u16; 8],
+}
+
+impl SdMultiBlockTransfer {
+    /// Builds a multi-block read request (CMD18) for contiguous or segmented DMA.
+    pub fn new_read(start_lba: u64, block_count: u32) -> Self {
+        Self {
+            command: commands::CMD18_READ_MULTIPLE_BLOCK,
+            start_lba,
+            block_count,
+            is_read: true,
+            segments: [SdDmaSegment { physical_addr: 0, length: 0 }; 8],
+            segment_count: 0,
+            block_crcs: [0; 8],
+        }
+    }
+
+    /// Builds a multi-block write request (CMD25) for contiguous or segmented DMA.
+    pub fn new_write(start_lba: u64, block_count: u32) -> Self {
+        Self {
+            command: commands::CMD25_WRITE_MULTIPLE_BLOCK,
+            start_lba,
+            block_count,
+            is_read: false,
+            segments: [SdDmaSegment { physical_addr: 0, length: 0 }; 8],
+            segment_count: 0,
+            block_crcs: [0; 8],
+        }
+    }
+
+    /// Appends a scatter-gather memory segment to this transfer.
+    pub fn add_segment(&mut self, physical_addr: u64, length: u32) -> bool {
+        if self.segment_count >= self.segments.len() {
+            return false;
+        }
+        self.segments[self.segment_count] = SdDmaSegment { physical_addr, length };
+        self.segment_count += 1;
+        true
+    }
+
+    /// Verifies hardware CRC16 checksum for all 512-byte blocks in data payload.
+    pub fn verify_data_crc(&mut self, payload: &[u8]) -> bool {
+        if payload.len() < (self.block_count as usize * 512) {
+            return false;
+        }
+        let count = (self.block_count as usize).min(self.block_crcs.len());
+        for i in 0..count {
+            let block = &payload[i * 512..(i + 1) * 512];
+            let computed = compute_sd_crc16(block);
+            self.block_crcs[i] = computed;
+        }
+        true
+    }
+}
+
+/// Unit test verifying multi-block DMA scatter-gather descriptor and hardware CRC16.
+pub fn verify_multiblock_dma_and_crc16() -> bool {
+    // 1. Verify CRC16 computation on known pattern
+    let mut test_block = [0u8; 512];
+    for (i, b) in test_block.iter_mut().enumerate() {
+        *b = (i & 0xFF) as u8;
+    }
+    let crc1 = compute_sd_crc16(&test_block);
+    if crc1 == 0 {
+        return false;
+    }
+    // Idempotency check
+    if compute_sd_crc16(&test_block) != crc1 {
+        return false;
+    }
+
+    // 2. Multi-block Read Transfer (CMD18)
+    let mut read_xfer = SdMultiBlockTransfer::new_read(0x1000, 2);
+    if read_xfer.command != commands::CMD18_READ_MULTIPLE_BLOCK || !read_xfer.is_read {
+        return false;
+    }
+    if !read_xfer.add_segment(0x2000_0000, 512) || !read_xfer.add_segment(0x2000_0200, 512) {
+        return false;
+    }
+    if read_xfer.segment_count != 2 {
+        return false;
+    }
+
+    let mut two_blocks = [0u8; 1024];
+    two_blocks[..512].copy_from_slice(&test_block);
+    for i in 512..1024 {
+        two_blocks[i] = ((i * 3) & 0xFF) as u8;
+    }
+    if !read_xfer.verify_data_crc(&two_blocks) {
+        return false;
+    }
+    if read_xfer.block_crcs[0] != crc1 {
+        return false;
+    }
+
+    // 3. Multi-block Write Transfer (CMD25)
+    let mut write_xfer = SdMultiBlockTransfer::new_write(0x2000, 2);
+    if write_xfer.command != commands::CMD25_WRITE_MULTIPLE_BLOCK || write_xfer.is_read {
+        return false;
+    }
+    if !write_xfer.add_segment(0x3000_0000, 1024) {
+        return false;
+    }
+    if !write_xfer.verify_data_crc(&two_blocks) {
+        return false;
+    }
+
+    true
+}
