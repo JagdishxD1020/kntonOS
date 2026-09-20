@@ -216,6 +216,144 @@ impl D3D12_DEPTH_BOUNDS_EVALUATOR {
     }
 }
 
+/// Token stream opcodes for depth bounds and dynamic stencil reference packets.
+pub const D3D12_TOKEN_OM_SET_DEPTH_BOUNDS: u32 = 0x4442_4E44; // 'DBND'
+pub const D3D12_TOKEN_OM_SET_STENCIL_REF: u32 = 0x5354_454E;  // 'STEN'
+pub const D3D12_TOKEN_DB_DRAW_INSTANCED: u32 = 0x4452_574E;      // 'DRWN'
+pub const D3D12_TOKEN_DB_DISPATCH: u32 = 0x4453_5054;            // 'DSPT'
+
+/// Packet recorded into GPU command stream for Output Merger state modifications.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepthBoundsCommandPacket {
+    SetDepthBounds { min_depth: f32, max_depth: f32 },
+    DisableDepthBounds,
+    SetStencilRef { stencil_ref: u32 },
+    DrawInstanced {
+        vertex_count_per_instance: u32,
+        instance_count: u32,
+        start_vertex_location: u32,
+        start_instance_location: u32,
+    },
+    Dispatch {
+        thread_group_count_x: u32,
+        thread_group_count_y: u32,
+        thread_group_count_z: u32,
+    },
+}
+
+/// Command recorder for Output Merger depth bounds and dynamic stencil commands.
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DEPTH_BOUNDS_COMMAND_RECORDER {
+    pub current_om_state: D3D12_OM_STATE,
+    pub total_commands_recorded: u32,
+    pub packets: alloc::vec::Vec<DepthBoundsCommandPacket>,
+}
+
+impl D3D12_DEPTH_BOUNDS_COMMAND_RECORDER {
+    /// Creates a new recorder with default OM state.
+    pub fn new() -> Self {
+        Self {
+            current_om_state: D3D12_OM_STATE::new(),
+            total_commands_recorded: 0,
+            packets: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Records dynamic depth bounds range into command stream.
+    pub fn om_set_depth_bounds(&mut self, min_depth: f32, max_depth: f32) -> Result<(), DepthBoundsError> {
+        self.current_om_state.om_set_depth_bounds(min_depth, max_depth)?;
+        self.packets.push(DepthBoundsCommandPacket::SetDepthBounds { min_depth, max_depth });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+        Ok(())
+    }
+
+    /// Records depth bounds disable command into command stream.
+    pub fn om_disable_depth_bounds(&mut self) {
+        self.current_om_state.om_disable_depth_bounds();
+        self.packets.push(DepthBoundsCommandPacket::DisableDepthBounds);
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Records dynamic stencil reference value into command stream.
+    pub fn om_set_stencil_ref(&mut self, stencil_ref: u32) {
+        self.current_om_state.om_set_stencil_ref(stencil_ref);
+        self.packets.push(DepthBoundsCommandPacket::SetStencilRef { stencil_ref });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Records instanced draw command.
+    pub fn draw_instanced(
+        &mut self,
+        vertex_count_per_instance: u32,
+        instance_count: u32,
+        start_vertex_location: u32,
+        start_instance_location: u32,
+    ) {
+        self.packets.push(DepthBoundsCommandPacket::DrawInstanced {
+            vertex_count_per_instance,
+            instance_count,
+            start_vertex_location,
+            start_instance_location,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Records compute dispatch command.
+    pub fn dispatch(&mut self, thread_group_count_x: u32, thread_group_count_y: u32, thread_group_count_z: u32) {
+        self.packets.push(DepthBoundsCommandPacket::Dispatch {
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    /// Encodes recorded Output Merger packets into binary token stream.
+    pub fn encode_token_stream(&self, stream: &mut alloc::vec::Vec<u8>) {
+        for packet in &self.packets {
+            match packet {
+                DepthBoundsCommandPacket::SetDepthBounds { min_depth, max_depth } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_OM_SET_DEPTH_BOUNDS.to_le_bytes());
+                    stream.extend_from_slice(&min_depth.to_le_bytes());
+                    stream.extend_from_slice(&max_depth.to_le_bytes());
+                }
+                DepthBoundsCommandPacket::DisableDepthBounds => {
+                    stream.extend_from_slice(&D3D12_TOKEN_OM_SET_DEPTH_BOUNDS.to_le_bytes());
+                    stream.extend_from_slice(&0.0f32.to_le_bytes());
+                    stream.extend_from_slice(&1.0f32.to_le_bytes());
+                }
+                DepthBoundsCommandPacket::SetStencilRef { stencil_ref } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_OM_SET_STENCIL_REF.to_le_bytes());
+                    stream.extend_from_slice(&stencil_ref.to_le_bytes());
+                }
+                DepthBoundsCommandPacket::DrawInstanced {
+                    vertex_count_per_instance,
+                    instance_count,
+                    start_vertex_location,
+                    start_instance_location,
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_DB_DRAW_INSTANCED.to_le_bytes());
+                    stream.extend_from_slice(&vertex_count_per_instance.to_le_bytes());
+                    stream.extend_from_slice(&instance_count.to_le_bytes());
+                    stream.extend_from_slice(&start_vertex_location.to_le_bytes());
+                    stream.extend_from_slice(&start_instance_location.to_le_bytes());
+                }
+                DepthBoundsCommandPacket::Dispatch {
+                    thread_group_count_x,
+                    thread_group_count_y,
+                    thread_group_count_z,
+                } => {
+                    stream.extend_from_slice(&D3D12_TOKEN_DB_DISPATCH.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_x.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_y.to_le_bytes());
+                    stream.extend_from_slice(&thread_group_count_z.to_le_bytes());
+                }
+            }
+        }
+    }
+}
+
 /// Temporary stub for depth bounds subsystem test during incremental commits.
 pub fn test_depth_bounds_subsystem() -> bool {
     true
