@@ -1227,3 +1227,117 @@ pub fn verify_6dof_quaternion_fusion() -> bool {
 
     true
 }
+
+
+// Linear Motion Separator & Game Tilt Control Governor.
+
+/// Separated acceleration components and game tilt controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionSeparationResult {
+    /// Pure linear dynamic acceleration [X, Y, Z] in m/s^2 (gravity isolated).
+    pub linear_accel_mss: [f32; 3],
+    /// Estimated gravity vector [X, Y, Z] in m/s^2.
+    pub gravity_vector_mss: [f32; 3],
+    /// Game tilt roll angle in degrees (-180..+180).
+    pub roll_deg: f32,
+    /// Game tilt pitch angle in degrees (-90..+90).
+    pub pitch_deg: f32,
+}
+
+/// Linear Motion Separator and Game Tilt Control Engine.
+#[derive(Debug, Clone)]
+pub struct LinearMotionSeparator {
+    pub deadband_mss: f32,
+    pub tilt_deadband_deg: f32,
+}
+
+impl LinearMotionSeparator {
+    pub const fn new(deadband_mss: f32, tilt_deadband_deg: f32) -> Self {
+        Self {
+            deadband_mss,
+            tilt_deadband_deg,
+        }
+    }
+
+    /// Isolates linear acceleration and extracts pitch/roll from quaternion and accel reading.
+    pub fn separate_motion(
+        &self,
+        q: &OrientationQuaternion,
+        accel_mss: [f32; 3],
+    ) -> MotionSeparationResult {
+        let g_vec = q.estimate_gravity_vector();
+
+        // Remove gravity from measured proper acceleration
+        let mut lin_x = accel_mss[0] - g_vec[0];
+        let mut lin_y = accel_mss[1] - g_vec[1];
+        let mut lin_z = accel_mss[2] - g_vec[2];
+
+        // Apply deadband
+        if lin_x.abs() < self.deadband_mss { lin_x = 0.0; }
+        if lin_y.abs() < self.deadband_mss { lin_y = 0.0; }
+        if lin_z.abs() < self.deadband_mss { lin_z = 0.0; }
+
+        // Compute tilt angles from quaternion
+        // Roll: atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+        // Pitch: asin(clamp(2*(w*y - z*x), -1, 1))
+        let sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z);
+        let cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+        let roll_rad = atan2_f32(sinr_cosp, cosr_cosp);
+
+        let sinp = 2.0 * (q.w * q.y - q.z * q.x);
+        let pitch_rad = if sinp.abs() >= 1.0 {
+            if sinp > 0.0 { 1.5707963 } else { -1.5707963 }
+        } else {
+            asin_f32(sinp)
+        };
+
+        let rad_to_deg = 180.0 / 3.14159265;
+        let mut roll_deg = roll_rad * rad_to_deg;
+        let mut pitch_deg = pitch_rad * rad_to_deg;
+
+        if roll_deg.abs() < self.tilt_deadband_deg { roll_deg = 0.0; }
+        if pitch_deg.abs() < self.tilt_deadband_deg { pitch_deg = 0.0; }
+
+        MotionSeparationResult {
+            linear_accel_mss: [lin_x, lin_y, lin_z],
+            gravity_vector_mss: g_vec,
+            roll_deg,
+            pitch_deg,
+        }
+    }
+}
+
+/// Unit test verifying linear motion separation and tilt angle extraction.
+pub fn verify_linear_motion_separator() -> bool {
+    let separator = LinearMotionSeparator::new(0.05, 0.5);
+
+    // 1. Static test: flat orientation, gravity only
+    let q_flat = OrientationQuaternion::identity();
+    let accel_static = [0.0, 0.0, GRAVITY_MSS];
+
+    let res_static = separator.separate_motion(&q_flat, accel_static);
+    // Linear acceleration should be zeroed (gravity canceled)
+    if res_static.linear_accel_mss[0] != 0.0
+        || res_static.linear_accel_mss[1] != 0.0
+        || res_static.linear_accel_mss[2] != 0.0
+    {
+        return false;
+    }
+    // Tilt angles should be 0.0
+    if res_static.roll_deg != 0.0 || res_static.pitch_deg != 0.0 {
+        return false;
+    }
+
+    // 2. Dynamic impulse test: add +2.0 m/s^2 linear acceleration along X (lateral shake)
+    let accel_shake = [2.0, 0.0, GRAVITY_MSS];
+    let res_shake = separator.separate_motion(&q_flat, accel_shake);
+
+    if (res_shake.linear_accel_mss[0] - 2.0).abs() > 0.05 {
+        return false;
+    }
+    if res_shake.linear_accel_mss[1] != 0.0 || res_shake.linear_accel_mss[2] != 0.0 {
+        return false;
+    }
+
+    true
+}
