@@ -1402,3 +1402,84 @@ pub fn verify_circular_outer_boundary_normalizer() -> bool {
 
     true
 }
+
+
+// Dynamic Anti-Deadzone Injection Engine for Competitive Micro-Aiming.
+
+/// Dynamic anti-deadzone injection mapper for canceling hardcoded game deadzones.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicAntiDeadzoneInjector {
+    /// Hardware stick inner deadzone (noise threshold, nominally 0.02 .. 0.04).
+    pub inner_deadzone: f32,
+    /// Hardware stick outer deadzone (saturation threshold, nominally 0.96 .. 1.00).
+    pub outer_deadzone: f32,
+    /// Game engine hardcoded deadzone offset to cancel (nominally 0.10 .. 0.25).
+    pub game_deadzone_offset: f32,
+}
+
+impl DynamicAntiDeadzoneInjector {
+    pub const fn new(inner_deadzone: f32, outer_deadzone: f32, game_deadzone_offset: f32) -> Self {
+        Self {
+            inner_deadzone,
+            outer_deadzone,
+            game_deadzone_offset,
+        }
+    }
+
+    /// Injects anti-deadzone boost so micro-deflections instantly cross the game deadzone threshold.
+    pub fn inject_anti_deadzone(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        let r = sqrt_f32(x * x + y * y);
+        if r <= self.inner_deadzone {
+            return (0.0, 0.0, 0.0);
+        }
+
+        let denom = self.outer_deadzone - self.inner_deadzone;
+        let t = if denom > 0.0001 {
+            ((r - self.inner_deadzone) / denom).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // Output starts at game_deadzone_offset and ramps linearly to 1.0
+        let boosted_r = self.game_deadzone_offset + (1.0 - self.game_deadzone_offset) * t;
+        let clamped_r = boosted_r.clamp(0.0, 1.0);
+
+        let unit_x = (x / r) * clamped_r;
+        let unit_y = (y / r) * clamped_r;
+
+        (unit_x, unit_y, clamped_r)
+    }
+}
+
+/// Unit test verifying dynamic anti-deadzone injection and micro-aiming sensitivity.
+pub fn verify_dynamic_anti_deadzone_injection() -> bool {
+    let injector = DynamicAntiDeadzoneInjector::new(0.03, 0.98, 0.15);
+
+    // 1. Stick at rest / noise level (r = 0.02 <= 0.03): outputs exactly 0.0
+    let (rx, ry, rr) = injector.inject_anti_deadzone(0.015, 0.010);
+    if rx != 0.0 || ry != 0.0 || rr != 0.0 {
+        return false;
+    }
+
+    // 2. Micro-aiming input just outside inner deadzone (r = 0.035 > 0.03)
+    let (mx, my, mr) = injector.inject_anti_deadzone(0.035, 0.0);
+    // Must immediately jump to >= 0.15 (crossing game deadzone)
+    if mr < 0.15 || mx < 0.15 || my != 0.0 {
+        return false;
+    }
+
+    // 3. Mid-range stick deflection (r = 0.505): t = (0.505 - 0.03)/0.95 = 0.5
+    // boosted_r = 0.15 + (1.0 - 0.15) * 0.5 = 0.15 + 0.425 = 0.575
+    let (_, _, mid_r) = injector.inject_anti_deadzone(0.505, 0.0);
+    if (mid_r - 0.575).abs() > 0.01 {
+        return false;
+    }
+
+    // 4. Maximum throw (r >= 0.98): boosted_r must saturate at 1.0
+    let (fx, _, fr) = injector.inject_anti_deadzone(1.0, 0.0);
+    if (fr - 1.0).abs() > 0.001 || (fx - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
