@@ -1325,3 +1325,80 @@ pub fn verify_magnetic_flux_linearization() -> bool {
 
     true
 }
+
+
+// Circular Outer Boundary Normalizer for Diagonal Deflections.
+
+/// Circular outer boundary normalizer mapping 2D stick deflections to true unit circle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CircularOuterBoundaryNormalizer {
+    /// Maximum radial reach (nominally 1.0 for unit circle).
+    pub max_radius: f32,
+    /// Outer deadzone boundary threshold where scaling begins clamping (nominally 0.95 .. 1.0).
+    pub outer_clamp_threshold: f32,
+}
+
+impl CircularOuterBoundaryNormalizer {
+    pub const fn new(outer_clamp_threshold: f32) -> Self {
+        Self {
+            max_radius: 1.0,
+            outer_clamp_threshold,
+        }
+    }
+
+    /// Normalizes raw stick deflection (x, y) to unit circle, eliminating square corner clipping.
+    pub fn normalize_to_unit_circle(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        let r = sqrt_f32(x * x + y * y);
+        if r < 0.00001 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        // Clamp radius to outer boundary
+        let clamped_r = if r >= self.outer_clamp_threshold {
+            self.max_radius
+        } else {
+            (r / self.outer_clamp_threshold) * self.max_radius
+        };
+
+        let unit_x = (x / r) * clamped_r;
+        let unit_y = (y / r) * clamped_r;
+
+        (unit_x, unit_y, clamped_r)
+    }
+}
+
+/// Unit test verifying circular outer boundary normalizer and diagonal corner clamping.
+pub fn verify_circular_outer_boundary_normalizer() -> bool {
+    let normalizer = CircularOuterBoundaryNormalizer::new(0.98);
+
+    // 1. Center resting
+    let (cx, cy, cr) = normalizer.normalize_to_unit_circle(0.0, 0.0);
+    if cx != 0.0 || cy != 0.0 || cr != 0.0 {
+        return false;
+    }
+
+    // 2. Cardinal full throw (1.0, 0.0)
+    let (ex, ey, er) = normalizer.normalize_to_unit_circle(1.0, 0.0);
+    if (ex - 1.0).abs() > 0.001 || ey.abs() > 0.001 || (er - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    // 3. Diagonal corner throw (1.0, 1.0) with r = sqrt(2) ~ 1.4142
+    let (dx, dy, dr) = normalizer.normalize_to_unit_circle(1.0, 1.0);
+    // Radial magnitude must be constrained to exactly 1.0
+    if (dr - 1.0).abs() > 0.001 {
+        return false;
+    }
+    // Diagonal angle must be preserved: dx == dy == 1/sqrt(2) ~ 0.7071
+    if (dx - 0.7071).abs() > 0.005 || (dy - 0.7071).abs() > 0.005 {
+        return false;
+    }
+
+    // 4. Proportional mid-range diagonal (0.5, 0.5): r ~ 0.7071
+    let (mx, my, mr) = normalizer.normalize_to_unit_circle(0.5, 0.5);
+    if mr >= 1.0 || (mx - my).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
