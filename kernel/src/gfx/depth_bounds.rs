@@ -354,7 +354,108 @@ impl D3D12_DEPTH_BOUNDS_COMMAND_RECORDER {
     }
 }
 
-/// Temporary stub for depth bounds subsystem test during incremental commits.
+// Comprehensive verification self-test suite for Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref
 pub fn test_depth_bounds_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS] Initializing Direct3D 12 Depth Bounds Testing self-test...\r\n");
+
+    // 1. Verify D3D12 Options2 feature query and DepthBoundsTestSupported reporting
+    let options2 = query_d3d12_options2_features();
+    if !options2.DepthBoundsTestSupported || options2.ProgrammableSamplePositionsTier == 0 {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Depth bounds test capability query failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Direct3D 12 Options2 depth bounds hardware capability verified\r\n");
+
+    // 2. Verify OMSetDepthBounds [0.0, 1.0] range validation and OMSetStencilRef dynamic binding
+    let valid_bounds = D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(0.2, 0.7);
+    if valid_bounds != Ok(D3D12_DEPTH_BOUNDS::active(0.2, 0.7)) {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Valid depth bounds range rejected\r\n");
+        return false;
+    }
+
+    if D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(0.8, 0.2) != Err(DepthBoundsError::InvalidDepthRange) {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Inverted depth bounds range (min > max) was not rejected\r\n");
+        return false;
+    }
+
+    if D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(-0.1, 0.5) != Err(DepthBoundsError::InvalidDepthRange) {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Negative depth bounds min was not rejected\r\n");
+        return false;
+    }
+
+    if D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(0.5, 1.2) != Err(DepthBoundsError::InvalidDepthRange) {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Depth bounds max > 1.0 was not rejected\r\n");
+        return false;
+    }
+
+    if D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(f32::NAN, 0.5) != Err(DepthBoundsError::NonFiniteDepthValue) {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Non-finite depth bounds value was not rejected\r\n");
+        return false;
+    }
+
+    let stencil_ref = D3D12_DEPTH_BOUNDS_VALIDATOR::validate_stencil_ref(0x1A5);
+    if stencil_ref.stencil_ref != 0xA5 {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Dynamic stencil reference 8-bit masking mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * OMSetDepthBounds [0.0, 1.0] range validation and stencil ref binding verified\r\n");
+
+    // 3. Verify depth bounds culling evaluator and GPU lighting volume rejection
+    let mut evaluator = D3D12_DEPTH_BOUNDS_EVALUATOR::new(D3D12_OM_STATE::new());
+    if evaluator.om_set_depth_bounds(0.3, 0.6).is_err() {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Setting depth bounds on evaluator failed\r\n");
+        return false;
+    }
+
+    let light_volume_samples = [
+        0.10, 0.15, 0.20, 0.25, // Foreground (4 culled)
+        0.35, 0.40, 0.50, 0.58, // Inside volume (4 passed)
+        0.65, 0.70, 0.85, 0.90, // Background (4 culled)
+    ];
+
+    let (passed, culled) = evaluator.evaluate_lighting_volume(&light_volume_samples);
+    if passed != 4 || culled != 8 {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Lighting volume rejection counts mismatch\r\n");
+        return false;
+    }
+    if evaluator.shader_invocations_saved != 8 || evaluator.bandwidth_saved_bytes != 512 {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Saved shader invocations or bandwidth mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * GPU lighting volume depth bounds rejection and shader savings verified\r\n");
+
+    // 4. Verify command recorder token stream encoder for depth bounds and stencil ref
+    let mut recorder = D3D12_DEPTH_BOUNDS_COMMAND_RECORDER::new();
+    if recorder.om_set_depth_bounds(0.3, 0.6).is_err() {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Recording OMSetDepthBounds failed\r\n");
+        return false;
+    }
+    recorder.om_set_stencil_ref(0xA5);
+    recorder.draw_instanced(36, 1, 0, 0);
+    recorder.om_disable_depth_bounds();
+    recorder.dispatch(8, 8, 1);
+
+    if recorder.total_commands_recorded != 5 {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Command recorder total packet count mismatch\r\n");
+        return false;
+    }
+
+    let mut stream = alloc::vec::Vec::new();
+    recorder.encode_token_stream(&mut stream);
+    if stream.is_empty() {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] Token stream encoding is empty\r\n");
+        return false;
+    }
+
+    let token_dbnd = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]);
+    if token_dbnd != D3D12_TOKEN_OM_SET_DEPTH_BOUNDS {
+        crate::serial_write_str("[KNT-DEPTHBOUNDS-FAIL] First token is not D3D12_TOKEN_OM_SET_DEPTH_BOUNDS\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Output Merger token stream encoder and packet lifecycle verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS-PASS] Direct3D 12 depth bounds testing and dynamic stencil ref engine verified\r\n");
     true
 }
+
