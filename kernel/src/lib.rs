@@ -691,6 +691,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Dual-IMU dead reckoning subsystem self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld IMU 6-DoF Sensor Fusion & Thermal Drift Governor (TASK-KNT-192)
+    if !drivers::sensor::test_imu_fusion_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld IMU 6-DoF sensor fusion and thermal drift governor self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Backlight PWM Modulator & Flicker-Free DC Dimming Governor
     if !drivers::display::test_backlight_pwm_subsystem() {
         serial_write_str("[KNT-PANIC] Backlight PWM and DC dimming governor self-test failed!\r\n");

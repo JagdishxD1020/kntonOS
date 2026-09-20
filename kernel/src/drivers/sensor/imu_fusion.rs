@@ -1341,3 +1341,36 @@ pub fn verify_linear_motion_separator() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld IMU 6-DoF Sensor Fusion & Thermal Drift Governor.
+pub fn test_imu_fusion_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SENSOR] Testing Handheld IMU 6-DoF sensor fusion & thermal drift governor...\r\n");
+
+    // 1. Verify 6-Axis IMU Raw Packet Parser & 1 kHz Stream Conditioner
+    if !verify_raw_imu_parser_and_stream() {
+        crate::serial_write_str("[KNT-PANIC] Raw IMU parser and stream conditioner verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Thermal Drift Compensation Governor & Gyro Zero-Rate Bias Model
+    if !verify_thermal_drift_compensation() {
+        crate::serial_write_str("[KNT-PANIC] Thermal drift compensation governor verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify 6-DoF Mahony/Madgwick Orientation Quaternion Fusion Filter
+    if !verify_6dof_quaternion_fusion() {
+        crate::serial_write_str("[KNT-PANIC] 6-DoF orientation quaternion fusion verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Linear Motion Separator & Game Tilt Control Governor
+    if !verify_linear_motion_separator() {
+        crate::serial_write_str("[KNT-PANIC] Linear motion separator / tilt control verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-IMU-FUSION-PASS] Handheld IMU 6-DoF sensor fusion and thermal drift governor verified\r\n");
+    true
+}
