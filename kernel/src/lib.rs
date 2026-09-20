@@ -960,6 +960,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 Windows registry subsystem self-test failed!\r\n");
     }
 
+    // Verify Win32 Memory-Mapped Files & File Mapping Shared Cache Subsystem (TASK-KNT-189)
+    unsafe {
+        if !pe::test_win32_mmap_subsystem() {
+            serial_write_str("[KNT-PANIC] Win32 memory-mapped files and shared cache self-test failed!\r\n");
+        }
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

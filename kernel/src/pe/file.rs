@@ -304,6 +304,9 @@ pub unsafe fn win32_close_handle(h_object: HANDLE) -> bool {
         if crate::pe::pipe::is_pipe_handle(h_object) {
             return crate::pe::pipe::win32_close_pipe(h_object);
         }
+        if crate::pe::mmap::is_mapping_handle(h_object) {
+            return crate::pe::mmap::win32_close_mapping(h_object);
+        }
         crate::pe::kernel32::win32_set_last_error(crate::pe::kernel32::ERROR_INVALID_HANDLE);
         false
     }
@@ -962,4 +965,9 @@ pub fn test_win32_file_io_subsystem() -> bool {
 
     crate::serial_write_str("[KNT-PE-FILE-IO-PASS] Win32 file I/O and VFS path translation verified\r\n");
     true
+}
+
+pub fn win32_get_file_path_for_mapping(h_file: HANDLE) -> Option<alloc::string::String> {
+    let table = FILE_HANDLE_TABLE.lock();
+    table.get(&h_file).map(|obj| obj.vfs_path.clone())
 }

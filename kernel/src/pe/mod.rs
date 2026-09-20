@@ -19,6 +19,7 @@ pub mod delay_load;
 pub mod crypto;
 pub mod pipe;
 pub mod registry;
+pub mod mmap;
 
 pub use header::*;
 pub use ntdll::*;
@@ -37,6 +38,7 @@ pub use delay_load::*;
 pub use crypto::*;
 pub use pipe::*;
 pub use registry::*;
+pub use mmap::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
