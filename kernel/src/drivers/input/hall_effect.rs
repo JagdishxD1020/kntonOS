@@ -1483,3 +1483,117 @@ pub fn verify_dynamic_anti_deadzone_injection() -> bool {
 
     true
 }
+
+
+// Analog Trigger Hair-Trigger Mode for Competitive FPS.
+
+/// Configurable hair-trigger profile and rapid-fire state machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HairTriggerProfile {
+    /// Actuation threshold percentage [0.0 .. 1.0] (nominally 0.05 = 5% travel).
+    pub actuation_threshold: f32,
+    /// Release threshold percentage [0.0 .. 1.0] (nominally 0.03 = 3% travel for hysteresis).
+    pub release_threshold: f32,
+    /// Rapid-reset delta: releases trigger when pull reduces by delta even before release threshold.
+    pub rapid_reset_delta: f32,
+}
+
+impl HairTriggerProfile {
+    /// Esports competitive shooter profile: hair-trigger snap at 5% pull with 1.5% rapid-reset.
+    pub const fn competitive_fps() -> Self {
+        Self {
+            actuation_threshold: 0.05,
+            release_threshold: 0.03,
+            rapid_reset_delta: 0.015,
+        }
+    }
+}
+
+/// Hair-Trigger Calibrator Engine with Rapid-Fire Reset Support.
+#[derive(Debug, Clone)]
+pub struct HairTriggerCalibrator {
+    pub profile: HairTriggerProfile,
+    pub is_active: bool,
+    pub peak_travel: f32,
+    pub trigger_fired_count: u32,
+}
+
+impl HairTriggerCalibrator {
+    pub const fn new(profile: HairTriggerProfile) -> Self {
+        Self {
+            profile,
+            is_active: false,
+            peak_travel: 0.0,
+            trigger_fired_count: 0,
+        }
+    }
+
+    /// Evaluates current analog trigger travel [0.0 .. 1.0] against hair-trigger and rapid-reset rules.
+    pub fn update(&mut self, travel: f32) -> (f32, bool) {
+        let t = travel.clamp(0.0, 1.0);
+
+        if self.is_active {
+            // Track highest travel while pressed
+            if t > self.peak_travel {
+                self.peak_travel = t;
+            }
+
+            // Rapid-reset check: if travel drops by rapid_reset_delta from peak, or below release_threshold
+            if (self.peak_travel - t) >= self.profile.rapid_reset_delta || t <= self.profile.release_threshold {
+                self.is_active = false;
+                self.peak_travel = t;
+                (0.0, false)
+            } else {
+                (1.0, true)
+            }
+        } else {
+            // Actuation check
+            if t >= self.profile.actuation_threshold {
+                self.is_active = true;
+                self.peak_travel = t;
+                self.trigger_fired_count += 1;
+                (1.0, true)
+            } else {
+                (0.0, false)
+            }
+        }
+    }
+}
+
+/// Unit test verifying analog trigger hair-trigger mode and rapid-fire resets.
+pub fn verify_hair_trigger_calibrator() -> bool {
+    let mut calibrator = HairTriggerCalibrator::new(HairTriggerProfile::competitive_fps());
+
+    // 1. Initial resting state (0.02 travel < 0.05 actuation): outputs (0.0, false)
+    let (v0, f0) = calibrator.update(0.02);
+    if v0 != 0.0 || f0 || calibrator.trigger_fired_count != 0 {
+        return false;
+    }
+
+    // 2. Press to 0.06 travel (crosses 0.05 threshold): snaps immediately to (1.0, true)
+    let (v1, f1) = calibrator.update(0.06);
+    if v1 != 1.0 || !f1 || calibrator.trigger_fired_count != 1 {
+        return false;
+    }
+
+    // 3. Deeper pull to 0.80 travel: stays (1.0, true)
+    let (v2, f2) = calibrator.update(0.80);
+    if v2 != 1.0 || !f2 || calibrator.peak_travel != 0.80 {
+        return false;
+    }
+
+    // 4. Rapid-reset: release by 0.02 to 0.78 (delta 0.02 >= rapid_reset_delta 0.015)
+    // Resets trigger to (0.0, false) even at 78% depth!
+    let (v3, f3) = calibrator.update(0.78);
+    if v3 != 0.0 || f3 {
+        return false;
+    }
+
+    // 5. Immediate re-press from 0.78 to 0.85: rapid-fires second shot!
+    let (v4, f4) = calibrator.update(0.85);
+    if v4 != 1.0 || !f4 || calibrator.trigger_fired_count != 2 {
+        return false;
+    }
+
+    true
+}
