@@ -69,6 +69,70 @@ impl D3D12_STENCIL_REF {
     }
 }
 
+/// Errors resulting from invalid depth bounds testing parameters or state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthBoundsError {
+    InvalidDepthRange,
+    NonFiniteDepthValue,
+    FeatureNotSupported,
+}
+
+/// Validator for Direct3D 12 depth bounds range and dynamic stencil reference values.
+#[allow(non_camel_case_types)]
+pub struct D3D12_DEPTH_BOUNDS_VALIDATOR;
+
+impl D3D12_DEPTH_BOUNDS_VALIDATOR {
+    /// Validates that depth bounds lie within [0.0, 1.0] and min <= max.
+    pub fn validate_depth_bounds(min_depth: f32, max_depth: f32) -> Result<D3D12_DEPTH_BOUNDS, DepthBoundsError> {
+        if !min_depth.is_finite() || !max_depth.is_finite() {
+            return Err(DepthBoundsError::NonFiniteDepthValue);
+        }
+        if min_depth < 0.0 || max_depth > 1.0 || min_depth > max_depth {
+            return Err(DepthBoundsError::InvalidDepthRange);
+        }
+        Ok(D3D12_DEPTH_BOUNDS::active(min_depth, max_depth))
+    }
+
+    /// Validates and masks 8-bit dynamic stencil reference value.
+    pub const fn validate_stencil_ref(stencil_ref: u32) -> D3D12_STENCIL_REF {
+        D3D12_STENCIL_REF::new(stencil_ref & 0xFF)
+    }
+}
+
+/// Direct3D 12 Output Merger pipeline state maintaining dynamic depth bounds and stencil ref.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_OM_STATE {
+    pub depth_bounds: D3D12_DEPTH_BOUNDS,
+    pub stencil_ref: D3D12_STENCIL_REF,
+}
+
+impl D3D12_OM_STATE {
+    /// Creates a new default OM state with depth bounds disabled and stencil ref 0.
+    pub const fn new() -> Self {
+        Self {
+            depth_bounds: D3D12_DEPTH_BOUNDS::disabled(),
+            stencil_ref: D3D12_STENCIL_REF { stencil_ref: 0 },
+        }
+    }
+
+    /// Sets dynamic depth bounds testing range (`OMSetDepthBounds`).
+    pub fn om_set_depth_bounds(&mut self, min_depth: f32, max_depth: f32) -> Result<(), DepthBoundsError> {
+        self.depth_bounds = D3D12_DEPTH_BOUNDS_VALIDATOR::validate_depth_bounds(min_depth, max_depth)?;
+        Ok(())
+    }
+
+    /// Disables dynamic depth bounds testing.
+    pub fn om_disable_depth_bounds(&mut self) {
+        self.depth_bounds = D3D12_DEPTH_BOUNDS::disabled();
+    }
+
+    /// Sets dynamic stencil reference value (`OMSetStencilRef`).
+    pub fn om_set_stencil_ref(&mut self, stencil_ref: u32) {
+        self.stencil_ref = D3D12_DEPTH_BOUNDS_VALIDATOR::validate_stencil_ref(stencil_ref);
+    }
+}
+
 /// Temporary stub for depth bounds subsystem test during incremental commits.
 pub fn test_depth_bounds_subsystem() -> bool {
     true
