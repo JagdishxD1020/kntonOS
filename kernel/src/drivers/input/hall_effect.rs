@@ -1219,3 +1219,427 @@ pub fn verify_trigger_curves_and_dynamic_centering() -> bool {
 
     true
 }
+
+
+// Magnetic Flux Linearization Interpolation Engine.
+
+/// Number of calibration points in Hall sensor magnetic flux linearization LUT.
+pub const FLUX_LUT_POINTS: usize = 17;
+
+/// 1D Piecewise Linearization Lookup Table for Hall effect magnetic deflection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MagneticFluxLinearizer {
+    /// Non-linear raw ADC deflection nodes [0.0 .. 1.0].
+    pub adc_nodes: [f32; FLUX_LUT_POINTS],
+    /// True physical displacement target nodes [0.0 .. 1.0].
+    pub linear_targets: [f32; FLUX_LUT_POINTS],
+}
+
+impl MagneticFluxLinearizer {
+    /// Factory calibration LUT modeling typical inverse-square/sinh Hall magnet non-linearity.
+    pub const fn default_calibrated() -> Self {
+        Self {
+            adc_nodes: [
+                0.000, 0.040, 0.085, 0.135, 0.190, 0.250, 0.315, 0.385,
+                0.460, 0.540, 0.625, 0.715, 0.805, 0.885, 0.940, 0.980, 1.000,
+            ],
+            linear_targets: [
+                0.0000, 0.0625, 0.1250, 0.1875, 0.2500, 0.3125, 0.3750, 0.4375,
+                0.5000, 0.5625, 0.6250, 0.6875, 0.7500, 0.8125, 0.8750, 0.9375, 1.0000,
+            ],
+        }
+    }
+
+    /// Linearizes raw normalized deflection [0.0 .. 1.0] using piecewise linear interpolation.
+    pub fn linearize(&self, raw_normalized: f32) -> f32 {
+        let val = raw_normalized.clamp(0.0, 1.0);
+        if val <= self.adc_nodes[0] {
+            return self.linear_targets[0];
+        }
+        if val >= self.adc_nodes[FLUX_LUT_POINTS - 1] {
+            return self.linear_targets[FLUX_LUT_POINTS - 1];
+        }
+
+        // Binary search for LUT segment
+        let mut low = 0;
+        let mut high = FLUX_LUT_POINTS - 1;
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            if self.adc_nodes[mid] <= val {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+
+        let x0 = self.adc_nodes[low];
+        let x1 = self.adc_nodes[high];
+        let y0 = self.linear_targets[low];
+        let y1 = self.linear_targets[high];
+
+        let span = x1 - x0;
+        if span > 0.00001 {
+            y0 + (y1 - y0) * ((val - x0) / span)
+        } else {
+            y0
+        }
+    }
+
+    /// Linearizes bipolar stick axis deflection [-1.0 .. +1.0] preserving deflection direction.
+    pub fn linearize_axis(&self, raw_axis: f32) -> f32 {
+        let sign = if raw_axis < 0.0 { -1.0 } else { 1.0 };
+        let mag = raw_axis.abs();
+        sign * self.linearize(mag)
+    }
+}
+
+/// Unit test verifying magnetic flux linearization LUT and piecewise interpolation.
+pub fn verify_magnetic_flux_linearization() -> bool {
+    let linearizer = MagneticFluxLinearizer::default_calibrated();
+
+    // 1. Center check
+    if linearizer.linearize(0.0) != 0.0 {
+        return false;
+    }
+    // 2. Full throw check
+    if linearizer.linearize(1.0) != 1.0 {
+        return false;
+    }
+    // 3. Negative bipolar check
+    if linearizer.linearize_axis(-1.0) != -1.0 {
+        return false;
+    }
+
+    // 4. Non-linear compensation check: raw 0.460 corresponds to linear 0.5000
+    let lin_mid = linearizer.linearize(0.460);
+    if (lin_mid - 0.5000).abs() > 0.001 {
+        return false;
+    }
+
+    // 5. Interpolation between nodes 0.190 (0.25) and 0.250 (0.3125): midpoint 0.220 -> ~0.28125
+    let lin_interp = linearizer.linearize(0.220);
+    let expected = 0.2500 + (0.3125 - 0.2500) * ((0.220 - 0.190) / (0.250 - 0.190));
+    if (lin_interp - expected).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
+
+
+// Circular Outer Boundary Normalizer for Diagonal Deflections.
+
+/// Circular outer boundary normalizer mapping 2D stick deflections to true unit circle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CircularOuterBoundaryNormalizer {
+    /// Maximum radial reach (nominally 1.0 for unit circle).
+    pub max_radius: f32,
+    /// Outer deadzone boundary threshold where scaling begins clamping (nominally 0.95 .. 1.0).
+    pub outer_clamp_threshold: f32,
+}
+
+impl CircularOuterBoundaryNormalizer {
+    pub const fn new(outer_clamp_threshold: f32) -> Self {
+        Self {
+            max_radius: 1.0,
+            outer_clamp_threshold,
+        }
+    }
+
+    /// Normalizes raw stick deflection (x, y) to unit circle, eliminating square corner clipping.
+    pub fn normalize_to_unit_circle(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        let r = sqrt_f32(x * x + y * y);
+        if r < 0.00001 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        // Clamp radius to outer boundary
+        let clamped_r = if r >= self.outer_clamp_threshold {
+            self.max_radius
+        } else {
+            (r / self.outer_clamp_threshold) * self.max_radius
+        };
+
+        let unit_x = (x / r) * clamped_r;
+        let unit_y = (y / r) * clamped_r;
+
+        (unit_x, unit_y, clamped_r)
+    }
+}
+
+/// Unit test verifying circular outer boundary normalizer and diagonal corner clamping.
+pub fn verify_circular_outer_boundary_normalizer() -> bool {
+    let normalizer = CircularOuterBoundaryNormalizer::new(0.98);
+
+    // 1. Center resting
+    let (cx, cy, cr) = normalizer.normalize_to_unit_circle(0.0, 0.0);
+    if cx != 0.0 || cy != 0.0 || cr != 0.0 {
+        return false;
+    }
+
+    // 2. Cardinal full throw (1.0, 0.0)
+    let (ex, ey, er) = normalizer.normalize_to_unit_circle(1.0, 0.0);
+    if (ex - 1.0).abs() > 0.001 || ey.abs() > 0.001 || (er - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    // 3. Diagonal corner throw (1.0, 1.0) with r = sqrt(2) ~ 1.4142
+    let (dx, dy, dr) = normalizer.normalize_to_unit_circle(1.0, 1.0);
+    // Radial magnitude must be constrained to exactly 1.0
+    if (dr - 1.0).abs() > 0.001 {
+        return false;
+    }
+    // Diagonal angle must be preserved: dx == dy == 1/sqrt(2) ~ 0.7071
+    if (dx - 0.7071).abs() > 0.005 || (dy - 0.7071).abs() > 0.005 {
+        return false;
+    }
+
+    // 4. Proportional mid-range diagonal (0.5, 0.5): r ~ 0.7071
+    let (mx, my, mr) = normalizer.normalize_to_unit_circle(0.5, 0.5);
+    if mr >= 1.0 || (mx - my).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
+
+
+// Dynamic Anti-Deadzone Injection Engine for Competitive Micro-Aiming.
+
+/// Dynamic anti-deadzone injection mapper for canceling hardcoded game deadzones.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicAntiDeadzoneInjector {
+    /// Hardware stick inner deadzone (noise threshold, nominally 0.02 .. 0.04).
+    pub inner_deadzone: f32,
+    /// Hardware stick outer deadzone (saturation threshold, nominally 0.96 .. 1.00).
+    pub outer_deadzone: f32,
+    /// Game engine hardcoded deadzone offset to cancel (nominally 0.10 .. 0.25).
+    pub game_deadzone_offset: f32,
+}
+
+impl DynamicAntiDeadzoneInjector {
+    pub const fn new(inner_deadzone: f32, outer_deadzone: f32, game_deadzone_offset: f32) -> Self {
+        Self {
+            inner_deadzone,
+            outer_deadzone,
+            game_deadzone_offset,
+        }
+    }
+
+    /// Injects anti-deadzone boost so micro-deflections instantly cross the game deadzone threshold.
+    pub fn inject_anti_deadzone(&self, x: f32, y: f32) -> (f32, f32, f32) {
+        let r = sqrt_f32(x * x + y * y);
+        if r <= self.inner_deadzone {
+            return (0.0, 0.0, 0.0);
+        }
+
+        let denom = self.outer_deadzone - self.inner_deadzone;
+        let t = if denom > 0.0001 {
+            ((r - self.inner_deadzone) / denom).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+
+        // Output starts at game_deadzone_offset and ramps linearly to 1.0
+        let boosted_r = self.game_deadzone_offset + (1.0 - self.game_deadzone_offset) * t;
+        let clamped_r = boosted_r.clamp(0.0, 1.0);
+
+        let unit_x = (x / r) * clamped_r;
+        let unit_y = (y / r) * clamped_r;
+
+        (unit_x, unit_y, clamped_r)
+    }
+}
+
+/// Unit test verifying dynamic anti-deadzone injection and micro-aiming sensitivity.
+pub fn verify_dynamic_anti_deadzone_injection() -> bool {
+    let injector = DynamicAntiDeadzoneInjector::new(0.03, 0.98, 0.15);
+
+    // 1. Stick at rest / noise level (r = 0.02 <= 0.03): outputs exactly 0.0
+    let (rx, ry, rr) = injector.inject_anti_deadzone(0.015, 0.010);
+    if rx != 0.0 || ry != 0.0 || rr != 0.0 {
+        return false;
+    }
+
+    // 2. Micro-aiming input just outside inner deadzone (r = 0.035 > 0.03)
+    let (mx, my, mr) = injector.inject_anti_deadzone(0.035, 0.0);
+    // Must immediately jump to >= 0.15 (crossing game deadzone)
+    if mr < 0.15 || mx < 0.15 || my != 0.0 {
+        return false;
+    }
+
+    // 3. Mid-range stick deflection (r = 0.505): t = (0.505 - 0.03)/0.95 = 0.5
+    // boosted_r = 0.15 + (1.0 - 0.15) * 0.5 = 0.15 + 0.425 = 0.575
+    let (_, _, mid_r) = injector.inject_anti_deadzone(0.505, 0.0);
+    if (mid_r - 0.575).abs() > 0.01 {
+        return false;
+    }
+
+    // 4. Maximum throw (r >= 0.98): boosted_r must saturate at 1.0
+    let (fx, _, fr) = injector.inject_anti_deadzone(1.0, 0.0);
+    if (fr - 1.0).abs() > 0.001 || (fx - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
+
+
+// Analog Trigger Hair-Trigger Mode for Competitive FPS.
+
+/// Configurable hair-trigger profile and rapid-fire state machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HairTriggerProfile {
+    /// Actuation threshold percentage [0.0 .. 1.0] (nominally 0.05 = 5% travel).
+    pub actuation_threshold: f32,
+    /// Release threshold percentage [0.0 .. 1.0] (nominally 0.03 = 3% travel for hysteresis).
+    pub release_threshold: f32,
+    /// Rapid-reset delta: releases trigger when pull reduces by delta even before release threshold.
+    pub rapid_reset_delta: f32,
+}
+
+impl HairTriggerProfile {
+    /// Esports competitive shooter profile: hair-trigger snap at 5% pull with 1.5% rapid-reset.
+    pub const fn competitive_fps() -> Self {
+        Self {
+            actuation_threshold: 0.05,
+            release_threshold: 0.03,
+            rapid_reset_delta: 0.015,
+        }
+    }
+}
+
+/// Hair-Trigger Calibrator Engine with Rapid-Fire Reset Support.
+#[derive(Debug, Clone)]
+pub struct HairTriggerCalibrator {
+    pub profile: HairTriggerProfile,
+    pub is_active: bool,
+    pub peak_travel: f32,
+    pub trigger_fired_count: u32,
+}
+
+impl HairTriggerCalibrator {
+    pub const fn new(profile: HairTriggerProfile) -> Self {
+        Self {
+            profile,
+            is_active: false,
+            peak_travel: 0.0,
+            trigger_fired_count: 0,
+        }
+    }
+
+    /// Evaluates current analog trigger travel [0.0 .. 1.0] against hair-trigger and rapid-reset rules.
+    pub fn update(&mut self, travel: f32) -> (f32, bool) {
+        let t = travel.clamp(0.0, 1.0);
+
+        if self.is_active {
+            // Track highest travel while pressed
+            if t > self.peak_travel {
+                self.peak_travel = t;
+            }
+
+            // Rapid-reset check: if travel drops by rapid_reset_delta from peak, or below release_threshold
+            if (self.peak_travel - t) >= self.profile.rapid_reset_delta || t <= self.profile.release_threshold {
+                self.is_active = false;
+                self.peak_travel = t;
+                (0.0, false)
+            } else {
+                (1.0, true)
+            }
+        } else {
+            // Actuation check
+            if t >= self.profile.actuation_threshold {
+                self.is_active = true;
+                self.peak_travel = t;
+                self.trigger_fired_count += 1;
+                (1.0, true)
+            } else {
+                (0.0, false)
+            }
+        }
+    }
+}
+
+/// Unit test verifying analog trigger hair-trigger mode and rapid-fire resets.
+pub fn verify_hair_trigger_calibrator() -> bool {
+    let mut calibrator = HairTriggerCalibrator::new(HairTriggerProfile::competitive_fps());
+
+    // 1. Initial resting state (0.02 travel < 0.05 actuation): outputs (0.0, false)
+    let (v0, f0) = calibrator.update(0.02);
+    if v0 != 0.0 || f0 || calibrator.trigger_fired_count != 0 {
+        return false;
+    }
+
+    // 2. Press to 0.06 travel (crosses 0.05 threshold): snaps immediately to (1.0, true)
+    let (v1, f1) = calibrator.update(0.06);
+    if v1 != 1.0 || !f1 || calibrator.trigger_fired_count != 1 {
+        return false;
+    }
+
+    // 3. Deeper pull to 0.80 travel: stays (1.0, true)
+    let (v2, f2) = calibrator.update(0.80);
+    if v2 != 1.0 || !f2 || calibrator.peak_travel != 0.80 {
+        return false;
+    }
+
+    // 4. Rapid-reset: release by 0.02 to 0.78 (delta 0.02 >= rapid_reset_delta 0.015)
+    // Resets trigger to (0.0, false) even at 78% depth!
+    let (v3, f3) = calibrator.update(0.78);
+    if v3 != 0.0 || f3 {
+        return false;
+    }
+
+    // 5. Immediate re-press from 0.78 to 0.85: rapid-fires second shot!
+    let (v4, f4) = calibrator.update(0.85);
+    if v4 != 1.0 || !f4 || calibrator.trigger_fired_count != 2 {
+        return false;
+    }
+
+    true
+}
+
+
+
+/// Comprehensive verification self-test suite for Handheld Hall-Effect Stick & Analog Trigger Calibrator.
+pub fn test_hall_effect_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Hall-Effect Stick & Analog Trigger Calibrator...\r\n");
+
+    // 1. Verify Hall Effect ADC Raw Readings, Sensor Channels & Temperature Drift Compensation
+    if !verify_calibration_and_adc_profiles() {
+        crate::serial_write_str("[KNT-PANIC] Hall effect calibration and ADC profile verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Magnetic Flux Linearization Interpolation LUT
+    if !verify_magnetic_flux_linearization() {
+        crate::serial_write_str("[KNT-PANIC] Magnetic flux linearization LUT verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Circular Outer Boundary Normalizer (True Unit Circle Diagonal Mapping)
+    if !verify_circular_outer_boundary_normalizer() {
+        crate::serial_write_str("[KNT-PANIC] Circular outer boundary normalizer verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Dynamic Anti-Deadzone Injection Engine for Micro-Aiming
+    if !verify_dynamic_anti_deadzone_injection() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic anti-deadzone injection verification failed!\r\n");
+        return false;
+    }
+
+    // 5. Verify Analog Trigger Hair-Trigger Mode & Rapid-Fire Reset Mechanism
+    if !verify_hair_trigger_calibrator() {
+        crate::serial_write_str("[KNT-PANIC] Hair-trigger calibrator verification failed!\r\n");
+        return false;
+    }
+
+    // 6. Verify Full Trigger Curves (Linear, Exponential, Dual-Stage) & Dynamic Self-Centering
+    if !verify_trigger_curves_and_dynamic_centering() {
+        crate::serial_write_str("[KNT-PANIC] Trigger curves and dynamic self-centering verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-HALL-EFFECT-PASS] Handheld Hall-effect stick and analog trigger calibrator verified\r\n");
+    true
+}
