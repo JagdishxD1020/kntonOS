@@ -133,6 +133,89 @@ impl D3D12_OM_STATE {
     }
 }
 
+/// Hardware-accelerated depth bounds culling evaluator for lighting volume rejection.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_DEPTH_BOUNDS_EVALUATOR {
+    pub om_state: D3D12_OM_STATE,
+    pub samples_evaluated: u64,
+    pub samples_passed: u64,
+    pub samples_culled: u64,
+    pub shader_invocations_saved: u64,
+    pub bandwidth_saved_bytes: u64,
+}
+
+impl D3D12_DEPTH_BOUNDS_EVALUATOR {
+    /// Creates a new depth bounds evaluator with initial Output Merger state.
+    pub const fn new(om_state: D3D12_OM_STATE) -> Self {
+        Self {
+            om_state,
+            samples_evaluated: 0,
+            samples_passed: 0,
+            samples_culled: 0,
+            shader_invocations_saved: 0,
+            bandwidth_saved_bytes: 0,
+        }
+    }
+
+    /// Updates Output Merger pipeline state.
+    pub fn set_om_state(&mut self, state: D3D12_OM_STATE) {
+        self.om_state = state;
+    }
+
+    /// Sets dynamic depth bounds testing range.
+    pub fn om_set_depth_bounds(&mut self, min_depth: f32, max_depth: f32) -> Result<(), DepthBoundsError> {
+        self.om_state.om_set_depth_bounds(min_depth, max_depth)
+    }
+
+    /// Disables dynamic depth bounds testing.
+    pub fn om_disable_depth_bounds(&mut self) {
+        self.om_state.om_disable_depth_bounds();
+    }
+
+    /// Tests a single depth sample against current depth bounds without updating counters.
+    #[inline(always)]
+    pub fn test_depth_sample(&self, depth_sample: f32) -> bool {
+        if !self.om_state.depth_bounds.enabled {
+            return true;
+        }
+        depth_sample >= self.om_state.depth_bounds.min_depth
+            && depth_sample <= self.om_state.depth_bounds.max_depth
+    }
+
+    /// Evaluates a depth sample, updates performance metrics, and returns pass/cull result.
+    pub fn evaluate_sample(&mut self, depth_sample: f32) -> bool {
+        self.samples_evaluated = self.samples_evaluated.saturating_add(1);
+
+        if self.test_depth_sample(depth_sample) {
+            self.samples_passed = self.samples_passed.saturating_add(1);
+            true
+        } else {
+            self.samples_culled = self.samples_culled.saturating_add(1);
+            self.shader_invocations_saved = self.shader_invocations_saved.saturating_add(1);
+            // 64 bytes saved per culled pixel (G-buffer read and lighting accumulation write avoided)
+            self.bandwidth_saved_bytes = self.bandwidth_saved_bytes.saturating_add(64);
+            false
+        }
+    }
+
+    /// Evaluates an array of depth buffer samples intersecting a light bounding volume.
+    pub fn evaluate_lighting_volume(&mut self, depth_buffer: &[f32]) -> (u64, u64) {
+        let mut passed = 0u64;
+        let mut culled = 0u64;
+
+        for &depth in depth_buffer {
+            if self.evaluate_sample(depth) {
+                passed = passed.saturating_add(1);
+            } else {
+                culled = culled.saturating_add(1);
+            }
+        }
+
+        (passed, culled)
+    }
+}
+
 /// Temporary stub for depth bounds subsystem test during incremental commits.
 pub fn test_depth_bounds_subsystem() -> bool {
     true
