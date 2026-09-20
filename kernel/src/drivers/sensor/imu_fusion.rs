@@ -777,3 +777,600 @@ pub fn verify_zupt_drift_cancellation_and_dead_reckoning() -> bool {
 
     true
 }
+
+
+// 6-Axis IMU 1 kHz Raw Data Parser & Sample Stream Processor.
+
+/// Accelerometer full-scale range configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelScale {
+    Fs2g,
+    Fs4g,
+    Fs8g,
+    Fs16g,
+}
+
+impl AccelScale {
+    /// Returns scale factor in (m/s^2) per LSB.
+    pub fn scale_factor_mss(self) -> f32 {
+        match self {
+            AccelScale::Fs2g => (2.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs4g => (4.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs8g => (8.0 * GRAVITY_MSS) / 32768.0,
+            AccelScale::Fs16g => (16.0 * GRAVITY_MSS) / 32768.0,
+        }
+    }
+}
+
+/// Gyroscope full-scale range configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GyroScale {
+    Fs250dps,
+    Fs500dps,
+    Fs1000dps,
+    Fs2000dps,
+}
+
+impl GyroScale {
+    /// Returns scale factor in (rad/s) per LSB.
+    pub fn scale_factor_rad_s(self) -> f32 {
+        let deg_to_rad = 3.14159265 / 180.0;
+        match self {
+            GyroScale::Fs250dps => (250.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs500dps => (500.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs1000dps => (1000.0 / 32768.0) * deg_to_rad,
+            GyroScale::Fs2000dps => (2000.0 / 32768.0) * deg_to_rad,
+        }
+    }
+}
+
+/// 6-DoF IMU sample packet sampled at 1 kHz with calibrated physical units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Imu6DofSample {
+    /// Accelerometer acceleration [X, Y, Z] in m/s^2.
+    pub accel_mss: [f32; 3],
+    /// Gyroscope angular rate [X, Y, Z] in rad/s.
+    pub gyro_rad_s: [f32; 3],
+    /// Die temperature in degrees Celsius.
+    pub temp_c: f32,
+    /// Timestamp in microseconds.
+    pub timestamp_us: u64,
+}
+
+impl Imu6DofSample {
+    pub const fn zero() -> Self {
+        Self {
+            accel_mss: [0.0, 0.0, 0.0],
+            gyro_rad_s: [0.0, 0.0, 0.0],
+            temp_c: 25.0,
+            timestamp_us: 0,
+        }
+    }
+}
+
+/// 6-Axis IMU Raw Packet Parser and 1 kHz Stream Conditioner.
+#[derive(Debug, Clone)]
+pub struct ImuStreamParser {
+    pub accel_scale: AccelScale,
+    pub gyro_scale: GyroScale,
+    pub prev_sample: Imu6DofSample,
+    pub sample_count: u64,
+    pub alpha_lpf: f32,
+}
+
+impl ImuStreamParser {
+    pub const fn new(accel_scale: AccelScale, gyro_scale: GyroScale) -> Self {
+        Self {
+            accel_scale,
+            gyro_scale,
+            prev_sample: Imu6DofSample::zero(),
+            sample_count: 0,
+            alpha_lpf: 0.85,
+        }
+    }
+
+    /// Parses raw 14-byte 6-axis IMU SPI/I2C burst frame (Big Endian).
+    pub fn parse_raw_packet(&mut self, frame: &[u8; 14], timestamp_us: u64) -> Imu6DofSample {
+        let ax_raw = i16::from_be_bytes([frame[0], frame[1]]);
+        let ay_raw = i16::from_be_bytes([frame[2], frame[3]]);
+        let az_raw = i16::from_be_bytes([frame[4], frame[5]]);
+        let temp_raw = i16::from_be_bytes([frame[6], frame[7]]);
+        let gx_raw = i16::from_be_bytes([frame[8], frame[9]]);
+        let gy_raw = i16::from_be_bytes([frame[10], frame[11]]);
+        let gz_raw = i16::from_be_bytes([frame[12], frame[13]]);
+
+        let a_scale = self.accel_scale.scale_factor_mss();
+        let g_scale = self.gyro_scale.scale_factor_rad_s();
+
+        let raw_accel = [
+            (ax_raw as f32) * a_scale,
+            (ay_raw as f32) * a_scale,
+            (az_raw as f32) * a_scale,
+        ];
+        let raw_gyro = [
+            (gx_raw as f32) * g_scale,
+            (gy_raw as f32) * g_scale,
+            (gz_raw as f32) * g_scale,
+        ];
+        let temp_c = 25.0 + (temp_raw as f32) / 326.8;
+
+        // Apply low-pass filter
+        let filtered_accel = if self.sample_count == 0 {
+            raw_accel
+        } else {
+            [
+                self.alpha_lpf * raw_accel[0] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[0],
+                self.alpha_lpf * raw_accel[1] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[1],
+                self.alpha_lpf * raw_accel[2] + (1.0 - self.alpha_lpf) * self.prev_sample.accel_mss[2],
+            ]
+        };
+
+        let sample = Imu6DofSample {
+            accel_mss: filtered_accel,
+            gyro_rad_s: raw_gyro,
+            temp_c,
+            timestamp_us,
+        };
+
+        self.prev_sample = sample;
+        self.sample_count += 1;
+        sample
+    }
+}
+
+/// Unit test verifying 6-axis IMU raw packet parser and stream conditioner.
+pub fn verify_raw_imu_parser_and_stream() -> bool {
+    let mut parser = ImuStreamParser::new(AccelScale::Fs8g, GyroScale::Fs2000dps);
+
+    // Frame: Ax=0, Ay=0, Az=4096 (1g), Temp=0 (25.0C), Gx=0, Gy=0, Gz=0
+    let az_bytes = (4096i16).to_be_bytes();
+    let frame = [
+        0, 0,
+        0, 0,
+        az_bytes[0], az_bytes[1],
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+    ];
+
+    let sample = parser.parse_raw_packet(&frame, 1000);
+    if sample.timestamp_us != 1000 {
+        return false;
+    }
+    if sample.temp_c < 24.9 || sample.temp_c > 25.1 {
+        return false;
+    }
+    // Az should be ~GRAVITY_MSS (approx 9.8 m/s^2)
+    if sample.accel_mss[2] < 9.7 || sample.accel_mss[2] > 9.9 {
+        return false;
+    }
+    if sample.accel_mss[0].abs() > 0.001 || sample.accel_mss[1].abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
+
+
+// Thermal Drift Compensation Governor for Gyro Zero-Rate Bias.
+
+/// Thermal sensitivity coefficients for 3-axis gyroscope zero-rate offset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThermalCoefficients {
+    /// Linear thermal drift slope (rad/s per °C) [X, Y, Z].
+    pub linear_slope: [f32; 3],
+    /// Quadratic thermal curvature (rad/s per °C^2) [X, Y, Z].
+    pub quadratic_curve: [f32; 3],
+    /// Reference factory calibration temperature (°C, nominally 25.0°C).
+    pub ref_temp_c: f32,
+}
+
+impl ThermalCoefficients {
+    /// Factory calibration coefficients typical for handheld gaming MEMS IMUs.
+    pub const fn default_factory() -> Self {
+        Self {
+            linear_slope: [0.00012, -0.00015, 0.00008],
+            quadratic_curve: [0.0000015, -0.0000020, 0.0000010],
+            ref_temp_c: 25.0,
+        }
+    }
+}
+
+/// Dynamic Thermal Drift Compensation Governor.
+#[derive(Debug, Clone)]
+pub struct ThermalDriftGovernor {
+    /// Baseline zero-rate bias at reference temperature [X, Y, Z] in rad/s.
+    pub base_bias_rad_s: [f32; 3],
+    /// Factory thermal drift model coefficients.
+    pub coefficients: ThermalCoefficients,
+    /// Current calculated thermal bias offset [X, Y, Z] in rad/s.
+    pub current_bias_rad_s: [f32; 3],
+    /// Filtered temperature in °C.
+    pub filtered_temp_c: f32,
+}
+
+impl ThermalDriftGovernor {
+    pub const fn new(base_bias: [f32; 3], coefficients: ThermalCoefficients) -> Self {
+        Self {
+            base_bias_rad_s: base_bias,
+            coefficients,
+            current_bias_rad_s: base_bias,
+            filtered_temp_c: 25.0,
+        }
+    }
+
+    /// Evaluates thermal drift model for die temperature T and computes active bias offsets.
+    pub fn compute_thermal_bias(&mut self, die_temp_c: f32) -> [f32; 3] {
+        // Temperature low-pass smoothing (tau ~ 0.5s)
+        self.filtered_temp_c = 0.98 * self.filtered_temp_c + 0.02 * die_temp_c;
+        let delta_t = self.filtered_temp_c - self.coefficients.ref_temp_c;
+        let delta_t_sq = delta_t * delta_t;
+
+        let mut computed = [0.0f32; 3];
+        for i in 0..3 {
+            computed[i] = self.base_bias_rad_s[i]
+                + self.coefficients.linear_slope[i] * delta_t
+                + self.coefficients.quadratic_curve[i] * delta_t_sq;
+        }
+
+        self.current_bias_rad_s = computed;
+        computed
+    }
+
+    /// Compensates raw angular rate measurement by removing active thermal bias.
+    pub fn compensate_gyro(&mut self, raw_gyro: [f32; 3], die_temp_c: f32) -> [f32; 3] {
+        let bias = self.compute_thermal_bias(die_temp_c);
+        [
+            raw_gyro[0] - bias[0],
+            raw_gyro[1] - bias[1],
+            raw_gyro[2] - bias[2],
+        ]
+    }
+}
+
+/// Unit test verifying thermal drift compensation curves and bias cancellation.
+pub fn verify_thermal_drift_compensation() -> bool {
+    let base_bias = [0.005, -0.004, 0.002];
+    let mut gov = ThermalDriftGovernor::new(base_bias, ThermalCoefficients::default_factory());
+
+    // At reference temperature (25.0C), bias should match base bias
+    for _ in 0..100 {
+        gov.compute_thermal_bias(25.0);
+    }
+    let b25 = gov.current_bias_rad_s;
+    if (b25[0] - base_bias[0]).abs() > 0.0001 || (b25[1] - base_bias[1]).abs() > 0.0001 {
+        return false;
+    }
+
+    // Warm up handheld chassis under APU load to 65.0C (delta_t = +40C)
+    for _ in 0..200 {
+        gov.compute_thermal_bias(65.0);
+    }
+    let b65 = gov.current_bias_rad_s;
+    // Bias must have shifted with temperature
+    if b65[0] <= base_bias[0] || b65[1] >= base_bias[1] {
+        return false;
+    }
+
+    // Raw stationary gyro sample exhibiting thermal drift
+    let raw_drifting = [b65[0], b65[1], b65[2]];
+    let compensated = gov.compensate_gyro(raw_drifting, 65.0);
+
+    // Compensated angular rate should be zeroed (within 0.0001 rad/s)
+    if compensated[0].abs() > 0.0001 || compensated[1].abs() > 0.0001 || compensated[2].abs() > 0.0001 {
+        return false;
+    }
+
+    true
+}
+
+
+// 6-DoF Mahony/Madgwick Orientation Quaternion Fusion Filter.
+
+/// 4-Element Unit Quaternion representing 3D spatial rotation [w, x, y, z].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrientationQuaternion {
+    pub w: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl OrientationQuaternion {
+    /// Identity quaternion (zero rotation).
+    pub const fn identity() -> Self {
+        Self { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    /// Normalizes quaternion to ensure unit magnitude.
+    pub fn normalize(&mut self) {
+        let norm_sq = self.w * self.w + self.x * self.x + self.y * self.y + self.z * self.z;
+        if norm_sq > 0.0000001 {
+            let inv_norm = 1.0 / sqrt_f32(norm_sq);
+            self.w *= inv_norm;
+            self.x *= inv_norm;
+            self.y *= inv_norm;
+            self.z *= inv_norm;
+        } else {
+            *self = Self::identity();
+        }
+    }
+
+    /// Computes estimated gravity direction vector in sensor reference frame [X, Y, Z].
+    pub fn estimate_gravity_vector(&self) -> [f32; 3] {
+        [
+            2.0 * (self.x * self.z - self.w * self.y) * GRAVITY_MSS,
+            2.0 * (self.w * self.x + self.y * self.z) * GRAVITY_MSS,
+            (self.w * self.w - self.x * self.x - self.y * self.y + self.z * self.z) * GRAVITY_MSS,
+        ]
+    }
+}
+
+/// 6-DoF Madgwick / Mahony Sensor Fusion Filter.
+#[derive(Debug, Clone)]
+pub struct Imu6DofFusionFilter {
+    pub q: OrientationQuaternion,
+    pub beta: f32,
+    pub dt_s: f32,
+    pub converged: bool,
+}
+
+impl Imu6DofFusionFilter {
+    pub const fn new(beta: f32, dt_s: f32) -> Self {
+        Self {
+            q: OrientationQuaternion::identity(),
+            beta,
+            dt_s,
+            converged: false,
+        }
+    }
+
+    /// Updates orientation quaternion using calibrated accel and gyro samples.
+    pub fn update(&mut self, accel: [f32; 3], gyro: [f32; 3]) {
+        let q0 = self.q.w;
+        let q1 = self.q.x;
+        let q2 = self.q.y;
+        let q3 = self.q.z;
+
+        // Rate of change of quaternion from gyroscope
+        let q_dot_omega = [
+            0.5 * (-q1 * gyro[0] - q2 * gyro[1] - q3 * gyro[2]),
+            0.5 * ( q0 * gyro[0] + q2 * gyro[2] - q3 * gyro[1]),
+            0.5 * ( q0 * gyro[1] - q1 * gyro[2] + q3 * gyro[0]),
+            0.5 * ( q0 * gyro[2] + q1 * gyro[1] - q2 * gyro[0]),
+        ];
+
+        // Compute feedback from accelerometer if non-zero
+        let a_norm_sq = accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2];
+        let mut s = [0.0f32; 4];
+
+        if a_norm_sq > 0.01 {
+            let inv_a = 1.0 / sqrt_f32(a_norm_sq);
+            let ax = accel[0] * inv_a;
+            let ay = accel[1] * inv_a;
+            let az = accel[2] * inv_a;
+
+            // Auxiliary variables to avoid repeated calculations
+            let _2q0 = 2.0 * q0;
+            let _2q1 = 2.0 * q1;
+            let _2q2 = 2.0 * q2;
+            let _2q3 = 2.0 * q3;
+            let _4q0 = 4.0 * q0;
+            let _4q1 = 4.0 * q1;
+            let _4q2 = 4.0 * q2;
+            let _8q1 = 8.0 * q1;
+            let _8q2 = 8.0 * q2;
+            let q0q0 = q0 * q0;
+            let q1q1 = q1 * q1;
+            let q2q2 = q2 * q2;
+            let q3q3 = q3 * q3;
+
+            // Gradient descent algorithm corrective step
+            let mut s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
+            let mut s1 = _4q1 * q3q3 - _2q3 * ax + 4.0 * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+            let mut s2 = 4.0 * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+            let mut s3 = 4.0 * q1q1 * q3 - _2q1 * ax + 4.0 * q2q2 * q3 - _2q2 * ay;
+
+            let s_norm_sq = s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3;
+            if s_norm_sq > 0.000001 {
+                let inv_s = 1.0 / sqrt_f32(s_norm_sq);
+                s0 *= inv_s;
+                s1 *= inv_s;
+                s2 *= inv_s;
+                s3 *= inv_s;
+            }
+
+            s = [s0, s1, s2, s3];
+        }
+
+        // Apply corrective step and integrate
+        self.q.w += (q_dot_omega[0] - self.beta * s[0]) * self.dt_s;
+        self.q.x += (q_dot_omega[1] - self.beta * s[1]) * self.dt_s;
+        self.q.y += (q_dot_omega[2] - self.beta * s[2]) * self.dt_s;
+        self.q.z += (q_dot_omega[3] - self.beta * s[3]) * self.dt_s;
+
+        self.q.normalize();
+        self.converged = true;
+    }
+}
+
+/// Unit test verifying 6-DoF orientation quaternion fusion and gravity vector convergence.
+pub fn verify_6dof_quaternion_fusion() -> bool {
+    let mut filter = Imu6DofFusionFilter::new(0.04, 0.001);
+
+    // Initial state: handheld flat on table, gravity straight down along +Z
+    let accel = [0.0, 0.0, GRAVITY_MSS];
+    let gyro = [0.0, 0.0, 0.0];
+
+    // Run 500 filter steps
+    for _ in 0..500 {
+        filter.update(accel, gyro);
+    }
+
+    if !filter.converged {
+        return false;
+    }
+
+    // Estimated gravity vector in sensor frame should match [0, 0, 9.80665]
+    let g_est = filter.q.estimate_gravity_vector();
+    if g_est[0].abs() > 0.1 || g_est[1].abs() > 0.1 || (g_est[2] - GRAVITY_MSS).abs() > 0.1 {
+        return false;
+    }
+
+    // Quaternion magnitude must be unit
+    let q = filter.q;
+    let mag = sqrt_f32(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (mag - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
+
+
+// Linear Motion Separator & Game Tilt Control Governor.
+
+/// Separated acceleration components and game tilt controls.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionSeparationResult {
+    /// Pure linear dynamic acceleration [X, Y, Z] in m/s^2 (gravity isolated).
+    pub linear_accel_mss: [f32; 3],
+    /// Estimated gravity vector [X, Y, Z] in m/s^2.
+    pub gravity_vector_mss: [f32; 3],
+    /// Game tilt roll angle in degrees (-180..+180).
+    pub roll_deg: f32,
+    /// Game tilt pitch angle in degrees (-90..+90).
+    pub pitch_deg: f32,
+}
+
+/// Linear Motion Separator and Game Tilt Control Engine.
+#[derive(Debug, Clone)]
+pub struct LinearMotionSeparator {
+    pub deadband_mss: f32,
+    pub tilt_deadband_deg: f32,
+}
+
+impl LinearMotionSeparator {
+    pub const fn new(deadband_mss: f32, tilt_deadband_deg: f32) -> Self {
+        Self {
+            deadband_mss,
+            tilt_deadband_deg,
+        }
+    }
+
+    /// Isolates linear acceleration and extracts pitch/roll from quaternion and accel reading.
+    pub fn separate_motion(
+        &self,
+        q: &OrientationQuaternion,
+        accel_mss: [f32; 3],
+    ) -> MotionSeparationResult {
+        let g_vec = q.estimate_gravity_vector();
+
+        // Remove gravity from measured proper acceleration
+        let mut lin_x = accel_mss[0] - g_vec[0];
+        let mut lin_y = accel_mss[1] - g_vec[1];
+        let mut lin_z = accel_mss[2] - g_vec[2];
+
+        // Apply deadband
+        if lin_x.abs() < self.deadband_mss { lin_x = 0.0; }
+        if lin_y.abs() < self.deadband_mss { lin_y = 0.0; }
+        if lin_z.abs() < self.deadband_mss { lin_z = 0.0; }
+
+        // Compute tilt angles from quaternion
+        // Roll: atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+        // Pitch: asin(clamp(2*(w*y - z*x), -1, 1))
+        let sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z);
+        let cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+        let roll_rad = atan2_f32(sinr_cosp, cosr_cosp);
+
+        let sinp = 2.0 * (q.w * q.y - q.z * q.x);
+        let pitch_rad = if sinp.abs() >= 1.0 {
+            if sinp > 0.0 { 1.5707963 } else { -1.5707963 }
+        } else {
+            asin_f32(sinp)
+        };
+
+        let rad_to_deg = 180.0 / 3.14159265;
+        let mut roll_deg = roll_rad * rad_to_deg;
+        let mut pitch_deg = pitch_rad * rad_to_deg;
+
+        if roll_deg.abs() < self.tilt_deadband_deg { roll_deg = 0.0; }
+        if pitch_deg.abs() < self.tilt_deadband_deg { pitch_deg = 0.0; }
+
+        MotionSeparationResult {
+            linear_accel_mss: [lin_x, lin_y, lin_z],
+            gravity_vector_mss: g_vec,
+            roll_deg,
+            pitch_deg,
+        }
+    }
+}
+
+/// Unit test verifying linear motion separation and tilt angle extraction.
+pub fn verify_linear_motion_separator() -> bool {
+    let separator = LinearMotionSeparator::new(0.05, 0.5);
+
+    // 1. Static test: flat orientation, gravity only
+    let q_flat = OrientationQuaternion::identity();
+    let accel_static = [0.0, 0.0, GRAVITY_MSS];
+
+    let res_static = separator.separate_motion(&q_flat, accel_static);
+    // Linear acceleration should be zeroed (gravity canceled)
+    if res_static.linear_accel_mss[0] != 0.0
+        || res_static.linear_accel_mss[1] != 0.0
+        || res_static.linear_accel_mss[2] != 0.0
+    {
+        return false;
+    }
+    // Tilt angles should be 0.0
+    if res_static.roll_deg != 0.0 || res_static.pitch_deg != 0.0 {
+        return false;
+    }
+
+    // 2. Dynamic impulse test: add +2.0 m/s^2 linear acceleration along X (lateral shake)
+    let accel_shake = [2.0, 0.0, GRAVITY_MSS];
+    let res_shake = separator.separate_motion(&q_flat, accel_shake);
+
+    if (res_shake.linear_accel_mss[0] - 2.0).abs() > 0.05 {
+        return false;
+    }
+    if res_shake.linear_accel_mss[1] != 0.0 || res_shake.linear_accel_mss[2] != 0.0 {
+        return false;
+    }
+
+    true
+}
+
+
+/// Comprehensive verification self-test suite for Handheld IMU 6-DoF Sensor Fusion & Thermal Drift Governor.
+pub fn test_imu_fusion_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SENSOR] Testing Handheld IMU 6-DoF sensor fusion & thermal drift governor...\r\n");
+
+    // 1. Verify 6-Axis IMU Raw Packet Parser & 1 kHz Stream Conditioner
+    if !verify_raw_imu_parser_and_stream() {
+        crate::serial_write_str("[KNT-PANIC] Raw IMU parser and stream conditioner verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Thermal Drift Compensation Governor & Gyro Zero-Rate Bias Model
+    if !verify_thermal_drift_compensation() {
+        crate::serial_write_str("[KNT-PANIC] Thermal drift compensation governor verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify 6-DoF Mahony/Madgwick Orientation Quaternion Fusion Filter
+    if !verify_6dof_quaternion_fusion() {
+        crate::serial_write_str("[KNT-PANIC] 6-DoF orientation quaternion fusion verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Linear Motion Separator & Game Tilt Control Governor
+    if !verify_linear_motion_separator() {
+        crate::serial_write_str("[KNT-PANIC] Linear motion separator / tilt control verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-IMU-FUSION-PASS] Handheld IMU 6-DoF sensor fusion and thermal drift governor verified\r\n");
+    true
+}
