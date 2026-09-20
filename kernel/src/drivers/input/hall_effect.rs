@@ -1597,3 +1597,49 @@ pub fn verify_hair_trigger_calibrator() -> bool {
 
     true
 }
+
+
+
+/// Comprehensive verification self-test suite for Handheld Hall-Effect Stick & Analog Trigger Calibrator.
+pub fn test_hall_effect_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Hall-Effect Stick & Analog Trigger Calibrator...\r\n");
+
+    // 1. Verify Hall Effect ADC Raw Readings, Sensor Channels & Temperature Drift Compensation
+    if !verify_calibration_and_adc_profiles() {
+        crate::serial_write_str("[KNT-PANIC] Hall effect calibration and ADC profile verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Magnetic Flux Linearization Interpolation LUT
+    if !verify_magnetic_flux_linearization() {
+        crate::serial_write_str("[KNT-PANIC] Magnetic flux linearization LUT verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Circular Outer Boundary Normalizer (True Unit Circle Diagonal Mapping)
+    if !verify_circular_outer_boundary_normalizer() {
+        crate::serial_write_str("[KNT-PANIC] Circular outer boundary normalizer verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Dynamic Anti-Deadzone Injection Engine for Micro-Aiming
+    if !verify_dynamic_anti_deadzone_injection() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic anti-deadzone injection verification failed!\r\n");
+        return false;
+    }
+
+    // 5. Verify Analog Trigger Hair-Trigger Mode & Rapid-Fire Reset Mechanism
+    if !verify_hair_trigger_calibrator() {
+        crate::serial_write_str("[KNT-PANIC] Hair-trigger calibrator verification failed!\r\n");
+        return false;
+    }
+
+    // 6. Verify Full Trigger Curves (Linear, Exponential, Dual-Stage) & Dynamic Self-Centering
+    if !verify_trigger_curves_and_dynamic_centering() {
+        crate::serial_write_str("[KNT-PANIC] Trigger curves and dynamic self-centering verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-HALL-EFFECT-PASS] Handheld Hall-effect stick and analog trigger calibrator verified\r\n");
+    true
+}
