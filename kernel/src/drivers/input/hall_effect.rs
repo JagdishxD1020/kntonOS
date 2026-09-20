@@ -1219,3 +1219,109 @@ pub fn verify_trigger_curves_and_dynamic_centering() -> bool {
 
     true
 }
+
+
+// Magnetic Flux Linearization Interpolation Engine.
+
+/// Number of calibration points in Hall sensor magnetic flux linearization LUT.
+pub const FLUX_LUT_POINTS: usize = 17;
+
+/// 1D Piecewise Linearization Lookup Table for Hall effect magnetic deflection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MagneticFluxLinearizer {
+    /// Non-linear raw ADC deflection nodes [0.0 .. 1.0].
+    pub adc_nodes: [f32; FLUX_LUT_POINTS],
+    /// True physical displacement target nodes [0.0 .. 1.0].
+    pub linear_targets: [f32; FLUX_LUT_POINTS],
+}
+
+impl MagneticFluxLinearizer {
+    /// Factory calibration LUT modeling typical inverse-square/sinh Hall magnet non-linearity.
+    pub const fn default_calibrated() -> Self {
+        Self {
+            adc_nodes: [
+                0.000, 0.040, 0.085, 0.135, 0.190, 0.250, 0.315, 0.385,
+                0.460, 0.540, 0.625, 0.715, 0.805, 0.885, 0.940, 0.980, 1.000,
+            ],
+            linear_targets: [
+                0.0000, 0.0625, 0.1250, 0.1875, 0.2500, 0.3125, 0.3750, 0.4375,
+                0.5000, 0.5625, 0.6250, 0.6875, 0.7500, 0.8125, 0.8750, 0.9375, 1.0000,
+            ],
+        }
+    }
+
+    /// Linearizes raw normalized deflection [0.0 .. 1.0] using piecewise linear interpolation.
+    pub fn linearize(&self, raw_normalized: f32) -> f32 {
+        let val = raw_normalized.clamp(0.0, 1.0);
+        if val <= self.adc_nodes[0] {
+            return self.linear_targets[0];
+        }
+        if val >= self.adc_nodes[FLUX_LUT_POINTS - 1] {
+            return self.linear_targets[FLUX_LUT_POINTS - 1];
+        }
+
+        // Binary search for LUT segment
+        let mut low = 0;
+        let mut high = FLUX_LUT_POINTS - 1;
+        while low + 1 < high {
+            let mid = (low + high) / 2;
+            if self.adc_nodes[mid] <= val {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+
+        let x0 = self.adc_nodes[low];
+        let x1 = self.adc_nodes[high];
+        let y0 = self.linear_targets[low];
+        let y1 = self.linear_targets[high];
+
+        let span = x1 - x0;
+        if span > 0.00001 {
+            y0 + (y1 - y0) * ((val - x0) / span)
+        } else {
+            y0
+        }
+    }
+
+    /// Linearizes bipolar stick axis deflection [-1.0 .. +1.0] preserving deflection direction.
+    pub fn linearize_axis(&self, raw_axis: f32) -> f32 {
+        let sign = if raw_axis < 0.0 { -1.0 } else { 1.0 };
+        let mag = raw_axis.abs();
+        sign * self.linearize(mag)
+    }
+}
+
+/// Unit test verifying magnetic flux linearization LUT and piecewise interpolation.
+pub fn verify_magnetic_flux_linearization() -> bool {
+    let linearizer = MagneticFluxLinearizer::default_calibrated();
+
+    // 1. Center check
+    if linearizer.linearize(0.0) != 0.0 {
+        return false;
+    }
+    // 2. Full throw check
+    if linearizer.linearize(1.0) != 1.0 {
+        return false;
+    }
+    // 3. Negative bipolar check
+    if linearizer.linearize_axis(-1.0) != -1.0 {
+        return false;
+    }
+
+    // 4. Non-linear compensation check: raw 0.460 corresponds to linear 0.5000
+    let lin_mid = linearizer.linearize(0.460);
+    if (lin_mid - 0.5000).abs() > 0.001 {
+        return false;
+    }
+
+    // 5. Interpolation between nodes 0.190 (0.25) and 0.250 (0.3125): midpoint 0.220 -> ~0.28125
+    let lin_interp = linearizer.linearize(0.220);
+    let expected = 0.2500 + (0.3125 - 0.2500) * ((0.220 - 0.190) / (0.250 - 0.190));
+    if (lin_interp - expected).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
