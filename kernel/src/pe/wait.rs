@@ -448,3 +448,85 @@ pub fn evaluate_wait_handles(
 
     None
 }
+
+/// Waits until the specified object is in the signaled state or the time-out interval elapses.
+pub unsafe fn WaitForSingleObject(h_handle: HANDLE, dw_milliseconds: u32) -> u32 {
+    WaitForMultipleObjectsEx(1, &h_handle, 0, dw_milliseconds, 0)
+}
+
+/// Waits until one or all of the specified objects are in the signaled state or time-out occurs.
+pub unsafe fn WaitForMultipleObjects(
+    count: u32,
+    lp_handles: *const HANDLE,
+    b_wait_all: i32,
+    dw_milliseconds: u32,
+) -> u32 {
+    WaitForMultipleObjectsEx(count, lp_handles, b_wait_all, dw_milliseconds, 0)
+}
+
+/// Waits until one or all of the specified objects are in the signaled state, an I/O completion
+/// routine or APC is queued, or the time-out interval elapses.
+pub unsafe fn WaitForMultipleObjectsEx(
+    count: u32,
+    lp_handles: *const HANDLE,
+    b_wait_all: i32,
+    dw_milliseconds: u32,
+    b_alertable: i32,
+) -> u32 {
+    if count == 0 || count > MAXIMUM_WAIT_OBJECTS || lp_handles.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+
+    let handles = core::slice::from_raw_parts(lp_handles, count as usize);
+    let cur_tid = get_current_wait_tid();
+    let wait_all = b_wait_all != 0;
+    let alertable = b_alertable != 0;
+
+    let start_tick = crate::pe::perf_counter::win32_get_tick_count64();
+    let timeout_tick = if dw_milliseconds == INFINITE {
+        u64::MAX
+    } else {
+        start_tick.saturating_add(dw_milliseconds as u64)
+    };
+
+    loop {
+        let now = crate::pe::perf_counter::win32_get_tick_count64();
+        update_active_waitable_timers(now);
+
+        // Check and dispatch queued User APCs if in alertable wait
+        if alertable {
+            let pending_apc = {
+                let mut apc_table = THREAD_APC_QUEUES.lock();
+                apc_table.get_mut(&cur_tid).and_then(|q| q.pop_front())
+            };
+            if let Some(apc) = pending_apc {
+                if apc.pfn_apc != 0 {
+                    let apc_fn: unsafe extern "system" fn(usize) = core::mem::transmute(apc.pfn_apc);
+                    apc_fn(apc.dw_data);
+                }
+                win32_set_last_error(ERROR_SUCCESS);
+                return WAIT_IO_COMPLETION;
+            }
+        }
+
+        // Evaluate waitable handles
+        if let Some(res) = evaluate_wait_handles(handles, wait_all, cur_tid) {
+            win32_set_last_error(ERROR_SUCCESS);
+            return res;
+        }
+
+        if dw_milliseconds == 0 {
+            win32_set_last_error(ERROR_SUCCESS);
+            return WAIT_TIMEOUT;
+        }
+
+        if dw_milliseconds != INFINITE && now >= timeout_tick {
+            win32_set_last_error(ERROR_SUCCESS);
+            return WAIT_TIMEOUT;
+        }
+
+        core::hint::spin_loop();
+        crate::process::yield_now();
+    }
+}
