@@ -155,3 +155,123 @@ pub fn verify_trackpad_modes_and_touch_tracking() -> bool {
 
     true
 }
+
+
+
+// Virtual Trackball Momentum Physics & Friction Decay Engine.
+
+/// Virtual trackball physics configuration and active momentum state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackpadVirtualTrackball {
+    /// Friction decay coefficient (decay per second, nominally 3.5 .. 5.0).
+    pub friction_coeff: f32,
+    /// Minimum speed threshold below which momentum halts to zero.
+    pub stop_threshold: f32,
+    /// Active velocity along X in normalized units per second.
+    pub vx: f32,
+    /// Active velocity along Y in normalized units per second.
+    pub vy: f32,
+    /// Momentum active (ball currently spinning post-release).
+    pub is_spinning: bool,
+}
+
+impl TrackpadVirtualTrackball {
+    pub const fn new(friction_coeff: f32, stop_threshold: f32) -> Self {
+        Self {
+            friction_coeff,
+            stop_threshold,
+            vx: 0.0,
+            vy: 0.0,
+            is_spinning: false,
+        }
+    }
+
+    /// Default trackball setup tuned for gaming precision and smooth flicking.
+    pub const fn default_gaming() -> Self {
+        Self::new(4.0, 0.05)
+    }
+
+    /// Imparts velocity upon thumb release (fling gesture).
+    pub fn launch(&mut self, vx: f32, vy: f32) {
+        let speed = sqrt_f32(vx * vx + vy * vy);
+        if speed >= self.stop_threshold {
+            self.vx = vx;
+            self.vy = vy;
+            self.is_spinning = true;
+        } else {
+            self.stop();
+        }
+    }
+
+    /// Halts momentum immediately when thumb touches down on trackpad.
+    pub fn stop(&mut self) {
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.is_spinning = false;
+    }
+
+    /// Advances momentum simulation by time step dt_s and returns displacement (dx, dy).
+    pub fn step_simulation(&mut self, dt_s: f32) -> (f32, f32) {
+        if !self.is_spinning || dt_s <= 0.0 {
+            return (0.0, 0.0);
+        }
+
+        // Displacement during this time step
+        let dx = self.vx * dt_s;
+        let dy = self.vy * dt_s;
+
+        // Exponential friction decay
+        let decay_factor = (1.0 - self.friction_coeff * dt_s).max(0.0);
+        self.vx *= decay_factor;
+        self.vy *= decay_factor;
+
+        let current_speed = sqrt_f32(self.vx * self.vx + self.vy * self.vy);
+        if current_speed < self.stop_threshold {
+            self.stop();
+        }
+
+        (dx, dy)
+    }
+}
+
+/// Unit test verifying virtual trackball momentum physics and friction decay.
+pub fn verify_trackball_momentum_decay() -> bool {
+    let mut trackball = TrackpadVirtualTrackball::new(4.0, 0.05);
+
+    // Launch with fling velocity (10.0, 0.0)
+    trackball.launch(10.0, 0.0);
+    if !trackball.is_spinning || trackball.vx != 10.0 {
+        return false;
+    }
+
+    // Step 10ms (0.01s): displacement dx ~ 0.1, decay factor 1 - 0.04 = 0.96 -> vx ~ 9.6
+    let (dx1, dy1) = trackball.step_simulation(0.01);
+    if (dx1 - 0.1).abs() > 0.01 || dy1.abs() > 0.001 {
+        return false;
+    }
+    if (trackball.vx - 9.6).abs() > 0.05 {
+        return false;
+    }
+
+    // Simulate decay over 1.5 seconds (150 steps of 10ms)
+    for _ in 0..150 {
+        trackball.step_simulation(0.01);
+    }
+
+    // After 1.5 seconds with friction=4.0, momentum should have cleanly stopped
+    if trackball.is_spinning || trackball.vx != 0.0 || trackball.vy != 0.0 {
+        return false;
+    }
+
+    // Touchdown brake test
+    trackball.launch(8.0, 8.0);
+    if !trackball.is_spinning {
+        return false;
+    }
+    trackball.stop();
+    if trackball.is_spinning || trackball.vx != 0.0 || trackball.vy != 0.0 {
+        return false;
+    }
+
+    true
+}
