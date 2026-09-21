@@ -647,6 +647,11 @@ pub extern "C" fn kmain() -> ! {
     if !drivers::input::test_touchpad_gesture_filter_subsystem() {
         serial_write_str("[KNT-PANIC] Capacitive touchpad and multi-finger gesture filter self-test failed!\r\n");
     }
+
+    // Initialize and verify Handheld Dual Trackpad Haptic Surface & Mouse Emulation Engine (TASK-KNT-195)
+    if !drivers::input::test_trackpad_surface_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld dual trackpad surface self-test failed!\r\n");
+    }
     // Initialize and verify Handheld PC Hall Effect Magnetic Joystick & Trigger Calibration Engine
     if !drivers::input::test_hall_effect_subsystem() {
         serial_write_str("[KNT-PANIC] Hall effect magnetic joystick and trigger calibration self-test failed!\r\n");

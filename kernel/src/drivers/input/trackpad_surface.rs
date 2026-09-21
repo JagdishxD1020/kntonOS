@@ -622,3 +622,37 @@ pub fn verify_haptic_detents_and_mouse_synthesizer() -> bool {
 
     true
 }
+
+
+
+/// Comprehensive verification self-test suite for Handheld Dual Trackpad Haptic Surface & Mouse Emulation Engine.
+pub fn test_trackpad_surface_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Dual Trackpad Haptic Surface & Mouse Emulation Engine...\r\n");
+
+    // 1. Verify Dual-Trackpad Touch Tracking & Operating Modes
+    if !verify_trackpad_modes_and_touch_tracking() {
+        crate::serial_write_str("[KNT-PANIC] Trackpad modes and touch tracking verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Virtual Trackball Momentum Physics & Friction Decay
+    if !verify_trackball_momentum_decay() {
+        crate::serial_write_str("[KNT-PANIC] Trackball momentum physics and friction decay verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Circular Scroll Wheel & 16-Slice Radial Menu Sector Classifier
+    if !verify_scroll_wheel_and_radial_menu() {
+        crate::serial_write_str("[KNT-PANIC] Scroll wheel and radial menu sector mapping verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Rotational Haptic Detent Generator & Win32 Mouse Displacement Synthesizer
+    if !verify_haptic_detents_and_mouse_synthesizer() {
+        crate::serial_write_str("[KNT-PANIC] Haptic detents and mouse displacement synthesizer verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-TRACKPAD-PASS] Handheld dual trackpad haptic surface and mouse emulation engine verified\r\n");
+    true
+}
