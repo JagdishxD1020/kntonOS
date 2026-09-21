@@ -173,6 +173,94 @@ impl D3D12_SAMPLER_FEEDBACK_VALIDATOR {
     }
 }
 
+/// Storage surface and GPU sampling simulator for Direct3D 12 Sampler Feedback Maps.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SAMPLER_FEEDBACK_MAP {
+    pub desc: D3D12_SAMPLER_FEEDBACK_MAP_DESC,
+    pub min_mip_data: alloc::vec::Vec<u8>,
+    pub mip_mask_data: alloc::vec::Vec<u16>,
+    pub total_samples_recorded: u64,
+}
+
+impl D3D12_SAMPLER_FEEDBACK_MAP {
+    /// Allocates and initializes feedback map storage matching the descriptor.
+    pub fn new(desc: D3D12_SAMPLER_FEEDBACK_MAP_DESC) -> Self {
+        let count = desc.total_tiles() as usize;
+        let min_mip_data = alloc::vec![D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP; count];
+        let mip_mask_data = alloc::vec![0u16; count];
+
+        Self {
+            desc,
+            min_mip_data,
+            mip_mask_data,
+            total_samples_recorded: 0,
+        }
+    }
+
+    /// Clears feedback map contents for the next frame.
+    pub fn clear(&mut self) {
+        self.min_mip_data.fill(D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP);
+        self.mip_mask_data.fill(0);
+        self.total_samples_recorded = 0;
+    }
+
+    /// Records a GPU texture sampling operation at `(texel_x, texel_y)` accessing `mip_level`.
+    pub fn record_sample(&mut self, texel_x: u32, texel_y: u32, mip_level: u8) -> bool {
+        if texel_x >= self.desc.target_width || texel_y >= self.desc.target_height {
+            return false;
+        }
+        if mip_level >= self.desc.target_mip_levels as u8 {
+            return false;
+        }
+
+        let (tx, ty) = self.desc.texel_to_tile(texel_x, texel_y);
+        let idx = match self.desc.tile_index(tx, ty) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        match self.desc.feedback_type {
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIN_MIP => {
+                let current = self.min_mip_data[idx];
+                self.min_mip_data[idx] = if current == D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP {
+                    mip_level
+                } else {
+                    core::cmp::min(current, mip_level)
+                };
+            }
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED => {
+                self.mip_mask_data[idx] |= 1u16 << mip_level;
+            }
+        }
+
+        self.total_samples_recorded = self.total_samples_recorded.saturating_add(1);
+        true
+    }
+
+    /// Reads recorded minimum mip level for tile `(tile_x, tile_y)`.
+    pub fn get_min_mip(&self, tile_x: u32, tile_y: u32) -> Option<u8> {
+        self.desc.tile_index(tile_x, tile_y).map(|idx| self.min_mip_data[idx])
+    }
+
+    /// Reads recorded mip mask for tile `(tile_x, tile_y)`.
+    pub fn get_mip_mask(&self, tile_x: u32, tile_y: u32) -> Option<u16> {
+        self.desc.tile_index(tile_x, tile_y).map(|idx| self.mip_mask_data[idx])
+    }
+
+    /// Evaluates if tile `(tile_x, tile_y)` was accessed during the frame.
+    pub fn is_tile_accessed(&self, tile_x: u32, tile_y: u32) -> bool {
+        match self.desc.feedback_type {
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIN_MIP => {
+                self.get_min_mip(tile_x, tile_y).map_or(false, |m| m != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP)
+            }
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED => {
+                self.get_mip_mask(tile_x, tile_y).map_or(false, |m| m != 0)
+            }
+        }
+    }
+}
+
 /// Temporary stub for sampler feedback test during incremental commits.
 pub fn test_sampler_feedback_subsystem() -> bool {
     true
