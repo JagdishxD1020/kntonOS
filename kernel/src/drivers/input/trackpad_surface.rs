@@ -468,3 +468,157 @@ pub fn verify_scroll_wheel_and_radial_menu() -> bool {
 
     true
 }
+
+
+
+// Rotational Haptic Detent Generator & Win32 Mouse Displacement Synthesizer.
+
+/// Rotational and displacement haptic detent generator using tactile patterns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackpadHapticGenerator {
+    /// Linear distance traveled before triggering a detent tick.
+    pub step_distance: f32,
+    /// Distance accumulated since last haptic tick.
+    pub accumulated_distance: f32,
+    /// Previous sector index for boundary crossing detents.
+    pub prev_sector: Option<u8>,
+    /// Total haptic pulses emitted.
+    pub total_pulses_emitted: u32,
+}
+
+impl TrackpadHapticGenerator {
+    pub const fn new(step_distance: f32) -> Self {
+        Self {
+            step_distance,
+            accumulated_distance: 0.0,
+            prev_sector: None,
+            total_pulses_emitted: 0,
+        }
+    }
+
+    /// Evaluates motion displacement and triggers haptic tick if threshold exceeded.
+    pub fn process_displacement(&mut self, dx: f32, dy: f32) -> Option<TactilePattern> {
+        let dist = sqrt_f32(dx * dx + dy * dy);
+        self.accumulated_distance += dist;
+
+        if self.accumulated_distance >= self.step_distance {
+            self.accumulated_distance -= self.step_distance;
+            self.total_pulses_emitted += 1;
+            Some(TactilePattern::Tick)
+        } else {
+            None
+        }
+    }
+
+    /// Evaluates radial sector transitions and triggers a crisp click on crossing.
+    pub fn process_sector_transition(&mut self, current_sector: Option<u8>) -> Option<TactilePattern> {
+        let pulse = match (self.prev_sector, current_sector) {
+            (Some(prev), Some(curr)) if prev != curr => {
+                self.total_pulses_emitted += 1;
+                Some(TactilePattern::CrispClick)
+            }
+            (None, Some(_)) => {
+                self.total_pulses_emitted += 1;
+                Some(TactilePattern::CrispClick)
+            }
+            _ => None,
+        };
+
+        self.prev_sector = current_sector;
+        pulse
+    }
+}
+
+/// Win32 sub-pixel cursor displacement synthesizer with fractional residual accumulator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Win32MouseSynthesizer {
+    /// DPI / Sensitivity multiplier (counts per normalized unit, nominally 800.0 .. 1600.0).
+    pub sensitivity_dpi: f32,
+    /// Fractional sub-pixel X remainder from previous frames.
+    pub residual_x: f32,
+    /// Fractional sub-pixel Y remainder from previous frames.
+    pub residual_y: f32,
+}
+
+impl Win32MouseSynthesizer {
+    pub const fn new(sensitivity_dpi: f32) -> Self {
+        Self {
+            sensitivity_dpi,
+            residual_x: 0.0,
+            residual_y: 0.0,
+        }
+    }
+
+    /// Default 1200 DPI gaming sensitivity.
+    pub const fn default_gaming() -> Self {
+        Self::new(1200.0)
+    }
+
+    /// Converts normalized float displacement (dx, dy) into integer Win32 mouse units, preserving fractions.
+    pub fn synthesize_motion(&mut self, dx: f32, dy: f32) -> (i32, i32) {
+        let total_x = dx * self.sensitivity_dpi + self.residual_x;
+        let total_y = dy * self.sensitivity_dpi + self.residual_y;
+
+        let int_x = total_x as i32;
+        let int_y = total_y as i32;
+
+        self.residual_x = total_x - (int_x as f32);
+        self.residual_y = total_y - (int_y as f32);
+
+        (int_x, int_y)
+    }
+}
+
+/// Unit test verifying rotational haptic detents and Win32 mouse displacement synthesizer.
+pub fn verify_haptic_detents_and_mouse_synthesizer() -> bool {
+    // 1. Haptic detent displacement test
+    let mut haptics = TrackpadHapticGenerator::new(0.05);
+
+    // Move 0.02 units -> no pulse
+    if haptics.process_displacement(0.02, 0.0).is_some() || haptics.total_pulses_emitted != 0 {
+        return false;
+    }
+
+    // Move another 0.04 units (total 0.06 >= 0.05) -> triggers Tick
+    let p1 = haptics.process_displacement(0.04, 0.0);
+    if p1 != Some(TactilePattern::Tick) || haptics.total_pulses_emitted != 1 {
+        return false;
+    }
+
+    // Radial sector transition -> CrispClick
+    let p_sec = haptics.process_sector_transition(Some(2));
+    if p_sec != Some(TactilePattern::CrispClick) || haptics.total_pulses_emitted != 2 {
+        return false;
+    }
+    // Staying in same sector -> no click
+    if haptics.process_sector_transition(Some(2)).is_some() {
+        return false;
+    }
+    // Changing sector 2 -> 3 -> triggers CrispClick
+    if haptics.process_sector_transition(Some(3)) != Some(TactilePattern::CrispClick) {
+        return false;
+    }
+
+    // 2. Win32 Mouse Synthesizer test
+    let mut synth = Win32MouseSynthesizer::new(1000.0);
+
+    // Small sub-pixel micro-aiming: dx = 0.0004 -> total_x = 0.4 -> int_x = 0, residual = 0.4
+    let (mx0, my0) = synth.synthesize_motion(0.0004, 0.0);
+    if mx0 != 0 || my0 != 0 || (synth.residual_x - 0.4).abs() > 0.001 {
+        return false;
+    }
+
+    // Second micro-aiming frame: dx = 0.0008 -> total_x = 0.8 + 0.4 = 1.2 -> int_x = 1, residual = 0.2
+    let (mx1, my1) = synth.synthesize_motion(0.0008, 0.0);
+    if mx1 != 1 || my1 != 0 || (synth.residual_x - 0.2).abs() > 0.001 {
+        return false;
+    }
+
+    // Large flick: dx = 0.05 -> total_x = 50.0 + 0.2 = 50.2 -> int_x = 50, residual = 0.2
+    let (mx2, my2) = synth.synthesize_motion(0.05, 0.0);
+    if mx2 != 50 || my2 != 0 {
+        return false;
+    }
+
+    true
+}
