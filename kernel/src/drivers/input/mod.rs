@@ -22,9 +22,11 @@ pub mod haptic_dsp;
 pub mod controller_profile;
 pub mod touchscreen;
 pub mod virtual_keyboard;
+pub mod trackpad_surface;
 pub use controller_profile::*;
 pub use touchscreen::*;
 pub use virtual_keyboard::*;
+pub use trackpad_surface::*;
 
 pub use imu::*;
 pub use gamepad::*;
