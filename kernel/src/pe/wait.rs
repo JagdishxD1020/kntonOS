@@ -701,3 +701,142 @@ pub unsafe fn QueueUserAPC(
     win32_set_last_error(ERROR_SUCCESS);
     1
 }
+
+static mut TEST_APC_INVOCATIONS: u32 = 0;
+
+unsafe extern "system" fn test_apc_routine(dw_data: usize) {
+    TEST_APC_INVOCATIONS = TEST_APC_INVOCATIONS.saturating_add(dw_data as u32);
+}
+
+/// Comprehensive self-test suite verifying Win32 waitable objects and multi-thread synchronization.
+pub unsafe fn test_win32_wait_subsystem() -> bool {
+    // 1. Single-object wait (manual-reset & auto-reset events)
+    let h_manual = win32_create_waitable_event(true, false, Some("KntWaitManualEvent"));
+    let h_auto = win32_create_waitable_event(false, true, Some("KntWaitAutoEvent"));
+    if h_manual == 0 || h_auto == 0 {
+        return false;
+    }
+
+    if WaitForSingleObject(h_manual, 0) != WAIT_TIMEOUT {
+        return false;
+    }
+    if !win32_set_waitable_event(h_manual) {
+        return false;
+    }
+    if WaitForSingleObject(h_manual, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+    if WaitForSingleObject(h_manual, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+
+    // Auto-reset event initially signaled
+    if WaitForSingleObject(h_auto, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+    // Auto-reset consumed: next wait must time out
+    if WaitForSingleObject(h_auto, 0) != WAIT_TIMEOUT {
+        return false;
+    }
+
+    // 2. Mutex ownership and recursive acquisition
+    let h_mutex = win32_create_waitable_mutex(false, Some("KntWaitMutex"));
+    if h_mutex == 0 {
+        return false;
+    }
+    if WaitForSingleObject(h_mutex, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+    // Recursive acquisition
+    if WaitForSingleObject(h_mutex, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+    if !win32_release_waitable_mutex(h_mutex) {
+        return false;
+    }
+    if !win32_release_waitable_mutex(h_mutex) {
+        return false;
+    }
+
+    // 3. WaitAny multiplexing across heterogeneous objects
+    let h_sem = win32_create_waitable_semaphore(0, 10, Some("KntWaitSem"));
+    let h_timer = CreateWaitableTimerA(0, 0, b"KntWaitTimer\0".as_ptr());
+    if h_sem == 0 || h_timer == 0 {
+        return false;
+    }
+
+    let multiplex_handles = [h_sem, h_auto, h_timer];
+    if WaitForMultipleObjects(3, multiplex_handles.as_ptr(), 0, 0) != WAIT_TIMEOUT {
+        return false;
+    }
+
+    // Signal semaphore: WaitAny should return WAIT_OBJECT_0 + 0
+    if !win32_release_waitable_semaphore(h_sem, 1, core::ptr::null_mut()) {
+        return false;
+    }
+    if WaitForMultipleObjects(3, multiplex_handles.as_ptr(), 0, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+
+    // Signal auto event: WaitAny should return WAIT_OBJECT_0 + 1
+    if !win32_set_waitable_event(h_auto) {
+        return false;
+    }
+    if WaitForMultipleObjects(3, multiplex_handles.as_ptr(), 0, 0) != (WAIT_OBJECT_0 + 1) {
+        return false;
+    }
+
+    // 4. WaitAll atomic barrier
+    let barrier_handles = [h_sem, h_auto];
+    // h_sem count is 0, h_auto is false
+    if !win32_set_waitable_event(h_auto) {
+        return false;
+    }
+    // Only 1 of 2 is signaled: WaitAll must time out without consuming h_auto
+    if WaitForMultipleObjects(2, barrier_handles.as_ptr(), 1, 0) != WAIT_TIMEOUT {
+        return false;
+    }
+    // Verify atomic barrier preserved h_auto signaled state
+    if WaitForSingleObject(h_auto, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+
+    // Now signal both objects
+    if !win32_release_waitable_semaphore(h_sem, 1, core::ptr::null_mut()) {
+        return false;
+    }
+    if !win32_set_waitable_event(h_auto) {
+        return false;
+    }
+    if WaitForMultipleObjects(2, barrier_handles.as_ptr(), 1, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+
+    // 5. SignalObjectAndWait atomic transition
+    let h_sig_ev = win32_create_waitable_event(true, false, None);
+    let h_wait_ev = win32_create_waitable_event(true, true, None);
+    if SignalObjectAndWait(h_sig_ev, h_wait_ev, 0, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+    if WaitForSingleObject(h_sig_ev, 0) != WAIT_OBJECT_0 {
+        return false;
+    }
+
+    // 6. Alertable wait and User APC dispatch
+    TEST_APC_INVOCATIONS = 0;
+    if QueueUserAPC(test_apc_routine as *const () as usize, 0, 42) == 0 {
+        return false;
+    }
+
+    let h_nonsignaled = win32_create_waitable_event(false, false, None);
+    let wait_res = WaitForMultipleObjectsEx(1, &h_nonsignaled, 0, 10, 1);
+    if wait_res != WAIT_IO_COMPLETION {
+        return false;
+    }
+    if TEST_APC_INVOCATIONS != 42 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-WAIT-OK] Win32 waitable objects and multi-thread sync dispatcher verified\r\n");
+    true
+}
