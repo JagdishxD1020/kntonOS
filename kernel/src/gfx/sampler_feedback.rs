@@ -261,6 +261,166 @@ impl D3D12_SAMPLER_FEEDBACK_MAP {
     }
 }
 
+/// Representation of a required 64KB physical texture tile demanded by GPU feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequiredStreamingTile {
+    pub texture_id: u32,
+    pub mip_level: u16,
+    pub tile_x: u32,
+    pub tile_y: u32,
+    pub physical_tile_index: u32,
+    pub priority: u32,
+}
+
+/// Tracks current VRAM mip-level residency per 64KB physical tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureMipResidency {
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub resident_mips: alloc::vec::Vec<u8>,
+}
+
+impl TextureMipResidency {
+    /// Initializes residency map where all tiles initially reside at `default_mip`.
+    pub fn new(tiles_x: u32, tiles_y: u32, default_mip: u8) -> Self {
+        let count = (tiles_x * tiles_y) as usize;
+        Self {
+            tiles_x,
+            tiles_y,
+            resident_mips: alloc::vec![default_mip; count],
+        }
+    }
+
+    /// Returns resident mip level for tile `(tile_x, tile_y)`.
+    pub fn get_resident_mip(&self, tile_x: u32, tile_y: u32) -> u8 {
+        if tile_x < self.tiles_x && tile_y < self.tiles_y {
+            self.resident_mips[(tile_y * self.tiles_x + tile_x) as usize]
+        } else {
+            0xFF
+        }
+    }
+
+    /// Promotes resident mip level to higher-resolution `new_mip` if finer than current.
+    pub fn promote_tile_mip(&mut self, tile_x: u32, tile_y: u32, new_mip: u8) -> bool {
+        if tile_x < self.tiles_x && tile_y < self.tiles_y {
+            let idx = (tile_y * self.tiles_x + tile_x) as usize;
+            if new_mip < self.resident_mips[idx] {
+                self.resident_mips[idx] = new_mip;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Direct3D 12 Feedback Transcode Engine converting feedback maps to 64KB tile load requests.
+#[derive(Debug, Clone, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_FEEDBACK_TRANSCODE_ENGINE {
+    pub total_transcodes_performed: u64,
+    pub total_tiles_demanded: u64,
+    pub vram_bandwidth_saved_bytes: u64,
+}
+
+impl D3D12_FEEDBACK_TRANSCODE_ENGINE {
+    /// Creates a new feedback transcode engine.
+    pub const fn new() -> Self {
+        Self {
+            total_transcodes_performed: 0,
+            total_tiles_demanded: 0,
+            vram_bandwidth_saved_bytes: 0,
+        }
+    }
+
+    /// Transcodes a MinMip feedback map into prioritized 64KB physical tile load requests.
+    pub fn transcode_min_mip_map(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        residency: &TextureMipResidency,
+        texture_id: u32,
+    ) -> alloc::vec::Vec<RequiredStreamingTile> {
+        let mut required = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP {
+                        let resident_mip = residency.get_resident_mip(tx, ty);
+                        if sampled_mip < resident_mip {
+                            let priority = (resident_mip - sampled_mip) as u32 * 100;
+                            let physical_tile_index = ty * desc.map_width_tiles + tx;
+
+                            required.push(RequiredStreamingTile {
+                                texture_id,
+                                mip_level: sampled_mip as u16,
+                                tile_x: tx,
+                                tile_y: ty,
+                                physical_tile_index,
+                                priority,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort descending by priority (highest urgency loaded first)
+        required.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        self.total_transcodes_performed = self.total_transcodes_performed.saturating_add(1);
+        self.total_tiles_demanded = self.total_tiles_demanded.saturating_add(required.len() as u64);
+        // Track VRAM savings: each unaccessed tile saved 65536 bytes (64KB) of texture streaming
+        let unaccessed_count = desc.total_tiles().saturating_sub(required.len() as u32);
+        self.vram_bandwidth_saved_bytes = self.vram_bandwidth_saved_bytes
+            .saturating_add((unaccessed_count as u64) * 65536);
+
+        required
+    }
+
+    /// Transcodes a MipRegionUsed feedback bitmask map into physical 64KB tile load requests.
+    pub fn transcode_mip_region_used(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        residency: &TextureMipResidency,
+        texture_id: u32,
+    ) -> alloc::vec::Vec<RequiredStreamingTile> {
+        let mut required = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(mask) = feedback_map.get_mip_mask(tx, ty) {
+                    if mask != 0 {
+                        let resident_mip = residency.get_resident_mip(tx, ty);
+                        for m in 0..desc.target_mip_levels {
+                            if (mask & (1 << m)) != 0 && (m as u8) < resident_mip {
+                                let priority = (resident_mip - (m as u8)) as u32 * 100;
+                                let physical_tile_index = ty * desc.map_width_tiles + tx;
+
+                                required.push(RequiredStreamingTile {
+                                    texture_id,
+                                    mip_level: m,
+                                    tile_x: tx,
+                                    tile_y: ty,
+                                    physical_tile_index,
+                                    priority,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        required.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.total_transcodes_performed = self.total_transcodes_performed.saturating_add(1);
+        self.total_tiles_demanded = self.total_tiles_demanded.saturating_add(required.len() as u64);
+
+        required
+    }
+}
+
 /// Temporary stub for sampler feedback test during incremental commits.
 pub fn test_sampler_feedback_subsystem() -> bool {
     true
