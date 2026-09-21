@@ -421,7 +421,147 @@ impl D3D12_FEEDBACK_TRANSCODE_ENGINE {
     }
 }
 
-/// Temporary stub for sampler feedback test during incremental commits.
+// Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
+
+    // 1. Verify D3D12 Options7 feature query and Tier 1.0 capability reporting
+    let options7 = query_d3d12_options7_features();
+    if options7.SamplerFeedbackTier != D3D12_SAMPLER_FEEDBACK_TIER_1_0 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Options7 sampler feedback tier reporting failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Direct3D 12 Options7 Sampler Feedback Tier 1.0 capability verified\r\n");
+
+    // 2. Verify feedback map descriptor validation and coordinate conversion
+    let desc = match D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(
+        D3D12_SAMPLER_FEEDBACK_MIN_MIP,
+        2048,
+        2048,
+        12,
+        D3D12_SAMPLER_FEEDBACK_DEFAULT_TILE_SIZE,
+        D3D12_SAMPLER_FEEDBACK_DEFAULT_TILE_SIZE,
+    ) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::serial_write_str("[KNT-FEEDBACK-FAIL] Valid feedback map descriptor creation failed\r\n");
+            return false;
+        }
+    };
+
+    if desc.map_width_tiles != 16 || desc.map_height_tiles != 16 || desc.total_tiles() != 256 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Tile count calculation mismatch\r\n");
+        return false;
+    }
+    if desc.texel_to_tile(250, 500) != (1, 3) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Texel to tile coordinate mapping mismatch\r\n");
+        return false;
+    }
+
+    // Invalid parameters must fail
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 0, 1024, 10, 128, 128).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Zero texture width was not rejected\r\n");
+        return false;
+    }
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 1024, 1024, 0, 128, 128).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Zero mip count was not rejected\r\n");
+        return false;
+    }
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 1024, 1024, 10, 100, 100).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Non-power-of-two tile size was not rejected\r\n");
+        return false;
+    }
+
+    if D3D12_SAMPLER_FEEDBACK_VALIDATOR::validate_tile_region(&desc, 14, 14, 4, 4) != Err(SamplerFeedbackError::OutOfBounds) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Out of bounds tile region was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Feedback map descriptors and coordinate mappings verified\r\n");
+
+    // 3. Verify MinMip and MipRegionUsed GPU sampling simulation
+    let mut min_mip_map = D3D12_SAMPLER_FEEDBACK_MAP::new(desc);
+    if min_mip_map.get_min_mip(1, 1) != Some(D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Initial min-mip state must be unaccessed\r\n");
+        return false;
+    }
+
+    // Texel (150, 150) lies in tile (1, 1)
+    min_mip_map.record_sample(150, 150, 4);
+    if min_mip_map.get_min_mip(1, 1) != Some(4) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip sample record failed\r\n");
+        return false;
+    }
+
+    min_mip_map.record_sample(150, 150, 2); // Finer mip (numerically lower)
+    if min_mip_map.get_min_mip(1, 1) != Some(2) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip resolution to finer level failed\r\n");
+        return false;
+    }
+
+    min_mip_map.record_sample(150, 150, 5); // Coarser mip (numerically higher) should be ignored
+    if min_mip_map.get_min_mip(1, 1) != Some(2) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip erroneously clobbered by coarser mip\r\n");
+        return false;
+    }
+
+    if !min_mip_map.is_tile_accessed(1, 1) || min_mip_map.is_tile_accessed(0, 0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Tile accessed tracking mismatch\r\n");
+        return false;
+    }
+
+    let mask_desc = D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(
+        D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED,
+        2048,
+        2048,
+        12,
+        128,
+        128,
+    ).unwrap();
+    let mut mask_map = D3D12_SAMPLER_FEEDBACK_MAP::new(mask_desc);
+    mask_map.record_sample(150, 150, 1);
+    mask_map.record_sample(150, 150, 3);
+    if mask_map.get_mip_mask(1, 1) != Some(0x000A) { // bit 1 and bit 3
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] MipRegionUsed bitmask recording mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Min-mip and MipRegionUsed GPU sampling recording verified\r\n");
+
+    // 4. Verify feedback transcode engine and 64KB physical streaming tile generation
+    let mut residency = TextureMipResidency::new(16, 16, 4);
+    let mut transcode_engine = D3D12_FEEDBACK_TRANSCODE_ENGINE::new();
+
+    let demanded_tiles = transcode_engine.transcode_min_mip_map(&min_mip_map, &residency, 42);
+    if demanded_tiles.len() != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Transcode required tile count mismatch\r\n");
+        return false;
+    }
+
+    let tile = &demanded_tiles[0];
+    if tile.texture_id != 42 || tile.tile_x != 1 || tile.tile_y != 1 || tile.mip_level != 2 || tile.priority != 200 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Demanded tile metadata or priority mismatch\r\n");
+        return false;
+    }
+    if transcode_engine.vram_bandwidth_saved_bytes == 0 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] VRAM streaming bandwidth savings not tracked\r\n");
+        return false;
+    }
+
+    // Fulfill streaming tile promotion
+    if !residency.promote_tile_mip(tile.tile_x, tile.tile_y, tile.mip_level as u8) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Residency promotion failed\r\n");
+        return false;
+    }
+
+    // Re-transcode: no tiles demanded because residency now matches feedback min-mip
+    let re_demanded = transcode_engine.transcode_min_mip_map(&min_mip_map, &residency, 42);
+    if !re_demanded.is_empty() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Demanded tiles should be empty after promotion\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Transcode engine 64KB physical streaming tile generation verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-FEEDBACK-PASS] Direct3D 12 sampler feedback and texture streaming engine verified\r\n");
     true
 }
+
