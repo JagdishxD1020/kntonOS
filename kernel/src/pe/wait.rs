@@ -530,3 +530,174 @@ pub unsafe fn WaitForMultipleObjectsEx(
         crate::process::yield_now();
     }
 }
+
+/// Sets the specified waitable event object to the signaled state.
+pub fn win32_set_waitable_event(h_event: HANDLE) -> bool {
+    let mut table = WAITABLE_OBJECTS.lock();
+    if let Some(WaitableObject::Event(ref mut ev)) = table.get_mut(&h_event) {
+        ev.signaled = true;
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Sets the specified waitable event object to the nonsignaled state.
+pub fn win32_reset_waitable_event(h_event: HANDLE) -> bool {
+    let mut table = WAITABLE_OBJECTS.lock();
+    if let Some(WaitableObject::Event(ref mut ev)) = table.get_mut(&h_event) {
+        ev.signaled = false;
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Releases ownership of the specified waitable mutex object.
+pub fn win32_release_waitable_mutex(h_mutex: HANDLE) -> bool {
+    let cur_tid = get_current_wait_tid();
+    let mut table = WAITABLE_OBJECTS.lock();
+    if let Some(WaitableObject::Mutex(ref mut m)) = table.get_mut(&h_mutex) {
+        if m.owner_tid != cur_tid && m.owner_tid != 0 {
+            win32_set_last_error(ERROR_ACCESS_DENIED);
+            return false;
+        }
+        if m.recursion_count > 0 {
+            m.recursion_count -= 1;
+            if m.recursion_count == 0 {
+                m.owner_tid = 0;
+            }
+            win32_set_last_error(ERROR_SUCCESS);
+            true
+        } else {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            false
+        }
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Increases the count of the specified waitable semaphore.
+pub unsafe fn win32_release_waitable_semaphore(
+    h_semaphore: HANDLE,
+    release_count: i32,
+    previous_count: *mut i32,
+) -> bool {
+    if release_count <= 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let mut table = WAITABLE_OBJECTS.lock();
+    if let Some(WaitableObject::Semaphore(ref mut sem)) = table.get_mut(&h_semaphore) {
+        let prev = sem.current_count;
+        if prev.saturating_add(release_count) > sem.maximum_count {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        sem.current_count += release_count;
+        if !previous_count.is_null() {
+            *previous_count = prev;
+        }
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        false
+    }
+}
+
+/// Signals one object and waits on another object as an atomic operation.
+pub unsafe fn SignalObjectAndWait(
+    h_object_to_signal: HANDLE,
+    h_object_to_wait_on: HANDLE,
+    dw_milliseconds: u32,
+    b_alertable: i32,
+) -> u32 {
+    let cur_tid = get_current_wait_tid();
+    {
+        let mut table = WAITABLE_OBJECTS.lock();
+        let obj = match table.get_mut(&h_object_to_signal) {
+            Some(o) => o,
+            None => {
+                win32_set_last_error(ERROR_INVALID_HANDLE);
+                return WAIT_FAILED;
+            }
+        };
+
+        match obj {
+            WaitableObject::Event(ref mut ev) => {
+                ev.signaled = true;
+            }
+            WaitableObject::Mutex(ref mut m) => {
+                if m.owner_tid != cur_tid && m.owner_tid != 0 {
+                    win32_set_last_error(ERROR_ACCESS_DENIED);
+                    return WAIT_FAILED;
+                }
+                if m.recursion_count > 0 {
+                    m.recursion_count -= 1;
+                    if m.recursion_count == 0 {
+                        m.owner_tid = 0;
+                    }
+                }
+            }
+            WaitableObject::Semaphore(ref mut sem) => {
+                if sem.current_count < sem.maximum_count {
+                    sem.current_count += 1;
+                }
+            }
+            WaitableObject::Timer(ref mut t) => {
+                t.signaled = true;
+            }
+            WaitableObject::Thread(_) | WaitableObject::Process(_) => {
+                win32_set_last_error(ERROR_INVALID_PARAMETER);
+                return WAIT_FAILED;
+            }
+        }
+    }
+
+    WaitForMultipleObjectsEx(1, &h_object_to_wait_on, 0, dw_milliseconds, b_alertable)
+}
+
+/// Adds a user-mode asynchronous procedure call (APC) object to the APC queue of the specified thread.
+pub unsafe fn QueueUserAPC(
+    pfn_apc: usize,
+    h_thread: HANDLE,
+    dw_data: usize,
+) -> u32 {
+    if pfn_apc == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    let target_tid = {
+        let table = WAITABLE_OBJECTS.lock();
+        if let Some(WaitableObject::Thread(th)) = table.get(&h_thread) {
+            th.tid
+        } else if h_thread == 0 || h_thread == !0u64 {
+            get_current_wait_tid()
+        } else {
+            h_thread as u32
+        }
+    };
+
+    let entry = ApcEntry {
+        pfn_apc,
+        dw_data,
+    };
+
+    THREAD_APC_QUEUES
+        .lock()
+        .entry(target_tid)
+        .or_insert_with(VecDeque::new)
+        .push_back(entry);
+
+    win32_set_last_error(ERROR_SUCCESS);
+    1
+}
