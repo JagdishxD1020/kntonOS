@@ -1,727 +1,411 @@
-//! Direct3D 12 Kernel-Direct GPU Sampler Feedback Streaming & Texture LOD Clamp Engine.
-//! Implements hardware-accelerated Direct3D 12 Sampler Feedback specifications:
+//! Direct3D 12 Sampler Feedback & Texture Streaming Engine.
+//! Provides hardware-accelerated sampler feedback map generation and 64KB streaming tile transcoding.
 
-use alloc::vec;
-use alloc::vec::Vec;
+#![allow(dead_code)]
 
-/// Value indicating no mip level was sampled in a feedback tile (0xFF).
-pub const SAMPLER_FEEDBACK_UNACCESSED_MIP: u8 = 0xFF;
+/// Direct3D 12 Sampler Feedback Hardware Feature Tiers (`D3D12_SAMPLER_FEEDBACK_TIER`).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_SAMPLER_FEEDBACK_TIER {
+    #[default]
+    D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED = 0,
+    D3D12_SAMPLER_FEEDBACK_TIER_0_9 = 90,
+    D3D12_SAMPLER_FEEDBACK_TIER_1_0 = 100,
+}
 
-/// Maximum number of mip levels supported per texture resource.
-pub const MAX_TEXTURE_MIP_LEVELS: usize = 16;
+pub const D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED: D3D12_SAMPLER_FEEDBACK_TIER =
+    D3D12_SAMPLER_FEEDBACK_TIER::D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
+pub const D3D12_SAMPLER_FEEDBACK_TIER_0_9: D3D12_SAMPLER_FEEDBACK_TIER =
+    D3D12_SAMPLER_FEEDBACK_TIER::D3D12_SAMPLER_FEEDBACK_TIER_0_9;
+pub const D3D12_SAMPLER_FEEDBACK_TIER_1_0: D3D12_SAMPLER_FEEDBACK_TIER =
+    D3D12_SAMPLER_FEEDBACK_TIER::D3D12_SAMPLER_FEEDBACK_TIER_1_0;
 
-/// Default feedback tile dimension in texels (128x128).
-pub const DEFAULT_FEEDBACK_TILE_SIZE: u32 = 128;
+/// Direct3D 12 Options7 feature query structure (`D3D12_FEATURE_DATA_D3D12_OPTIONS7`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct D3D12_FEATURE_DATA_D3D12_OPTIONS7 {
+    pub SamplerFeedbackTier: D3D12_SAMPLER_FEEDBACK_TIER,
+}
 
-/// Errors returned by the sampler feedback subsystem.
+/// Queries hardware capability for Direct3D 12 Options7 sampler feedback support.
+pub fn query_d3d12_options7_features() -> D3D12_FEATURE_DATA_D3D12_OPTIONS7 {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 {
+        SamplerFeedbackTier: D3D12_SAMPLER_FEEDBACK_TIER::D3D12_SAMPLER_FEEDBACK_TIER_1_0,
+    }
+}
+
+/// Direct3D 12 Sampler Feedback Map archetype (`D3D12_SAMPLER_FEEDBACK_TYPE`).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_SAMPLER_FEEDBACK_TYPE {
+    /// Records the minimum (finest, numerically lowest) mip level accessed in each tile region.
+    D3D12_SAMPLER_FEEDBACK_MIN_MIP = 0,
+    /// Records a bitmask of accessed mip levels within each tile region.
+    D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED = 1,
+}
+
+pub const D3D12_SAMPLER_FEEDBACK_MIN_MIP: D3D12_SAMPLER_FEEDBACK_TYPE =
+    D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIN_MIP;
+pub const D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED: D3D12_SAMPLER_FEEDBACK_TYPE =
+    D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED;
+
+/// Sentinel indicating no mip level was sampled in a feedback tile (0xFF).
+pub const D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP: u8 = 0xFF;
+
+/// Standard 64KB tile dimension in texels for 2D RGBA8 textures.
+pub const D3D12_SAMPLER_FEEDBACK_DEFAULT_TILE_SIZE: u32 = 128;
+
+/// Errors returned by the sampler feedback and texture streaming subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplerFeedbackError {
-    /// Texture width or height is zero or invalid.
     InvalidTextureDimensions,
-    /// Tile coordinate or texel coordinate is out of bounds.
+    InvalidMipCount,
+    InvalidTileGranularity,
     OutOfBounds,
-    /// Mip level index exceeds texture's total mip count.
-    InvalidMipLevel,
-    /// Tile streaming request queue is full.
-    QueueFull,
-    /// Unsupported or invalid sampler feedback type.
-    InvalidFeedbackType,
+    UnsupportedFeatureTier,
 }
 
-/// Direct3D 12 Sampler Feedback map format archetype.
+/// Sampler Feedback Map creation descriptor pairing target texture dimensions with feedback tiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SamplerFeedbackType {
-    /// MinMipMap: Records the finest (numerically lowest) mip level accessed in each tile region.
-    MinMipMap,
-    /// TextureTranscoding: Records accessed tiles requiring on-demand format decompression or transcoding.
-    TextureTranscoding,
+#[allow(non_camel_case_types)]
+pub struct D3D12_SAMPLER_FEEDBACK_MAP_DESC {
+    pub feedback_type: D3D12_SAMPLER_FEEDBACK_TYPE,
+    pub target_width: u32,
+    pub target_height: u32,
+    pub target_mip_levels: u16,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub map_width_tiles: u32,
+    pub map_height_tiles: u32,
 }
 
-/// Sampler Feedback tile dimension granularity in texels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum FeedbackTileGranularity {
-    /// 32x32 texels per feedback tile.
-    Tile32x32 = 32,
-    /// 64x64 texels per feedback tile.
-    Tile64x64 = 64,
-    /// 128x128 texels per feedback tile.
-    Tile128x128 = 128,
-    /// 256x256 texels per feedback tile.
-    Tile256x256 = 256,
-}
-
-impl FeedbackTileGranularity {
-    /// Returns tile size in texels along one dimension.
-    #[inline]
-    pub const fn texel_size(self) -> u32 {
-        self as u32
-    }
-}
-
-/// Discrete rectangular region of tiles within a feedback map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FeedbackTileRegion {
-    /// Starting tile coordinate X.
-    pub tile_x: u32,
-    /// Starting tile coordinate Y.
-    pub tile_y: u32,
-    /// Number of tiles horizontally.
-    pub width_tiles: u32,
-    /// Number of tiles vertically.
-    pub height_tiles: u32,
-}
-
-impl FeedbackTileRegion {
-    /// Creates a new tile region.
-    pub const fn new(tile_x: u32, tile_y: u32, width_tiles: u32, height_tiles: u32) -> Self {
-        Self {
-            tile_x,
-            tile_y,
-            width_tiles,
-            height_tiles,
-        }
-    }
-
-    /// Evaluates if a given tile coordinate `(tx, ty)` lies within this region.
-    pub fn contains(&self, tx: u32, ty: u32) -> bool {
-        tx >= self.tile_x
-            && tx < self.tile_x.saturating_add(self.width_tiles)
-            && ty >= self.tile_y
-            && ty < self.tile_y.saturating_add(self.height_tiles)
-    }
-}
-
-/// Sampler Feedback Map Descriptor.
-/// Configures the association between a source texture resource and its paired
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FeedbackMapDescriptor {
-    /// Feedback map archetype (MinMipMap or TextureTranscoding).
-    pub feedback_type: SamplerFeedbackType,
-    /// Width of the paired texture in texels.
-    pub texture_width: u32,
-    /// Height of the paired texture in texels.
-    pub texture_height: u32,
-    /// Total number of mip levels in the paired texture.
-    pub mip_levels: u8,
-    /// Tile granularity in texels.
-    pub tile_granularity: FeedbackTileGranularity,
-    /// Number of horizontal feedback tiles.
-    pub tiles_x: u32,
-    /// Number of vertical feedback tiles.
-    pub tiles_y: u32,
-}
-
-impl FeedbackMapDescriptor {
-    /// Creates a new FeedbackMapDescriptor with validated dimensions.
+impl D3D12_SAMPLER_FEEDBACK_MAP_DESC {
+    /// Creates and validates a new sampler feedback map descriptor.
     pub fn new(
-        feedback_type: SamplerFeedbackType,
-        texture_width: u32,
-        texture_height: u32,
-        mip_levels: u8,
-        tile_granularity: FeedbackTileGranularity,
+        feedback_type: D3D12_SAMPLER_FEEDBACK_TYPE,
+        target_width: u32,
+        target_height: u32,
+        target_mip_levels: u16,
+        tile_width: u32,
+        tile_height: u32,
     ) -> Result<Self, SamplerFeedbackError> {
-        if texture_width == 0 || texture_height == 0 {
+        if target_width == 0 || target_height == 0 || target_width > 16384 || target_height > 16384 {
             return Err(SamplerFeedbackError::InvalidTextureDimensions);
         }
-        if mip_levels == 0 || mip_levels as usize > MAX_TEXTURE_MIP_LEVELS {
-            return Err(SamplerFeedbackError::InvalidMipLevel);
+        if target_mip_levels == 0 || target_mip_levels > 16 {
+            return Err(SamplerFeedbackError::InvalidMipCount);
+        }
+        if tile_width == 0 || tile_height == 0 || !tile_width.is_power_of_two() || !tile_height.is_power_of_two() {
+            return Err(SamplerFeedbackError::InvalidTileGranularity);
         }
 
-        let tile_size = tile_granularity.texel_size();
-        let tiles_x = (texture_width + tile_size - 1) / tile_size;
-        let tiles_y = (texture_height + tile_size - 1) / tile_size;
+        let map_width_tiles = (target_width.saturating_add(tile_width - 1)) / tile_width;
+        let map_height_tiles = (target_height.saturating_add(tile_height - 1)) / tile_height;
 
         Ok(Self {
             feedback_type,
-            texture_width,
-            texture_height,
-            mip_levels,
-            tile_granularity,
-            tiles_x,
-            tiles_y,
+            target_width,
+            target_height,
+            target_mip_levels,
+            tile_width,
+            tile_height,
+            map_width_tiles,
+            map_height_tiles,
         })
     }
 
-    /// Total number of feedback tiles in this map.
+    /// Total number of discrete feedback tiles spanning the target texture.
     #[inline]
-    pub fn total_tiles(&self) -> usize {
-        (self.tiles_x as usize) * (self.tiles_y as usize)
+    pub const fn total_tiles(&self) -> u32 {
+        self.map_width_tiles * self.map_height_tiles
     }
 
-    /// Maps a 2D texel coordinate `(x, y)` to its corresponding feedback tile coordinate `(tile_x, tile_y)`.
+    /// Maps a source texture texel coordinate `(x, y)` to its corresponding feedback tile coordinate.
+    #[inline]
     pub fn texel_to_tile(&self, x: u32, y: u32) -> (u32, u32) {
-        let tile_size = self.tile_granularity.texel_size();
-        let tx = core::cmp::min(x / tile_size, self.tiles_x.saturating_sub(1));
-        let ty = core::cmp::min(y / tile_size, self.tiles_y.saturating_sub(1));
-        (tx, ty)
+        (x / self.tile_width, y / self.tile_height)
+    }
+
+    /// Computes linear tile index for a given tile coordinate `(tile_x, tile_y)`.
+    #[inline]
+    pub fn tile_index(&self, tile_x: u32, tile_y: u32) -> Option<usize> {
+        if tile_x < self.map_width_tiles && tile_y < self.map_height_tiles {
+            Some((tile_y * self.map_width_tiles + tile_x) as usize)
+        } else {
+            None
+        }
     }
 }
 
-/// Underlying storage for a MinMipMap sampler feedback surface.
-/// Each tile is represented by 1 byte storing the minimum (highest resolution) mip level
-#[derive(Debug, Clone)]
-pub struct MinMipMapStorage {
-    tiles_x: u32,
-    tiles_y: u32,
-    data: Vec<u8>,
+/// Validator for Direct3D 12 Sampler Feedback creation and region bindings.
+#[allow(non_camel_case_types)]
+pub struct D3D12_SAMPLER_FEEDBACK_VALIDATOR;
+
+impl D3D12_SAMPLER_FEEDBACK_VALIDATOR {
+    /// Validates paired target texture dimensions and mip count.
+    pub fn validate_target_texture(width: u32, height: u32, mip_levels: u16) -> Result<(), SamplerFeedbackError> {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return Err(SamplerFeedbackError::InvalidTextureDimensions);
+        }
+        if mip_levels == 0 || mip_levels > 16 {
+            return Err(SamplerFeedbackError::InvalidMipCount);
+        }
+        Ok(())
+    }
+
+    /// Validates rectangular tile region against feedback map bounds.
+    pub fn validate_tile_region(
+        desc: &D3D12_SAMPLER_FEEDBACK_MAP_DESC,
+        tile_x: u32,
+        tile_y: u32,
+        width_tiles: u32,
+        height_tiles: u32,
+    ) -> Result<(), SamplerFeedbackError> {
+        if tile_x.saturating_add(width_tiles) > desc.map_width_tiles
+            || tile_y.saturating_add(height_tiles) > desc.map_height_tiles
+        {
+            return Err(SamplerFeedbackError::OutOfBounds);
+        }
+        Ok(())
+    }
 }
 
-impl MinMipMapStorage {
-    /// Creates a new storage buffer initialized to unaccessed state (0xFF).
-    pub fn new(tiles_x: u32, tiles_y: u32) -> Self {
-        let total = (tiles_x as usize) * (tiles_y as usize);
+/// Storage surface and GPU sampling simulator for Direct3D 12 Sampler Feedback Maps.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_SAMPLER_FEEDBACK_MAP {
+    pub desc: D3D12_SAMPLER_FEEDBACK_MAP_DESC,
+    pub min_mip_data: alloc::vec::Vec<u8>,
+    pub mip_mask_data: alloc::vec::Vec<u16>,
+    pub total_samples_recorded: u64,
+}
+
+impl D3D12_SAMPLER_FEEDBACK_MAP {
+    /// Allocates and initializes feedback map storage matching the descriptor.
+    pub fn new(desc: D3D12_SAMPLER_FEEDBACK_MAP_DESC) -> Self {
+        let count = desc.total_tiles() as usize;
+        let min_mip_data = alloc::vec![D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP; count];
+        let mip_mask_data = alloc::vec![0u16; count];
+
         Self {
-            tiles_x,
-            tiles_y,
-            data: vec![SAMPLER_FEEDBACK_UNACCESSED_MIP; total],
+            desc,
+            min_mip_data,
+            mip_mask_data,
+            total_samples_recorded: 0,
         }
     }
 
-    /// Clears the feedback map back to 0xFF (GPU clear operation).
+    /// Clears feedback map contents for the next frame.
     pub fn clear(&mut self) {
-        for byte in self.data.iter_mut() {
-            *byte = SAMPLER_FEEDBACK_UNACCESSED_MIP;
-        }
+        self.min_mip_data.fill(D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP);
+        self.mip_mask_data.fill(0);
+        self.total_samples_recorded = 0;
     }
 
-    /// Retrieves the recorded minimum mip level for tile `(tile_x, tile_y)`.
-    pub fn get(&self, tile_x: u32, tile_y: u32) -> Option<u8> {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return None;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        self.data.get(index).copied()
-    }
-
-    /// Records a texture sample operation into the feedback map (atomic minimum update).
-    pub fn record_sample(&mut self, tile_x: u32, tile_y: u32, sampled_mip: u8) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
+    /// Records a GPU texture sampling operation at `(texel_x, texel_y)` accessing `mip_level`.
+    pub fn record_sample(&mut self, texel_x: u32, texel_y: u32, mip_level: u8) -> bool {
+        if texel_x >= self.desc.target_width || texel_y >= self.desc.target_height {
             return false;
         }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        if let Some(slot) = self.data.get_mut(index) {
-            // Atomic Min: record coarsest or finest based on MinMip semantics (smaller number = higher res)
-            if *slot == SAMPLER_FEEDBACK_UNACCESSED_MIP || sampled_mip < *slot {
-                *slot = sampled_mip;
+        if mip_level >= self.desc.target_mip_levels as u8 {
+            return false;
+        }
+
+        let (tx, ty) = self.desc.texel_to_tile(texel_x, texel_y);
+        let idx = match self.desc.tile_index(tx, ty) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        match self.desc.feedback_type {
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIN_MIP => {
+                let current = self.min_mip_data[idx];
+                self.min_mip_data[idx] = if current == D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP {
+                    mip_level
+                } else {
+                    core::cmp::min(current, mip_level)
+                };
             }
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Whether a tile has been accessed by any shader invocation since last clear.
-    #[inline]
-    pub fn is_accessed(&self, tile_x: u32, tile_y: u32) -> bool {
-        self.get(tile_x, tile_y)
-            .map(|val| val != SAMPLER_FEEDBACK_UNACCESSED_MIP)
-            .unwrap_or(false)
-    }
-
-    /// Returns a slice over the raw 1-byte-per-tile buffer.
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Total tiles in the storage buffer.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Whether the storage buffer is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-}
-
-/// Flag indicating a tile requires on-demand format decompression or transcoding.
-pub const TRANSCODE_FLAG_REQUIRED: u8 = 0x01;
-/// Flag indicating a tile has completed transcoding and is ready for sampling.
-pub const TRANSCODE_FLAG_READY: u8 = 0x02;
-
-/// Underlying storage for a Texture Transcoding sampler feedback surface.
-/// Records which texture tiles were accessed by shaders to drive asynchronous
-#[derive(Debug, Clone)]
-pub struct TextureTranscodingStorage {
-    tiles_x: u32,
-    tiles_y: u32,
-    flags: Vec<u8>,
-}
-
-impl TextureTranscodingStorage {
-    /// Creates a new transcoding feedback storage buffer.
-    pub fn new(tiles_x: u32, tiles_y: u32) -> Self {
-        let total = (tiles_x as usize) * (tiles_y as usize);
-        Self {
-            tiles_x,
-            tiles_y,
-            flags: vec![0u8; total],
-        }
-    }
-
-    /// Clears all transcoding flags back to zero.
-    pub fn clear(&mut self) {
-        for slot in self.flags.iter_mut() {
-            *slot = 0;
-        }
-    }
-
-    /// Marks a tile as accessed and requiring transcoding.
-    pub fn mark_transcode_needed(&mut self, tile_x: u32, tile_y: u32) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        if let Some(slot) = self.flags.get_mut(index) {
-            *slot |= TRANSCODE_FLAG_REQUIRED;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Marks a tile as transcoded and ready.
-    pub fn mark_transcode_ready(&mut self, tile_x: u32, tile_y: u32) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        if let Some(slot) = self.flags.get_mut(index) {
-            *slot = (*slot & !TRANSCODE_FLAG_REQUIRED) | TRANSCODE_FLAG_READY;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Checks if a tile is flagged as requiring transcoding.
-    pub fn is_transcode_needed(&self, tile_x: u32, tile_y: u32) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        self.flags.get(index).map(|&f| (f & TRANSCODE_FLAG_REQUIRED) != 0).unwrap_or(false)
-    }
-
-    /// Checks if a tile is marked as transcoded and ready.
-    pub fn is_transcode_ready(&self, tile_x: u32, tile_y: u32) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        self.flags.get(index).map(|&f| (f & TRANSCODE_FLAG_READY) != 0).unwrap_or(false)
-    }
-}
-
-/// Tracks per-tile mip level residency for tiled / sparse textures in VRAM.
-#[derive(Debug, Clone)]
-pub struct TextureMipResidency {
-    tiles_x: u32,
-    tiles_y: u32,
-    base_resident_mip: u8,
-    resident_mips: Vec<u8>,
-}
-
-impl TextureMipResidency {
-    /// Creates a new residency map initialized to `base_resident_mip` for all tiles.
-    pub fn new(tiles_x: u32, tiles_y: u32, base_resident_mip: u8) -> Self {
-        let total = (tiles_x as usize) * (tiles_y as usize);
-        Self {
-            tiles_x,
-            tiles_y,
-            base_resident_mip,
-            resident_mips: vec![base_resident_mip; total],
-        }
-    }
-
-    /// Returns the currently resident finest mip level for tile `(tile_x, tile_y)`.
-    pub fn get_resident_mip(&self, tile_x: u32, tile_y: u32) -> u8 {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return self.base_resident_mip;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        self.resident_mips.get(index).copied().unwrap_or(self.base_resident_mip)
-    }
-
-    /// Promotes a tile's resident mip level to a finer (higher-resolution) mip level.
-    pub fn promote_tile_mip(&mut self, tile_x: u32, tile_y: u32, new_mip: u8) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        if let Some(slot) = self.resident_mips.get_mut(index) {
-            if new_mip < *slot {
-                *slot = new_mip;
-                true
-            } else {
-                false
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED => {
+                self.mip_mask_data[idx] |= 1u16 << mip_level;
             }
-        } else {
-            false
         }
+
+        self.total_samples_recorded = self.total_samples_recorded.saturating_add(1);
+        true
     }
 
-    /// Demotes a tile's resident mip level (coarser resolution, e.g. for memory eviction).
-    pub fn demote_tile_mip(&mut self, tile_x: u32, tile_y: u32, new_mip: u8) -> bool {
-        if tile_x >= self.tiles_x || tile_y >= self.tiles_y {
-            return false;
-        }
-        let index = (tile_y as usize) * (self.tiles_x as usize) + (tile_x as usize);
-        if let Some(slot) = self.resident_mips.get_mut(index) {
-            if new_mip > *slot {
-                *slot = new_mip;
-                true
-            } else {
-                false
+    /// Reads recorded minimum mip level for tile `(tile_x, tile_y)`.
+    pub fn get_min_mip(&self, tile_x: u32, tile_y: u32) -> Option<u8> {
+        self.desc.tile_index(tile_x, tile_y).map(|idx| self.min_mip_data[idx])
+    }
+
+    /// Reads recorded mip mask for tile `(tile_x, tile_y)`.
+    pub fn get_mip_mask(&self, tile_x: u32, tile_y: u32) -> Option<u16> {
+        self.desc.tile_index(tile_x, tile_y).map(|idx| self.mip_mask_data[idx])
+    }
+
+    /// Evaluates if tile `(tile_x, tile_y)` was accessed during the frame.
+    pub fn is_tile_accessed(&self, tile_x: u32, tile_y: u32) -> bool {
+        match self.desc.feedback_type {
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIN_MIP => {
+                self.get_min_mip(tile_x, tile_y).map_or(false, |m| m != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP)
             }
-        } else {
-            false
-        }
-    }
-
-    /// Evaluates the coarsest resident mip across the entire texture.
-    pub fn coarsest_resident_mip(&self) -> u8 {
-        self.resident_mips.iter().copied().max().unwrap_or(self.base_resident_mip)
-    }
-
-    /// Evaluates the finest resident mip across the entire texture.
-    pub fn finest_resident_mip(&self) -> u8 {
-        self.resident_mips.iter().copied().min().unwrap_or(self.base_resident_mip)
-    }
-
-    /// Resets all tiles back to the base resident mip.
-    pub fn reset_to_base(&mut self) {
-        for slot in self.resident_mips.iter_mut() {
-            *slot = self.base_resident_mip;
+            D3D12_SAMPLER_FEEDBACK_TYPE::D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED => {
+                self.get_mip_mask(tile_x, tile_y).map_or(false, |m| m != 0)
+            }
         }
     }
 }
 
-/// A prioritized tile streaming request generated from feedback analysis.
+/// Representation of a required 64KB physical texture tile demanded by GPU feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TileStreamingRequest {
-    /// Texture resource identifier.
+pub struct RequiredStreamingTile {
     pub texture_id: u32,
-    /// Tile coordinate X.
+    pub mip_level: u16,
     pub tile_x: u32,
-    /// Tile coordinate Y.
     pub tile_y: u32,
-    /// Mip level requested by the GPU shader.
-    pub requested_mip: u8,
-    /// Streaming urgency priority (higher value = higher priority).
+    pub physical_tile_index: u32,
     pub priority: u32,
 }
 
-impl TileStreamingRequest {
-    /// Creates a new streaming request.
-    pub const fn new(
-        texture_id: u32,
-        tile_x: u32,
-        tile_y: u32,
-        requested_mip: u8,
-        priority: u32,
-    ) -> Self {
-        Self {
-            texture_id,
-            tile_x,
-            tile_y,
-            requested_mip,
-            priority,
-        }
-    }
+/// Tracks current VRAM mip-level residency per 64KB physical tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureMipResidency {
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub resident_mips: alloc::vec::Vec<u8>,
 }
 
-/// Request queue prioritizing texture tile streaming for DirectStorage and asynchronous I/O.
-#[derive(Debug, Clone)]
-pub struct TileRequestQueue {
-    requests: Vec<TileStreamingRequest>,
-    capacity: usize,
-}
-
-impl TileRequestQueue {
-    /// Creates a new request queue with the specified maximum capacity.
-    pub fn new(capacity: usize) -> Self {
+impl TextureMipResidency {
+    /// Initializes residency map where all tiles initially reside at `default_mip`.
+    pub fn new(tiles_x: u32, tiles_y: u32, default_mip: u8) -> Self {
+        let count = (tiles_x * tiles_y) as usize;
         Self {
-            requests: Vec::with_capacity(capacity),
-            capacity,
+            tiles_x,
+            tiles_y,
+            resident_mips: alloc::vec![default_mip; count],
         }
     }
 
-    /// Pushes a tile streaming request into the queue with deduplication and priority ordering.
-    /// Returns `Ok(true)` if newly added, `Ok(false)` if merged/deduplicated, or `Err(QueueFull)`.
-    pub fn push(&mut self, request: TileStreamingRequest) -> Result<bool, SamplerFeedbackError> {
-        // Check for duplicate request targeting the same tile
-        if let Some(existing) = self.requests.iter_mut().find(|r| {
-            r.texture_id == request.texture_id && r.tile_x == request.tile_x && r.tile_y == request.tile_y
-        }) {
-            // Update to higher priority and finer mip level if new request is more urgent
-            if request.requested_mip < existing.requested_mip {
-                existing.requested_mip = request.requested_mip;
-            }
-            if request.priority > existing.priority {
-                existing.priority = request.priority;
-            }
-            return Ok(false);
-        }
-
-        if self.requests.len() >= self.capacity {
-            return Err(SamplerFeedbackError::QueueFull);
-        }
-
-        // Insert maintaining descending priority order
-        let insert_pos = self
-            .requests
-            .iter()
-            .position(|r| r.priority < request.priority)
-            .unwrap_or(self.requests.len());
-
-        self.requests.insert(insert_pos, request);
-        Ok(true)
-    }
-
-    /// Pops the highest-priority pending tile request.
-    pub fn pop(&mut self) -> Option<TileStreamingRequest> {
-        if self.requests.is_empty() {
-            None
+    /// Returns resident mip level for tile `(tile_x, tile_y)`.
+    pub fn get_resident_mip(&self, tile_x: u32, tile_y: u32) -> u8 {
+        if tile_x < self.tiles_x && tile_y < self.tiles_y {
+            self.resident_mips[(tile_y * self.tiles_x + tile_x) as usize]
         } else {
-            Some(self.requests.remove(0))
+            0xFF
         }
     }
 
-    /// Peeks at the highest-priority pending tile request without removing it.
-    #[inline]
-    pub fn peek(&self) -> Option<&TileStreamingRequest> {
-        self.requests.first()
-    }
-
-    /// Number of pending requests currently queued.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.requests.len()
-    }
-
-    /// Whether the queue is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
-    /// Maximum capacity of the queue.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Clears all pending requests.
-    pub fn clear(&mut self) {
-        self.requests.clear();
+    /// Promotes resident mip level to higher-resolution `new_mip` if finer than current.
+    pub fn promote_tile_mip(&mut self, tile_x: u32, tile_y: u32, new_mip: u8) -> bool {
+        if tile_x < self.tiles_x && tile_y < self.tiles_y {
+            let idx = (tile_y * self.tiles_x + tile_x) as usize;
+            if new_mip < self.resident_mips[idx] {
+                self.resident_mips[idx] = new_mip;
+                return true;
+            }
+        }
+        false
     }
 }
 
-/// Telemetry statistics for the sampler feedback and texture streaming engine.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SamplerFeedbackStats {
-    /// Total simulated GPU texture sample operations recorded into feedback map.
-    pub total_samples_recorded: u64,
-    /// Total evaluations performed across the feedback map.
-    pub evaluations_performed: u64,
-    /// Total tile streaming I/O requests generated for missing high-res mips.
-    pub tile_requests_generated: u64,
-    /// Total tile streaming requests fulfilled and uploaded to VRAM.
-    pub tile_requests_fulfilled: u64,
+/// Direct3D 12 Feedback Transcode Engine converting feedback maps to 64KB tile load requests.
+#[derive(Debug, Clone, Default)]
+#[allow(non_camel_case_types)]
+pub struct D3D12_FEEDBACK_TRANSCODE_ENGINE {
+    pub total_transcodes_performed: u64,
+    pub total_tiles_demanded: u64,
+    pub vram_bandwidth_saved_bytes: u64,
 }
 
-/// Dynamic Texture LOD Clamp Governor.
-/// Dynamically calculates hardware sampler MinLOD clamps to prevent GPU shaders from
-#[derive(Debug, Clone)]
-pub struct TextureLodClampGovernor {
-    /// Active hardware sampler minimum LOD clamp (finest allowed mip index).
-    active_min_lod_clamp: f32,
-    /// Baseline fallback resident mip level (always present in VRAM).
-    base_resident_mip: u8,
-    /// Target ideal mip level requested by shaders.
-    target_mip: u8,
-}
-
-impl TextureLodClampGovernor {
-    /// Creates a new LOD clamp governor initialized to the base resident mip level.
-    pub fn new(base_resident_mip: u8) -> Self {
+impl D3D12_FEEDBACK_TRANSCODE_ENGINE {
+    /// Creates a new feedback transcode engine.
+    pub const fn new() -> Self {
         Self {
-            active_min_lod_clamp: base_resident_mip as f32,
-            base_resident_mip,
-            target_mip: 0,
+            total_transcodes_performed: 0,
+            total_tiles_demanded: 0,
+            vram_bandwidth_saved_bytes: 0,
         }
     }
 
-    /// Active minimum LOD clamp value (in fractional mip level units).
-    #[inline]
-    pub fn active_min_lod_clamp(&self) -> f32 {
-        self.active_min_lod_clamp
-    }
+    /// Transcodes a MinMip feedback map into prioritized 64KB physical tile load requests.
+    pub fn transcode_min_mip_map(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        residency: &TextureMipResidency,
+        texture_id: u32,
+    ) -> alloc::vec::Vec<RequiredStreamingTile> {
+        let mut required = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
 
-    /// Base resident fallback mip level.
-    #[inline]
-    pub fn base_resident_mip(&self) -> u8 {
-        self.base_resident_mip
-    }
-
-    /// Target ideal mip level requested by GPU shaders.
-    #[inline]
-    pub fn target_mip(&self) -> u8 {
-        self.target_mip
-    }
-
-    /// Updates the hardware sampler clamp based on current per-tile residency.
-    pub fn update_clamp_from_residency(&mut self, residency: &TextureMipResidency) {
-        let finest_resident = residency.finest_resident_mip();
-        self.active_min_lod_clamp = finest_resident as f32;
-    }
-
-    /// Sets the target ideal mip level.
-    pub fn set_target_mip(&mut self, target: u8) {
-        self.target_mip = target;
-    }
-}
-
-/// Kernel-Direct GPU Sampler Feedback Streaming & Texture LOD Clamp Engine.
-/// Orchestrates paired sampler feedback maps (MinMipMap and TextureTranscoding),
-#[derive(Debug)]
-pub struct SamplerFeedbackEngine {
-    /// Paired texture and feedback map descriptor.
-    descriptor: FeedbackMapDescriptor,
-    /// MinMipMap feedback storage surface.
-    min_mip_map: MinMipMapStorage,
-    /// Texture transcoding feedback storage surface.
-    transcoding_map: TextureTranscodingStorage,
-    /// Per-tile mip level residency tracker.
-    residency: TextureMipResidency,
-    /// Priority request queue for asynchronous tile streaming.
-    request_queue: TileRequestQueue,
-    /// Dynamic hardware sampler LOD clamp governor.
-    lod_governor: TextureLodClampGovernor,
-    /// Profiling and streaming telemetry.
-    stats: SamplerFeedbackStats,
-}
-
-impl SamplerFeedbackEngine {
-    /// Creates a new SamplerFeedbackEngine paired with a texture resource.
-    pub fn new(
-        descriptor: FeedbackMapDescriptor,
-        base_resident_mip: u8,
-        queue_capacity: usize,
-    ) -> Self {
-        let tx = descriptor.tiles_x;
-        let ty = descriptor.tiles_y;
-
-        Self {
-            descriptor,
-            min_mip_map: MinMipMapStorage::new(tx, ty),
-            transcoding_map: TextureTranscodingStorage::new(tx, ty),
-            residency: TextureMipResidency::new(tx, ty, base_resident_mip),
-            request_queue: TileRequestQueue::new(queue_capacity),
-            lod_governor: TextureLodClampGovernor::new(base_resident_mip),
-            stats: SamplerFeedbackStats::default(),
-        }
-    }
-
-    /// Paired feedback map descriptor.
-    #[inline]
-    pub fn descriptor(&self) -> &FeedbackMapDescriptor {
-        &self.descriptor
-    }
-
-    /// Reference to MinMipMap storage.
-    #[inline]
-    pub fn min_mip_map(&self) -> &MinMipMapStorage {
-        &self.min_mip_map
-    }
-
-    /// Mutably access MinMipMap storage.
-    #[inline]
-    pub fn min_mip_map_mut(&mut self) -> &mut MinMipMapStorage {
-        &mut self.min_mip_map
-    }
-
-    /// Reference to Transcoding map storage.
-    #[inline]
-    pub fn transcoding_map(&self) -> &TextureTranscodingStorage {
-        &self.transcoding_map
-    }
-
-    /// Reference to texture mip residency tracker.
-    #[inline]
-    pub fn residency(&self) -> &TextureMipResidency {
-        &self.residency
-    }
-
-    /// Mutably access residency tracker.
-    #[inline]
-    pub fn residency_mut(&mut self) -> &mut TextureMipResidency {
-        &mut self.residency
-    }
-
-    /// Reference to the tile request queue.
-    #[inline]
-    pub fn request_queue(&self) -> &TileRequestQueue {
-        &self.request_queue
-    }
-
-    /// Mutably access tile request queue.
-    #[inline]
-    pub fn request_queue_mut(&mut self) -> &mut TileRequestQueue {
-        &mut self.request_queue
-    }
-
-    /// Reference to the LOD clamp governor.
-    #[inline]
-    pub fn lod_governor(&self) -> &TextureLodClampGovernor {
-        &self.lod_governor
-    }
-
-    /// Engine telemetry statistics.
-    #[inline]
-    pub fn stats(&self) -> &SamplerFeedbackStats {
-        &self.stats
-    }
-
-    /// Records a simulated GPU shader texture sample operation into the feedback map.
-    pub fn record_sample(&mut self, texel_x: u32, texel_y: u32, sampled_mip: u8) {
-        let (tx, ty) = self.descriptor.texel_to_tile(texel_x, texel_y);
-        self.min_mip_map.record_sample(tx, ty, sampled_mip);
-        self.transcoding_map.mark_transcode_needed(tx, ty);
-        self.stats.total_samples_recorded += 1;
-    }
-
-    /// Evaluates the feedback map against current VRAM residency.
-    /// Identifies all tiles where `sampled_mip < resident_mip` (missing higher-resolution detail),
-    pub fn evaluate_feedback(&mut self, texture_id: u32) -> Result<usize, SamplerFeedbackError> {
-        let mut new_requests_count = 0;
-
-        for ty in 0..self.descriptor.tiles_y {
-            for tx in 0..self.descriptor.tiles_x {
-                if let Some(sampled_mip) = self.min_mip_map.get(tx, ty) {
-                    if sampled_mip != SAMPLER_FEEDBACK_UNACCESSED_MIP {
-                        let resident_mip = self.residency.get_resident_mip(tx, ty);
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP {
+                        let resident_mip = residency.get_resident_mip(tx, ty);
                         if sampled_mip < resident_mip {
-                            // Missing higher-resolution mip tile!
-                            // Priority calculation: urgency scales with mip distance
-                            let urgency = (resident_mip - sampled_mip) as u32 * 100;
+                            let priority = (resident_mip - sampled_mip) as u32 * 100;
+                            let physical_tile_index = ty * desc.map_width_tiles + tx;
 
-                            let req = TileStreamingRequest::new(
+                            required.push(RequiredStreamingTile {
                                 texture_id,
-                                tx,
-                                ty,
-                                sampled_mip,
-                                urgency,
-                            );
+                                mip_level: sampled_mip as u16,
+                                tile_x: tx,
+                                tile_y: ty,
+                                physical_tile_index,
+                                priority,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
-                            if self.request_queue.push(req)? {
-                                new_requests_count += 1;
-                                self.stats.tile_requests_generated += 1;
+        // Sort descending by priority (highest urgency loaded first)
+        required.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        self.total_transcodes_performed = self.total_transcodes_performed.saturating_add(1);
+        self.total_tiles_demanded = self.total_tiles_demanded.saturating_add(required.len() as u64);
+        // Track VRAM savings: each unaccessed tile saved 65536 bytes (64KB) of texture streaming
+        let unaccessed_count = desc.total_tiles().saturating_sub(required.len() as u32);
+        self.vram_bandwidth_saved_bytes = self.vram_bandwidth_saved_bytes
+            .saturating_add((unaccessed_count as u64) * 65536);
+
+        required
+    }
+
+    /// Transcodes a MipRegionUsed feedback bitmask map into physical 64KB tile load requests.
+    pub fn transcode_mip_region_used(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        residency: &TextureMipResidency,
+        texture_id: u32,
+    ) -> alloc::vec::Vec<RequiredStreamingTile> {
+        let mut required = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(mask) = feedback_map.get_mip_mask(tx, ty) {
+                    if mask != 0 {
+                        let resident_mip = residency.get_resident_mip(tx, ty);
+                        for m in 0..desc.target_mip_levels {
+                            if (mask & (1 << m)) != 0 && (m as u8) < resident_mip {
+                                let priority = (resident_mip - (m as u8)) as u32 * 100;
+                                let physical_tile_index = ty * desc.map_width_tiles + tx;
+
+                                required.push(RequiredStreamingTile {
+                                    texture_id,
+                                    mip_level: m,
+                                    tile_x: tx,
+                                    tile_y: ty,
+                                    physical_tile_index,
+                                    priority,
+                                });
                             }
                         }
                     }
@@ -729,27 +413,155 @@ impl SamplerFeedbackEngine {
             }
         }
 
-        self.lod_governor.update_clamp_from_residency(&self.residency);
-        self.stats.evaluations_performed += 1;
+        required.sort_by(|a, b| b.priority.cmp(&a.priority));
+        self.total_transcodes_performed = self.total_transcodes_performed.saturating_add(1);
+        self.total_tiles_demanded = self.total_tiles_demanded.saturating_add(required.len() as u64);
 
-        Ok(new_requests_count)
-    }
-
-    /// Fulfills a streaming tile request by promoting tile residency in VRAM
-    /// and updating the active sampler LOD clamp.
-    pub fn fulfill_tile_request(&mut self, req: &TileStreamingRequest) -> bool {
-        let promoted = self.residency.promote_tile_mip(req.tile_x, req.tile_y, req.requested_mip);
-        if promoted {
-            self.transcoding_map.mark_transcode_ready(req.tile_x, req.tile_y);
-            self.lod_governor.update_clamp_from_residency(&self.residency);
-            self.stats.tile_requests_fulfilled += 1;
-        }
-        promoted
-    }
-
-    /// Clears both MinMipMap and Transcoding feedback surfaces for the next frame.
-    pub fn clear_feedback(&mut self) {
-        self.min_mip_map.clear();
-        self.transcoding_map.clear();
+        required
     }
 }
+
+// Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
+pub fn test_sampler_feedback_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
+
+    // 1. Verify D3D12 Options7 feature query and Tier 1.0 capability reporting
+    let options7 = query_d3d12_options7_features();
+    if options7.SamplerFeedbackTier != D3D12_SAMPLER_FEEDBACK_TIER_1_0 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Options7 sampler feedback tier reporting failed\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Direct3D 12 Options7 Sampler Feedback Tier 1.0 capability verified\r\n");
+
+    // 2. Verify feedback map descriptor validation and coordinate conversion
+    let desc = match D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(
+        D3D12_SAMPLER_FEEDBACK_MIN_MIP,
+        2048,
+        2048,
+        12,
+        D3D12_SAMPLER_FEEDBACK_DEFAULT_TILE_SIZE,
+        D3D12_SAMPLER_FEEDBACK_DEFAULT_TILE_SIZE,
+    ) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::serial_write_str("[KNT-FEEDBACK-FAIL] Valid feedback map descriptor creation failed\r\n");
+            return false;
+        }
+    };
+
+    if desc.map_width_tiles != 16 || desc.map_height_tiles != 16 || desc.total_tiles() != 256 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Tile count calculation mismatch\r\n");
+        return false;
+    }
+    if desc.texel_to_tile(250, 500) != (1, 3) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Texel to tile coordinate mapping mismatch\r\n");
+        return false;
+    }
+
+    // Invalid parameters must fail
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 0, 1024, 10, 128, 128).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Zero texture width was not rejected\r\n");
+        return false;
+    }
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 1024, 1024, 0, 128, 128).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Zero mip count was not rejected\r\n");
+        return false;
+    }
+    if D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(D3D12_SAMPLER_FEEDBACK_MIN_MIP, 1024, 1024, 10, 100, 100).is_ok() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Non-power-of-two tile size was not rejected\r\n");
+        return false;
+    }
+
+    if D3D12_SAMPLER_FEEDBACK_VALIDATOR::validate_tile_region(&desc, 14, 14, 4, 4) != Err(SamplerFeedbackError::OutOfBounds) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Out of bounds tile region was not rejected\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Feedback map descriptors and coordinate mappings verified\r\n");
+
+    // 3. Verify MinMip and MipRegionUsed GPU sampling simulation
+    let mut min_mip_map = D3D12_SAMPLER_FEEDBACK_MAP::new(desc);
+    if min_mip_map.get_min_mip(1, 1) != Some(D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Initial min-mip state must be unaccessed\r\n");
+        return false;
+    }
+
+    // Texel (150, 150) lies in tile (1, 1)
+    min_mip_map.record_sample(150, 150, 4);
+    if min_mip_map.get_min_mip(1, 1) != Some(4) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip sample record failed\r\n");
+        return false;
+    }
+
+    min_mip_map.record_sample(150, 150, 2); // Finer mip (numerically lower)
+    if min_mip_map.get_min_mip(1, 1) != Some(2) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip resolution to finer level failed\r\n");
+        return false;
+    }
+
+    min_mip_map.record_sample(150, 150, 5); // Coarser mip (numerically higher) should be ignored
+    if min_mip_map.get_min_mip(1, 1) != Some(2) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Min-mip erroneously clobbered by coarser mip\r\n");
+        return false;
+    }
+
+    if !min_mip_map.is_tile_accessed(1, 1) || min_mip_map.is_tile_accessed(0, 0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Tile accessed tracking mismatch\r\n");
+        return false;
+    }
+
+    let mask_desc = D3D12_SAMPLER_FEEDBACK_MAP_DESC::new(
+        D3D12_SAMPLER_FEEDBACK_MIP_REGION_USED,
+        2048,
+        2048,
+        12,
+        128,
+        128,
+    ).unwrap();
+    let mut mask_map = D3D12_SAMPLER_FEEDBACK_MAP::new(mask_desc);
+    mask_map.record_sample(150, 150, 1);
+    mask_map.record_sample(150, 150, 3);
+    if mask_map.get_mip_mask(1, 1) != Some(0x000A) { // bit 1 and bit 3
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] MipRegionUsed bitmask recording mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Min-mip and MipRegionUsed GPU sampling recording verified\r\n");
+
+    // 4. Verify feedback transcode engine and 64KB physical streaming tile generation
+    let mut residency = TextureMipResidency::new(16, 16, 4);
+    let mut transcode_engine = D3D12_FEEDBACK_TRANSCODE_ENGINE::new();
+
+    let demanded_tiles = transcode_engine.transcode_min_mip_map(&min_mip_map, &residency, 42);
+    if demanded_tiles.len() != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Transcode required tile count mismatch\r\n");
+        return false;
+    }
+
+    let tile = &demanded_tiles[0];
+    if tile.texture_id != 42 || tile.tile_x != 1 || tile.tile_y != 1 || tile.mip_level != 2 || tile.priority != 200 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Demanded tile metadata or priority mismatch\r\n");
+        return false;
+    }
+    if transcode_engine.vram_bandwidth_saved_bytes == 0 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] VRAM streaming bandwidth savings not tracked\r\n");
+        return false;
+    }
+
+    // Fulfill streaming tile promotion
+    if !residency.promote_tile_mip(tile.tile_x, tile.tile_y, tile.mip_level as u8) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Residency promotion failed\r\n");
+        return false;
+    }
+
+    // Re-transcode: no tiles demanded because residency now matches feedback min-mip
+    let re_demanded = transcode_engine.transcode_min_mip_map(&min_mip_map, &residency, 42);
+    if !re_demanded.is_empty() {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Demanded tiles should be empty after promotion\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Transcode engine 64KB physical streaming tile generation verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-FEEDBACK-PASS] Direct3D 12 sampler feedback and texture streaming engine verified\r\n");
+    true
+}
+

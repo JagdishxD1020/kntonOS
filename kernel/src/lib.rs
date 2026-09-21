@@ -367,9 +367,9 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 work graphs autonomous GPU execution engine self-test failed!\r\n");
     }
 
-    // Initialize and verify Direct3D 12 Sampler Feedback Streaming & Texture LOD Clamp Engine
+    // Initialize and verify Direct3D 12 Sampler Feedback & Texture Streaming Engine (TASK-KNT-197)
     if !gfx::test_sampler_feedback_subsystem() {
-        serial_write_str("[KNT-PANIC] Direct3D 12 sampler feedback streaming self-test failed!\r\n");
+        serial_write_str("[KNT-PANIC] Direct3D 12 sampler feedback engine self-test failed!\r\n");
     }
 
     // Initialize and verify Direct3D 12 Enhanced Barriers & Split-Barrier Synchronized GPU Transition Engine
