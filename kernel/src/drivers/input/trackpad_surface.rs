@@ -275,3 +275,196 @@ pub fn verify_trackball_momentum_decay() -> bool {
 
     true
 }
+
+
+
+// Circular Scroll Wheel & 16-Slice Radial Menu Engine.
+
+/// Circular scroll wheel engine tracking rotational angle for scrolling and weapon cycling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CircularScrollWheel {
+    /// Angular step per discrete scroll notch in radians (e.g. 22.5 deg = 0.3927 rad).
+    pub step_angle_rad: f32,
+    /// Minimum radius threshold from center to engage scrolling (deadzone).
+    pub min_radius: f32,
+    /// Previous touch angle in radians (-PI .. +PI).
+    pub prev_angle_rad: f32,
+    /// Accumulated angular delta since last discrete scroll tick.
+    pub accumulated_angle_rad: f32,
+    /// Total discrete scroll clicks emitted.
+    pub total_scroll_clicks: i32,
+    /// Whether wheel tracking is currently active.
+    pub is_active: bool,
+}
+
+impl CircularScrollWheel {
+    pub const fn new(step_angle_rad: f32, min_radius: f32) -> Self {
+        Self {
+            step_angle_rad,
+            min_radius,
+            prev_angle_rad: 0.0,
+            accumulated_angle_rad: 0.0,
+            total_scroll_clicks: 0,
+            is_active: false,
+        }
+    }
+
+    /// Default 16-notch scroll wheel (22.5 degrees per tick, 0.20 deadzone).
+    pub const fn default_16_notch() -> Self {
+        Self::new(0.3926991, 0.20)
+    }
+
+    /// Updates touch point and computes discrete scroll tick output (+1 clockwise, -1 counter-clockwise).
+    pub fn update(&mut self, x: f32, y: f32, touching: bool) -> i32 {
+        if !touching {
+            self.is_active = false;
+            self.accumulated_angle_rad = 0.0;
+            return 0;
+        }
+
+        let r = sqrt_f32(x * x + y * y);
+        if r < self.min_radius {
+            return 0;
+        }
+
+        let current_angle = atan2_f32(y, x);
+
+        if !self.is_active {
+            self.prev_angle_rad = current_angle;
+            self.is_active = true;
+            return 0;
+        }
+
+        // Compute shortest angular delta across [-PI, +PI] boundary
+        let mut d_theta = current_angle - self.prev_angle_rad;
+        let pi = 3.14159265;
+        while d_theta > pi {
+            d_theta -= 2.0 * pi;
+        }
+        while d_theta < -pi {
+            d_theta += 2.0 * pi;
+        }
+
+        self.prev_angle_rad = current_angle;
+        self.accumulated_angle_rad += d_theta;
+
+        let mut ticks = 0;
+        while self.accumulated_angle_rad >= self.step_angle_rad {
+            self.accumulated_angle_rad -= self.step_angle_rad;
+            ticks += 1;
+        }
+        while self.accumulated_angle_rad <= -self.step_angle_rad {
+            self.accumulated_angle_rad += self.step_angle_rad;
+            ticks -= 1;
+        }
+
+        self.total_scroll_clicks += ticks;
+        ticks
+    }
+}
+
+/// 16-Slice Radial Menu touch classifier for quick weapon/inventory selection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RadialMenuClassifier {
+    /// Inner deadzone radius below which no sector is highlighted.
+    pub deadzone_radius: f32,
+    /// Currently highlighted sector index (0..15), or None if in deadzone.
+    pub active_sector: Option<u8>,
+}
+
+impl RadialMenuClassifier {
+    pub const fn new(deadzone_radius: f32) -> Self {
+        Self {
+            deadzone_radius,
+            active_sector: None,
+        }
+    }
+
+    /// Evaluates touch point and returns active sector (0..15).
+    pub fn classify(&mut self, x: f32, y: f32, touching: bool) -> Option<u8> {
+        if !touching {
+            self.active_sector = None;
+            return None;
+        }
+
+        let r = sqrt_f32(x * x + y * y);
+        if r < self.deadzone_radius {
+            self.active_sector = None;
+            return None;
+        }
+
+        // Angle in radians [-PI .. +PI]
+        let angle = atan2_f32(y, x);
+        let pi = 3.14159265;
+        // Shift to [0 .. 2*PI]
+        let normalized_angle = if angle < 0.0 { angle + 2.0 * pi } else { angle };
+
+        // 16 sectors: sector size = 2*PI / 16 = PI / 8
+        let sector_size = (2.0 * pi) / 16.0;
+        // Add half sector offset so sector 0 is centered on positive X axis
+        let offset_angle = (normalized_angle + sector_size * 0.5) % (2.0 * pi);
+        let sector = (offset_angle / sector_size) as u8;
+        let clamped_sector = sector.min(15);
+
+        self.active_sector = Some(clamped_sector);
+        self.active_sector
+    }
+}
+
+/// Unit test verifying circular scroll wheel and 16-slice radial menu sector mapping.
+pub fn verify_scroll_wheel_and_radial_menu() -> bool {
+    // 1. Scroll Wheel verification
+    let mut wheel = CircularScrollWheel::default_16_notch();
+
+    // Touch down at (1.0, 0.0) -> angle 0
+    let t0 = wheel.update(1.0, 0.0, true);
+    if t0 != 0 || !wheel.is_active {
+        return false;
+    }
+
+    // Rotate clockwise: (0.92388, 0.38268) -> angle 22.5 deg (0.3927 rad)
+    let t1 = wheel.update(0.92388, 0.38268, true);
+    if t1 != 1 || wheel.total_scroll_clicks != 1 {
+        return false;
+    }
+
+    // Deadzone check: inside 0.20 radius -> outputs 0 ticks
+    let t_dz = wheel.update(0.05, 0.05, true);
+    if t_dz != 0 {
+        return false;
+    }
+
+    // 2. Radial Menu verification
+    let mut radial = RadialMenuClassifier::new(0.20);
+
+    // Deadzone check: (0.1, 0.0) with r=0.1 < 0.2 -> None
+    if radial.classify(0.1, 0.0, true).is_some() {
+        return false;
+    }
+
+    // East / 0 deg: (0.8, 0.0) -> Sector 0
+    let s_east = radial.classify(0.8, 0.0, true);
+    if s_east != Some(0) {
+        return false;
+    }
+
+    // North / 90 deg: (0.0, 0.8) -> Sector 4
+    let s_north = radial.classify(0.0, 0.8, true);
+    if s_north != Some(4) {
+        return false;
+    }
+
+    // West / 180 deg: (-0.8, 0.0) -> Sector 8
+    let s_west = radial.classify(-0.8, 0.0, true);
+    if s_west != Some(8) {
+        return false;
+    }
+
+    // South / 270 deg: (0.0, -0.8) -> Sector 12
+    let s_south = radial.classify(0.0, -0.8, true);
+    if s_south != Some(12) {
+        return false;
+    }
+
+    true
+}
