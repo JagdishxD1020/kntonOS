@@ -332,3 +332,119 @@ pub fn win32_set_thread_terminated(tid: u32, exit_code: u32) {
         }
     }
 }
+
+/// Updates active timers against current hardware tick count.
+pub fn update_active_waitable_timers(now_ticks: u64) {
+    let mut table = WAITABLE_OBJECTS.lock();
+    for obj in table.values_mut() {
+        if let WaitableObject::Timer(ref mut t) = obj {
+            if t.active && !t.signaled && now_ticks >= t.due_tick {
+                t.signaled = true;
+                if t.period_ms > 0 {
+                    t.due_tick = now_ticks.saturating_add(t.period_ms as u64);
+                } else if !t.manual_reset {
+                    t.active = false;
+                }
+            }
+        }
+    }
+}
+
+/// Evaluates if a waitable object is in the signaled state.
+pub fn is_waitable_signaled(obj: &WaitableObject, cur_tid: u32) -> bool {
+    match obj {
+        WaitableObject::Event(ev) => ev.signaled,
+        WaitableObject::Mutex(m) => m.owner_tid == 0 || m.owner_tid == cur_tid || m.abandoned,
+        WaitableObject::Semaphore(sem) => sem.current_count > 0,
+        WaitableObject::Timer(t) => t.signaled,
+        WaitableObject::Thread(th) => th.terminated,
+        WaitableObject::Process(pr) => pr.terminated,
+    }
+}
+
+/// Satisfies the wait on an object, updating its internal state.
+pub fn satisfy_waitable_object(obj: &mut WaitableObject, cur_tid: u32) -> bool {
+    match obj {
+        WaitableObject::Event(ev) => {
+            if !ev.manual_reset {
+                ev.signaled = false;
+            }
+            false
+        }
+        WaitableObject::Mutex(m) => {
+            let was_abandoned = m.abandoned;
+            m.abandoned = false;
+            m.owner_tid = cur_tid;
+            m.recursion_count = m.recursion_count.saturating_add(1);
+            was_abandoned
+        }
+        WaitableObject::Semaphore(sem) => {
+            sem.current_count = sem.current_count.saturating_sub(1);
+            false
+        }
+        WaitableObject::Timer(t) => {
+            if !t.manual_reset {
+                t.signaled = false;
+            }
+            false
+        }
+        WaitableObject::Thread(_) => false,
+        WaitableObject::Process(_) => false,
+    }
+}
+
+/// Dispatches wait evaluation across handles with WaitAny and WaitAll barrier semantics.
+pub fn evaluate_wait_handles(
+    handles: &[HANDLE],
+    wait_all: bool,
+    cur_tid: u32,
+) -> Option<u32> {
+    let mut table = WAITABLE_OBJECTS.lock();
+
+    // Verify all handles exist
+    for &h in handles {
+        if !table.contains_key(&h) {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return Some(WAIT_FAILED);
+        }
+    }
+
+    if wait_all {
+        let mut all_signaled = true;
+        for &h in handles {
+            if let Some(obj) = table.get(&h) {
+                if !is_waitable_signaled(obj, cur_tid) {
+                    all_signaled = false;
+                    break;
+                }
+            }
+        }
+
+        if all_signaled {
+            let mut abandoned = false;
+            for &h in handles {
+                if let Some(obj) = table.get_mut(&h) {
+                    if satisfy_waitable_object(obj, cur_tid) {
+                        abandoned = true;
+                    }
+                }
+            }
+            return Some(if abandoned { WAIT_ABANDONED_0 } else { WAIT_OBJECT_0 });
+        }
+    } else {
+        for (idx, &h) in handles.iter().enumerate() {
+            if let Some(obj) = table.get(&h) {
+                if is_waitable_signaled(obj, cur_tid) {
+                    let mut abandoned = false;
+                    if let Some(mut_obj) = table.get_mut(&h) {
+                        abandoned = satisfy_waitable_object(mut_obj, cur_tid);
+                    }
+                    let base = if abandoned { WAIT_ABANDONED_0 } else { WAIT_OBJECT_0 };
+                    return Some(base + idx as u32);
+                }
+            }
+        }
+    }
+
+    None
+}
