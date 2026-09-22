@@ -20,6 +20,7 @@ pub mod crypto;
 pub mod pipe;
 pub mod registry;
 pub mod mmap;
+pub mod wait;
 
 pub use header::*;
 pub use ntdll::*;
@@ -39,6 +40,7 @@ pub use crypto::*;
 pub use pipe::*;
 pub use registry::*;
 pub use mmap::*;
+pub use wait::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;

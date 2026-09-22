@@ -972,6 +972,13 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // Verify Win32 Waitable Objects & Multi-Thread Synchronization Dispatcher (TASK-KNT-196)
+    unsafe {
+        if !pe::test_win32_wait_subsystem() {
+            serial_write_str("[KNT-PANIC] Win32 waitable objects and multi-thread sync dispatcher self-test failed!\r\n");
+        }
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
