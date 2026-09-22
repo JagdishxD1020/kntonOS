@@ -442,6 +442,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 predication engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 DXR 1.1 Inline Ray Query & Procedural Intersection Engine (TASK-KNT-199)
+    if !gfx::test_ray_query_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 DXR 1.1 inline ray query self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Dynamic Micro-Mesh Displacement & Sub-Triangle Geometry LOD Compressor
     if !gfx::test_micromesh_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 micro-mesh displacement & sub-triangle self-test failed!\r\n");
