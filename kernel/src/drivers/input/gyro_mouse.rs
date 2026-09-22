@@ -192,3 +192,103 @@ pub fn verify_yaw_roll_tilt_combiner() -> bool {
 
     true
 }
+
+
+
+// Dual-Zone Angular Acceleration Curve for Precision Micro-Aiming & Flick Turns.
+
+/// Dual-zone acceleration curve settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualZoneAccelerationCurve {
+    /// Noise deadzone threshold in rad/s (below which output is zeroed).
+    pub deadzone_rad_s: f32,
+    /// Low-velocity threshold for micro-aiming dampening.
+    pub micro_aim_thresh_rad_s: f32,
+    /// Dampening scale factor for micro-aiming [0.0 .. 1.0] (nominally 0.60).
+    pub micro_aim_damping: f32,
+    /// High-velocity threshold where flick acceleration begins.
+    pub flick_thresh_rad_s: f32,
+    /// Quadratic acceleration multiplier coefficient for flicks.
+    pub flick_accel_coeff: f32,
+    /// Maximum acceleration multiplier cap.
+    pub max_accel_cap: f32,
+}
+
+impl DualZoneAccelerationCurve {
+    /// Esports competitive FPS profile with tremor suppression and rapid flick turns.
+    pub const fn competitive_fps() -> Self {
+        Self {
+            deadzone_rad_s: 0.015,
+            micro_aim_thresh_rad_s: 0.20,
+            micro_aim_damping: 0.60,
+            flick_thresh_rad_s: 1.00,
+            flick_accel_coeff: 0.80,
+            max_accel_cap: 3.00,
+        }
+    }
+
+    /// Evaluates dynamic sensitivity multiplier based on total angular speed in rad/s.
+    pub fn evaluate_gain(&self, angular_speed: f32) -> f32 {
+        if angular_speed <= self.deadzone_rad_s {
+            return 0.0;
+        }
+
+        if angular_speed < self.micro_aim_thresh_rad_s {
+            // Smoothly ramp from micro_aim_damping up towards 1.0
+            let t = (angular_speed - self.deadzone_rad_s) / (self.micro_aim_thresh_rad_s - self.deadzone_rad_s);
+            self.micro_aim_damping + (1.0 - self.micro_aim_damping) * t
+        } else if angular_speed <= self.flick_thresh_rad_s {
+            // Linear 1:1 natural response
+            1.0
+        } else {
+            // High-speed exponential flick turn zone
+            let excess = angular_speed - self.flick_thresh_rad_s;
+            let boosted = 1.0 + self.flick_accel_coeff * excess * excess;
+            boosted.min(self.max_accel_cap)
+        }
+    }
+
+    /// Applies dual-zone curve to 2D angular velocity vector (omega_x, omega_y).
+    pub fn apply_curve(&self, omega_x: f32, omega_y: f32) -> (f32, f32) {
+        let speed = sqrt_f32(omega_x * omega_x + omega_y * omega_y);
+        let gain = self.evaluate_gain(speed);
+        (omega_x * gain, omega_y * gain)
+    }
+}
+
+/// Unit test verifying dual-zone angular acceleration curve across velocity regimes.
+pub fn verify_dual_zone_acceleration() -> bool {
+    let curve = DualZoneAccelerationCurve::competitive_fps();
+
+    // 1. Noise deadzone test (0.01 rad/s <= 0.015) -> gain = 0.0
+    if curve.evaluate_gain(0.01) != 0.0 {
+        return false;
+    }
+
+    // 2. Micro-aiming zone (0.05 rad/s) -> gain is dampened (< 1.0)
+    let g_micro = curve.evaluate_gain(0.05);
+    if g_micro < 0.60 || g_micro >= 1.0 {
+        return false;
+    }
+
+    // 3. Normal tracking zone (0.50 rad/s) -> gain = 1.0 (exact natural response)
+    let g_norm = curve.evaluate_gain(0.50);
+    if (g_norm - 1.0).abs() > 0.001 {
+        return false;
+    }
+
+    // 4. High-velocity flick zone (2.0 rad/s > 1.0 thresh) -> gain is boosted (> 1.0)
+    let g_flick = curve.evaluate_gain(2.00);
+    // excess = 1.0 -> 1.0 + 0.8 * 1.0 = 1.8
+    if (g_flick - 1.8).abs() > 0.05 {
+        return false;
+    }
+
+    // 5. Max cap test (10.0 rad/s) -> clamped to max_accel_cap (3.00)
+    let g_max = curve.evaluate_gain(10.0);
+    if (g_max - 3.00).abs() > 0.001 {
+        return false;
+    }
+
+    true
+}
