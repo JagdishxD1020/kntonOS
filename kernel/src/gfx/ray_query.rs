@@ -79,3 +79,68 @@ impl InlineRayQueryDesc {
         }
     }
 }
+
+/// Axis-Aligned Bounding Box (AABB) enclosing procedural primitives in BVH leaves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RayAABB {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+impl RayAABB {
+    /// Creates a new Axis-Aligned Bounding Box.
+    pub const fn new(min: [f32; 3], max: [f32; 3]) -> Self {
+        Self { min, max }
+    }
+
+    /// Evaluates ray-box slab intersection returning entry and exit distances `(t_near, t_far)`.
+    pub fn intersect_ray(&self, ray: &RayDesc) -> Option<(f32, f32)> {
+        let mut t_near = ray.t_min;
+        let mut t_far = ray.t_max;
+
+        for i in 0..3 {
+            let dir = ray.direction[i];
+            let origin = ray.origin[i];
+            let b_min = self.min[i];
+            let b_max = self.max[i];
+
+            if dir.abs() < 1e-6 {
+                // Ray is parallel to slab; check if origin is outside box
+                if origin < b_min || origin > b_max {
+                    return None;
+                }
+            } else {
+                let inv_d = 1.0 / dir;
+                let mut t0 = (b_min - origin) * inv_d;
+                let mut t1 = (b_max - origin) * inv_d;
+
+                if t0 > t1 {
+                    core::mem::swap(&mut t0, &mut t1);
+                }
+
+                if t0 > t_near {
+                    t_near = t0;
+                }
+                if t1 < t_far {
+                    t_far = t1;
+                }
+
+                if t_near > t_far {
+                    return None;
+                }
+            }
+        }
+
+        Some((t_near, t_far))
+    }
+
+    /// Computes the center position of the bounding box.
+    #[inline(always)]
+    pub fn center(&self) -> [f32; 3] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+            (self.min[2] + self.max[2]) * 0.5,
+        ]
+    }
+}
