@@ -762,3 +762,95 @@ pub fn run_120fps_frame_benchmark() -> FrameBenchmarkMetrics {
         achieved_fps: 120,
     }
 }
+
+/// Global supervisor managing the Milestone 200 health matrix and benchmarks.
+pub struct Milestone200Supervisor {
+    registry: Milestone200Registry,
+    sweep_sequence: u64,
+    last_sweep: Option<Milestone200TelemetrySweep>,
+    last_benchmark: Option<FrameBenchmarkMetrics>,
+}
+
+static SUPERVISOR_INSTANCE: Spinlock<Milestone200Supervisor> = Spinlock::new(Milestone200Supervisor::new());
+
+impl Milestone200Supervisor {
+    /// Creates a newly initialized supervisor with standard operational subsystems.
+    pub const fn new() -> Self {
+        Self {
+            registry: Milestone200Registry::new(),
+            sweep_sequence: 0,
+            last_sweep: None,
+            last_benchmark: None,
+        }
+    }
+
+    /// Access the global supervisor singleton.
+    pub fn global() -> &'static Spinlock<Milestone200Supervisor> {
+        &SUPERVISOR_INSTANCE
+    }
+
+    /// Executes a telemetry sweep and saves the resulting snapshot.
+    pub fn run_telemetry_sweep(&mut self) -> Milestone200TelemetrySweep {
+        self.sweep_sequence += 1;
+        let sweep = self.registry.perform_telemetry_sweep(self.sweep_sequence);
+        self.last_sweep = Some(sweep);
+        sweep
+    }
+
+    /// Executes the 120 FPS frame benchmark and saves the resulting metrics.
+    pub fn run_frame_benchmark(&mut self) -> FrameBenchmarkMetrics {
+        let metrics = run_120fps_frame_benchmark();
+        self.last_benchmark = Some(metrics);
+        metrics
+    }
+
+    /// Returns the active registry reference.
+    pub fn registry(&self) -> &Milestone200Registry {
+        &self.registry
+    }
+
+    /// Returns a mutable reference to the registry.
+    pub fn registry_mut(&mut self) -> &mut Milestone200Registry {
+        &mut self.registry
+    }
+
+    /// Returns the last cached telemetry sweep if one has occurred.
+    pub fn last_sweep(&self) -> Option<Milestone200TelemetrySweep> {
+        self.last_sweep
+    }
+
+    /// Returns the last cached frame benchmark metrics.
+    pub fn last_benchmark(&self) -> Option<FrameBenchmarkMetrics> {
+        self.last_benchmark
+    }
+
+    /// Calculates overall readiness percentage across all subsystems.
+    pub fn overall_readiness(&self) -> u8 {
+        self.registry.calculate_readiness_score()
+    }
+
+    /// Returns category health summary.
+    pub fn category_summary(&self, category: SubsystemCategory) -> CategoryHealthSummary {
+        self.registry.category_summary(category)
+    }
+
+    /// Look up subsystem descriptor by ID.
+    pub fn get_subsystem(&self, id: u16) -> Option<Milestone200SubsystemEntry> {
+        self.registry.get_subsystem(id).copied()
+    }
+}
+
+/// Global convenience function to run a telemetry sweep via supervisor.
+pub fn milestone200_telemetry_sweep() -> Milestone200TelemetrySweep {
+    SUPERVISOR_INSTANCE.lock().run_telemetry_sweep()
+}
+
+/// Global convenience function to run 120 FPS benchmark via supervisor.
+pub fn milestone200_run_benchmark() -> FrameBenchmarkMetrics {
+    SUPERVISOR_INSTANCE.lock().run_frame_benchmark()
+}
+
+/// Global convenience function to query overall readiness score.
+pub fn milestone200_readiness_score() -> u8 {
+    SUPERVISOR_INSTANCE.lock().overall_readiness()
+}
