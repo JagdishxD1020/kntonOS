@@ -81,7 +81,7 @@ impl InlineRayQueryDesc {
 }
 
 /// Axis-Aligned Bounding Box (AABB) enclosing procedural primitives in BVH leaves.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct RayAABB {
     pub min: [f32; 3],
     pub max: [f32; 3],
@@ -293,5 +293,220 @@ impl InlineRayQuery {
     pub fn abort(&mut self) {
         self.status = RayQueryStatus::Finished;
         self.candidate = None;
+    }
+}
+
+/// Scene triangle primitive with Möller–Trumbore ray intersection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneTriangle {
+    pub v0: [f32; 3],
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub is_opaque: bool,
+    pub primitive_index: u32,
+}
+
+impl SceneTriangle {
+    /// Creates a new scene triangle.
+    pub const fn new(v0: [f32; 3], v1: [f32; 3], v2: [f32; 3], is_opaque: bool, primitive_index: u32) -> Self {
+        Self {
+            v0,
+            v1,
+            v2,
+            is_opaque,
+            primitive_index,
+        }
+    }
+
+    /// Evaluates ray-triangle intersection via Möller–Trumbore algorithm.
+    pub fn intersect_ray(&self, ray: &RayDesc) -> Option<(f32, [f32; 2], bool)> {
+        let e1 = [
+            self.v1[0] - self.v0[0],
+            self.v1[1] - self.v0[1],
+            self.v1[2] - self.v0[2],
+        ];
+        let e2 = [
+            self.v2[0] - self.v0[0],
+            self.v2[1] - self.v0[1],
+            self.v2[2] - self.v0[2],
+        ];
+
+        let h = [
+            ray.direction[1] * e2[2] - ray.direction[2] * e2[1],
+            ray.direction[2] * e2[0] - ray.direction[0] * e2[2],
+            ray.direction[0] * e2[1] - ray.direction[1] * e2[0],
+        ];
+
+        let a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+        if a.abs() < 1e-7 {
+            return None;
+        }
+
+        let f = 1.0 / a;
+        let s = [
+            ray.origin[0] - self.v0[0],
+            ray.origin[1] - self.v0[1],
+            ray.origin[2] - self.v0[2],
+        ];
+
+        let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+        if u < 0.0 || u > 1.0 {
+            return None;
+        }
+
+        let q = [
+            s[1] * e1[2] - s[2] * e1[1],
+            s[2] * e1[0] - s[0] * e1[2],
+            s[0] * e1[1] - s[1] * e1[0],
+        ];
+
+        let v = f * (ray.direction[0] * q[0] + ray.direction[1] * q[1] + ray.direction[2] * q[2]);
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+
+        let t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+        if t >= ray.t_min && t <= ray.t_max {
+            let front_face = a > 0.0;
+            Some((t, [u, v], front_face))
+        } else {
+            None
+        }
+    }
+}
+
+/// Procedural custom geometry AABB primitive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SceneProceduralAABB {
+    pub aabb: RayAABB,
+    pub primitive_index: u32,
+}
+
+/// Aggregated scene geometry simulating a TLAS/BLAS hierarchy.
+#[derive(Debug, Clone, Default)]
+pub struct SceneBVH {
+    pub bounds: RayAABB,
+    pub triangles: alloc::vec::Vec<SceneTriangle>,
+    pub procedural_aabbs: alloc::vec::Vec<SceneProceduralAABB>,
+}
+
+impl SceneBVH {
+    /// Creates an empty scene BVH.
+    pub const fn new(bounds: RayAABB) -> Self {
+        Self {
+            bounds,
+            triangles: alloc::vec::Vec::new(),
+            procedural_aabbs: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Adds a triangle primitive to the scene.
+    pub fn add_triangle(&mut self, tri: SceneTriangle) {
+        self.triangles.push(tri);
+    }
+
+    /// Adds a procedural AABB primitive to the scene.
+    pub fn add_procedural(&mut self, proc: SceneProceduralAABB) {
+        self.procedural_aabbs.push(proc);
+    }
+}
+
+/// Traversal engine simulating inline `RayQuery::Proceed()` execution loop.
+impl InlineRayQuery {
+    /// Progresses ray traversal through the scene BVH.
+    /// Returns `true` when a candidate is yielded for shader handling, or `false` when traversal finishes.
+    pub fn proceed(&mut self, scene: &SceneBVH, cursor: &mut usize) -> bool {
+        if self.status == RayQueryStatus::Finished {
+            return false;
+        }
+
+        if self.status == RayQueryStatus::NotStarted {
+            // First invocation: test scene-level bounding box
+            if scene.bounds.intersect_ray(&self.desc.ray).is_none() {
+                self.status = RayQueryStatus::Finished;
+                return false;
+            }
+            self.status = RayQueryStatus::InProgress;
+        }
+
+        // Process procedural AABB primitives first
+        if (self.desc.ray_flags & RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES) == 0 {
+            while *cursor < scene.procedural_aabbs.len() {
+                let idx = *cursor;
+                *cursor += 1;
+
+                let p = &scene.procedural_aabbs[idx];
+                let test_ray = RayDesc::new(
+                    self.desc.ray.origin,
+                    self.desc.ray.t_min,
+                    self.desc.ray.direction,
+                    self.ray_t_current,
+                );
+
+                if let Some((t_near, t_far)) = p.aabb.intersect_ray(&test_ray) {
+                    if t_near <= self.ray_t_current {
+                        self.candidate = Some(RayQueryCandidate::ProceduralPrimitive {
+                            primitive_index: p.primitive_index,
+                            aabb: p.aabb,
+                            t_near,
+                            t_far,
+                        });
+                        self.status = RayQueryStatus::InProgress;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Process triangle primitives
+        let tri_offset = scene.procedural_aabbs.len();
+        if (self.desc.ray_flags & RAY_FLAG_SKIP_TRIANGLES) == 0 {
+            while *cursor >= tri_offset && (*cursor - tri_offset) < scene.triangles.len() {
+                let tri_idx = *cursor - tri_offset;
+                *cursor += 1;
+
+                let tri = &scene.triangles[tri_idx];
+                let test_ray = RayDesc::new(
+                    self.desc.ray.origin,
+                    self.desc.ray.t_min,
+                    self.desc.ray.direction,
+                    self.ray_t_current,
+                );
+
+                if let Some((t, bary, front)) = tri.intersect_ray(&test_ray) {
+                    let is_opaque = tri.is_opaque || (self.desc.ray_flags & RAY_FLAG_FORCE_OPAQUE) != 0;
+
+                    if is_opaque && (self.desc.ray_flags & RAY_FLAG_FORCE_NON_OPAQUE) == 0 {
+                        // Opaque triangle: automatically commit as closest hit
+                        self.ray_t_current = t;
+                        self.committed_hit = CommittedHit::Triangle {
+                            instance_index: 0,
+                            primitive_index: tri.primitive_index,
+                            barycentrics: bary,
+                            t_hit: t,
+                            front_face: front,
+                        };
+
+                        if (self.desc.ray_flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0 {
+                            self.status = RayQueryStatus::Finished;
+                            return false;
+                        }
+                    } else {
+                        // Non-opaque triangle: yield candidate to shader
+                        self.candidate = Some(RayQueryCandidate::NonOpaqueTriangle {
+                            primitive_index: tri.primitive_index,
+                            barycentrics: bary,
+                            t_hit: t,
+                            front_face: front,
+                        });
+                        self.status = RayQueryStatus::InProgress;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        self.status = RayQueryStatus::Finished;
+        false
     }
 }
