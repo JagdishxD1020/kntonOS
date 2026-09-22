@@ -624,6 +624,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Gyro aiming and motion assist governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Gyro-to-Mouse & Dynamic Flick Aiming Translator (TASK-KNT-198)
+    if !drivers::input::test_gyro_mouse_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld gyro-to-mouse translator self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Capacitive Touch Controller & Multi-Finger Gesture Engine
     if !drivers::input::test_touch_and_gesture_subsystem() {
         serial_write_str("[KNT-PANIC] Touch and gesture subsystem self-test failed!\r\n");
