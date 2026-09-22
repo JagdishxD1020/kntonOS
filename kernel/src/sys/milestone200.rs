@@ -854,3 +854,60 @@ pub fn milestone200_run_benchmark() -> FrameBenchmarkMetrics {
 pub fn milestone200_readiness_score() -> u8 {
     SUPERVISOR_INSTANCE.lock().overall_readiness()
 }
+
+/// Comprehensive self-test for Milestone 200 supervisor, health matrix, and 120 FPS benchmark.
+pub fn test_milestone_200_supervisor() -> bool {
+    let mut supervisor = Milestone200Supervisor::new();
+
+    // 1. Verify subsystem registry completeness across all 41 subsystems.
+    if supervisor.registry().entries.len() != TOTAL_MILESTONE_200_SUBSYSTEMS {
+        return false;
+    }
+
+    let graphics = supervisor.category_summary(SubsystemCategory::Graphics);
+    let handheld = supervisor.category_summary(SubsystemCategory::Handheld);
+    let win32 = supervisor.category_summary(SubsystemCategory::Win32Userland);
+
+    if graphics.subsystems_count != 15 || graphics.operational_count != 15 {
+        return false;
+    }
+    if handheld.subsystems_count != 16 || handheld.operational_count != 16 {
+        return false;
+    }
+    if win32.subsystems_count != 10 || win32.operational_count != 10 {
+        return false;
+    }
+
+    // 2. Verify unified telemetry sweep and readiness scoring.
+    let sweep = supervisor.run_telemetry_sweep();
+    if sweep.total_subsystems != 41 || sweep.total_operational != 41 {
+        return false;
+    }
+    if sweep.overall_readiness_score != 100 {
+        return false;
+    }
+    if sweep.memory_report.total_allocated_bytes == 0 || sweep.thread_summary.active_threads == 0 {
+        return false;
+    }
+
+    // 3. Verify 120 FPS multi-threaded handheld frame benchmark loop.
+    let bench = supervisor.run_frame_benchmark();
+    if bench.frames_evaluated != 120 || bench.dropped_deadlines != 0 || bench.achieved_fps != 120 {
+        return false;
+    }
+    if bench.input_polling_max_us > FramePhase::InputPolling.budget_us() {
+        return false;
+    }
+    if bench.physics_wait_max_us > FramePhase::PhysicsWaitDispatch.budget_us() {
+        return false;
+    }
+    if bench.gpu_submit_max_us > FramePhase::GpuCommandSubmit.budget_us() {
+        return false;
+    }
+    if bench.audio_mix_max_us > FramePhase::AudioSpatialMix.budget_us() {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-MILESTONE-200-PASS] Milestone 200 unified gaming runtime supervisor verified\r\n");
+    true
+}

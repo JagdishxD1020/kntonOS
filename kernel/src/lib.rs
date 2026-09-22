@@ -979,6 +979,11 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // Verify Milestone 200 Unified Gaming Runtime Supervisor & Health Matrix (TASK-KNT-200)
+    if !sys::test_milestone_200_supervisor() {
+        serial_write_str("[KNT-PANIC] Milestone 200 supervisor self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
