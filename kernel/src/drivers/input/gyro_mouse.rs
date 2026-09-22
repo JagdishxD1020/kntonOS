@@ -292,3 +292,168 @@ pub fn verify_dual_zone_acceleration() -> bool {
 
     true
 }
+
+
+
+// Dual-Output Mapper (Relative Mouse Deltas & Virtual Thumbstick Deflection).
+
+/// Target output mode for translated gyro aiming motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GyroOutputTarget {
+    /// Relative mouse (dX, dY) delta packets for PC/Windows native aiming.
+    RelativeMouse,
+    /// Virtual right thumbstick deflection injection for console/gamepad-only titles.
+    VirtualThumbstick,
+}
+
+/// Output payload from gyro motion translator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GyroAimOutput {
+    /// Target mode used for this output.
+    pub target: GyroOutputTarget,
+    /// Relative mouse horizontal pixel delta (if RelativeMouse).
+    pub mouse_dx: i32,
+    /// Relative mouse vertical pixel delta (if RelativeMouse).
+    pub mouse_dy: i32,
+    /// Normalized right thumbstick X deflection [-1.0 .. 1.0] (if VirtualThumbstick).
+    pub stick_x: f32,
+    /// Normalized right thumbstick Y deflection [-1.0 .. 1.0] (if VirtualThumbstick).
+    pub stick_y: f32,
+    /// 16-bit signed stick X deflection [-32768 .. 32767].
+    pub raw_stick_x: i16,
+    /// 16-bit signed stick Y deflection [-32768 .. 32767].
+    pub raw_stick_y: i16,
+}
+
+impl GyroAimOutput {
+    pub const fn zero() -> Self {
+        Self {
+            target: GyroOutputTarget::RelativeMouse,
+            mouse_dx: 0,
+            mouse_dy: 0,
+            stick_x: 0.0,
+            stick_y: 0.0,
+            raw_stick_x: 0,
+            raw_stick_y: 0,
+        }
+    }
+}
+
+/// Dual-output gyro translator synthesizer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualOutputMapper {
+    pub target: GyroOutputTarget,
+    /// Mouse sensitivity scale: dots per radian (nominally 3600 / (2*PI) ~ 572.96).
+    pub mouse_dots_per_radian: f32,
+    /// Stick sensitivity scale: normalized deflection per (rad/s) (e.g. 0.50).
+    pub stick_gain_per_rad_s: f32,
+    /// Sub-pixel mouse X fractional accumulator.
+    pub residual_mouse_x: f32,
+    /// Sub-pixel mouse Y fractional accumulator.
+    pub residual_mouse_y: f32,
+}
+
+impl DualOutputMapper {
+    pub const fn new(target: GyroOutputTarget, mouse_dots_per_radian: f32, stick_gain: f32) -> Self {
+        Self {
+            target,
+            mouse_dots_per_radian,
+            stick_gain_per_rad_s: stick_gain,
+            residual_mouse_x: 0.0,
+            residual_mouse_y: 0.0,
+        }
+    }
+
+    /// Default hybrid gaming configuration (573 dots/rad, 0.5 stick gain).
+    pub const fn default_gaming(target: GyroOutputTarget) -> Self {
+        Self::new(target, 572.9578, 0.50)
+    }
+
+    /// Synthesizes output packet from angular rate (omega_x, omega_y) and delta time dt_s.
+    pub fn translate(&mut self, omega_x: f32, omega_y: f32, dt_s: f32) -> GyroAimOutput {
+        match self.target {
+            GyroOutputTarget::RelativeMouse => {
+                let rot_x = omega_x * dt_s;
+                let rot_y = omega_y * dt_s;
+
+                let total_x = rot_x * self.mouse_dots_per_radian + self.residual_mouse_x;
+                let total_y = rot_y * self.mouse_dots_per_radian + self.residual_mouse_y;
+
+                let dx = total_x as i32;
+                let dy = total_y as i32;
+
+                self.residual_mouse_x = total_x - (dx as f32);
+                self.residual_mouse_y = total_y - (dy as f32);
+
+                GyroAimOutput {
+                    target: GyroOutputTarget::RelativeMouse,
+                    mouse_dx: dx,
+                    mouse_dy: dy,
+                    stick_x: 0.0,
+                    stick_y: 0.0,
+                    raw_stick_x: 0,
+                    raw_stick_y: 0,
+                }
+            }
+            GyroOutputTarget::VirtualThumbstick => {
+                let sx = (omega_x * self.stick_gain_per_rad_s).clamp(-1.0, 1.0);
+                let sy = (omega_y * self.stick_gain_per_rad_s).clamp(-1.0, 1.0);
+
+                let raw_x = (sx * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                let raw_y = (sy * 32767.0).clamp(-32768.0, 32767.0) as i16;
+
+                GyroAimOutput {
+                    target: GyroOutputTarget::VirtualThumbstick,
+                    mouse_dx: 0,
+                    mouse_dy: 0,
+                    stick_x: sx,
+                    stick_y: sy,
+                    raw_stick_x: raw_x,
+                    raw_stick_y: raw_y,
+                }
+            }
+        }
+    }
+}
+
+/// Unit test verifying dual-output mapper for relative mouse and virtual thumbstick deflection.
+pub fn verify_dual_output_mapper() -> bool {
+    // 1. Relative Mouse translation test
+    let mut mouse_mapper = DualOutputMapper::default_gaming(GyroOutputTarget::RelativeMouse);
+
+    // Micro rotation: 0.1 rad/s for 1ms (0.001s) -> rot = 0.0001 rad -> dots = 0.0573
+    // Under integer threshold: dx = 0, residual accumulates
+    let out0 = mouse_mapper.translate(0.1, 0.0, 0.001);
+    if out0.mouse_dx != 0 || out0.target != GyroOutputTarget::RelativeMouse {
+        return false;
+    }
+    if (mouse_mapper.residual_mouse_x - 0.0573).abs() > 0.001 {
+        return false;
+    }
+
+    // Faster wrist rotation: 2.0 rad/s for 10ms (0.01s) -> rot = 0.02 rad -> dots = 11.459 + residual ~ 11.516
+    let out1 = mouse_mapper.translate(2.0, 0.0, 0.01);
+    if out1.mouse_dx != 11 {
+        return false;
+    }
+
+    // 2. Virtual Thumbstick translation test
+    let mut stick_mapper = DualOutputMapper::default_gaming(GyroOutputTarget::VirtualThumbstick);
+
+    // Rotate at 1.0 rad/s -> stick_x = 1.0 * 0.5 = 0.50
+    let out_stick = stick_mapper.translate(1.0, -1.0, 0.01);
+    if (out_stick.stick_x - 0.50).abs() > 0.01 || (out_stick.stick_y - (-0.50)).abs() > 0.01 {
+        return false;
+    }
+    if out_stick.raw_stick_x < 16000 || out_stick.raw_stick_y > -16000 {
+        return false;
+    }
+
+    // Saturation clamp: 5.0 rad/s -> stick_x clamped to 1.0 (raw 32767)
+    let out_sat = stick_mapper.translate(5.0, 0.0, 0.01);
+    if (out_sat.stick_x - 1.0).abs() > 0.001 || out_sat.raw_stick_x != 32767 {
+        return false;
+    }
+
+    true
+}
