@@ -144,3 +144,154 @@ impl RayAABB {
         ]
     }
 }
+
+/// Candidate intersection yielded by `RayQuery::Proceed` for shader inspection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RayQueryCandidate {
+    NonOpaqueTriangle {
+        primitive_index: u32,
+        barycentrics: [f32; 2],
+        t_hit: f32,
+        front_face: bool,
+    },
+    ProceduralPrimitive {
+        primitive_index: u32,
+        aabb: RayAABB,
+        t_near: f32,
+        t_far: f32,
+    },
+}
+
+/// Final committed intersection state of an inline ray query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommittedHit {
+    None,
+    Triangle {
+        instance_index: u32,
+        primitive_index: u32,
+        barycentrics: [f32; 2],
+        t_hit: f32,
+        front_face: bool,
+    },
+    Procedural {
+        instance_index: u32,
+        primitive_index: u32,
+        t_hit: f32,
+    },
+}
+
+impl Default for CommittedHit {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Inline Ray Query state machine coordinating ray traversal and candidate commitment.
+#[derive(Debug, Clone)]
+pub struct InlineRayQuery {
+    pub desc: InlineRayQueryDesc,
+    pub status: RayQueryStatus,
+    pub candidate: Option<RayQueryCandidate>,
+    pub committed_hit: CommittedHit,
+    pub ray_t_current: f32,
+}
+
+impl InlineRayQuery {
+    /// Initializes an inline ray query in `NotStarted` state.
+    pub fn new(desc: InlineRayQueryDesc) -> Self {
+        let ray_t_current = desc.ray.t_max;
+        Self {
+            desc,
+            status: RayQueryStatus::NotStarted,
+            candidate: None,
+            committed_hit: CommittedHit::None,
+            ray_t_current,
+        }
+    }
+
+    /// Current traversal state of the query.
+    #[inline(always)]
+    pub fn status(&self) -> RayQueryStatus {
+        self.status
+    }
+
+    /// Committed intersection result.
+    #[inline(always)]
+    pub fn committed_hit(&self) -> &CommittedHit {
+        &self.committed_hit
+    }
+
+    /// Active candidate awaiting shader accept/commit or reject decision.
+    #[inline(always)]
+    pub fn candidate(&self) -> Option<&RayQueryCandidate> {
+        self.candidate.as_ref()
+    }
+
+    /// Commits a candidate procedural primitive hit with caller-calculated intersection distance $t$.
+    pub fn commit_procedural_primitive_hit(&mut self, t_hit: f32) -> bool {
+        if self.status != RayQueryStatus::InProgress {
+            return false;
+        }
+
+        if let Some(RayQueryCandidate::ProceduralPrimitive { primitive_index, .. }) = self.candidate {
+            if t_hit >= self.desc.ray.t_min && t_hit <= self.ray_t_current {
+                self.ray_t_current = t_hit;
+                self.committed_hit = CommittedHit::Procedural {
+                    instance_index: 0,
+                    primitive_index,
+                    t_hit,
+                };
+                self.candidate = None;
+
+                if (self.desc.ray_flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0 {
+                    self.status = RayQueryStatus::Finished;
+                } else {
+                    self.status = RayQueryStatus::CommittedProceduralHit;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Commits a candidate non-opaque triangle hit.
+    pub fn commit_non_opaque_triangle_hit(&mut self) -> bool {
+        if self.status != RayQueryStatus::InProgress {
+            return false;
+        }
+
+        if let Some(RayQueryCandidate::NonOpaqueTriangle {
+            primitive_index,
+            barycentrics,
+            t_hit,
+            front_face,
+        }) = self.candidate
+        {
+            if t_hit >= self.desc.ray.t_min && t_hit <= self.ray_t_current {
+                self.ray_t_current = t_hit;
+                self.committed_hit = CommittedHit::Triangle {
+                    instance_index: 0,
+                    primitive_index,
+                    barycentrics,
+                    t_hit,
+                    front_face,
+                };
+                self.candidate = None;
+
+                if (self.desc.ray_flags & RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH) != 0 {
+                    self.status = RayQueryStatus::Finished;
+                } else {
+                    self.status = RayQueryStatus::CommittedTriangleHit;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Aborts the inline ray query, immediately terminating further traversal.
+    pub fn abort(&mut self) {
+        self.status = RayQueryStatus::Finished;
+        self.candidate = None;
+    }
+}
