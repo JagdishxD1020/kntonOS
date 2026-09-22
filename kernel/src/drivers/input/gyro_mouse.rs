@@ -457,3 +457,37 @@ pub fn verify_dual_output_mapper() -> bool {
 
     true
 }
+
+
+
+/// Comprehensive verification self-test suite for Handheld Gyro-to-Mouse & Dynamic Flick Aiming Translator.
+pub fn test_gyro_mouse_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Gyro-to-Mouse & Dynamic Flick Aiming Translator...\r\n");
+
+    // 1. Verify Activation Gating Triggers (Capacitive, Soft-Pull, Always-On, Button)
+    if !verify_activation_gating() {
+        crate::serial_write_str("[KNT-PANIC] Gyro activation gating verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Natural Yaw-Roll Sensor Combiner Across Tilt Pitch Angles
+    if !verify_yaw_roll_tilt_combiner() {
+        crate::serial_write_str("[KNT-PANIC] Natural yaw-roll sensor combiner verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Dual-Zone Angular Acceleration Curve (Micro-Aiming Dampener & Flick Multiplier)
+    if !verify_dual_zone_acceleration() {
+        crate::serial_write_str("[KNT-PANIC] Dual-zone angular acceleration curve verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Dual-Output Mapper (Relative Mouse Deltas & Virtual Stick Deflection)
+    if !verify_dual_output_mapper() {
+        crate::serial_write_str("[KNT-PANIC] Dual-output mapper verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-GYRO-MOUSE-PASS] Handheld gyro-to-mouse and dynamic flick aiming translator verified\r\n");
+    true
+}
