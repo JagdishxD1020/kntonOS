@@ -557,6 +557,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld BLE gamepad and LE Audio transceiver self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Wi-Fi 6E/7 Low-Latency Streaming & Packet Pacer (TASK-KNT-201)
+    if !drivers::net::test_wifi_gaming_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld Wi-Fi 6E/7 streaming and packet pacer self-test failed!\r\n");
+    }
+
     // Verify Unified Handheld PC Wi-Fi 6E/7 Latency-Optimized Packet Scheduler & Roaming Daemon (TASK-KNT-110)
     if !net::test_wifi_scheduler_and_roaming_subsystem() {
         serial_write_str("[KNT-PANIC] Wi-Fi 6E/7 packet scheduler and roaming daemon self-test failed!\r\n");
