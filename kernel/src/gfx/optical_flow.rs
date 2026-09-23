@@ -492,7 +492,111 @@ impl MotionVectorDilationFilter {
     }
 }
 
-/// Temporary stub for optical flow subsystem self-test during incremental commits.
+// Comprehensive verification self-test suite for Direct3D 12 Screen-Space Motion Vectors & Optical Flow
 pub fn test_optical_flow_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GPU-OPTICALFLOW] Initializing Direct3D 12 Optical Flow self-test...\r\n");
+
+    // 1. Verify 16-bit half-precision float encoding/decoding
+    let original_mv = ScreenSpaceMotionVector::new(12.5, -4.25);
+    let (hx, hy) = original_mv.to_half_f16();
+    let decoded_mv = ScreenSpaceMotionVector::from_half_f16(hx, hy);
+    if (decoded_mv.dx - 12.5).abs() > 0.05 || (decoded_mv.dy - -4.25).abs() > 0.05 {
+        crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Half-precision f16 encoding/decoding mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * 16-bit half-precision motion vector encoding verified\r\n");
+
+    // 2. Verify camera matrix delta velocity calculator from depth reprojection
+    let width = 32u32;
+    let height = 32u32;
+    let vp_prev = Matrix4x4::identity();
+    let mut vp_curr = Matrix4x4::identity();
+    // Simulate camera translation in X by +0.5 units
+    vp_curr.m[3][0] = 0.5;
+
+    let depth_buffer = alloc::vec![0.5f32; (width * height) as usize];
+    let motion_field = match CameraReprojectionVelocityCalculator::calculate_motion_field(
+        &vp_curr,
+        &vp_prev,
+        &depth_buffer,
+        width,
+        height,
+    ) {
+        Ok(field) => field,
+        Err(_) => {
+            crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Camera reprojection motion field generation failed\r\n");
+            return false;
+        }
+    };
+
+    let center_mv = motion_field.get(16, 16);
+    if center_mv.dx.abs() < 1e-4 {
+        crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Camera translation produced zero screen displacement\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Camera matrix delta reprojection and screen-space velocity verified\r\n");
+
+    // 3. Verify bidirectional optical flow cross-check and disocclusion mask detection
+    let mut fwd_flow = MotionVectorBuffer::new(width, height).unwrap();
+    let mut bwd_flow = MotionVectorBuffer::new(width, height).unwrap();
+
+    // Moving foreground object in forward flow: box (10..20, 10..20) moves (+4, 0)
+    for y in 10..20 {
+        for x in 10..20 {
+            fwd_flow.set(x, y, ScreenSpaceMotionVector::new(4.0, 0.0));
+        }
+    }
+    // Backward flow: box at (14..24, 10..20) moves (-4, 0)
+    for y in 10..20 {
+        for x in 14..24 {
+            bwd_flow.set(x, y, ScreenSpaceMotionVector::new(-4.0, 0.0));
+        }
+    }
+
+    let mask = match DisocclusionMask::detect(&fwd_flow, &bwd_flow, 1.0) {
+        Ok(m) => m,
+        Err(_) => {
+            crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Disocclusion mask detection failed\r\n");
+            return false;
+        }
+    };
+
+    if mask.disoccluded_pixels == 0 {
+        crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] No disocclusion detected behind moving object\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Bidirectional optical flow cross-check and disocclusion mask verified\r\n");
+
+    // 4. Verify motion vector dilation filter on silhouette edges
+    let mut depth_buf = alloc::vec![0.9f32; (width * height) as usize]; // Background depth 0.9
+    let mut raw_mv = MotionVectorBuffer::new(width, height).unwrap();
+
+    // Foreground object at depth 0.2 with high velocity (5.0, 0.0)
+    for y in 10..20 {
+        for x in 10..20 {
+            depth_buf[(y * width + x) as usize] = 0.2;
+            raw_mv.set(x, y, ScreenSpaceMotionVector::new(5.0, 0.0));
+        }
+    }
+
+    // Silhouette pixel at (20, 15) is background (depth 0.9, raw velocity 0.0)
+    let dilated_mv = match MotionVectorDilationFilter::dilate_motion_vectors(&raw_mv, &depth_buf, 0.5) {
+        Ok(d) => d,
+        Err(_) => {
+            crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Motion vector dilation filter failed\r\n");
+            return false;
+        }
+    };
+
+    let edge_mv = dilated_mv.get(20, 15);
+    if (edge_mv.dx - 5.0).abs() > 0.01 {
+        crate::serial_write_str("[KNT-OPTICALFLOW-FAIL] Silhouette edge pixel did not receive dilated foreground velocity\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Motion vector dilation filter and silhouette ghosting prevention verified\r\n");
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-GPU-OPTICALFLOW-PASS] Direct3D 12 screen-space motion vectors and optical flow generator verified\r\n");
     true
 }
+

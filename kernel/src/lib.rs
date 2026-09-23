@@ -417,9 +417,9 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 cluster cull & LOD streamer self-test failed!\r\n");
     }
 
-    // Initialize and verify Direct3D 12 Hardware Optical Flow Vector Accelerator & Frame Interpolation Motion Engine
+    // Initialize and verify Direct3D 12 Screen-Space Motion Vectors & Optical Flow Generator (TASK-KNT-202)
     if !gfx::test_optical_flow_subsystem() {
-        serial_write_str("[KNT-PANIC] Direct3D 12 optical flow & frame interpolation self-test failed!\r\n");
+        serial_write_str("[KNT-PANIC] Direct3D 12 optical flow generator self-test failed!\r\n");
     }
 
     // Initialize and verify Direct3D 12 Dynamic Tile Pool Memory Compactor & Sparse Virtual Texture Eviction Engine
