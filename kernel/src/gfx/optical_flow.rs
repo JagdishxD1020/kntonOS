@@ -345,6 +345,91 @@ impl CameraReprojectionVelocityCalculator {
     }
 }
 
+/// Binary disocclusion mask identifying newly revealed regions behind moving silhouettes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisocclusionMask {
+    pub width: u32,
+    pub height: u32,
+    pub mask: alloc::vec::Vec<u8>,
+    pub disoccluded_pixels: u32,
+}
+
+impl DisocclusionMask {
+    /// Creates a blank disocclusion mask.
+    pub fn new(width: u32, height: u32) -> Result<Self, OpticalFlowError> {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return Err(OpticalFlowError::InvalidDimensions);
+        }
+        let total = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(OpticalFlowError::InvalidDimensions)?;
+
+        Ok(Self {
+            width,
+            height,
+            mask: alloc::vec![0u8; total],
+            disoccluded_pixels: 0,
+        })
+    }
+
+    /// Evaluates if pixel `(x, y)` is marked as disoccluded.
+    #[inline(always)]
+    pub fn is_disoccluded(&self, x: u32, y: u32) -> bool {
+        if x < self.width && y < self.height {
+            self.mask[(y * self.width + x) as usize] == 255
+        } else {
+            true
+        }
+    }
+
+    /// Performs bidirectional optical flow cross-check between forward and backward vector fields.
+    pub fn detect(
+        forward: &MotionVectorBuffer,
+        backward: &MotionVectorBuffer,
+        tolerance_pixels: f32,
+    ) -> Result<Self, OpticalFlowError> {
+        if forward.width != backward.width || forward.height != backward.height {
+            return Err(OpticalFlowError::InvalidDimensions);
+        }
+
+        let width = forward.width;
+        let height = forward.height;
+        let mut result = Self::new(width, height)?;
+        let tol_sq = tolerance_pixels * tolerance_pixels;
+        let mut disoccluded_count = 0u32;
+
+        for y in 0..height {
+            for x in 0..width {
+                let vf = forward.get(x, y);
+                let target_x = (x as f32) + vf.dx;
+                let target_y = (y as f32) + vf.dy;
+
+                let is_disoccluded = if target_x < 0.0
+                    || target_x >= (width as f32)
+                    || target_y < 0.0
+                    || target_y >= (height as f32)
+                {
+                    true
+                } else {
+                    let vb = backward.sample_bilinear(target_x, target_y);
+                    let err_x = vf.dx + vb.dx;
+                    let err_y = vf.dy + vb.dy;
+                    let err_dist_sq = err_x * err_x + err_y * err_y;
+                    err_dist_sq > tol_sq
+                };
+
+                if is_disoccluded {
+                    result.mask[(y * width + x) as usize] = 255;
+                    disoccluded_count = disoccluded_count.saturating_add(1);
+                }
+            }
+        }
+
+        result.disoccluded_pixels = disoccluded_count;
+        Ok(result)
+    }
+}
+
 /// Temporary stub for optical flow subsystem self-test during incremental commits.
 pub fn test_optical_flow_subsystem() -> bool {
     true
