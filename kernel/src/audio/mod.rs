@@ -16,6 +16,7 @@ pub mod xaudio2;
 pub mod dsound;
 pub mod winmm;
 pub mod openal;
+pub mod footstep_enhancer;
 
 pub use occlusion::test_audio_occlusion_subsystem;
 pub use vad::test_audio_vad_subsystem;
@@ -38,6 +39,7 @@ pub use xaudio2::*;
 pub use dsound::*;
 pub use winmm::*;
 pub use openal::*;
+pub use footstep_enhancer::*;
 
 /// Verification self-test suite for Real-Time 3D Audio Spatializer & Binaural HRTF DSP Pipeline.
 pub fn test_audio_spatializer_subsystem() -> bool {
