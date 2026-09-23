@@ -196,6 +196,155 @@ impl MotionVectorBuffer {
     }
 }
 
+/// Column-major 4x4 matrix for camera view-projection transformations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Matrix4x4 {
+    pub m: [[f32; 4]; 4],
+}
+
+impl Matrix4x4 {
+    /// Creates an identity 4x4 matrix.
+    pub const fn identity() -> Self {
+        Self {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Transforms a 4D homogeneous vector `p` by the matrix.
+    #[inline(always)]
+    pub fn transform_point4(&self, p: [f32; 4]) -> [f32; 4] {
+        [
+            self.m[0][0] * p[0] + self.m[1][0] * p[1] + self.m[2][0] * p[2] + self.m[3][0] * p[3],
+            self.m[0][1] * p[0] + self.m[1][1] * p[1] + self.m[2][1] * p[2] + self.m[3][1] * p[3],
+            self.m[0][2] * p[0] + self.m[1][2] * p[1] + self.m[2][2] * p[2] + self.m[3][2] * p[3],
+            self.m[0][3] * p[0] + self.m[1][3] * p[1] + self.m[2][3] * p[2] + self.m[3][3] * p[3],
+        ]
+    }
+
+    /// Computes matrix inverse via cofactor expansion. Returns `None` if singular.
+    pub fn inverse(&self) -> Option<Self> {
+        let m = &self.m;
+        let mut inv = [[0.0f32; 4]; 4];
+
+        inv[0][0] = m[1][1] * m[2][2] * m[3][3] - m[1][1] * m[2][3] * m[3][2] - m[2][1] * m[1][2] * m[3][3]
+            + m[2][1] * m[1][3] * m[3][2] + m[3][1] * m[1][2] * m[2][3] - m[3][1] * m[1][3] * m[2][2];
+        inv[1][0] = -m[1][0] * m[2][2] * m[3][3] + m[1][0] * m[2][3] * m[3][2] + m[2][0] * m[1][2] * m[3][3]
+            - m[2][0] * m[1][3] * m[3][2] - m[3][0] * m[1][2] * m[2][3] + m[3][0] * m[1][3] * m[2][2];
+        inv[2][0] = m[1][0] * m[2][1] * m[3][3] - m[1][0] * m[2][3] * m[3][1] - m[2][0] * m[1][1] * m[3][3]
+            + m[2][0] * m[1][3] * m[3][1] + m[3][0] * m[1][1] * m[2][3] - m[3][0] * m[1][3] * m[2][1];
+        inv[3][0] = -m[1][0] * m[2][1] * m[3][2] + m[1][0] * m[2][2] * m[3][1] + m[2][0] * m[1][1] * m[3][2]
+            - m[2][0] * m[1][2] * m[3][1] - m[3][0] * m[1][1] * m[2][2] + m[3][0] * m[1][2] * m[2][1];
+
+        let det = m[0][0] * inv[0][0] + m[0][1] * inv[1][0] + m[0][2] * inv[2][0] + m[0][3] * inv[3][0];
+        if det.abs() < 1e-9 {
+            return None;
+        }
+
+        inv[0][1] = -m[0][1] * m[2][2] * m[3][3] + m[0][1] * m[2][3] * m[3][2] + m[2][1] * m[0][2] * m[3][3]
+            - m[2][1] * m[0][3] * m[3][2] - m[3][1] * m[0][2] * m[2][3] + m[3][1] * m[0][3] * m[2][2];
+        inv[1][1] = m[0][0] * m[2][2] * m[3][3] - m[0][0] * m[2][3] * m[3][2] - m[2][0] * m[0][2] * m[3][3]
+            + m[2][0] * m[0][3] * m[3][2] + m[3][0] * m[0][2] * m[2][3] - m[3][0] * m[0][3] * m[2][2];
+        inv[2][1] = -m[0][0] * m[2][1] * m[3][3] + m[0][0] * m[2][3] * m[3][1] + m[2][0] * m[0][1] * m[3][3]
+            - m[2][0] * m[0][3] * m[3][1] - m[3][0] * m[0][1] * m[2][3] + m[3][0] * m[0][3] * m[2][1];
+        inv[3][1] = m[0][0] * m[2][1] * m[3][2] - m[0][0] * m[2][2] * m[3][1] - m[2][0] * m[0][1] * m[3][2]
+            + m[2][0] * m[0][2] * m[3][1] + m[3][0] * m[0][1] * m[2][2] - m[3][0] * m[0][2] * m[2][1];
+
+        inv[0][2] = m[0][1] * m[1][2] * m[3][3] - m[0][1] * m[1][3] * m[3][2] - m[1][1] * m[0][2] * m[3][3]
+            + m[1][1] * m[0][3] * m[3][2] + m[3][1] * m[0][2] * m[1][3] - m[3][1] * m[0][3] * m[1][2];
+        inv[1][2] = -m[0][0] * m[1][2] * m[3][3] + m[0][0] * m[1][3] * m[3][2] + m[1][0] * m[0][2] * m[3][3]
+            - m[1][0] * m[0][3] * m[3][2] - m[3][0] * m[0][2] * m[1][3] + m[3][0] * m[0][3] * m[1][2];
+        inv[2][2] = m[0][0] * m[1][1] * m[3][3] - m[0][0] * m[1][3] * m[3][1] - m[1][0] * m[0][1] * m[3][3]
+            + m[1][0] * m[0][3] * m[3][1] + m[3][0] * m[0][1] * m[1][3] - m[3][0] * m[0][3] * m[1][1];
+        inv[3][2] = -m[0][0] * m[1][1] * m[3][2] + m[0][0] * m[1][2] * m[3][1] + m[1][0] * m[0][1] * m[3][2]
+            - m[1][0] * m[0][2] * m[3][1] - m[3][0] * m[0][1] * m[1][2] + m[3][0] * m[0][2] * m[1][1];
+
+        inv[0][3] = -m[0][1] * m[1][2] * m[2][3] + m[0][1] * m[1][3] * m[2][2] + m[1][1] * m[0][2] * m[2][3]
+            - m[1][1] * m[0][3] * m[2][2] - m[2][1] * m[0][2] * m[1][3] + m[2][1] * m[0][3] * m[1][2];
+        inv[1][3] = m[0][0] * m[1][2] * m[2][3] - m[0][0] * m[1][3] * m[2][2] - m[1][0] * m[0][2] * m[2][3]
+            + m[1][0] * m[0][3] * m[2][2] + m[2][0] * m[0][2] * m[1][3] - m[2][0] * m[0][3] * m[1][2];
+        inv[2][3] = -m[0][0] * m[1][1] * m[2][3] + m[0][0] * m[1][3] * m[2][1] + m[1][0] * m[0][1] * m[2][3]
+            - m[1][0] * m[0][3] * m[2][1] - m[2][0] * m[0][1] * m[1][3] + m[2][0] * m[0][3] * m[1][1];
+        inv[3][3] = m[0][0] * m[1][1] * m[2][2] - m[0][0] * m[1][2] * m[2][1] - m[1][0] * m[0][1] * m[2][2]
+            + m[1][0] * m[0][2] * m[2][1] + m[2][0] * m[0][1] * m[1][2] - m[2][0] * m[0][2] * m[1][1];
+
+        let inv_det = 1.0 / det;
+        for i in 0..4 {
+            for j in 0..4 {
+                inv[i][j] *= inv_det;
+            }
+        }
+
+        Some(Self { m: inv })
+    }
+}
+
+/// Calculator deriving per-pixel motion vectors from camera delta matrices and depth.
+pub struct CameraReprojectionVelocityCalculator;
+
+impl CameraReprojectionVelocityCalculator {
+    /// Derives screen-space motion vector for a single pixel `(x, y)` at specified depth.
+    pub fn calculate_pixel_velocity(
+        inv_view_proj_curr: &Matrix4x4,
+        view_proj_prev: &Matrix4x4,
+        x: u32,
+        y: u32,
+        depth: f32,
+        width: u32,
+        height: u32,
+    ) -> ScreenSpaceMotionVector {
+        let u = (x as f32 + 0.5) / (width as f32);
+        let v = (y as f32 + 0.5) / (height as f32);
+
+        let ndc_x = 2.0 * u - 1.0;
+        let ndc_y = 1.0 - 2.0 * v;
+        let ndc_curr = [ndc_x, ndc_y, depth, 1.0];
+
+        let world = inv_view_proj_curr.transform_point4(ndc_curr);
+        let w_inv = 1.0 / world[3];
+        let world_norm = [world[0] * w_inv, world[1] * w_inv, world[2] * w_inv, 1.0];
+
+        let clip_prev = view_proj_prev.transform_point4(world_norm);
+        let clip_inv = 1.0 / clip_prev[3];
+        let ndc_prev_x = clip_prev[0] * clip_inv;
+        let ndc_prev_y = clip_prev[1] * clip_inv;
+
+        let u_prev = (ndc_prev_x + 1.0) * 0.5;
+        let v_prev = (1.0 - ndc_prev_y) * 0.5;
+
+        let x_prev = u_prev * (width as f32) - 0.5;
+        let y_prev = v_prev * (height as f32) - 0.5;
+
+        ScreenSpaceMotionVector::new((x as f32) - x_prev, (y as f32) - y_prev)
+    }
+
+    /// Generates full-frame camera reprojection motion vector field from depth buffer.
+    pub fn calculate_motion_field(
+        view_proj_curr: &Matrix4x4,
+        view_proj_prev: &Matrix4x4,
+        depth_buffer: &[f32],
+        width: u32,
+        height: u32,
+    ) -> Result<MotionVectorBuffer, OpticalFlowError> {
+        let inv_curr = view_proj_curr.inverse().ok_or(OpticalFlowError::SingularMatrix)?;
+        let mut buffer = MotionVectorBuffer::new(width, height)?;
+
+        for y in 0..height {
+            for x in 0..width {
+                let depth = depth_buffer[(y * width + x) as usize];
+                let mv = Self::calculate_pixel_velocity(&inv_curr, view_proj_prev, x, y, depth, width, height);
+                buffer.set(x, y, mv);
+            }
+        }
+
+        Ok(buffer)
+    }
+}
+
 /// Temporary stub for optical flow subsystem self-test during incremental commits.
 pub fn test_optical_flow_subsystem() -> bool {
     true
