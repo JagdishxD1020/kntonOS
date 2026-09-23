@@ -187,3 +187,129 @@ pub fn verify_wmm_qos_classifier() -> bool {
 
     true
 }
+
+
+
+// Active Queue Management (AQM) Bufferbloat Mitigation & Packet Pacer.
+
+/// AQM state and sojourn latency regulator configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AqmPacketPacer {
+    /// Target maximum sojourn latency in microseconds (e.g. 5,000 us = 5ms).
+    pub target_sojourn_us: u32,
+    /// Minimum interval before dropping/throttling in microseconds (e.g. 30,000 us = 30ms).
+    pub interval_us: u32,
+    /// Timestamp when latency first exceeded target in microseconds.
+    pub first_above_time_us: u64,
+    /// Whether AQM is currently in dropping/throttling state.
+    pub is_dropping: bool,
+    /// Total packets dropped by AQM bufferbloat mitigation.
+    pub total_aqm_drops: u32,
+    /// Total bytes paced.
+    pub total_bytes_paced: u64,
+}
+
+impl AqmPacketPacer {
+    pub const fn new(target_sojourn_us: u32, interval_us: u32) -> Self {
+        Self {
+            target_sojourn_us,
+            interval_us,
+            first_above_time_us: 0,
+            is_dropping: false,
+            total_aqm_drops: 0,
+            total_bytes_paced: 0,
+        }
+    }
+
+    /// Default configuration tuned for sub-5ms handheld game streaming.
+    pub const fn default_gaming() -> Self {
+        Self::new(5_000, 30_000)
+    }
+
+    /// Evaluates sojourn time of a dequeued packet and determines whether to transmit or drop.
+    /// Critical gaming packets (AcVo, AcVi) are never dropped by AQM.
+    pub fn evaluate_packet(&mut self, pkt: &QueuedPacket, now_us: u64) -> bool {
+        let sojourn_us = if now_us >= pkt.enqueue_time_us {
+            (now_us - pkt.enqueue_time_us) as u32
+        } else {
+            0
+        };
+
+        // Critical interactive packets are never dropped
+        if pkt.ac == WmmAccessCategory::AcVo || pkt.ac == WmmAccessCategory::AcVi {
+            self.total_bytes_paced += pkt.length as u64;
+            return true;
+        }
+
+        // Background / best effort traffic evaluated against sojourn threshold
+        if sojourn_us > self.target_sojourn_us {
+            if self.first_above_time_us == 0 {
+                self.first_above_time_us = now_us;
+            } else if (now_us - self.first_above_time_us) >= (self.interval_us as u64) {
+                self.is_dropping = true;
+            }
+        } else {
+            self.first_above_time_us = 0;
+            self.is_dropping = false;
+        }
+
+        if self.is_dropping {
+            self.total_aqm_drops += 1;
+            false // Drop bulk packet to eliminate queue bloat
+        } else {
+            self.total_bytes_paced += pkt.length as u64;
+            true
+        }
+    }
+}
+
+/// Unit test verifying AQM bufferbloat mitigation and queue latency clamping.
+pub fn verify_aqm_bufferbloat_mitigation() -> bool {
+    let mut pacer = AqmPacketPacer::default_gaming();
+
+    // 1. Normal packet (sojourn 1ms <= 5ms target) -> accepted
+    let p_normal = QueuedPacket {
+        packet_id: 1,
+        ac: WmmAccessCategory::AcBk,
+        length: 1500,
+        enqueue_time_us: 10_000,
+    };
+    if !pacer.evaluate_packet(&p_normal, 11_000) || pacer.total_aqm_drops != 0 {
+        return false;
+    }
+
+    // 2. High sojourn packet during initial transient (sojourn 8ms > 5ms, but dt < 30ms interval) -> accepted
+    let p_bloat1 = QueuedPacket {
+        packet_id: 2,
+        ac: WmmAccessCategory::AcBk,
+        length: 1500,
+        enqueue_time_us: 10_000,
+    };
+    if !pacer.evaluate_packet(&p_bloat1, 18_000) || pacer.is_dropping {
+        return false;
+    }
+
+    // 3. Sustained bloat exceeding interval (> 30ms later, sojourn 10ms) -> dropped
+    let p_bloat2 = QueuedPacket {
+        packet_id: 3,
+        ac: WmmAccessCategory::AcBk,
+        length: 1500,
+        enqueue_time_us: 50_000,
+    };
+    if pacer.evaluate_packet(&p_bloat2, 60_000) || !pacer.is_dropping || pacer.total_aqm_drops != 1 {
+        return false;
+    }
+
+    // 4. Critical controller input (AcVo) with high sojourn -> MUST NEVER BE DROPPED
+    let p_input = QueuedPacket {
+        packet_id: 4,
+        ac: WmmAccessCategory::AcVo,
+        length: 64,
+        enqueue_time_us: 50_000,
+    };
+    if !pacer.evaluate_packet(&p_input, 65_000) {
+        return false;
+    }
+
+    true
+}
