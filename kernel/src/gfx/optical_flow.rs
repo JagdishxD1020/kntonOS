@@ -430,6 +430,68 @@ impl DisocclusionMask {
     }
 }
 
+/// Dilates closest-depth foreground velocities onto silhouette pixels to prevent edge ghosting.
+pub struct MotionVectorDilationFilter;
+
+impl MotionVectorDilationFilter {
+    /// Applies 3x3 depth-aware dilation filter to screen-space motion vectors.
+    pub fn dilate_motion_vectors(
+        input: &MotionVectorBuffer,
+        depth_buffer: &[f32],
+        depth_edge_threshold: f32,
+    ) -> Result<MotionVectorBuffer, OpticalFlowError> {
+        let width = input.width;
+        let height = input.height;
+        let expected_len = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or(OpticalFlowError::InvalidDimensions)?;
+
+        if depth_buffer.len() < expected_len {
+            return Err(OpticalFlowError::BufferTooSmall);
+        }
+
+        let mut output = MotionVectorBuffer::new(width, height)?;
+
+        for y in 0..height {
+            for x in 0..width {
+                let center_idx = (y * width + x) as usize;
+                let center_depth = depth_buffer[center_idx];
+
+                let mut min_depth = center_depth;
+                let mut best_mv = input.get(x, y);
+
+                // Examine 3x3 neighborhood for closer foreground depth
+                for dy in -1i32..=1i32 {
+                    for dx in -1i32..=1i32 {
+                        let nx = (x as i32) + dx;
+                        let ny = (y as i32) + dy;
+
+                        if nx >= 0 && nx < (width as i32) && ny >= 0 && ny < (height as i32) {
+                            let neighbor_idx = (ny as usize) * (width as usize) + (nx as usize);
+                            let neighbor_depth = depth_buffer[neighbor_idx];
+
+                            // Closer depth (smaller z in standard depth buffer)
+                            if neighbor_depth < min_depth {
+                                min_depth = neighbor_depth;
+                                best_mv = input.get(nx as u32, ny as u32);
+                            }
+                        }
+                    }
+                }
+
+                // If center pixel is significantly deeper than neighborhood minimum, dilate foreground velocity
+                if (center_depth - min_depth) > depth_edge_threshold {
+                    output.set(x, y, best_mv);
+                } else {
+                    output.set(x, y, input.get(x, y));
+                }
+            }
+        }
+
+        Ok(output)
+    }
+}
+
 /// Temporary stub for optical flow subsystem self-test during incremental commits.
 pub fn test_optical_flow_subsystem() -> bool {
     true
