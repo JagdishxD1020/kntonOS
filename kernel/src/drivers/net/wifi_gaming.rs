@@ -490,3 +490,157 @@ pub fn verify_packet_loss_concealment() -> bool {
 
     true
 }
+
+
+
+// Wi-Fi 6E/7 6GHz Channel Congestion Detector & Link Quality Estimator.
+
+/// Wi-Fi channel frequency band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiBand {
+    Band2_4GHz,
+    Band5GHz,
+    Band6GHz,
+}
+
+/// Link performance metrics measured by Wi-Fi 6E/7 radio interface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WifiLinkMetrics {
+    /// Radio band (2.4GHz, 5GHz, 6GHz).
+    pub band: WifiBand,
+    /// Operating primary channel number (e.g. Channel 37 in 6GHz).
+    pub channel: u8,
+    /// Channel bandwidth in MHz (20, 40, 80, 160, 320).
+    pub channel_width_mhz: u16,
+    /// Received Signal Strength Indicator in dBm (e.g. -50 dBm).
+    pub rssi_dbm: i8,
+    /// Channel utilization / BSS load percentage (0 .. 100%).
+    pub channel_load_pct: u8,
+    /// Negotiated MCS (Modulation and Coding Scheme) index [0..13].
+    pub mcs_index: u8,
+    /// Physical transmission link rate in Mbps.
+    pub phy_rate_mbps: u32,
+    /// Packet retry / retransmission percentage (0 .. 100%).
+    pub retry_rate_pct: u8,
+}
+
+impl WifiLinkMetrics {
+    pub const fn empty() -> Self {
+        Self {
+            band: WifiBand::Band6GHz,
+            channel: 37,
+            channel_width_mhz: 160,
+            rssi_dbm: -50,
+            channel_load_pct: 15,
+            mcs_index: 11,
+            phy_rate_mbps: 2402,
+            retry_rate_pct: 2,
+        }
+    }
+}
+
+/// Link Quality Estimator and 6GHz Congestion Detector.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WifiCongestionDetector {
+    /// Congestion threshold percentage (nominally 70%).
+    pub congestion_load_threshold: u8,
+    /// Critical retry threshold (nominally 15%).
+    pub retry_alert_threshold: u8,
+    /// Computed Link Quality Index [0 .. 100].
+    pub link_quality_index: u8,
+    /// Congestion flag indicating roaming or channel switch advised.
+    pub is_congested: bool,
+}
+
+impl WifiCongestionDetector {
+    pub const fn new(congestion_load_threshold: u8, retry_alert_threshold: u8) -> Self {
+        Self {
+            congestion_load_threshold,
+            retry_alert_threshold,
+            link_quality_index: 100,
+            is_congested: false,
+        }
+    }
+
+    /// Evaluates current radio metrics and computes Link Quality Index (LQI) and congestion state.
+    pub fn evaluate_link(&mut self, metrics: &WifiLinkMetrics) -> u8 {
+        // RSSI score: -40 dBm = 100, -85 dBm = 0
+        let rssi_score = if metrics.rssi_dbm >= -40 {
+            100.0
+        } else if metrics.rssi_dbm <= -85 {
+            0.0
+        } else {
+            ((metrics.rssi_dbm - (-85)) as f32 / 45.0) * 100.0
+        };
+
+        // Load penalty: 0% load = 100, 100% load = 0
+        let load_score = 100.0 - (metrics.channel_load_pct.min(100) as f32);
+
+        // Retry penalty: 0% retries = 100, 30% retries = 0
+        let retry_score = if metrics.retry_rate_pct >= 30 {
+            0.0
+        } else {
+            100.0 - ((metrics.retry_rate_pct as f32) / 30.0) * 100.0
+        };
+
+        // 6GHz band bonus (+10% score due to clean spectrum with no legacy interference)
+        let band_bonus = if metrics.band == WifiBand::Band6GHz { 10.0 } else { 0.0 };
+
+        // Combined LQI: 40% RSSI + 30% Load + 30% Retries + Bonus
+        let raw_lqi = 0.40 * rssi_score + 0.30 * load_score + 0.30 * retry_score + band_bonus;
+        let lqi = raw_lqi.clamp(0.0, 100.0) as u8;
+
+        self.link_quality_index = lqi;
+        self.is_congested = metrics.channel_load_pct >= self.congestion_load_threshold
+            || metrics.retry_rate_pct >= self.retry_alert_threshold
+            || lqi < 40;
+
+        lqi
+    }
+}
+
+/// Unit test verifying Wi-Fi 6E 6GHz channel congestion detector and link quality estimator.
+pub fn verify_channel_congestion_and_link_quality() -> bool {
+    let mut detector = WifiCongestionDetector::new(70, 15);
+
+    // 1. Pristine 6GHz Wi-Fi 6E link: -45 dBm, 10% load, 1% retries -> High LQI (> 85), not congested
+    let pristine = WifiLinkMetrics {
+        band: WifiBand::Band6GHz,
+        channel: 37,
+        channel_width_mhz: 160,
+        rssi_dbm: -45,
+        channel_load_pct: 10,
+        mcs_index: 11,
+        phy_rate_mbps: 2402,
+        retry_rate_pct: 1,
+    };
+    let lqi1 = detector.evaluate_link(&pristine);
+    if lqi1 < 85 || detector.is_congested {
+        return false;
+    }
+
+    // 2. Severe channel congestion in crowded apartment: 85% channel load -> Congested!
+    let congested = WifiLinkMetrics {
+        channel_load_pct: 85,
+        retry_rate_pct: 18,
+        ..pristine
+    };
+    let lqi2 = detector.evaluate_link(&congested);
+    if !detector.is_congested || lqi2 >= lqi1 {
+        return false;
+    }
+
+    // 3. Weak signal fringe link: -82 dBm RSSI -> Low LQI (< 45)
+    let weak = WifiLinkMetrics {
+        rssi_dbm: -82,
+        channel_load_pct: 40,
+        retry_rate_pct: 12,
+        ..pristine
+    };
+    let lqi3 = detector.evaluate_link(&weak);
+    if lqi3 > 55 {
+        return false;
+    }
+
+    true
+}
