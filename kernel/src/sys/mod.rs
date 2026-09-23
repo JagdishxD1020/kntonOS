@@ -7,7 +7,9 @@ pub mod health;
 pub mod minidump;
 pub mod checkpoint;
 pub mod kpkg;
+pub mod milestone200;
 pub use kpkg::*;
+pub use milestone200::*;
 
 pub use minidump::*;
 pub use checkpoint::*;
