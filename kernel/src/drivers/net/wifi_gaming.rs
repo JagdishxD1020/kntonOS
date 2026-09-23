@@ -313,3 +313,180 @@ pub fn verify_aqm_bufferbloat_mitigation() -> bool {
 
     true
 }
+
+
+
+// Game Streaming Packet Loss Concealment (PLC) & Redundant Input Framing.
+
+/// Captured compact controller input frame state for transmission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerInputFrame {
+    pub sequence_num: u32,
+    pub buttons: u16,
+    pub left_stick_x: i16,
+    pub left_stick_y: i16,
+    pub right_stick_x: i16,
+    pub right_stick_y: i16,
+    pub left_trigger: u8,
+    pub right_trigger: u8,
+}
+
+impl ControllerInputFrame {
+    pub const fn empty() -> Self {
+        Self {
+            sequence_num: 0,
+            buttons: 0,
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            left_trigger: 0,
+            right_trigger: 0,
+        }
+    }
+}
+
+/// Redundant UDP input packet containing current frame plus history of 2 previous frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedundantInputPacket {
+    pub current_frame: ControllerInputFrame,
+    pub history_1: ControllerInputFrame,
+    pub history_2: ControllerInputFrame,
+}
+
+impl RedundantInputPacket {
+    pub fn new(current: ControllerInputFrame, h1: ControllerInputFrame, h2: ControllerInputFrame) -> Self {
+        Self {
+            current_frame: current,
+            history_1: h1,
+            history_2: h2,
+        }
+    }
+}
+
+/// Receiver-side packet loss concealment engine.
+#[derive(Debug, Clone)]
+pub struct LossConcealmentEngine {
+    pub last_applied_seq: u32,
+    pub total_packets_received: u32,
+    pub total_packets_dropped: u32,
+    pub total_frames_recovered: u32,
+}
+
+impl LossConcealmentEngine {
+    pub const fn new() -> Self {
+        Self {
+            last_applied_seq: 0,
+            total_packets_received: 0,
+            total_packets_dropped: 0,
+            total_frames_recovered: 0,
+        }
+    }
+
+    /// Processes an incoming redundant packet. Returns an array of frames to apply:
+    /// (recovered_frames, recovered_count).
+    pub fn process_incoming_packet(
+        &mut self,
+        pkt: &RedundantInputPacket,
+    ) -> ([ControllerInputFrame; 3], usize) {
+        self.total_packets_received += 1;
+        let mut out_frames = [ControllerInputFrame::empty(); 3];
+        let mut count = 0;
+
+        let curr_seq = pkt.current_frame.sequence_num;
+
+        if self.last_applied_seq == 0 {
+            // First packet received
+            self.last_applied_seq = curr_seq;
+            out_frames[0] = pkt.current_frame;
+            return (out_frames, 1);
+        }
+
+        let gap = curr_seq.saturating_sub(self.last_applied_seq);
+
+        if gap == 1 {
+            // In-order packet
+            self.last_applied_seq = curr_seq;
+            out_frames[0] = pkt.current_frame;
+            count = 1;
+        } else if gap == 2 {
+            // 1 packet dropped! Recover history_1 (seq - 1) then current
+            self.total_packets_dropped += 1;
+            if pkt.history_1.sequence_num == curr_seq - 1 {
+                out_frames[0] = pkt.history_1;
+                out_frames[1] = pkt.current_frame;
+                count = 2;
+                self.total_frames_recovered += 1;
+            } else {
+                out_frames[0] = pkt.current_frame;
+                count = 1;
+            }
+            self.last_applied_seq = curr_seq;
+        } else if gap == 3 {
+            // 2 consecutive packets dropped! Recover history_2, history_1, then current
+            self.total_packets_dropped += 2;
+            if pkt.history_2.sequence_num == curr_seq - 2 && pkt.history_1.sequence_num == curr_seq - 1 {
+                out_frames[0] = pkt.history_2;
+                out_frames[1] = pkt.history_1;
+                out_frames[2] = pkt.current_frame;
+                count = 3;
+                self.total_frames_recovered += 2;
+            } else {
+                out_frames[0] = pkt.current_frame;
+                count = 1;
+            }
+            self.last_applied_seq = curr_seq;
+        } else if gap > 3 {
+            // Gap too large to conceal
+            self.total_packets_dropped += gap - 1;
+            out_frames[0] = pkt.current_frame;
+            count = 1;
+            self.last_applied_seq = curr_seq;
+        }
+
+        (out_frames, count)
+    }
+}
+
+/// Unit test verifying game streaming packet loss concealment and instant recovery.
+pub fn verify_packet_loss_concealment() -> bool {
+    let mut plc = LossConcealmentEngine::new();
+
+    let f100 = ControllerInputFrame { sequence_num: 100, buttons: 0x0001, left_stick_x: 1000, ..ControllerInputFrame::empty() };
+    let f101 = ControllerInputFrame { sequence_num: 101, buttons: 0x0002, left_stick_x: 2000, ..ControllerInputFrame::empty() };
+    let f102 = ControllerInputFrame { sequence_num: 102, buttons: 0x0004, left_stick_x: 3000, ..ControllerInputFrame::empty() };
+    let f103 = ControllerInputFrame { sequence_num: 103, buttons: 0x0008, left_stick_x: 4000, ..ControllerInputFrame::empty() };
+
+    // 1. Initial packet 100 arrives
+    let pkt100 = RedundantInputPacket::new(f100, ControllerInputFrame::empty(), ControllerInputFrame::empty());
+    let (out0, c0) = plc.process_incoming_packet(&pkt100);
+    if c0 != 1 || out0[0].sequence_num != 100 {
+        return false;
+    }
+
+    // 2. Packet 101 is dropped over Wi-Fi!
+    // Packet 102 arrives directly, carrying f102 as current and f101 as history_1
+    let pkt102 = RedundantInputPacket::new(f102, f101, f100);
+    let (out1, c1) = plc.process_incoming_packet(&pkt102);
+
+    // Must have recovered both 101 and 102 in exact sequence
+    if c1 != 2 || out1[0].sequence_num != 101 || out1[1].sequence_num != 102 {
+        return false;
+    }
+    if plc.total_packets_dropped != 1 || plc.total_frames_recovered != 1 {
+        return false;
+    }
+    // Verify payload integrity of recovered frame 101
+    if out1[0].buttons != 0x0002 || out1[0].left_stick_x != 2000 {
+        return false;
+    }
+
+    // 3. Packet 103 arrives normally in-order
+    let pkt103 = RedundantInputPacket::new(f103, f102, f101);
+    let (out2, c2) = plc.process_incoming_packet(&pkt103);
+    if c2 != 1 || out2[0].sequence_num != 103 {
+        return false;
+    }
+
+    true
+}
