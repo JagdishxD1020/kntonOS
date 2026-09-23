@@ -644,3 +644,37 @@ pub fn verify_channel_congestion_and_link_quality() -> bool {
 
     true
 }
+
+
+
+/// Comprehensive verification self-test suite for Handheld Wi-Fi 6E/7 Low-Latency Streaming & Packet Pacer.
+pub fn test_wifi_gaming_subsystem() -> bool {
+    crate::serial_write_str("[KNT-NET] Testing Handheld Wi-Fi 6E/7 Low-Latency Streaming & Packet Pacer...\r\n");
+
+    // 1. Verify WMM QoS Traffic Classifier & Multi-Queue Priority Scheduling
+    if !verify_wmm_qos_classifier() {
+        crate::serial_write_str("[KNT-PANIC] WMM QoS classifier and priority scheduler verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Active Queue Management (AQM) Bufferbloat Mitigation & Sojourn Clamping
+    if !verify_aqm_bufferbloat_mitigation() {
+        crate::serial_write_str("[KNT-PANIC] AQM bufferbloat mitigation verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Game Streaming Packet Loss Concealment (PLC) & Redundant Input Framing
+    if !verify_packet_loss_concealment() {
+        crate::serial_write_str("[KNT-PANIC] Packet loss concealment and redundant framing verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Wi-Fi 6E 6GHz Channel Congestion Detector & Link Quality Estimator
+    if !verify_channel_congestion_and_link_quality() {
+        crate::serial_write_str("[KNT-PANIC] Wi-Fi 6E channel congestion and link quality verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIFI-GAMING-PASS] Handheld Wi-Fi 6E/7 low-latency streaming and packet pacer verified\r\n");
+    true
+}
