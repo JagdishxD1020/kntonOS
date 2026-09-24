@@ -233,3 +233,107 @@ pub fn verify_footstep_resonance_and_rumble_filter() -> bool {
 
     true
 }
+
+
+
+// Fast Sub-1ms Dynamic Range Compressor (DRC) & Brickwall Limiter.
+
+/// Fast DRC limiter protecting against explosive game volume spikes while boosting quiet cues.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FastDrcLimiter {
+    /// Compression threshold linear amplitude (e.g. 0.35 ~ -9 dBFS).
+    pub threshold: f32,
+    /// Compression ratio above threshold (e.g. 4.0 for 4:1 compression).
+    pub ratio: f32,
+    /// Attack coefficient (sub-1ms attack, e.g. alpha ~ 0.85 per sample at 48 kHz).
+    pub attack_coeff: f32,
+    /// Release coefficient (smooth release over ~50ms).
+    pub release_coeff: f32,
+    /// Hard limiter ceiling amplitude (e.g. 0.95 ~ -0.45 dBFS).
+    pub ceiling: f32,
+    /// Current smoothed envelope detector state.
+    pub envelope: f32,
+}
+
+impl FastDrcLimiter {
+    pub const fn new(threshold: f32, ratio: f32, ceiling: f32) -> Self {
+        Self {
+            threshold,
+            ratio,
+            attack_coeff: 0.85,
+            release_coeff: 0.002,
+            ceiling,
+            envelope: 0.0,
+        }
+    }
+
+    /// Default fast gaming limiter configuration (0.35 threshold, 4:1 ratio, 0.95 ceiling).
+    pub const fn default_gaming() -> Self {
+        Self::new(0.35, 4.0, 0.95)
+    }
+
+    /// Compresses and limits an audio sample to prevent ear fatigue and clipping.
+    pub fn process_sample(&mut self, sample: f32) -> f32 {
+        let abs_val = sample.abs();
+
+        // Fast peak envelope follower
+        if abs_val > self.envelope {
+            self.envelope += self.attack_coeff * (abs_val - self.envelope);
+        } else {
+            self.envelope += self.release_coeff * (abs_val - self.envelope);
+        }
+
+        // Soft-knee dynamic compression calculation
+        let gain = if self.envelope > self.threshold {
+            let over = self.envelope - self.threshold;
+            let compressed_over = over / self.ratio;
+            (self.threshold + compressed_over) / self.envelope
+        } else {
+            1.0
+        };
+
+        let compressed = sample * gain;
+
+        // Brickwall ceiling limiter
+        compressed.clamp(-self.ceiling, self.ceiling)
+    }
+}
+
+/// Unit test verifying fast sub-1ms DRC attack and peak limiter attenuation.
+pub fn verify_fast_drc_and_limiter() -> bool {
+    let mut drc = FastDrcLimiter::default_gaming();
+
+    // 1. Quiet footstep signal (0.15 < threshold 0.35): untouched (gain = 1.0)
+    let quiet_out = drc.process_sample(0.15);
+    if (quiet_out - 0.15).abs() > 0.001 {
+        return false;
+    }
+
+    // 2. Sudden explosive blast (1.80 spike >> 0.35 threshold and > 1.0 clipping)
+    // Run 10 samples (sub-1ms at 48 kHz): attack must crush amplitude below ceiling (0.95)
+    let mut blast_out = 0.0f32;
+    for _ in 0..10 {
+        blast_out = drc.process_sample(1.80);
+    }
+
+    // Must be strictly clamped <= ceiling (0.95)
+    if blast_out > 0.95 {
+        return false;
+    }
+    // Envelope must have reacted instantly
+    if drc.envelope < 1.0 {
+        return false;
+    }
+
+    // 3. Steady high amplitude signal (0.80): compressed according to 4:1 ratio
+    let mut steady_out = 0.0f32;
+    for _ in 0..30 {
+        steady_out = drc.process_sample(0.80);
+    }
+    // threshold = 0.35, excess = 0.45, compressed = 0.35 + 0.45/4 = 0.4625
+    if (steady_out - 0.4625).abs() > 0.08 {
+        return false;
+    }
+
+    true
+}
