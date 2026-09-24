@@ -345,3 +345,157 @@ pub fn get_or_init_scheduler() -> &'static Spinlock<Option<WorkStealingJobSchedu
     drop(lock);
     &GLOBAL_SCHEDULER
 }
+
+/// Internal descriptor for a Win32 threadpool work object.
+pub struct ThreadpoolWorkInner {
+    pub id: u64,
+    pub pool_id: u64,
+    pub cleanup_group_id: u64,
+    pub pfn_callback: usize,
+    pub context: usize,
+    pub submitted_count: AtomicU32,
+    pub completed_count: AtomicU32,
+    pub cancelled_count: AtomicU32,
+}
+
+pub static THREADPOOL_WORKS: Spinlock<BTreeMap<u64, ThreadpoolWorkInner>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Creates a new work object for asynchronous execution in the threadpool.
+pub unsafe extern "system" fn CreateThreadpoolWork(
+    pfnwk: PTP_WORK_CALLBACK,
+    pv: *mut c_void,
+    pcbe: *const TP_CALLBACK_ENVIRON,
+) -> PTP_WORK {
+    if pfnwk.is_none() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let mut pool_id = 0u64;
+    let mut cleanup_group_id = 0u64;
+
+    if !pcbe.is_null() {
+        let env = &*pcbe;
+        if !env.Pool.is_null() {
+            pool_id = env.Pool as u64;
+        }
+        if !env.CleanupGroup.is_null() {
+            cleanup_group_id = env.CleanupGroup as u64;
+        }
+    }
+
+    let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::SeqCst);
+    let work = ThreadpoolWorkInner {
+        id,
+        pool_id,
+        cleanup_group_id,
+        pfn_callback: core::mem::transmute(pfnwk),
+        context: pv as usize,
+        submitted_count: AtomicU32::new(0),
+        completed_count: AtomicU32::new(0),
+        cancelled_count: AtomicU32::new(0),
+    };
+
+    THREADPOOL_WORKS.lock().insert(id, work);
+    win32_set_last_error(ERROR_SUCCESS);
+    id as PTP_WORK
+}
+
+/// Submits a work object to the threadpool job queue.
+pub unsafe extern "system" fn SubmitThreadpoolWork(pwk: PTP_WORK) {
+    if pwk.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pwk as u64;
+    let lock = THREADPOOL_WORKS.lock();
+    let (pfn, ctx, pool) = match lock.get(&id) {
+        Some(w) => {
+            w.submitted_count.fetch_add(1, Ordering::SeqCst);
+            (w.pfn_callback, w.context, w.pool_id)
+        }
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return;
+        }
+    };
+    drop(lock);
+
+    let sched_lock = get_or_init_scheduler();
+    if let Some(ref sched) = *sched_lock.lock() {
+        let job = JobDescriptor {
+            job_id: NEXT_HANDLE_ID.fetch_add(1, Ordering::SeqCst),
+            pool_id: pool,
+            callback: pfn,
+            context: ctx,
+            work_handle: id,
+            priority: JobPriority::Normal,
+            affinity_mask: 0xFFFF,
+        };
+        let lane = (id as usize) % sched.num_workers;
+        sched.push_job(lane, job);
+    }
+    win32_set_last_error(ERROR_SUCCESS);
+}
+
+/// Waits for outstanding callbacks of a work object to complete or cancel.
+pub unsafe extern "system" fn WaitForThreadpoolWorkCallbacks(
+    pwk: PTP_WORK,
+    f_cancel_pending_callbacks: BOOL,
+) {
+    if pwk.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pwk as u64;
+    let sched_lock = get_or_init_scheduler();
+    if let Some(ref sched) = *sched_lock.lock() {
+        if f_cancel_pending_callbacks != 0 {
+            // Cancel pending jobs remaining in worker lanes.
+            let mut cancelled = 0u32;
+            for wid in 0..sched.num_workers {
+                let mut lane = sched.workers[wid].lock();
+                let initial_len = lane.local_queue.len();
+                lane.local_queue.retain(|j| j.work_handle != id);
+                cancelled += (initial_len - lane.local_queue.len()) as u32;
+            }
+            let mut gq = sched.global_queue.lock();
+            let gq_len = gq.len();
+            gq.retain(|j| j.work_handle != id);
+            cancelled += (gq_len - gq.len()) as u32;
+            drop(gq);
+
+            let lock = THREADPOOL_WORKS.lock();
+            if let Some(w) = lock.get(&id) {
+                w.cancelled_count.fetch_add(cancelled, Ordering::SeqCst);
+            }
+        } else {
+            // Drain and complete all pending work callbacks.
+            sched.drain_all();
+            let lock = THREADPOOL_WORKS.lock();
+            if let Some(w) = lock.get(&id) {
+                let sub = w.submitted_count.load(Ordering::SeqCst);
+                w.completed_count.store(sub, Ordering::SeqCst);
+            }
+        }
+    }
+    win32_set_last_error(ERROR_SUCCESS);
+}
+
+/// Releases an allocated threadpool work object.
+pub unsafe extern "system" fn CloseThreadpoolWork(pwk: PTP_WORK) {
+    if pwk.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pwk as u64;
+    if THREADPOOL_WORKS.lock().remove(&id).is_some() {
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
