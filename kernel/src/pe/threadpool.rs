@@ -398,6 +398,12 @@ pub unsafe extern "system" fn CreateThreadpoolWork(
     };
 
     THREADPOOL_WORKS.lock().insert(id, work);
+    if cleanup_group_id != 0 {
+        let mut cg_lock = CLEANUP_GROUPS.lock();
+        if let Some(cg) = cg_lock.get_mut(&cleanup_group_id) {
+            cg.works.push(id);
+        }
+    }
     win32_set_last_error(ERROR_SUCCESS);
     id as PTP_WORK
 }
@@ -494,6 +500,253 @@ pub unsafe extern "system" fn CloseThreadpoolWork(pwk: PTP_WORK) {
 
     let id = pwk as u64;
     if THREADPOOL_WORKS.lock().remove(&id).is_some() {
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
+
+/// Internal descriptor for a Win32 threadpool timer object.
+pub struct ThreadpoolTimerInner {
+    pub id: u64,
+    pub pool_id: u64,
+    pub cleanup_group_id: u64,
+    pub pfn_callback: usize,
+    pub context: usize,
+    pub due_time: u64,
+    pub period_ms: u32,
+    pub window_length_ms: u32,
+    pub is_set: bool,
+    pub fired_count: AtomicU32,
+}
+
+pub static THREADPOOL_TIMERS: Spinlock<BTreeMap<u64, ThreadpoolTimerInner>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Creates a new timer object for scheduled callbacks in the threadpool.
+pub unsafe extern "system" fn CreateThreadpoolTimer(
+    pfnti: PTP_TIMER_CALLBACK,
+    pv: *mut c_void,
+    pcbe: *const TP_CALLBACK_ENVIRON,
+) -> PTP_TIMER {
+    if pfnti.is_none() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let mut pool_id = 0u64;
+    let mut cleanup_group_id = 0u64;
+
+    if !pcbe.is_null() {
+        let env = &*pcbe;
+        if !env.Pool.is_null() {
+            pool_id = env.Pool as u64;
+        }
+        if !env.CleanupGroup.is_null() {
+            cleanup_group_id = env.CleanupGroup as u64;
+        }
+    }
+
+    let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::SeqCst);
+    let timer = ThreadpoolTimerInner {
+        id,
+        pool_id,
+        cleanup_group_id,
+        pfn_callback: core::mem::transmute(pfnti),
+        context: pv as usize,
+        due_time: 0,
+        period_ms: 0,
+        window_length_ms: 0,
+        is_set: false,
+        fired_count: AtomicU32::new(0),
+    };
+
+    THREADPOOL_TIMERS.lock().insert(id, timer);
+    if cleanup_group_id != 0 {
+        let mut cg_lock = CLEANUP_GROUPS.lock();
+        if let Some(cg) = cg_lock.get_mut(&cleanup_group_id) {
+            cg.timers.push(id);
+        }
+    }
+    win32_set_last_error(ERROR_SUCCESS);
+    id as PTP_TIMER
+}
+
+/// Sets due time, period, and window length for a threadpool timer.
+pub unsafe extern "system" fn SetThreadpoolTimer(
+    pti: PTP_TIMER,
+    pft_due_time: *const FILETIME,
+    ms_period: u32,
+    ms_window_length: u32,
+) {
+    if pti.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pti as u64;
+    let mut lock = THREADPOOL_TIMERS.lock();
+    if let Some(t) = lock.get_mut(&id) {
+        if pft_due_time.is_null() {
+            // Passing NULL for pft_due_time disables the timer.
+            t.is_set = false;
+        } else {
+            t.is_set = true;
+            let ft = *pft_due_time;
+            t.due_time = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+            t.period_ms = ms_period;
+            t.window_length_ms = ms_window_length;
+        }
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
+
+/// Returns whether the threadpool timer is currently scheduled.
+pub unsafe extern "system" fn IsThreadpoolTimerSet(pti: PTP_TIMER) -> BOOL {
+    if pti.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let id = pti as u64;
+    let lock = THREADPOOL_TIMERS.lock();
+    if let Some(t) = lock.get(&id) {
+        win32_set_last_error(ERROR_SUCCESS);
+        if t.is_set { TRUE } else { FALSE }
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Waits for outstanding callbacks of a threadpool timer to finish or cancel.
+pub unsafe extern "system" fn WaitForThreadpoolTimerCallbacks(
+    pti: PTP_TIMER,
+    f_cancel_pending_callbacks: BOOL,
+) {
+    if pti.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pti as u64;
+    let lock = THREADPOOL_TIMERS.lock();
+    if let Some(t) = lock.get(&id) {
+        if f_cancel_pending_callbacks != 0 {
+            // Cancel pending execution.
+        } else if t.is_set && t.pfn_callback != 0 {
+            // Dispatch pending timer callback once.
+            let cb: unsafe extern "system" fn(
+                PTP_CALLBACK_INSTANCE,
+                *mut c_void,
+                PTP_TIMER,
+            ) = core::mem::transmute(t.pfn_callback);
+            cb(
+                core::ptr::null_mut(),
+                t.context as *mut c_void,
+                id as PTP_TIMER,
+            );
+            t.fired_count.fetch_add(1, Ordering::SeqCst);
+        }
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
+
+/// Closes an allocated threadpool timer object.
+pub unsafe extern "system" fn CloseThreadpoolTimer(pti: PTP_TIMER) {
+    if pti.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = pti as u64;
+    if THREADPOOL_TIMERS.lock().remove(&id).is_some() {
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
+
+/// Internal descriptor for a Win32 threadpool cleanup group.
+pub struct ThreadpoolCleanupGroupInner {
+    pub id: u64,
+    pub works: Vec<u64>,
+    pub timers: Vec<u64>,
+    pub closed: bool,
+}
+
+pub static CLEANUP_GROUPS: Spinlock<BTreeMap<u64, ThreadpoolCleanupGroupInner>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Creates a new cleanup group to manage bulk teardown of threadpool objects.
+pub unsafe extern "system" fn CreateThreadpoolCleanupGroup() -> PTP_CLEANUP_GROUP {
+    let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::SeqCst);
+    let group = ThreadpoolCleanupGroupInner {
+        id,
+        works: Vec::new(),
+        timers: Vec::new(),
+        closed: false,
+    };
+
+    CLEANUP_GROUPS.lock().insert(id, group);
+    win32_set_last_error(ERROR_SUCCESS);
+    id as PTP_CLEANUP_GROUP
+}
+
+/// Closes all members enrolled in the cleanup group and dispatches cancellations.
+pub unsafe extern "system" fn CloseThreadpoolCleanupGroupMembers(
+    ptpcg: PTP_CLEANUP_GROUP,
+    f_cancel_pending_callbacks: BOOL,
+    _pv_cleanup_context: *mut c_void,
+) {
+    if ptpcg.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = ptpcg as u64;
+    let mut cg_lock = CLEANUP_GROUPS.lock();
+    let (works_to_clean, timers_to_clean) = match cg_lock.get_mut(&id) {
+        Some(cg) => {
+            let w = core::mem::take(&mut cg.works);
+            let t = core::mem::take(&mut cg.timers);
+            (w, t)
+        }
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return;
+        }
+    };
+    drop(cg_lock);
+
+    // Teardown all enrolled work items.
+    for wid in works_to_clean {
+        WaitForThreadpoolWorkCallbacks(wid as PTP_WORK, f_cancel_pending_callbacks);
+        CloseThreadpoolWork(wid as PTP_WORK);
+    }
+
+    // Teardown all enrolled timer items.
+    for tid in timers_to_clean {
+        WaitForThreadpoolTimerCallbacks(tid as PTP_TIMER, f_cancel_pending_callbacks);
+        CloseThreadpoolTimer(tid as PTP_TIMER);
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+}
+
+/// Closes an empty cleanup group object.
+pub unsafe extern "system" fn CloseThreadpoolCleanupGroup(ptpcg: PTP_CLEANUP_GROUP) {
+    if ptpcg.is_null() {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return;
+    }
+
+    let id = ptpcg as u64;
+    if CLEANUP_GROUPS.lock().remove(&id).is_some() {
         win32_set_last_error(ERROR_SUCCESS);
     } else {
         win32_set_last_error(ERROR_INVALID_HANDLE);
