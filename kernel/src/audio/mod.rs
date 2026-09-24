@@ -25,6 +25,7 @@ pub use dsound::test_dsound_service_subsystem;
 pub use winmm::test_winmm_service_subsystem;
 pub use openal::test_openal_service_subsystem;
 pub use hrtf::test_hrtf_doppler_subsystem;
+pub use footstep_enhancer::test_footstep_enhancer_subsystem;
 
 pub use hrtf::*;
 pub use drc::*;

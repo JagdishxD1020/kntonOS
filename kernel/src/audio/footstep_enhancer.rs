@@ -438,3 +438,37 @@ pub fn verify_itd_ild_cue_sharpener() -> bool {
 
     true
 }
+
+
+
+/// Comprehensive verification self-test suite for Handheld Directional Footstep Audio Enhancer & Headphone Amp.
+pub fn test_footstep_enhancer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-AUDIO] Testing Handheld Directional Footstep Audio Enhancer & Headphone Amp...\r\n");
+
+    // 1. Verify Headphone Jack Impedance Auto-Detection & DAC Gain Stage
+    if !verify_impedance_detection_and_gain() {
+        crate::serial_write_str("[KNT-PANIC] Impedance detection and gain stage verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Footstep Acoustic Resonance Booster & Low-Frequency Rumble Filter
+    if !verify_footstep_resonance_and_rumble_filter() {
+        crate::serial_write_str("[KNT-PANIC] Footstep acoustic resonance booster verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Fast Sub-1ms Dynamic Range Compressor (DRC) & Peak Limiter
+    if !verify_fast_drc_and_limiter() {
+        crate::serial_write_str("[KNT-PANIC] Fast DRC limiter verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Positional ITD/ILD Spatial Cue Sharpener for Competitive FPS
+    if !verify_itd_ild_cue_sharpener() {
+        crate::serial_write_str("[KNT-PANIC] Positional ITD/ILD spatial cue sharpener verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-AUDIO-FOOTSTEP-PASS] Handheld directional footstep audio enhancer and headphone amp verified\r\n");
+    true
+}
