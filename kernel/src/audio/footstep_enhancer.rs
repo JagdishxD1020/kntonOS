@@ -337,3 +337,104 @@ pub fn verify_fast_drc_and_limiter() -> bool {
 
     true
 }
+
+
+
+// Positional ITD/ILD Spatial Cue Sharpener for Competitive 360-Degree Localization.
+
+/// Maximum fractional ITD delay line buffer size in samples (~1.5 ms at 48 kHz).
+pub const ITD_MAX_DELAY_SAMPLES: usize = 72;
+
+/// Positional 3D binaural cue sharpener exaggerating ITD and ILD for competitive FPS.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpatialCueSharpener {
+    /// Amplification factor for spatial cue separation (e.g. 1.35x).
+    pub cue_boost_factor: f32,
+    /// Left ear delay line ring buffer.
+    pub left_delay_line: [f32; ITD_MAX_DELAY_SAMPLES],
+    /// Right ear delay line ring buffer.
+    pub right_delay_line: [f32; ITD_MAX_DELAY_SAMPLES],
+    /// Write index into delay ring buffers.
+    pub write_idx: usize,
+}
+
+impl SpatialCueSharpener {
+    pub const fn new(cue_boost_factor: f32) -> Self {
+        Self {
+            cue_boost_factor,
+            left_delay_line: [0.0; ITD_MAX_DELAY_SAMPLES],
+            right_delay_line: [0.0; ITD_MAX_DELAY_SAMPLES],
+            write_idx: 0,
+        }
+    }
+
+    /// Default competitive FPS cue sharpener (1.35x spatial boost).
+    pub const fn default_competitive() -> Self {
+        Self::new(1.35)
+    }
+
+    /// Sharpens binaural cues for a stereo sample pair given horizontal azimuth angle in radians:
+    /// azimuth_rad: -PI/2 (pure left) .. 0 (front) .. +PI/2 (pure right).
+    pub fn sharpen_stereo(
+        &mut self,
+        left_in: f32,
+        right_in: f32,
+        azimuth_rad: f32,
+    ) -> (f32, f32) {
+        // Store current samples in delay line
+        self.left_delay_line[self.write_idx] = left_in;
+        self.right_delay_line[self.write_idx] = right_in;
+
+        // Woodworth model maximum human head ITD ~ 0.65ms -> 31 samples at 48 kHz
+        let sin_azimuth = crate::graphics::sin_f32(azimuth_rad.clamp(-1.5707963, 1.5707963));
+        let base_delay_samples = (sin_azimuth * 31.0) * self.cue_boost_factor;
+        let delay_int = base_delay_samples.abs() as usize;
+        let delay_clamped = delay_int.min(ITD_MAX_DELAY_SAMPLES - 1);
+
+        // ILD attenuation factor on far ear: head shadow attenuates contralateral ear up to -12 dB (factor 0.25)
+        let shadow_depth = (sin_azimuth.abs() * 0.70 * self.cue_boost_factor).min(0.85);
+
+        let (left_out, right_out) = if sin_azimuth > 0.0 {
+            // Sound is from the right: Left ear is delayed and shadowed (far ear)
+            let read_idx = (self.write_idx + ITD_MAX_DELAY_SAMPLES - delay_clamped) % ITD_MAX_DELAY_SAMPLES;
+            let delayed_left = self.left_delay_line[read_idx] * (1.0 - shadow_depth);
+            (delayed_left, right_in)
+        } else {
+            // Sound is from the left: Right ear is delayed and shadowed (far ear)
+            let read_idx = (self.write_idx + ITD_MAX_DELAY_SAMPLES - delay_clamped) % ITD_MAX_DELAY_SAMPLES;
+            let delayed_right = self.right_delay_line[read_idx] * (1.0 - shadow_depth);
+            (left_in, delayed_right)
+        };
+
+        self.write_idx = (self.write_idx + 1) % ITD_MAX_DELAY_SAMPLES;
+        (left_out, right_out)
+    }
+}
+
+/// Unit test verifying positional ITD/ILD spatial cue sharpening.
+pub fn verify_itd_ild_cue_sharpener() -> bool {
+    let mut sharpener = SpatialCueSharpener::default_competitive();
+
+    // 1. Center sound (azimuth = 0.0 rad): no delay, no shadowing (exact match)
+    let (l0, r0) = sharpener.sharpen_stereo(0.5, 0.5, 0.0);
+    if (l0 - 0.5).abs() > 0.001 || (r0 - 0.5).abs() > 0.001 {
+        return false;
+    }
+
+    // 2. Pure Right sound (azimuth = +PI/2 ~ 1.5708 rad):
+    // Feed impulse into right channel (left=0.0, right=1.0)
+    let (l_right, r_right) = sharpener.sharpen_stereo(1.0, 1.0, 1.5707963);
+    // Right ear must receive immediate sound (1.0), Left ear must be heavily shadowed (< 0.35)
+    if (r_right - 1.0).abs() > 0.001 || l_right > 0.35 {
+        return false;
+    }
+
+    // 3. Pure Left sound (azimuth = -PI/2 ~ -1.5708 rad):
+    let (l_left, r_left) = sharpener.sharpen_stereo(1.0, 1.0, -1.5707963);
+    // Left ear must receive immediate sound (1.0), Right ear must be shadowed (< 0.35)
+    if (l_left - 1.0).abs() > 0.001 || r_left > 0.35 {
+        return false;
+    }
+
+    true
+}
