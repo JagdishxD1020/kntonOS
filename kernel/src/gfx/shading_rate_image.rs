@@ -190,6 +190,143 @@ impl ShadingRateCombinerPipeline {
     }
 }
 
+// Configuration thresholds for contrast-adaptive shading rate generation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContrastAdaptiveConfig {
+    // Variance threshold above which 1x1 shading rate is preserved for high-frequency details.
+    pub edge_threshold: f32,
+    // Variance threshold above which 2x2 coarse shading rate is applied.
+    pub medium_threshold: f32,
+    // Enable peripheral bias to aggressively downscale shading rates towards screen borders.
+    pub peripheral_bias: bool,
+}
+
+impl Default for ContrastAdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            edge_threshold: 0.02,
+            medium_threshold: 0.005,
+            peripheral_bias: true,
+        }
+    }
+}
+
+// Contrast-Adaptive Shading Rate Generator computing local luminance variance per tile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContrastAdaptiveShadingRateGenerator {
+    pub config: ContrastAdaptiveConfig,
+}
+
+impl ContrastAdaptiveShadingRateGenerator {
+    // Creates a new generator with custom config.
+    pub const fn new(config: ContrastAdaptiveConfig) -> Self {
+        Self { config }
+    }
+
+    // Computes luminance from an RGB byte triplet normalized to 0.0..1.0.
+    #[inline(always)]
+    pub fn rgb_to_luminance(r: u8, g: u8, b: u8) -> f32 {
+        (r as f32 * 0.299 + g as f32 * 0.587 + b as f32 * 0.114) * (1.0 / 255.0)
+    }
+
+    // Computes local luminance variance for a tile rect in an RGBA8 buffer.
+    pub fn compute_tile_variance_rgba8(
+        rgba_buffer: &[u8],
+        image_width: u32,
+        image_height: u32,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+    ) -> f32 {
+        let x_start = tile_x * tile_size;
+        let y_start = tile_y * tile_size;
+        let x_end = core::cmp::min(x_start + tile_size, image_width);
+        let y_end = core::cmp::min(y_start + tile_size, image_height);
+
+        let mut count = 0u32;
+        let mut sum = 0.0f32;
+        let mut sum_sq = 0.0f32;
+
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let offset = ((y * image_width + x) * 4) as usize;
+                if offset + 2 < rgba_buffer.len() {
+                    let r = rgba_buffer[offset];
+                    let g = rgba_buffer[offset + 1];
+                    let b = rgba_buffer[offset + 2];
+                    let l = Self::rgb_to_luminance(r, g, b);
+                    sum += l;
+                    sum_sq += l * l;
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 {
+            return 0.0;
+        }
+
+        let mean = sum / (count as f32);
+        let var = (sum_sq / (count as f32)) - (mean * mean);
+        if var > 0.0 { var } else { 0.0 }
+    }
+
+    // Classifies variance and peripheral distance into a D3D12 shading rate.
+    pub fn classify_rate(&self, variance: f32, dist_from_center: f32) -> D3D12_SHADING_RATE {
+        let effective_variance = if self.config.peripheral_bias {
+            variance / (1.0 + dist_from_center * 2.0)
+        } else {
+            variance
+        };
+
+        if effective_variance >= self.config.edge_threshold {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1
+        } else if effective_variance >= self.config.medium_threshold {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2
+        } else {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4
+        }
+    }
+
+    // Generates a complete ShadingRateImageSurface from an RGBA8 input buffer.
+    pub fn generate_from_rgba8(
+        &self,
+        rgba_buffer: &[u8],
+        desc: D3D12_SHADING_RATE_IMAGE_DESC,
+    ) -> Result<ShadingRateImageSurface, ShadingRateImageError> {
+        let min_len = (desc.width_pixels as usize) * (desc.height_pixels as usize) * 4;
+        if rgba_buffer.len() < min_len {
+            return Err(ShadingRateImageError::BufferTooSmall);
+        }
+
+        let mut surface = ShadingRateImageSurface::new(desc, D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1)?;
+        let tile_size = desc.tile_granularity.tile_size();
+        let center_x = (desc.tiles_x as f32) * 0.5;
+        let center_y = (desc.tiles_y as f32) * 0.5;
+        let max_dist = center_x * center_x + center_y * center_y;
+
+        for ty in 0..desc.tiles_y {
+            for tx in 0..desc.tiles_x {
+                let var = Self::compute_tile_variance_rgba8(
+                    rgba_buffer,
+                    desc.width_pixels,
+                    desc.height_pixels,
+                    tx,
+                    ty,
+                    tile_size,
+                );
+                let dx = (tx as f32) - center_x;
+                let dy = (ty as f32) - center_y;
+                let norm_dist = if max_dist > 0.0 { (dx * dx + dy * dy) / max_dist } else { 0.0 };
+                let rate = self.classify_rate(var, norm_dist);
+                surface.set_rate(tx, ty, rate);
+            }
+        }
+
+        Ok(surface)
+    }
+}
+
 /// Temporary stub for shading rate image self-test during incremental commits.
 pub fn test_shading_rate_image_subsystem() -> bool {
     true
