@@ -452,7 +452,168 @@ impl D3D12ShadingRateCommandRecorder {
     }
 }
 
-/// Temporary stub for shading rate image self-test during incremental commits.
+// Comprehensive self-test for D3D12 VRS Tier 2 shading rate image & combiner subsystem.
 pub fn test_shading_rate_image_subsystem() -> bool {
+    // 1. Verify tile coordinate math and surface descriptor
+    let desc = match D3D12_SHADING_RATE_IMAGE_DESC::new(
+        1920,
+        1080,
+        D3D12_SHADING_RATE_IMAGE_TILE_GRANULARITY::Tile16x16,
+    ) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    if desc.tiles_x != 120 || desc.tiles_y != 68 || desc.total_tiles() != 8160 {
+        return false;
+    }
+
+    if desc.pixel_to_tile(0, 0) != (0, 0) {
+        return false;
+    }
+    if desc.pixel_to_tile(15, 15) != (0, 0) {
+        return false;
+    }
+    if desc.pixel_to_tile(16, 16) != (1, 1) {
+        return false;
+    }
+    if desc.pixel_to_tile(1919, 1079) != (119, 67) {
+        return false;
+    }
+
+    let mut surface = match ShadingRateImageSurface::new(desc, D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    if surface.get_rate(0, 0) != D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1 {
+        return false;
+    }
+    if !surface.set_rate(1, 1, D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2) {
+        return false;
+    }
+    if surface.sample_at_pixel(16, 16) != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    // 2. Verify combiner evaluation rules
+    let p_pass = ShadingRateCombinerPipeline::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+    );
+    if p_pass != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let p_over = ShadingRateCombinerPipeline::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+    );
+    if p_over != D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4 {
+        return false;
+    }
+
+    let p_min = ShadingRateCombinerPipeline::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+    );
+    if p_min != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let p_max = ShadingRateCombinerPipeline::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+    );
+    if p_max != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let p_sum = ShadingRateCombinerPipeline::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_SUM,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+    );
+    if p_sum != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let pipeline = ShadingRateCombinerPipeline::new(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+    );
+    let resolved = pipeline.resolve(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+    );
+    if resolved != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    // 3. Verify contrast-adaptive rate map generation
+    let mut rgba_test = alloc::vec![128u8; 64 * 64 * 4];
+    // Fill tile (0, 0) with alternating black and white pixels for high contrast edge
+    for y in 0..16 {
+        for x in 0..16 {
+            let offset = (y * 64 + x) * 4;
+            let val = if (x + y) % 2 == 0 { 255 } else { 0 };
+            rgba_test[offset] = val;
+            rgba_test[offset + 1] = val;
+            rgba_test[offset + 2] = val;
+            rgba_test[offset + 3] = 255;
+        }
+    }
+
+    let cas_desc = match D3D12_SHADING_RATE_IMAGE_DESC::new(
+        64,
+        64,
+        D3D12_SHADING_RATE_IMAGE_TILE_GRANULARITY::Tile16x16,
+    ) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    let mut cas_config = ContrastAdaptiveConfig::default();
+    cas_config.peripheral_bias = false;
+    let cas_gen = ContrastAdaptiveShadingRateGenerator::new(cas_config);
+    let cas_surface = match cas_gen.generate_from_rgba8(&rgba_test, cas_desc) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    if cas_surface.get_rate(0, 0) != D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1 {
+        return false;
+    }
+    if cas_surface.get_rate(1, 1) != D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4 {
+        return false;
+    }
+
+    // 4. Verify command list recorder and token stream
+    let mut recorder = D3D12ShadingRateCommandRecorder::new();
+    recorder.RSSetShadingRate(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        [
+            D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+            D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        ],
+    );
+    recorder.RSSetShadingRateImage(Some(cas_surface), 0xABCD_0000);
+
+    if recorder.total_commands_recorded != 2 {
+        return false;
+    }
+
+    let mut tokens = alloc::vec::Vec::new();
+    recorder.encode_token_stream(&mut tokens);
+    if tokens.is_empty() || tokens[0] != D3D12_TOKEN_RS_SET_SHADING_RATE {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-GPU-VRS-IMAGE-PASS] Direct3D 12 VRS Tier 2 shading rate image and combiner pipeline verified\r\n");
     true
 }
