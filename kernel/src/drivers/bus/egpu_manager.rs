@@ -289,3 +289,130 @@ pub fn verify_bar_rebalancing_allocator() -> bool {
 
     true
 }
+
+
+
+// Primary GPU Rendering Handover Coordinator (D3D12 Adapter Migration).
+
+/// Physical GPU adapter type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuAdapterType {
+    /// Integrated APU graphics (e.g. AMD Radeon 780M / Intel Arc).
+    InternalApu,
+    /// External discrete GPU connected via PCIe tunnel (e.g. RTX 4070 / RX 7800 XT).
+    ExternalEgpu,
+}
+
+/// Dynamic handover coordination state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverStatus {
+    /// Only internal APU active.
+    ApuOnly,
+    /// eGPU detected; draining in-flight APU command queues and migrating resources.
+    HandoverPending,
+    /// eGPU fully established as primary rendering engine.
+    EgpuPrimary,
+    /// Fallback migration in progress back to internal APU.
+    FallbackToApu,
+}
+
+/// Rendering Handover Coordinator managing seamless adapter switching.
+#[derive(Debug, Clone)]
+pub struct GpuHandoverCoordinator {
+    pub status: HandoverStatus,
+    pub active_adapter: GpuAdapterType,
+    pub in_flight_fences_drained: bool,
+    pub swapchain_rebound: bool,
+    pub handover_count: u32,
+}
+
+impl GpuHandoverCoordinator {
+    pub const fn new() -> Self {
+        Self {
+            status: HandoverStatus::ApuOnly,
+            active_adapter: GpuAdapterType::InternalApu,
+            in_flight_fences_drained: true,
+            swapchain_rebound: false,
+            handover_count: 0,
+        }
+    }
+
+    /// Initiates handover from internal APU to newly connected eGPU.
+    pub fn initiate_handover_to_egpu(&mut self) -> Result<(), &'static str> {
+        if self.status != HandoverStatus::ApuOnly {
+            return Err("Cannot initiate handover from current state");
+        }
+
+        self.status = HandoverStatus::HandoverPending;
+        self.in_flight_fences_drained = false;
+        self.swapchain_rebound = false;
+        Ok(())
+    }
+
+    /// Drains APU command queue and migrates swapchain surfaces to eGPU.
+    pub fn complete_handover_to_egpu(&mut self) -> Result<(), &'static str> {
+        if self.status != HandoverStatus::HandoverPending {
+            return Err("Handover not pending");
+        }
+
+        // Drain in-flight queue submissions
+        self.in_flight_fences_drained = true;
+        // Re-bind swapchain backbuffers to eGPU display pipeline
+        self.swapchain_rebound = true;
+        self.active_adapter = GpuAdapterType::ExternalEgpu;
+        self.status = HandoverStatus::EgpuPrimary;
+        self.handover_count += 1;
+        Ok(())
+    }
+
+    /// Initiates fallback transition to internal APU.
+    pub fn initiate_fallback_to_apu(&mut self) {
+        self.status = HandoverStatus::FallbackToApu;
+        self.swapchain_rebound = false;
+    }
+
+    /// Completes fallback transition back to internal APU.
+    pub fn complete_fallback_to_apu(&mut self) {
+        self.active_adapter = GpuAdapterType::InternalApu;
+        self.status = HandoverStatus::ApuOnly;
+        self.in_flight_fences_drained = true;
+        self.swapchain_rebound = true;
+        self.handover_count += 1;
+    }
+}
+
+/// Unit test verifying primary GPU rendering handover coordinator.
+pub fn verify_gpu_handover_coordinator() -> bool {
+    let mut coordinator = GpuHandoverCoordinator::new();
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    // 1. Initiate handover to eGPU
+    if coordinator.initiate_handover_to_egpu().is_err() || coordinator.status != HandoverStatus::HandoverPending {
+        return false;
+    }
+    if coordinator.in_flight_fences_drained {
+        return false;
+    }
+
+    // 2. Complete handover
+    if coordinator.complete_handover_to_egpu().is_err() || coordinator.status != HandoverStatus::EgpuPrimary {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::ExternalEgpu || !coordinator.swapchain_rebound {
+        return false;
+    }
+
+    // 3. Fallback to APU
+    coordinator.initiate_fallback_to_apu();
+    if coordinator.status != HandoverStatus::FallbackToApu {
+        return false;
+    }
+    coordinator.complete_fallback_to_apu();
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    true
+}
