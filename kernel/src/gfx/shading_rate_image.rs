@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use super::vrs::D3D12_SHADING_RATE;
+use super::vrs::{D3D12_SHADING_RATE, D3D12_SHADING_RATE_COMBINER};
 
 /// Errors returned by the shading rate image and combiner subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +136,57 @@ impl ShadingRateImageSurface {
     pub fn sample_at_pixel(&self, px: u32, py: u32) -> D3D12_SHADING_RATE {
         let (tx, ty) = self.desc.pixel_to_tile(px, py);
         self.get_rate(tx, ty)
+    }
+}
+
+// Multi-stage shading rate combiner pipeline evaluating D3D12 VRS Tier 2 combiner rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadingRateCombinerPipeline {
+    // Combiner for base pipeline rate and primitive rate.
+    pub primitive_combiner: D3D12_SHADING_RATE_COMBINER,
+    // Combiner for intermediate rate and screen-space shading rate image.
+    pub image_combiner: D3D12_SHADING_RATE_COMBINER,
+}
+
+impl Default for ShadingRateCombinerPipeline {
+    fn default() -> Self {
+        Self {
+            primitive_combiner: D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            image_combiner: D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        }
+    }
+}
+
+impl ShadingRateCombinerPipeline {
+    // Creates a new combiner pipeline instance.
+    pub const fn new(
+        primitive_combiner: D3D12_SHADING_RATE_COMBINER,
+        image_combiner: D3D12_SHADING_RATE_COMBINER,
+    ) -> Self {
+        Self {
+            primitive_combiner,
+            image_combiner,
+        }
+    }
+
+    // Combines two shading rates directly according to a specified combiner mode.
+    pub fn evaluate_combiner(
+        combiner: D3D12_SHADING_RATE_COMBINER,
+        rate_a: D3D12_SHADING_RATE,
+        rate_b: D3D12_SHADING_RATE,
+    ) -> D3D12_SHADING_RATE {
+        combiner.combine(rate_a, rate_b)
+    }
+
+    // Resolves final effective rate from base rate, primitive rate, and screen-space image rate.
+    pub fn resolve(
+        &self,
+        base_rate: D3D12_SHADING_RATE,
+        primitive_rate: D3D12_SHADING_RATE,
+        image_rate: D3D12_SHADING_RATE,
+    ) -> D3D12_SHADING_RATE {
+        let intermediate = self.primitive_combiner.combine(base_rate, primitive_rate);
+        self.image_combiner.combine(intermediate, image_rate)
     }
 }
 
