@@ -199,3 +199,149 @@ pub unsafe extern "system" fn SetThreadpoolCallbackCleanupGroup(
         (*pcbe).CleanupGroupCancelCallback = pfnc;
     }
 }
+
+/// Job execution priority for game and physics dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobPriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+/// Descriptor for a dispatched job item in the threadpool queue.
+#[derive(Debug, Clone, Copy)]
+pub struct JobDescriptor {
+    pub job_id: u64,
+    pub pool_id: u64,
+    pub callback: usize,
+    pub context: usize,
+    pub work_handle: u64,
+    pub priority: JobPriority,
+    pub affinity_mask: u64,
+}
+
+/// Per-core worker thread queue lane supporting local enqueue and remote stealing.
+pub struct WorkerThreadLane {
+    pub worker_id: usize,
+    pub local_queue: alloc::collections::VecDeque<JobDescriptor>,
+    pub jobs_executed: u64,
+    pub jobs_stolen: u64,
+}
+
+/// Work-stealing MPMC job scheduler coordinating multi-core worker threads.
+pub struct WorkStealingJobScheduler {
+    pub num_workers: usize,
+    pub workers: Vec<Spinlock<WorkerThreadLane>>,
+    pub global_queue: Spinlock<alloc::collections::VecDeque<JobDescriptor>>,
+    pub total_dispatched: AtomicU64,
+    pub total_completed: AtomicU64,
+}
+
+impl WorkStealingJobScheduler {
+    /// Initializes scheduler with the specified worker thread count.
+    pub fn new(num_workers: usize) -> Self {
+        let mut workers = Vec::with_capacity(num_workers);
+        for id in 0..num_workers {
+            workers.push(Spinlock::new(WorkerThreadLane {
+                worker_id: id,
+                local_queue: alloc::collections::VecDeque::new(),
+                jobs_executed: 0,
+                jobs_stolen: 0,
+            }));
+        }
+
+        Self {
+            num_workers,
+            workers,
+            global_queue: Spinlock::new(alloc::collections::VecDeque::new()),
+            total_dispatched: AtomicU64::new(0),
+            total_completed: AtomicU64::new(0),
+        }
+    }
+
+    /// Enqueues a job into a preferred worker lane or the global fallback queue.
+    pub fn push_job(&self, worker_hint: usize, job: JobDescriptor) {
+        self.total_dispatched.fetch_add(1, Ordering::SeqCst);
+        if worker_hint < self.num_workers {
+            self.workers[worker_hint].lock().local_queue.push_back(job);
+        } else {
+            self.global_queue.lock().push_back(job);
+        }
+    }
+
+    /// Pops a job for a worker, attempting local queue, then global, then stealing.
+    pub fn pop_job(&self, worker_id: usize) -> Option<JobDescriptor> {
+        // 1. Try local worker queue first (LIFO order for cache locality).
+        if let Some(job) = self.workers[worker_id].lock().local_queue.pop_back() {
+            return Some(job);
+        }
+
+        // 2. Try global shared queue (FIFO order).
+        if let Some(job) = self.global_queue.lock().pop_front() {
+            return Some(job);
+        }
+
+        // 3. Work stealing: steal from other worker lanes (FIFO order from head).
+        for offset in 1..self.num_workers {
+            let victim = (worker_id + offset) % self.num_workers;
+            let mut victim_lane = self.workers[victim].lock();
+            if let Some(stolen) = victim_lane.local_queue.pop_front() {
+                self.workers[worker_id].lock().jobs_stolen += 1;
+                return Some(stolen);
+            }
+        }
+
+        None
+    }
+
+    /// Executes the next available job for the designated worker thread.
+    pub fn execute_next_job(&self, worker_id: usize) -> bool {
+        if let Some(job) = self.pop_job(worker_id) {
+            if job.callback != 0 {
+                unsafe {
+                    let cb: unsafe extern "system" fn(
+                        PTP_CALLBACK_INSTANCE,
+                        *mut c_void,
+                        PTP_WORK,
+                    ) = core::mem::transmute(job.callback);
+                    cb(
+                        core::ptr::null_mut(),
+                        job.context as *mut c_void,
+                        job.work_handle as PTP_WORK,
+                    );
+                }
+            }
+            self.workers[worker_id].lock().jobs_executed += 1;
+            self.total_completed.fetch_add(1, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drains all currently queued jobs across all worker lanes.
+    pub fn drain_all(&self) {
+        let mut executed_any = true;
+        while executed_any {
+            executed_any = false;
+            for wid in 0..self.num_workers {
+                if self.execute_next_job(wid) {
+                    executed_any = true;
+                }
+            }
+        }
+    }
+}
+
+pub static GLOBAL_SCHEDULER: Spinlock<Option<WorkStealingJobScheduler>> = Spinlock::new(None);
+
+/// Ensures the global job scheduler is initialized.
+pub fn get_or_init_scheduler() -> &'static Spinlock<Option<WorkStealingJobScheduler>> {
+    let mut lock = GLOBAL_SCHEDULER.lock();
+    if lock.is_none() {
+        *lock = Some(WorkStealingJobScheduler::new(4));
+    }
+    drop(lock);
+    &GLOBAL_SCHEDULER
+}
