@@ -327,6 +327,131 @@ impl ContrastAdaptiveShadingRateGenerator {
     }
 }
 
+// Token stream opcodes for D3D12 VRS Tier 2 shading rate commands.
+pub const D3D12_TOKEN_RS_SET_SHADING_RATE: u32 = 0x5352_5445;
+pub const D3D12_TOKEN_RS_SET_SHADING_RATE_IMAGE: u32 = 0x5352_494D;
+
+// Command packet recorded into command stream for shading rate updates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShadingRateImageCommandPacket {
+    SetShadingRate {
+        base_rate: D3D12_SHADING_RATE,
+        combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    },
+    SetShadingRateImage {
+        gpu_virtual_address: u64,
+        surface: Option<ShadingRateImageSurface>,
+    },
+}
+
+// Current command list state tracking active shading rate and bound rate image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadingRateListState {
+    pub base_rate: D3D12_SHADING_RATE,
+    pub combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    pub image_gpu_address: u64,
+    pub bound_surface: Option<ShadingRateImageSurface>,
+}
+
+impl Default for ShadingRateListState {
+    fn default() -> Self {
+        Self {
+            base_rate: D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+            combiners: [
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            ],
+            image_gpu_address: 0,
+            bound_surface: None,
+        }
+    }
+}
+
+// Direct3D 12 Command List recorder implementing RSSetShadingRate & RSSetShadingRateImage.
+#[derive(Debug, Clone, Default)]
+pub struct D3D12ShadingRateCommandRecorder {
+    pub state: ShadingRateListState,
+    pub packets: alloc::vec::Vec<ShadingRateImageCommandPacket>,
+    pub total_commands_recorded: u32,
+}
+
+impl D3D12ShadingRateCommandRecorder {
+    // Constructs a new command list recorder with default VRS state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Direct3D 12 API: RSSetShadingRate sets pipeline base rate and two combiner stages.
+    #[allow(non_snake_case)]
+    pub fn RSSetShadingRate(
+        &mut self,
+        base_rate: D3D12_SHADING_RATE,
+        combiners: [D3D12_SHADING_RATE_COMBINER; 2],
+    ) {
+        self.state.base_rate = base_rate;
+        self.state.combiners = combiners;
+        self.packets.push(ShadingRateImageCommandPacket::SetShadingRate {
+            base_rate,
+            combiners,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    // Direct3D 12 API: RSSetShadingRateImage binds or unbinds screen-space shading rate image.
+    #[allow(non_snake_case)]
+    pub fn RSSetShadingRateImage(
+        &mut self,
+        surface: Option<ShadingRateImageSurface>,
+        gpu_virtual_address: u64,
+    ) {
+        self.state.bound_surface = surface.clone();
+        self.state.image_gpu_address = gpu_virtual_address;
+        self.packets.push(ShadingRateImageCommandPacket::SetShadingRateImage {
+            gpu_virtual_address,
+            surface,
+        });
+        self.total_commands_recorded = self.total_commands_recorded.saturating_add(1);
+    }
+
+    // Evaluates final shading rate at pixel coordinate according to recorded state.
+    pub fn resolve_pixel_rate(
+        &self,
+        pixel_x: u32,
+        pixel_y: u32,
+        primitive_rate: D3D12_SHADING_RATE,
+    ) -> D3D12_SHADING_RATE {
+        let pipeline = ShadingRateCombinerPipeline::new(self.state.combiners[0], self.state.combiners[1]);
+        let image_rate = match &self.state.bound_surface {
+            Some(surf) => surf.sample_at_pixel(pixel_x, pixel_y),
+            None => D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        };
+        pipeline.resolve(self.state.base_rate, primitive_rate, image_rate)
+    }
+
+    // Encodes recorded command packets into a raw token stream buffer.
+    pub fn encode_token_stream(&self, out_stream: &mut alloc::vec::Vec<u32>) {
+        for packet in &self.packets {
+            match packet {
+                ShadingRateImageCommandPacket::SetShadingRate { base_rate, combiners } => {
+                    out_stream.push(D3D12_TOKEN_RS_SET_SHADING_RATE);
+                    out_stream.push(*base_rate as u32);
+                    out_stream.push(combiners[0] as u32);
+                    out_stream.push(combiners[1] as u32);
+                }
+                ShadingRateImageCommandPacket::SetShadingRateImage {
+                    gpu_virtual_address,
+                    surface,
+                } => {
+                    out_stream.push(D3D12_TOKEN_RS_SET_SHADING_RATE_IMAGE);
+                    out_stream.push((*gpu_virtual_address & 0xFFFF_FFFF) as u32);
+                    out_stream.push((*gpu_virtual_address >> 32) as u32);
+                    out_stream.push(if surface.is_some() { 1 } else { 0 });
+                }
+            }
+        }
+    }
+}
+
 /// Temporary stub for shading rate image self-test during incremental commits.
 pub fn test_shading_rate_image_subsystem() -> bool {
     true
