@@ -63,6 +63,33 @@ pub struct IoCompletionPortInner {
     pub closed: bool,
 }
 
+impl IoCompletionPortInner {
+    /// Pushes a completed I/O packet onto the completion queue.
+    pub fn push_packet(&mut self, packet: CompletionPacket) {
+        self.queue.push_back(packet);
+    }
+
+    /// Pops the next completed I/O packet in FIFO order.
+    pub fn pop_packet(&mut self) -> Option<CompletionPacket> {
+        self.queue.pop_front()
+    }
+
+    /// Checks if the port has reached its maximum concurrent running threads limit.
+    pub fn is_at_concurrency_limit(&self) -> bool {
+        self.active_threads.load(Ordering::SeqCst) >= self.max_concurrency
+    }
+
+    /// Increments the active running thread count when a thread wakes up with a packet.
+    pub fn enter_active_thread(&self) {
+        self.active_threads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the active running thread count when a thread blocks or yields.
+    pub fn leave_active_thread(&self) {
+        self.active_threads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 static NEXT_IOCP_ID: AtomicU64 = AtomicU64::new(0x9000_1000);
 pub static IOCP_PORTS: Spinlock<BTreeMap<HANDLE, IoCompletionPortInner>> =
     Spinlock::new(BTreeMap::new());
@@ -108,5 +135,40 @@ pub unsafe extern "system" fn CreateIoCompletionPort(
             win32_set_last_error(ERROR_INVALID_HANDLE);
             0
         }
+    }
+}
+
+/// Enqueues an I/O completion packet to the specified completion port.
+pub unsafe extern "system" fn PostQueuedCompletionStatus(
+    CompletionPort: HANDLE,
+    dwNumberOfBytesTransferred: u32,
+    dwCompletionKey: usize,
+    lpOverlapped: LPOVERLAPPED,
+) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(port) = lock.get_mut(&CompletionPort) {
+        if port.closed {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+
+        let packet = CompletionPacket {
+            bytes_transferred: dwNumberOfBytesTransferred,
+            completion_key: dwCompletionKey,
+            overlapped_ptr: lpOverlapped as usize,
+            status: 0,
+        };
+
+        port.push_packet(packet);
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
     }
 }
