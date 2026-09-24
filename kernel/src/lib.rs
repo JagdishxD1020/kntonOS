@@ -868,6 +868,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Binaural HRTF spatial audio filter and Doppler engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Directional Footstep Audio Enhancer & Headphone Amp (TASK-KNT-203)
+    if !audio::test_footstep_enhancer_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld footstep audio enhancer self-test failed!\r\n");
+    }
+
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
     if !crypto::test_crypto_rng_subsystem() {
