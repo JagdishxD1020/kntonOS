@@ -994,6 +994,11 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // Verify Win32 Threadpool API & Parallel Game Job Scheduler (TASK-KNT-204)
+    if !pe::test_win32_threadpool_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 threadpool and job scheduler self-test failed!\r\n");
+    }
+
     // Verify Milestone 200 Unified Gaming Runtime Supervisor & Health Matrix (TASK-KNT-200)
     if !sys::test_milestone_200_supervisor() {
         serial_write_str("[KNT-PANIC] Milestone 200 supervisor self-test failed!\r\n");

@@ -752,3 +752,117 @@ pub unsafe extern "system" fn CloseThreadpoolCleanupGroup(ptpcg: PTP_CLEANUP_GRO
         win32_set_last_error(ERROR_INVALID_HANDLE);
     }
 }
+
+static TEST_WORK_COUNTER: AtomicU32 = AtomicU32::new(0);
+static TEST_TIMER_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_work_callback(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _work: PTP_WORK,
+) {
+    let add_val = context as usize as u32;
+    TEST_WORK_COUNTER.fetch_add(add_val, Ordering::SeqCst);
+}
+
+unsafe extern "system" fn test_timer_callback(
+    _instance: PTP_CALLBACK_INSTANCE,
+    context: *mut c_void,
+    _timer: PTP_TIMER,
+) {
+    let add_val = context as usize as u32;
+    TEST_TIMER_COUNTER.fetch_add(add_val, Ordering::SeqCst);
+}
+
+/// Comprehensive self-test for Win32 threadpool, work queues, timers, and cleanup groups.
+pub fn test_win32_threadpool_subsystem() -> bool {
+    unsafe {
+        // 1. Threadpool creation and thread limits.
+        let pool = CreateThreadpool(core::ptr::null_mut());
+        if pool.is_null() {
+            return false;
+        }
+        if SetThreadpoolThreadMinimum(pool, 2) != TRUE {
+            return false;
+        }
+        SetThreadpoolThreadMaximum(pool, 8);
+
+        // 2. Callback environment configuration.
+        let mut env = TP_CALLBACK_ENVIRON::default();
+        InitializeThreadpoolEnvironment(&mut env);
+        SetThreadpoolCallbackPool(&mut env, pool);
+
+        // 3. Threadpool work items submission and completion barrier.
+        TEST_WORK_COUNTER.store(0, Ordering::SeqCst);
+        let work = CreateThreadpoolWork(Some(test_work_callback), 10 as *mut c_void, &env);
+        if work.is_null() {
+            return false;
+        }
+
+        // Submit 5 work items (each adds 10 -> total 50).
+        for _ in 0..5 {
+            SubmitThreadpoolWork(work);
+        }
+
+        // Wait for all callbacks to finish.
+        WaitForThreadpoolWorkCallbacks(work, FALSE);
+        if TEST_WORK_COUNTER.load(Ordering::SeqCst) != 50 {
+            return false;
+        }
+        CloseThreadpoolWork(work);
+
+        // 4. Threadpool timers scheduling and firing.
+        TEST_TIMER_COUNTER.store(0, Ordering::SeqCst);
+        let timer = CreateThreadpoolTimer(Some(test_timer_callback), 25 as *mut c_void, &env);
+        if timer.is_null() {
+            return false;
+        }
+        if IsThreadpoolTimerSet(timer) != FALSE {
+            return false;
+        }
+
+        let due_time = FILETIME { dwLowDateTime: 1000, dwHighDateTime: 0 };
+        SetThreadpoolTimer(timer, &due_time, 100, 10);
+        if IsThreadpoolTimerSet(timer) != TRUE {
+            return false;
+        }
+
+        WaitForThreadpoolTimerCallbacks(timer, FALSE);
+        if TEST_TIMER_COUNTER.load(Ordering::SeqCst) != 25 {
+            return false;
+        }
+        CloseThreadpoolTimer(timer);
+
+        // 5. Cleanup groups for bulk teardown during level transition.
+        let cleanup_group = CreateThreadpoolCleanupGroup();
+        if cleanup_group.is_null() {
+            return false;
+        }
+        SetThreadpoolCallbackCleanupGroup(&mut env, cleanup_group, None);
+
+        let cg_work = CreateThreadpoolWork(Some(test_work_callback), 5 as *mut c_void, &env);
+        let cg_timer = CreateThreadpoolTimer(Some(test_timer_callback), 5 as *mut c_void, &env);
+        if cg_work.is_null() || cg_timer.is_null() {
+            return false;
+        }
+
+        SubmitThreadpoolWork(cg_work);
+        CloseThreadpoolCleanupGroupMembers(cleanup_group, FALSE, core::ptr::null_mut());
+        CloseThreadpoolCleanupGroup(cleanup_group);
+
+        if THREADPOOL_WORKS.lock().contains_key(&(cg_work as u64)) {
+            return false;
+        }
+        if THREADPOOL_TIMERS.lock().contains_key(&(cg_timer as u64)) {
+            return false;
+        }
+
+        CloseThreadpool(pool);
+        DestroyThreadpoolEnvironment(&mut env);
+
+        crate::serial_write_str(
+            "[KNT-WIN32-THREADPOOL-OK] Win32 threadpool API and parallel game job scheduler verified\r\n",
+        );
+        true
+    }
+}
