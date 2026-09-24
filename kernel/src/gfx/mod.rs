@@ -38,7 +38,8 @@ pub mod drs;
 pub mod render_pass;
 pub mod predication;
 pub mod ray_query;
-pub mod shading_rate_image;
+pub mod shading_rate_image;
+pub mod descriptor_suballocator;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -77,7 +78,8 @@ pub use drs::*;
 pub use render_pass::*;
 pub use predication::*;
 pub use ray_query::*;
-pub use shading_rate_image::*;
+pub use shading_rate_image::*;
+pub use descriptor_suballocator::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
