@@ -280,3 +280,175 @@ pub fn verify_pd31_epr_negotiation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Thermal Bypass Governor for High-Load APU Power Path Switching
+// ============================================================================
+
+/// Power path routing mode for motherboard and battery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassPowerMode {
+    /// No AC supply connected; battery powers motherboard.
+    BatteryDischarge,
+    /// AC supply powers motherboard and concurrently charges battery pack.
+    SimultaneousCharge,
+    /// AC supply powers motherboard directly; battery charging FET isolated.
+    DirectBypass,
+}
+
+/// Hardware power path MOSFET switch state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerPathSwitchState {
+    /// AC input power FET closed (conducting).
+    pub ac_input_closed: bool,
+    /// Battery pack charge FET closed (conducting).
+    pub batt_charge_closed: bool,
+    /// Battery pack discharge FET closed (conducting).
+    pub batt_discharge_closed: bool,
+}
+
+impl PowerPathSwitchState {
+    pub const fn new() -> Self {
+        Self {
+            ac_input_closed: false,
+            batt_charge_closed: false,
+            batt_discharge_closed: true,
+        }
+    }
+}
+
+/// Governor evaluating APU TDP and battery thermals to engage direct bypass.
+#[derive(Debug, Clone)]
+pub struct ThermalBypassGovernor {
+    /// High-load APU TDP threshold in Watts (e.g. 25.0W).
+    pub apu_tdp_threshold_w: f32,
+    /// Hysteresis recovery TDP threshold in Watts (e.g. 20.0W).
+    pub apu_tdp_recovery_w: f32,
+    /// Battery pack critical thermal threshold in Celsius (e.g. 42.0°C).
+    pub batt_temp_threshold_c: f32,
+    /// Battery thermal recovery threshold in Celsius (e.g. 38.0°C).
+    pub batt_temp_recovery_c: f32,
+    /// Current power path mode.
+    pub current_mode: BypassPowerMode,
+    /// Active switch configuration.
+    pub switches: PowerPathSwitchState,
+    /// Whether direct thermal bypass is currently engaged.
+    pub bypass_engaged: bool,
+    /// Consecutive tick counter for hysteresis recovery.
+    pub recovery_tick_count: u32,
+    /// Total bypass trigger events.
+    pub bypass_trigger_count: u32,
+}
+
+impl ThermalBypassGovernor {
+    pub const fn new() -> Self {
+        Self {
+            apu_tdp_threshold_w: 25.0,
+            apu_tdp_recovery_w: 20.0,
+            batt_temp_threshold_c: 42.0,
+            batt_temp_recovery_c: 38.0,
+            current_mode: BypassPowerMode::BatteryDischarge,
+            switches: PowerPathSwitchState::new(),
+            bypass_engaged: false,
+            recovery_tick_count: 0,
+            bypass_trigger_count: 0,
+        }
+    }
+
+    /// Evaluates system thermals and APU power to configure power path routing.
+    pub fn evaluate(
+        &mut self,
+        ac_connected: bool,
+        ac_power_w: f32,
+        apu_tdp_w: f32,
+        batt_temp_c: f32,
+    ) -> BypassPowerMode {
+        if !ac_connected || ac_power_w < 15.0 {
+            self.current_mode = BypassPowerMode::BatteryDischarge;
+            self.switches.ac_input_closed = false;
+            self.switches.batt_charge_closed = false;
+            self.switches.batt_discharge_closed = true;
+            self.bypass_engaged = false;
+            self.recovery_tick_count = 0;
+            return self.current_mode;
+        }
+
+        self.switches.ac_input_closed = true;
+        self.switches.batt_discharge_closed = false;
+
+        let thermal_trip = batt_temp_c >= self.batt_temp_threshold_c;
+        let tdp_trip = apu_tdp_w >= self.apu_tdp_threshold_w;
+
+        if tdp_trip || thermal_trip {
+            self.bypass_engaged = true;
+            self.recovery_tick_count = 0;
+            self.bypass_trigger_count += 1;
+        } else if self.bypass_engaged {
+            if apu_tdp_w <= self.apu_tdp_recovery_w && batt_temp_c <= self.batt_temp_recovery_c {
+                self.recovery_tick_count += 1;
+                if self.recovery_tick_count >= 3 {
+                    self.bypass_engaged = false;
+                    self.recovery_tick_count = 0;
+                }
+            } else {
+                self.recovery_tick_count = 0;
+            }
+        }
+
+        if self.bypass_engaged {
+            self.current_mode = BypassPowerMode::DirectBypass;
+            self.switches.batt_charge_closed = false;
+        } else {
+            self.current_mode = BypassPowerMode::SimultaneousCharge;
+            self.switches.batt_charge_closed = true;
+        }
+
+        self.current_mode
+    }
+}
+
+/// Unit test verifying thermal bypass governor under heavy APU gaming load.
+pub fn verify_thermal_bypass_governor() -> bool {
+    let mut gov = ThermalBypassGovernor::new();
+
+    // 1. Unplugged: battery discharge mode
+    let m0 = gov.evaluate(false, 0.0, 15.0, 30.0);
+    if m0 != BypassPowerMode::BatteryDischarge || gov.bypass_engaged {
+        return false;
+    }
+
+    // 2. Plugged in, light load (15W APU TDP, 32°C): simultaneous charging
+    let m1 = gov.evaluate(true, 100.0, 15.0, 32.0);
+    if m1 != BypassPowerMode::SimultaneousCharge || !gov.switches.batt_charge_closed {
+        return false;
+    }
+
+    // 3. Heavy gaming load (28W APU TDP > 25W threshold): trigger direct bypass
+    let m2 = gov.evaluate(true, 100.0, 28.0, 35.0);
+    if m2 != BypassPowerMode::DirectBypass || !gov.bypass_engaged || gov.switches.batt_charge_closed {
+        return false;
+    }
+
+    // 4. Hysteresis: TDP drops to 22W (between 20W and 25W): bypass remains engaged
+    let m3 = gov.evaluate(true, 100.0, 22.0, 35.0);
+    if m3 != BypassPowerMode::DirectBypass || !gov.bypass_engaged {
+        return false;
+    }
+
+    // 5. Recovery: TDP drops to 18W (< 20W) for 3 ticks: transitions back to simultaneous charge
+    gov.evaluate(true, 100.0, 18.0, 34.0);
+    gov.evaluate(true, 100.0, 18.0, 34.0);
+    let m_rec = gov.evaluate(true, 100.0, 18.0, 34.0);
+    if m_rec != BypassPowerMode::SimultaneousCharge || gov.bypass_engaged || !gov.switches.batt_charge_closed {
+        return false;
+    }
+
+    // 6. Thermal trip: low TDP (18W) but battery overheats (43°C >= 42°C threshold)
+    let m_hot = gov.evaluate(true, 100.0, 18.0, 43.0);
+    if m_hot != BypassPowerMode::DirectBypass || !gov.bypass_engaged {
+        return false;
+    }
+
+    true
+}
