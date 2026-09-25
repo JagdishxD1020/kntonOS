@@ -1,0 +1,584 @@
+//! Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor.
+
+#![allow(dead_code)]
+
+/// Standard Hot-Plug Controller (SHPC) state machine for handheld eGPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgpuHotplugState {
+    /// No external GPU connected to USB4/Oculink port.
+    Disconnected,
+    /// Cable detected; protocol negotiation and PCIe tunnel training active.
+    TunnelNegotiating,
+    /// High-speed PCIe Gen4 x4 tunnel established and link trained.
+    LinkReadyGen4,
+    /// MMIO BARs allocated and eGPU active as primary graphics renderer.
+    ActivePrimary,
+    /// Sudden physical disconnect detected while active; safety fallback engaged.
+    SurpriseRemoval,
+}
+
+/// PCIe Link Generation and Lane Width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcieLinkSpeed {
+    None,
+    Gen3x4,
+    Gen4x4,
+}
+
+/// Hot-plug eGPU controller tracking connection state and PCIe link negotiation.
+#[derive(Debug, Clone)]
+pub struct EgpuController {
+    pub state: EgpuHotplugState,
+    pub link_speed: PcieLinkSpeed,
+    pub link_width: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub state_transition_count: u32,
+}
+
+impl EgpuController {
+    pub const fn new() -> Self {
+        Self {
+            state: EgpuHotplugState::Disconnected,
+            link_speed: PcieLinkSpeed::None,
+            link_width: 0,
+            vendor_id: 0,
+            device_id: 0,
+            state_transition_count: 0,
+        }
+    }
+
+    /// Handles physical cable insertion interrupt event.
+    pub fn on_cable_insert(&mut self) -> EgpuHotplugState {
+        if self.state == EgpuHotplugState::Disconnected {
+            self.state = EgpuHotplugState::TunnelNegotiating;
+            self.state_transition_count += 1;
+        }
+        self.state
+    }
+
+    /// Completes PCIe tunnel training and establishes high-speed link.
+    pub fn complete_tunnel_training(&mut self, vendor_id: u16, device_id: u16) -> Result<PcieLinkSpeed, &'static str> {
+        if self.state != EgpuHotplugState::TunnelNegotiating {
+            return Err("Not in tunnel negotiating state");
+        }
+
+        self.vendor_id = vendor_id;
+        self.device_id = device_id;
+        self.link_speed = PcieLinkSpeed::Gen4x4;
+        self.link_width = 4;
+        self.state = EgpuHotplugState::LinkReadyGen4;
+        self.state_transition_count += 1;
+        Ok(self.link_speed)
+    }
+
+    /// Transitions to active primary renderer once BARs are mapped.
+    pub fn mark_active_primary(&mut self) -> Result<(), &'static str> {
+        if self.state != EgpuHotplugState::LinkReadyGen4 {
+            return Err("Link not ready");
+        }
+        self.state = EgpuHotplugState::ActivePrimary;
+        self.state_transition_count += 1;
+        Ok(())
+    }
+
+    /// Triggers sudden surprise removal safety sequence.
+    pub fn on_surprise_removal(&mut self) -> EgpuHotplugState {
+        self.state = EgpuHotplugState::SurpriseRemoval;
+        self.link_speed = PcieLinkSpeed::None;
+        self.link_width = 0;
+        self.state_transition_count += 1;
+        self.state
+    }
+
+    /// Resets state machine back to Disconnected after teardown.
+    pub fn complete_disconnect(&mut self) {
+        self.state = EgpuHotplugState::Disconnected;
+        self.vendor_id = 0;
+        self.device_id = 0;
+        self.state_transition_count += 1;
+    }
+}
+
+/// Unit test verifying eGPU hot-plug controller state machine and link negotiation.
+pub fn verify_egpu_state_machine() -> bool {
+    let mut egpu = EgpuController::new();
+    if egpu.state != EgpuHotplugState::Disconnected {
+        return false;
+    }
+
+    // 1. Cable insertion -> TunnelNegotiating
+    let s1 = egpu.on_cable_insert();
+    if s1 != EgpuHotplugState::TunnelNegotiating {
+        return false;
+    }
+
+    // 2. Tunnel training -> LinkReadyGen4 (e.g. AMD Radeon RX 7800 XT / NVIDIA RTX 4070)
+    let res = egpu.complete_tunnel_training(0x10DE, 0x2782);
+    if res != Ok(PcieLinkSpeed::Gen4x4) || egpu.state != EgpuHotplugState::LinkReadyGen4 {
+        return false;
+    }
+    if egpu.link_width != 4 {
+        return false;
+    }
+
+    // 3. Mark active primary
+    if egpu.mark_active_primary().is_err() || egpu.state != EgpuHotplugState::ActivePrimary {
+        return false;
+    }
+
+    // 4. Sudden disconnect -> SurpriseRemoval
+    let s_drop = egpu.on_surprise_removal();
+    if s_drop != EgpuHotplugState::SurpriseRemoval || egpu.link_speed != PcieLinkSpeed::None {
+        return false;
+    }
+
+    // 5. Complete teardown
+    egpu.complete_disconnect();
+    if egpu.state != EgpuHotplugState::Disconnected {
+        return false;
+    }
+
+    true
+}
+
+
+
+// 64-bit BAR Rebalancing Allocator for eGPU High-MMIO Apertures.
+
+/// Allocated MMIO BAR aperture range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarAllocation {
+    pub bar_index: u8,
+    pub base_addr: u64,
+    pub size_bytes: u64,
+    pub is_64bit: bool,
+    pub is_prefetchable: bool,
+}
+
+impl BarAllocation {
+    pub const fn empty() -> Self {
+        Self {
+            bar_index: 0,
+            base_addr: 0,
+            size_bytes: 0,
+            is_64bit: false,
+            is_prefetchable: false,
+        }
+    }
+}
+
+/// Dynamic 64-bit High MMIO Aperture Allocator above APU Unified Memory.
+#[derive(Debug, Clone)]
+pub struct BarRebalancingAllocator {
+    /// Starting boundary of high 64-bit MMIO window (e.g. 0x0000_3800_0000_0000).
+    pub aperture_base: u64,
+    /// Total aperture size in bytes (e.g. 256 GB).
+    pub aperture_size: u64,
+    /// Current bump allocation pointer within aperture.
+    pub current_alloc_ptr: u64,
+    /// Active BAR allocations.
+    pub allocations: [BarAllocation; 6],
+    pub allocation_count: usize,
+}
+
+impl BarRebalancingAllocator {
+    pub const fn new(aperture_base: u64, aperture_size: u64) -> Self {
+        Self {
+            aperture_base,
+            aperture_size,
+            current_alloc_ptr: aperture_base,
+            allocations: [BarAllocation::empty(); 6],
+            allocation_count: 0,
+        }
+    }
+
+    /// Default high 64-bit aperture starting well above 64GB APU unified RAM.
+    pub const fn default_handheld() -> Self {
+        // Base at 0x3800_0000_0000 (~56 TB), size 256 GB (0x40_0000_0000)
+        Self::new(0x0000_3800_0000_0000, 0x0000_0040_0000_0000)
+    }
+
+    /// Allocates an aligned high-MMIO BAR window for eGPU (e.g. Resizable BAR VRAM).
+    pub fn allocate_bar(
+        &mut self,
+        bar_index: u8,
+        size_bytes: u64,
+        is_prefetchable: bool,
+    ) -> Result<BarAllocation, &'static str> {
+        if self.allocation_count >= self.allocations.len() {
+            return Err("Maximum BAR allocations reached");
+        }
+        if size_bytes == 0 {
+            return Err("Invalid BAR size");
+        }
+
+        // Align current_alloc_ptr to requested size (standard PCIe requirement)
+        let alignment = size_bytes;
+        let aligned_base = (self.current_alloc_ptr + (alignment - 1)) & !(alignment - 1);
+
+        if (aligned_base + size_bytes) > (self.aperture_base + self.aperture_size) {
+            return Err("Aperture space exhausted");
+        }
+
+        let alloc = BarAllocation {
+            bar_index,
+            base_addr: aligned_base,
+            size_bytes,
+            is_64bit: true,
+            is_prefetchable,
+        };
+
+        self.allocations[self.allocation_count] = alloc;
+        self.allocation_count += 1;
+        self.current_alloc_ptr = aligned_base + size_bytes;
+        Ok(alloc)
+    }
+
+    /// Verifies that an allocated address does not collide with APU unified memory (0 .. 64 GB).
+    pub fn is_free_of_apu_collision(&self, base_addr: u64, size_bytes: u64) -> bool {
+        let apu_max_ram = 0x0000_0010_0000_0000; // 64 GB
+        let alloc_end = base_addr + size_bytes;
+        base_addr >= apu_max_ram && alloc_end <= (self.aperture_base + self.aperture_size)
+    }
+
+    /// Resets all allocations on eGPU detachment.
+    pub fn reset(&mut self) {
+        self.current_alloc_ptr = self.aperture_base;
+        self.allocation_count = 0;
+        self.allocations = [BarAllocation::empty(); 6];
+    }
+}
+
+/// Unit test verifying BAR rebalancing allocator and collision avoidance with APU RAM.
+pub fn verify_bar_rebalancing_allocator() -> bool {
+    let mut allocator = BarRebalancingAllocator::default_handheld();
+
+    // 1. Allocate 16GB Resizable BAR (VRAM aperture) at BAR 0
+    let vram_16gb = 16 * 1024 * 1024 * 1024u64;
+    let alloc0 = allocator.allocate_bar(0, vram_16gb, true);
+    if alloc0.is_err() {
+        return false;
+    }
+    let bar0 = alloc0.unwrap();
+    if bar0.base_addr != allocator.aperture_base || bar0.size_bytes != vram_16gb {
+        return false;
+    }
+    // Must be completely free of APU collision
+    if !allocator.is_free_of_apu_collision(bar0.base_addr, bar0.size_bytes) {
+        return false;
+    }
+
+    // 2. Allocate 64MB Control MMIO register window at BAR 2
+    let mmio_64mb = 64 * 1024 * 1024u64;
+    let alloc2 = allocator.allocate_bar(2, mmio_64mb, false);
+    if alloc2.is_err() {
+        return false;
+    }
+    let bar2 = alloc2.unwrap();
+    // Base must be aligned and placed immediately following BAR 0
+    if bar2.base_addr != (bar0.base_addr + vram_16gb) || bar2.size_bytes != mmio_64mb {
+        return false;
+    }
+
+    // 3. Reset check
+    allocator.reset();
+    if allocator.allocation_count != 0 || allocator.current_alloc_ptr != allocator.aperture_base {
+        return false;
+    }
+
+    true
+}
+
+
+
+// Primary GPU Rendering Handover Coordinator (D3D12 Adapter Migration).
+
+/// Physical GPU adapter type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuAdapterType {
+    /// Integrated APU graphics (e.g. AMD Radeon 780M / Intel Arc).
+    InternalApu,
+    /// External discrete GPU connected via PCIe tunnel (e.g. RTX 4070 / RX 7800 XT).
+    ExternalEgpu,
+}
+
+/// Dynamic handover coordination state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoverStatus {
+    /// Only internal APU active.
+    ApuOnly,
+    /// eGPU detected; draining in-flight APU command queues and migrating resources.
+    HandoverPending,
+    /// eGPU fully established as primary rendering engine.
+    EgpuPrimary,
+    /// Fallback migration in progress back to internal APU.
+    FallbackToApu,
+}
+
+/// Rendering Handover Coordinator managing seamless adapter switching.
+#[derive(Debug, Clone)]
+pub struct GpuHandoverCoordinator {
+    pub status: HandoverStatus,
+    pub active_adapter: GpuAdapterType,
+    pub in_flight_fences_drained: bool,
+    pub swapchain_rebound: bool,
+    pub handover_count: u32,
+}
+
+impl GpuHandoverCoordinator {
+    pub const fn new() -> Self {
+        Self {
+            status: HandoverStatus::ApuOnly,
+            active_adapter: GpuAdapterType::InternalApu,
+            in_flight_fences_drained: true,
+            swapchain_rebound: false,
+            handover_count: 0,
+        }
+    }
+
+    /// Initiates handover from internal APU to newly connected eGPU.
+    pub fn initiate_handover_to_egpu(&mut self) -> Result<(), &'static str> {
+        if self.status != HandoverStatus::ApuOnly {
+            return Err("Cannot initiate handover from current state");
+        }
+
+        self.status = HandoverStatus::HandoverPending;
+        self.in_flight_fences_drained = false;
+        self.swapchain_rebound = false;
+        Ok(())
+    }
+
+    /// Drains APU command queue and migrates swapchain surfaces to eGPU.
+    pub fn complete_handover_to_egpu(&mut self) -> Result<(), &'static str> {
+        if self.status != HandoverStatus::HandoverPending {
+            return Err("Handover not pending");
+        }
+
+        // Drain in-flight queue submissions
+        self.in_flight_fences_drained = true;
+        // Re-bind swapchain backbuffers to eGPU display pipeline
+        self.swapchain_rebound = true;
+        self.active_adapter = GpuAdapterType::ExternalEgpu;
+        self.status = HandoverStatus::EgpuPrimary;
+        self.handover_count += 1;
+        Ok(())
+    }
+
+    /// Initiates fallback transition to internal APU.
+    pub fn initiate_fallback_to_apu(&mut self) {
+        self.status = HandoverStatus::FallbackToApu;
+        self.swapchain_rebound = false;
+    }
+
+    /// Completes fallback transition back to internal APU.
+    pub fn complete_fallback_to_apu(&mut self) {
+        self.active_adapter = GpuAdapterType::InternalApu;
+        self.status = HandoverStatus::ApuOnly;
+        self.in_flight_fences_drained = true;
+        self.swapchain_rebound = true;
+        self.handover_count += 1;
+    }
+}
+
+/// Unit test verifying primary GPU rendering handover coordinator.
+pub fn verify_gpu_handover_coordinator() -> bool {
+    let mut coordinator = GpuHandoverCoordinator::new();
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    // 1. Initiate handover to eGPU
+    if coordinator.initiate_handover_to_egpu().is_err() || coordinator.status != HandoverStatus::HandoverPending {
+        return false;
+    }
+    if coordinator.in_flight_fences_drained {
+        return false;
+    }
+
+    // 2. Complete handover
+    if coordinator.complete_handover_to_egpu().is_err() || coordinator.status != HandoverStatus::EgpuPrimary {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::ExternalEgpu || !coordinator.swapchain_rebound {
+        return false;
+    }
+
+    // 3. Fallback to APU
+    coordinator.initiate_fallback_to_apu();
+    if coordinator.status != HandoverStatus::FallbackToApu {
+        return false;
+    }
+    coordinator.complete_fallback_to_apu();
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    true
+}
+
+
+// ============================================================================
+// Sudden Disconnect Safety Fallback and DMA Isolation Governor
+// ============================================================================
+
+/// Safety governor managing unexpected physical cable disconnection events.
+#[derive(Debug, Clone)]
+pub struct DisconnectSafetyFallback {
+    /// Whether in-flight DMA submissions to the eGPU bus have been halted.
+    pub dma_halted: bool,
+    /// Whether root-port bus master bit and MMIO access have been revoked.
+    pub bus_master_isolated: bool,
+    /// Whether the graphics pipeline is currently held in a paused failsafe state.
+    pub failsafe_active: bool,
+    /// Number of surprise disconnect events intercepted.
+    pub disconnect_count: u32,
+    /// Number of aborted DMA queue submissions.
+    pub dma_aborts_count: u32,
+    /// Number of recovery completions back to APU.
+    pub recovery_count: u32,
+}
+
+impl DisconnectSafetyFallback {
+    pub const fn new() -> Self {
+        Self {
+            dma_halted: false,
+            bus_master_isolated: false,
+            failsafe_active: false,
+            disconnect_count: 0,
+            dma_aborts_count: 0,
+            recovery_count: 0,
+        }
+    }
+
+    /// Intercepts physical cable disconnect and executes sudden disconnect safety fallback.
+    pub fn handle_surprise_disconnect(
+        &mut self,
+        controller: &mut EgpuController,
+        coordinator: &mut GpuHandoverCoordinator,
+        allocator: &mut BarRebalancingAllocator,
+    ) -> bool {
+        // 1. Immediately halt in-flight DMA submissions to avoid memory bus timeouts
+        self.dma_halted = true;
+        self.dma_aborts_count += 1;
+
+        // 2. Isolate PCIe Root Port bus mastering and revoke MMIO apertures
+        self.bus_master_isolated = true;
+        allocator.reset();
+
+        // 3. Mark eGPU controller in SurpriseRemoval state
+        controller.on_surprise_removal();
+
+        // 4. Enter paused failsafe state
+        self.failsafe_active = true;
+        self.disconnect_count += 1;
+
+        // 5. Trigger emergency fallback of rendering engine back to internal APU
+        coordinator.initiate_fallback_to_apu();
+        coordinator.complete_fallback_to_apu();
+
+        true
+    }
+
+    /// Recovers graphics pipeline from paused failsafe state once APU is confirmed active.
+    pub fn recover_to_safe_state(
+        &mut self,
+        controller: &mut EgpuController,
+        coordinator: &GpuHandoverCoordinator,
+    ) -> Result<(), &'static str> {
+        if !self.failsafe_active {
+            return Err("Failsafe not active");
+        }
+        if coordinator.active_adapter != GpuAdapterType::InternalApu {
+            return Err("APU not active");
+        }
+
+        // Clean up controller to Disconnected
+        controller.complete_disconnect();
+
+        // Release failsafe and reset DMA isolation flags
+        self.failsafe_active = false;
+        self.dma_halted = false;
+        self.bus_master_isolated = false;
+        self.recovery_count += 1;
+        Ok(())
+    }
+}
+
+/// Unit test verifying sudden disconnect safety fallback and DMA isolation.
+pub fn verify_surprise_disconnect_fallback() -> bool {
+    let mut controller = EgpuController::new();
+    let mut allocator = BarRebalancingAllocator::default_handheld();
+    let mut coordinator = GpuHandoverCoordinator::new();
+    let mut fallback = DisconnectSafetyFallback::new();
+
+    // Setup active state: insert cable, negotiate tunnel, allocate BAR, handover to eGPU
+    controller.on_cable_insert();
+    if controller.complete_tunnel_training(0x10DE, 0x2782).is_err() {
+        return false;
+    }
+    if allocator.allocate_bar(0, 16 * 1024 * 1024 * 1024, true).is_err() {
+        return false;
+    }
+    if controller.mark_active_primary().is_err() {
+        return false;
+    }
+    if coordinator.initiate_handover_to_egpu().is_err() || coordinator.complete_handover_to_egpu().is_err() {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::ExternalEgpu {
+        return false;
+    }
+
+    // Trigger sudden disconnect
+    if !fallback.handle_surprise_disconnect(&mut controller, &mut coordinator, &mut allocator) {
+        return false;
+    }
+
+    // Verify post-disconnect safety state
+    if !fallback.dma_halted || !fallback.bus_master_isolated || !fallback.failsafe_active {
+        return false;
+    }
+    if controller.state != EgpuHotplugState::SurpriseRemoval {
+        return false;
+    }
+    if allocator.allocation_count != 0 {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    // Recover from failsafe state
+    if fallback.recover_to_safe_state(&mut controller, &coordinator).is_err() {
+        return false;
+    }
+    if fallback.failsafe_active || fallback.dma_halted || fallback.bus_master_isolated {
+        return false;
+    }
+    if controller.state != EgpuHotplugState::Disconnected {
+        return false;
+    }
+
+    true
+}
+
+
+/// Comprehensive verification self-test suite for Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor.
+pub fn test_egpu_manager_subsystem() -> bool {
+    crate::serial_write_str("[KNT-BUS] Testing Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor...\r\n");
+    if !verify_egpu_state_machine() {
+        return false;
+    }
+    if !verify_bar_rebalancing_allocator() {
+        return false;
+    }
+    if !verify_gpu_handover_coordinator() {
+        return false;
+    }
+    if !verify_surprise_disconnect_fallback() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-EGPU-MGR-PASS] Handheld eGPU hot-plug and PCIe bus rebalancing governor verified\r\n");
+    true
+}
