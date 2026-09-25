@@ -229,6 +229,165 @@ impl ChunkedDescriptorPool {
     }
 }
 
+// Simulated payload of an emulated 32-byte or 16-byte D3D12 descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimulatedDescriptorPayload {
+    pub raw_bytes: [u8; 32],
+    pub resource_gpu_address: u64,
+    pub format: u32,
+    pub view_type: u32,
+}
+
+impl SimulatedDescriptorPayload {
+    // Creates a new simulated descriptor payload.
+    pub fn new(resource_gpu_address: u64, format: u32, view_type: u32) -> Self {
+        let mut raw_bytes = [0u8; 32];
+        raw_bytes[0..8].copy_from_slice(&resource_gpu_address.to_le_bytes());
+        raw_bytes[8..12].copy_from_slice(&format.to_le_bytes());
+        raw_bytes[12..16].copy_from_slice(&view_type.to_le_bytes());
+        Self {
+            raw_bytes,
+            resource_gpu_address,
+            format,
+            view_type,
+        }
+    }
+}
+
+// Bulk descriptor copy engine supporting CopyDescriptorsSimple and CopyDescriptors.
+#[derive(Debug, Clone, Default)]
+pub struct DescriptorCopyEngine {
+    pub total_descriptors_copied: u64,
+    pub total_copy_operations: u64,
+}
+
+impl DescriptorCopyEngine {
+    // Constructs a new descriptor copy engine.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Translates a CPU handle to a GPU handle given heap base handles and descriptor size.
+    #[inline(always)]
+    pub fn translate_cpu_to_gpu(
+        dest_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+        heap_base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+        heap_base_gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+        descriptor_size: usize,
+    ) -> Option<D3D12_GPU_DESCRIPTOR_HANDLE> {
+        if dest_cpu.ptr >= heap_base_cpu.ptr && descriptor_size > 0 {
+            let offset_bytes = dest_cpu.ptr - heap_base_cpu.ptr;
+            let index = offset_bytes / descriptor_size;
+            Some(heap_base_gpu.offset(index, descriptor_size))
+        } else {
+            None
+        }
+    }
+
+    // Simulates CopyDescriptorsSimple copying a contiguous range of descriptors.
+    pub fn copy_descriptors_simple(
+        &mut self,
+        num_descriptors: usize,
+        dest_range_start: D3D12_CPU_DESCRIPTOR_HANDLE,
+        src_range_start: D3D12_CPU_DESCRIPTOR_HANDLE,
+        descriptor_size: usize,
+        descriptor_store: &mut [SimulatedDescriptorPayload],
+        heap_base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Result<usize, DescriptorSuballocatorError> {
+        if num_descriptors == 0 {
+            return Ok(0);
+        }
+        if descriptor_size == 0 || dest_range_start.ptr < heap_base_cpu.ptr {
+            return Err(DescriptorSuballocatorError::BufferOverflow);
+        }
+
+        let dest_base_idx = (dest_range_start.ptr - heap_base_cpu.ptr) / descriptor_size;
+        let src_base_idx = if src_range_start.ptr >= heap_base_cpu.ptr {
+            (src_range_start.ptr - heap_base_cpu.ptr) / descriptor_size
+        } else {
+            src_range_start.ptr / descriptor_size
+        };
+
+        if dest_base_idx + num_descriptors > descriptor_store.len() {
+            return Err(DescriptorSuballocatorError::BufferOverflow);
+        }
+
+        for i in 0..num_descriptors {
+            let src_idx = src_base_idx + i;
+            let dst_idx = dest_base_idx + i;
+            if src_idx < descriptor_store.len() {
+                descriptor_store[dst_idx] = descriptor_store[src_idx];
+            }
+        }
+
+        self.total_descriptors_copied = self.total_descriptors_copied.saturating_add(num_descriptors as u64);
+        self.total_copy_operations = self.total_copy_operations.saturating_add(1);
+
+        Ok(num_descriptors)
+    }
+
+    // Simulates CopyDescriptors copying multiple non-contiguous descriptor ranges.
+    pub fn copy_descriptors(
+        &mut self,
+        dest_range_starts: &[D3D12_CPU_DESCRIPTOR_HANDLE],
+        dest_range_sizes: &[usize],
+        src_range_starts: &[D3D12_CPU_DESCRIPTOR_HANDLE],
+        src_range_sizes: &[usize],
+        descriptor_size: usize,
+        descriptor_store: &mut [SimulatedDescriptorPayload],
+        heap_base_cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    ) -> Result<usize, DescriptorSuballocatorError> {
+        let total_dest: usize = dest_range_sizes.iter().sum();
+        let total_src: usize = src_range_sizes.iter().sum();
+        if total_dest != total_src {
+            return Err(DescriptorSuballocatorError::InvalidDescriptorCount);
+        }
+
+        let mut current_src_range = 0;
+        let mut src_offset = 0;
+        let mut copied = 0;
+
+        for (dest_idx, &dest_start) in dest_range_starts.iter().enumerate() {
+            let dest_size = if dest_idx < dest_range_sizes.len() {
+                dest_range_sizes[dest_idx]
+            } else {
+                1
+            };
+
+            for d in 0..dest_size {
+                while current_src_range < src_range_sizes.len()
+                    && src_offset >= src_range_sizes[current_src_range]
+                {
+                    current_src_range += 1;
+                    src_offset = 0;
+                }
+
+                if current_src_range >= src_range_starts.len() {
+                    break;
+                }
+
+                let src_start = src_range_starts[current_src_range];
+                let dest_handle = dest_start.offset(d, descriptor_size);
+                let src_handle = src_start.offset(src_offset, descriptor_size);
+
+                self.copy_descriptors_simple(
+                    1,
+                    dest_handle,
+                    src_handle,
+                    descriptor_size,
+                    descriptor_store,
+                    heap_base_cpu,
+                )?;
+
+                src_offset += 1;
+                copied += 1;
+            }
+        }
+
+        Ok(copied)
+    }
+}
+
 // Temporary stub for subsystem self-test during incremental commits.
 pub fn test_descriptor_suballocator_subsystem() -> bool {
     true
