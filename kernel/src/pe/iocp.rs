@@ -1,0 +1,486 @@
+//! Win32 I/O Completion Ports (IOCP) & Asynchronous Packet Dispatcher.
+//!
+//! Emulates Windows NT I/O completion ports, asynchronous packet queuing,
+//! multi-threaded worker dispatch, and high-performance game networking.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, unused_imports, dead_code)]
+
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::memory::spinlock::Spinlock;
+use crate::pe::kernel32::{
+    win32_set_last_error, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
+};
+pub use crate::pe::synch::{HANDLE, INFINITE, WAIT_TIMEOUT};
+pub use crate::pe::threadpool::{BOOL, FALSE, TRUE};
+
+pub const ERROR_TIMEOUT: u32 = 1460;
+pub const ERROR_ABANDONED_WAIT_0: u32 = 735;
+
+/// Win32 OVERLAPPED structure used in asynchronous I/O operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OVERLAPPED {
+    pub Internal: usize,
+    pub InternalHigh: usize,
+    pub Offset: u32,
+    pub OffsetHigh: u32,
+    pub hEvent: HANDLE,
+}
+pub type LPOVERLAPPED = *mut OVERLAPPED;
+
+/// Win32 OVERLAPPED_ENTRY structure for batch IOCP packet dequeue.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OVERLAPPED_ENTRY {
+    pub lpCompletionKey: usize,
+    pub lpOverlapped: LPOVERLAPPED,
+    pub Internal: usize,
+    pub dwNumberOfBytesTransferred: u32,
+}
+pub type LPOVERLAPPED_ENTRY = *mut OVERLAPPED_ENTRY;
+
+/// Completion packet queued in an I/O completion port.
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionPacket {
+    pub bytes_transferred: u32,
+    pub completion_key: usize,
+    pub overlapped_ptr: usize,
+    pub status: u32,
+}
+
+/// Internal descriptor for an I/O completion port.
+pub struct IoCompletionPortInner {
+    pub id: HANDLE,
+    pub max_concurrency: u32,
+    pub active_threads: AtomicU32,
+    pub queue: VecDeque<CompletionPacket>,
+    pub associated_handles: BTreeMap<HANDLE, usize>,
+    pub closed: bool,
+}
+
+impl IoCompletionPortInner {
+    /// Pushes a completed I/O packet onto the completion queue.
+    pub fn push_packet(&mut self, packet: CompletionPacket) {
+        self.queue.push_back(packet);
+    }
+
+    /// Pops the next completed I/O packet in FIFO order.
+    pub fn pop_packet(&mut self) -> Option<CompletionPacket> {
+        self.queue.pop_front()
+    }
+
+    /// Checks if the port has reached its maximum concurrent running threads limit.
+    pub fn is_at_concurrency_limit(&self) -> bool {
+        self.active_threads.load(Ordering::SeqCst) >= self.max_concurrency
+    }
+
+    /// Increments the active running thread count when a thread wakes up with a packet.
+    pub fn enter_active_thread(&self) {
+        self.active_threads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the active running thread count when a thread blocks or yields.
+    pub fn leave_active_thread(&self) {
+        self.active_threads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+static NEXT_IOCP_ID: AtomicU64 = AtomicU64::new(0x9000_1000);
+pub static IOCP_PORTS: Spinlock<BTreeMap<HANDLE, IoCompletionPortInner>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Creates an I/O completion port or associates a file handle with an existing port.
+pub unsafe extern "system" fn CreateIoCompletionPort(
+    FileHandle: HANDLE,
+    ExistingCompletionPort: HANDLE,
+    CompletionKey: usize,
+    NumberOfConcurrentThreads: u32,
+) -> HANDLE {
+    let mut lock = IOCP_PORTS.lock();
+
+    if ExistingCompletionPort == 0 {
+        // Create a new completion port.
+        let port_id = NEXT_IOCP_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+        let max_threads = if NumberOfConcurrentThreads == 0 { 4 } else { NumberOfConcurrentThreads };
+        let mut port = IoCompletionPortInner {
+            id: port_id,
+            max_concurrency: max_threads,
+            active_threads: AtomicU32::new(0),
+            queue: VecDeque::new(),
+            associated_handles: BTreeMap::new(),
+            closed: false,
+        };
+
+        if FileHandle != (INVALID_HANDLE_VALUE as HANDLE) && FileHandle != 0 {
+            port.associated_handles.insert(FileHandle, CompletionKey);
+        }
+
+        lock.insert(port_id, port);
+        win32_set_last_error(ERROR_SUCCESS);
+        port_id
+    } else {
+        // Associate an existing completion port with FileHandle.
+        if let Some(port) = lock.get_mut(&ExistingCompletionPort) {
+            if FileHandle != (INVALID_HANDLE_VALUE as HANDLE) && FileHandle != 0 {
+                port.associated_handles.insert(FileHandle, CompletionKey);
+            }
+            win32_set_last_error(ERROR_SUCCESS);
+            ExistingCompletionPort
+        } else {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            0
+        }
+    }
+}
+
+/// Enqueues an I/O completion packet to the specified completion port.
+pub unsafe extern "system" fn PostQueuedCompletionStatus(
+    CompletionPort: HANDLE,
+    dwNumberOfBytesTransferred: u32,
+    dwCompletionKey: usize,
+    lpOverlapped: LPOVERLAPPED,
+) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(port) = lock.get_mut(&CompletionPort) {
+        if port.closed {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+
+        let packet = CompletionPacket {
+            bytes_transferred: dwNumberOfBytesTransferred,
+            completion_key: dwCompletionKey,
+            overlapped_ptr: lpOverlapped as usize,
+            status: 0,
+        };
+
+        port.push_packet(packet);
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Attempts to dequeue an I/O completion packet from the specified port.
+pub unsafe extern "system" fn GetQueuedCompletionStatus(
+    CompletionPort: HANDLE,
+    lpNumberOfBytesTransferred: *mut u32,
+    lpCompletionKey: *mut usize,
+    lpOverlapped: *mut LPOVERLAPPED,
+    dwMilliseconds: u32,
+) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let port = match lock.get_mut(&CompletionPort) {
+        Some(p) => p,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if port.closed {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    if let Some(packet) = port.pop_packet() {
+        if !lpNumberOfBytesTransferred.is_null() {
+            *lpNumberOfBytesTransferred = packet.bytes_transferred;
+        }
+        if !lpCompletionKey.is_null() {
+            *lpCompletionKey = packet.completion_key;
+        }
+        if !lpOverlapped.is_null() {
+            *lpOverlapped = packet.overlapped_ptr as LPOVERLAPPED;
+        }
+
+        if packet.overlapped_ptr != 0 {
+            let ov = &mut *(packet.overlapped_ptr as LPOVERLAPPED);
+            ov.InternalHigh = packet.bytes_transferred as usize;
+            ov.Internal = packet.status as usize;
+        }
+
+        port.enter_active_thread();
+        win32_set_last_error(packet.status);
+        if packet.status == 0 { TRUE } else { FALSE }
+    } else {
+        if !lpOverlapped.is_null() {
+            *lpOverlapped = core::ptr::null_mut();
+        }
+        // No packet available; simulate timeout or immediate return.
+        let _ = dwMilliseconds;
+        win32_set_last_error(WAIT_TIMEOUT);
+        FALSE
+    }
+}
+
+/// Dequeues multiple completion packets in a single batch call.
+pub unsafe extern "system" fn GetQueuedCompletionStatusEx(
+    CompletionPort: HANDLE,
+    lpCompletionPortEntries: LPOVERLAPPED_ENTRY,
+    ulCount: u32,
+    ulNumEntriesRemoved: *mut u32,
+    dwMilliseconds: u32,
+    _fAlertable: BOOL,
+) -> BOOL {
+    if CompletionPort == 0
+        || lpCompletionPortEntries.is_null()
+        || ulNumEntriesRemoved.is_null()
+        || ulCount == 0
+    {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let port = match lock.get_mut(&CompletionPort) {
+        Some(p) => p,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if port.closed {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut removed = 0u32;
+    while removed < ulCount {
+        if let Some(packet) = port.pop_packet() {
+            let entry = &mut *lpCompletionPortEntries.add(removed as usize);
+            entry.lpCompletionKey = packet.completion_key;
+            entry.lpOverlapped = packet.overlapped_ptr as LPOVERLAPPED;
+            entry.Internal = packet.status as usize;
+            entry.dwNumberOfBytesTransferred = packet.bytes_transferred;
+
+            if packet.overlapped_ptr != 0 {
+                let ov = &mut *(packet.overlapped_ptr as LPOVERLAPPED);
+                ov.InternalHigh = packet.bytes_transferred as usize;
+                ov.Internal = packet.status as usize;
+            }
+
+            removed += 1;
+        } else {
+            break;
+        }
+    }
+
+    *ulNumEntriesRemoved = removed;
+
+    if removed > 0 {
+        port.enter_active_thread();
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        let _ = dwMilliseconds;
+        win32_set_last_error(WAIT_TIMEOUT);
+        FALSE
+    }
+}
+
+/// Binds a file or socket handle and its completion key to an I/O completion port.
+pub unsafe extern "system" fn iocp_bind_handle(
+    CompletionPort: HANDLE,
+    FileHandle: HANDLE,
+    CompletionKey: usize,
+) -> BOOL {
+    if CompletionPort == 0 || FileHandle == 0 || FileHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(port) = lock.get_mut(&CompletionPort) {
+        if port.closed {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        port.associated_handles.insert(FileHandle, CompletionKey);
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Automatically notifies all completion ports bound to the specified file handle.
+pub unsafe extern "system" fn iocp_notify_completion(
+    FileHandle: HANDLE,
+    dwNumberOfBytesTransferred: u32,
+    lpOverlapped: LPOVERLAPPED,
+    dwError: u32,
+) -> BOOL {
+    if FileHandle == 0 || FileHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let mut notified = false;
+
+    for port in lock.values_mut() {
+        if port.closed {
+            continue;
+        }
+        if let Some(&key) = port.associated_handles.get(&FileHandle) {
+            let packet = CompletionPacket {
+                bytes_transferred: dwNumberOfBytesTransferred,
+                completion_key: key,
+                overlapped_ptr: lpOverlapped as usize,
+                status: dwError,
+            };
+            port.push_packet(packet);
+            notified = true;
+        }
+    }
+
+    if notified { TRUE } else { FALSE }
+}
+
+/// Closes an open I/O completion port and frees its resources.
+pub unsafe extern "system" fn win32_close_iocp(CompletionPort: HANDLE) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(mut port) = lock.remove(&CompletionPort) {
+        port.closed = true;
+        port.queue.clear();
+        port.associated_handles.clear();
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Returns the current pending queue depth for the completion port.
+pub fn iocp_get_queue_depth(CompletionPort: HANDLE) -> usize {
+    let lock = IOCP_PORTS.lock();
+    lock.get(&CompletionPort).map(|p| p.queue.len()).unwrap_or(0)
+}
+
+/// Returns the active worker thread count currently executing on this port.
+pub fn iocp_get_active_threads(CompletionPort: HANDLE) -> u32 {
+    let lock = IOCP_PORTS.lock();
+    lock.get(&CompletionPort)
+        .map(|p| p.active_threads.load(Ordering::SeqCst))
+        .unwrap_or(0)
+}
+
+/// Comprehensive self-test for Win32 I/O completion ports and async packet dispatcher.
+pub fn test_win32_iocp_subsystem() -> bool {
+    unsafe {
+        // 1. Create a new I/O completion port with 4 concurrent worker threads.
+        let port = CreateIoCompletionPort(INVALID_HANDLE_VALUE as HANDLE, 0, 0, 4);
+        if port == 0 {
+            return false;
+        }
+
+        // 2. Associate a simulated file handle with completion key 0xABCD.
+        let dummy_handle = 0x5001 as HANDLE;
+        let completion_key = 0xABCDusize;
+        if CreateIoCompletionPort(dummy_handle, port, completion_key, 0) != port {
+            return false;
+        }
+
+        // 3. Post and retrieve a single completion packet.
+        let mut ov1 = OVERLAPPED::default();
+        if PostQueuedCompletionStatus(port, 1024, completion_key, &mut ov1 as LPOVERLAPPED) != TRUE {
+            return false;
+        }
+
+        let mut bytes = 0u32;
+        let mut key = 0usize;
+        let mut lp_ov = core::ptr::null_mut();
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 100) != TRUE {
+            return false;
+        }
+
+        if bytes != 1024
+            || key != completion_key
+            || lp_ov != (&mut ov1 as LPOVERLAPPED)
+            || ov1.InternalHigh != 1024
+        {
+            return false;
+        }
+
+        // 4. Batch packet posting and GetQueuedCompletionStatusEx dequeue.
+        let mut ov_batch = [OVERLAPPED::default(), OVERLAPPED::default(), OVERLAPPED::default()];
+        PostQueuedCompletionStatus(port, 128, 0x100, &mut ov_batch[0] as LPOVERLAPPED);
+        PostQueuedCompletionStatus(port, 256, 0x200, &mut ov_batch[1] as LPOVERLAPPED);
+        PostQueuedCompletionStatus(port, 512, 0x300, &mut ov_batch[2] as LPOVERLAPPED);
+
+        let mut entries = [OVERLAPPED_ENTRY::default(); 4];
+        let mut removed = 0u32;
+        if GetQueuedCompletionStatusEx(port, entries.as_mut_ptr(), 4, &mut removed, 100, FALSE) != TRUE {
+            return false;
+        }
+
+        if removed != 3 {
+            return false;
+        }
+        if entries[0].dwNumberOfBytesTransferred != 128 || entries[0].lpCompletionKey != 0x100 {
+            return false;
+        }
+        if entries[1].dwNumberOfBytesTransferred != 256 || entries[1].lpCompletionKey != 0x200 {
+            return false;
+        }
+        if entries[2].dwNumberOfBytesTransferred != 512 || entries[2].lpCompletionKey != 0x300 {
+            return false;
+        }
+
+        // 5. Test empty queue timeout.
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 0) != FALSE {
+            return false;
+        }
+        if !lp_ov.is_null() {
+            return false;
+        }
+
+        // 6. Test automatic completion notification via iocp_notify_completion.
+        let mut ov_notify = OVERLAPPED::default();
+        if iocp_notify_completion(dummy_handle, 2048, &mut ov_notify as LPOVERLAPPED, 0) != TRUE {
+            return false;
+        }
+
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 100) != TRUE {
+            return false;
+        }
+        if bytes != 2048 || key != completion_key || lp_ov != (&mut ov_notify as LPOVERLAPPED) {
+            return false;
+        }
+
+        // 7. Close completion port.
+        if win32_close_iocp(port) != TRUE {
+            return false;
+        }
+
+        crate::serial_write_str(
+            "[KNT-WIN32-IOCP-OK] Win32 I/O completion ports (IOCP) and async packet dispatcher verified\r\n",
+        );
+        true
+    }
+}
