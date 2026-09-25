@@ -535,7 +535,202 @@ impl DynamicDescriptorRingAllocator {
     }
 }
 
-// Temporary stub for subsystem self-test during incremental commits.
+// Comprehensive self-test for D3D12 dynamic descriptor heap suballocator & ring buffer.
 pub fn test_descriptor_suballocator_subsystem() -> bool {
+    let base_cpu = D3D12_CPU_DESCRIPTOR_HANDLE::new(0x1000_0000);
+    let base_gpu = D3D12_GPU_DESCRIPTOR_HANDLE::new(0x2000_0000);
+
+    // 1. Verify chunked pool allocation & suballocation
+    let mut pool = match ChunkedDescriptorPool::new(
+        base_cpu,
+        base_gpu,
+        D3D12_DESCRIPTOR_HEAP_TYPE::CbvSrvUav,
+        4,
+        DESCRIPTOR_SIZE_CBV_SRV_UAV,
+    ) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    if pool.available_chunks() != 4 {
+        return false;
+    }
+
+    let r1 = match pool.suballocate(16) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    if r1.count != 16 || r1.offset_in_chunk != 0 {
+        return false;
+    }
+    if r1.cpu_handle(0, DESCRIPTOR_SIZE_CBV_SRV_UAV).unwrap().ptr != 0x1000_0000 {
+        return false;
+    }
+    if r1.gpu_handle(0, DESCRIPTOR_SIZE_CBV_SRV_UAV).unwrap().ptr != 0x2000_0000 {
+        return false;
+    }
+
+    // Suballocate 50 descriptors: chunk 0 has only 48 left, so it spills to chunk 1
+    let r2 = match pool.suballocate(50) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    if r2.count != 50 || r2.chunk_index == r1.chunk_index {
+        return false;
+    }
+    if pool.available_chunks() != 2 {
+        return false;
+    }
+
+    // 2. Verify bulk descriptor copying & handle translation
+    let mut copy_engine = DescriptorCopyEngine::new();
+    let mut descriptor_store = alloc::vec![SimulatedDescriptorPayload::default(); 64];
+
+    for i in 0..4 {
+        descriptor_store[i] = SimulatedDescriptorPayload::new(0x8000_0000 + (i as u64) * 0x1000, 28, 1);
+    }
+
+    let src_h = base_cpu;
+    let dst_h = base_cpu.offset(16, DESCRIPTOR_SIZE_CBV_SRV_UAV);
+
+    let copied_simple = match copy_engine.copy_descriptors_simple(
+        4,
+        dst_h,
+        src_h,
+        DESCRIPTOR_SIZE_CBV_SRV_UAV,
+        &mut descriptor_store,
+        base_cpu,
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if copied_simple != 4 {
+        return false;
+    }
+
+    for i in 0..4 {
+        if descriptor_store[16 + i] != descriptor_store[i] {
+            return false;
+        }
+    }
+
+    let translated_gpu = DescriptorCopyEngine::translate_cpu_to_gpu(
+        dst_h,
+        base_cpu,
+        base_gpu,
+        DESCRIPTOR_SIZE_CBV_SRV_UAV,
+    );
+    if translated_gpu != Some(base_gpu.offset(16, DESCRIPTOR_SIZE_CBV_SRV_UAV)) {
+        return false;
+    }
+
+    // Multi-range copy
+    let dst_multi = [base_cpu.offset(30, DESCRIPTOR_SIZE_CBV_SRV_UAV)];
+    let dst_sizes = [2];
+    let src_multi = [base_cpu.offset(2, DESCRIPTOR_SIZE_CBV_SRV_UAV)];
+    let src_sizes = [2];
+
+    let copied_multi = match copy_engine.copy_descriptors(
+        &dst_multi,
+        &dst_sizes,
+        &src_multi,
+        &src_sizes,
+        DESCRIPTOR_SIZE_CBV_SRV_UAV,
+        &mut descriptor_store,
+        base_cpu,
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if copied_multi != 2 || descriptor_store[30] != descriptor_store[2] {
+        return false;
+    }
+
+    // 3. Verify GPU timeline fence retirement queue
+    let mut retirement_queue = GpuTimelineRetirementQueue::new();
+    retirement_queue.track_chunk_in_flight(r1.chunk_index, 10);
+    retirement_queue.track_chunk_in_flight(r2.chunk_index, 20);
+
+    if retirement_queue.in_flight_count() != 2 {
+        return false;
+    }
+
+    if retirement_queue.retire_completed_chunks(5, &mut pool) != 0 {
+        return false;
+    }
+    if retirement_queue.retire_completed_chunks(15, &mut pool) != 1 {
+        return false;
+    }
+    if retirement_queue.in_flight_count() != 1 {
+        return false;
+    }
+    if retirement_queue.retire_completed_chunks(25, &mut pool) != 1 {
+        return false;
+    }
+    if pool.available_chunks() != 4 {
+        return false;
+    }
+
+    // 4. Verify transient per-frame ring allocator
+    let mut ring = DynamicDescriptorRingAllocator::new(
+        base_cpu,
+        base_gpu,
+        128,
+        DESCRIPTOR_SIZE_CBV_SRV_UAV,
+    );
+
+    let ring_a = match ring.allocate(32) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if ring_a.offset_in_chunk != 0 {
+        return false;
+    }
+
+    let ring_b = match ring.allocate(64) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if ring_b.offset_in_chunk != 32 {
+        return false;
+    }
+
+    ring.mark_frame_fence(100);
+
+    let ring_c = match ring.allocate(32) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if ring_c.offset_in_chunk != 96 {
+        return false;
+    }
+
+    ring.mark_frame_fence(101);
+
+    // Buffer is full (tail == 128, head == 0). Wrap-around cannot overwrite head 0
+    if ring.allocate(32).is_ok() {
+        return false;
+    }
+
+    // Signal fence 100 -> head advances to 96
+    ring.on_frame_fence_signaled(100);
+    if ring.head != 96 {
+        return false;
+    }
+
+    // Now wrap-around to 0 is valid as 0 + 32 <= 96
+    let ring_d = match ring.allocate(32) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if ring_d.offset_in_chunk != 0 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-GPU-DESCRIPTOR-SUBALLOC-PASS] Direct3D 12 dynamic descriptor heap suballocator & ring buffer verified\r\n");
     true
 }

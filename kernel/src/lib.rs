@@ -477,6 +477,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 root signature subsystem self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Dynamic Descriptor Heap Suballocator & Ring Buffer (TASK-KNT-208)
+    if !gfx::test_descriptor_suballocator_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 descriptor suballocator self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Graphics PSO & Shader Bytecode Cache Engine (TASK-KNT-145)
     if !gfx::test_pso_cache_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 graphics PSO cache subsystem self-test failed!\r\n");
