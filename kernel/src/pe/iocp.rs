@@ -172,3 +172,127 @@ pub unsafe extern "system" fn PostQueuedCompletionStatus(
         FALSE
     }
 }
+
+/// Attempts to dequeue an I/O completion packet from the specified port.
+pub unsafe extern "system" fn GetQueuedCompletionStatus(
+    CompletionPort: HANDLE,
+    lpNumberOfBytesTransferred: *mut u32,
+    lpCompletionKey: *mut usize,
+    lpOverlapped: *mut LPOVERLAPPED,
+    dwMilliseconds: u32,
+) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let port = match lock.get_mut(&CompletionPort) {
+        Some(p) => p,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if port.closed {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    if let Some(packet) = port.pop_packet() {
+        if !lpNumberOfBytesTransferred.is_null() {
+            *lpNumberOfBytesTransferred = packet.bytes_transferred;
+        }
+        if !lpCompletionKey.is_null() {
+            *lpCompletionKey = packet.completion_key;
+        }
+        if !lpOverlapped.is_null() {
+            *lpOverlapped = packet.overlapped_ptr as LPOVERLAPPED;
+        }
+
+        if packet.overlapped_ptr != 0 {
+            let ov = &mut *(packet.overlapped_ptr as LPOVERLAPPED);
+            ov.InternalHigh = packet.bytes_transferred as usize;
+            ov.Internal = packet.status as usize;
+        }
+
+        port.enter_active_thread();
+        win32_set_last_error(packet.status);
+        if packet.status == 0 { TRUE } else { FALSE }
+    } else {
+        if !lpOverlapped.is_null() {
+            *lpOverlapped = core::ptr::null_mut();
+        }
+        // No packet available; simulate timeout or immediate return.
+        let _ = dwMilliseconds;
+        win32_set_last_error(WAIT_TIMEOUT);
+        FALSE
+    }
+}
+
+/// Dequeues multiple completion packets in a single batch call.
+pub unsafe extern "system" fn GetQueuedCompletionStatusEx(
+    CompletionPort: HANDLE,
+    lpCompletionPortEntries: LPOVERLAPPED_ENTRY,
+    ulCount: u32,
+    ulNumEntriesRemoved: *mut u32,
+    dwMilliseconds: u32,
+    _fAlertable: BOOL,
+) -> BOOL {
+    if CompletionPort == 0
+        || lpCompletionPortEntries.is_null()
+        || ulNumEntriesRemoved.is_null()
+        || ulCount == 0
+    {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let port = match lock.get_mut(&CompletionPort) {
+        Some(p) => p,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if port.closed {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut removed = 0u32;
+    while removed < ulCount {
+        if let Some(packet) = port.pop_packet() {
+            let entry = &mut *lpCompletionPortEntries.add(removed as usize);
+            entry.lpCompletionKey = packet.completion_key;
+            entry.lpOverlapped = packet.overlapped_ptr as LPOVERLAPPED;
+            entry.Internal = packet.status as usize;
+            entry.dwNumberOfBytesTransferred = packet.bytes_transferred;
+
+            if packet.overlapped_ptr != 0 {
+                let ov = &mut *(packet.overlapped_ptr as LPOVERLAPPED);
+                ov.InternalHigh = packet.bytes_transferred as usize;
+                ov.Internal = packet.status as usize;
+            }
+
+            removed += 1;
+        } else {
+            break;
+        }
+    }
+
+    *ulNumEntriesRemoved = removed;
+
+    if removed > 0 {
+        port.enter_active_thread();
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        let _ = dwMilliseconds;
+        win32_set_last_error(WAIT_TIMEOUT);
+        FALSE
+    }
+}
