@@ -296,3 +296,96 @@ pub unsafe extern "system" fn GetQueuedCompletionStatusEx(
         FALSE
     }
 }
+
+/// Binds a file or socket handle and its completion key to an I/O completion port.
+pub unsafe extern "system" fn iocp_bind_handle(
+    CompletionPort: HANDLE,
+    FileHandle: HANDLE,
+    CompletionKey: usize,
+) -> BOOL {
+    if CompletionPort == 0 || FileHandle == 0 || FileHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(port) = lock.get_mut(&CompletionPort) {
+        if port.closed {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        port.associated_handles.insert(FileHandle, CompletionKey);
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Automatically notifies all completion ports bound to the specified file handle.
+pub unsafe extern "system" fn iocp_notify_completion(
+    FileHandle: HANDLE,
+    dwNumberOfBytesTransferred: u32,
+    lpOverlapped: LPOVERLAPPED,
+    dwError: u32,
+) -> BOOL {
+    if FileHandle == 0 || FileHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    let mut notified = false;
+
+    for port in lock.values_mut() {
+        if port.closed {
+            continue;
+        }
+        if let Some(&key) = port.associated_handles.get(&FileHandle) {
+            let packet = CompletionPacket {
+                bytes_transferred: dwNumberOfBytesTransferred,
+                completion_key: key,
+                overlapped_ptr: lpOverlapped as usize,
+                status: dwError,
+            };
+            port.push_packet(packet);
+            notified = true;
+        }
+    }
+
+    if notified { TRUE } else { FALSE }
+}
+
+/// Closes an open I/O completion port and frees its resources.
+pub unsafe extern "system" fn win32_close_iocp(CompletionPort: HANDLE) -> BOOL {
+    if CompletionPort == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut lock = IOCP_PORTS.lock();
+    if let Some(mut port) = lock.remove(&CompletionPort) {
+        port.closed = true;
+        port.queue.clear();
+        port.associated_handles.clear();
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Returns the current pending queue depth for the completion port.
+pub fn iocp_get_queue_depth(CompletionPort: HANDLE) -> usize {
+    let lock = IOCP_PORTS.lock();
+    lock.get(&CompletionPort).map(|p| p.queue.len()).unwrap_or(0)
+}
+
+/// Returns the active worker thread count currently executing on this port.
+pub fn iocp_get_active_threads(CompletionPort: HANDLE) -> u32 {
+    let lock = IOCP_PORTS.lock();
+    lock.get(&CompletionPort)
+        .map(|p| p.active_threads.load(Ordering::SeqCst))
+        .unwrap_or(0)
+}
