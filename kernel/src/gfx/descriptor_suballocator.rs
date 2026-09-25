@@ -388,6 +388,153 @@ impl DescriptorCopyEngine {
     }
 }
 
+// Entry in timeline retirement queue tracking chunk index and target completion fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRetirementEntry {
+    pub chunk_index: usize,
+    pub fence_value: u64,
+}
+
+// GPU timeline fence retirement queue deferring chunk recycling until GPU signals fence.
+#[derive(Debug, Clone, Default)]
+pub struct GpuTimelineRetirementQueue {
+    pub pending_entries: Vec<ChunkRetirementEntry>,
+    pub last_completed_fence: u64,
+}
+
+impl GpuTimelineRetirementQueue {
+    // Creates a new empty retirement queue.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Enqueues an in-flight chunk associated with a GPU completion fence.
+    pub fn track_chunk_in_flight(&mut self, chunk_index: usize, fence_value: u64) {
+        self.pending_entries.push(ChunkRetirementEntry {
+            chunk_index,
+            fence_value,
+        });
+    }
+
+    // Retires all chunks whose associated fence value has signaled.
+    pub fn retire_completed_chunks(
+        &mut self,
+        completed_fence_value: u64,
+        pool: &mut ChunkedDescriptorPool,
+    ) -> usize {
+        self.last_completed_fence = completed_fence_value;
+        let mut retired_count = 0;
+        let mut i = 0;
+
+        while i < self.pending_entries.len() {
+            if self.pending_entries[i].fence_value <= completed_fence_value {
+                let entry = self.pending_entries.swap_remove(i);
+                let _ = pool.release_chunk(entry.chunk_index);
+                retired_count += 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        retired_count
+    }
+
+    // Number of chunks currently awaiting GPU completion.
+    pub fn in_flight_count(&self) -> usize {
+        self.pending_entries.len()
+    }
+}
+
+// Transient per-frame ring allocator for dynamic per-draw CBV/SRV/UAV bindings.
+#[derive(Debug, Clone)]
+pub struct DynamicDescriptorRingAllocator {
+    pub capacity_descriptors: usize,
+    pub descriptor_size: usize,
+    pub base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pub base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub head: usize,
+    pub tail: usize,
+    pub frame_sync_points: Vec<(u64, usize)>,
+}
+
+impl DynamicDescriptorRingAllocator {
+    // Creates a new transient ring allocator with given capacity.
+    pub fn new(
+        base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+        base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+        capacity_descriptors: usize,
+        descriptor_size: usize,
+    ) -> Self {
+        Self {
+            capacity_descriptors,
+            descriptor_size,
+            base_cpu_handle,
+            base_gpu_handle,
+            head: 0,
+            tail: 0,
+            frame_sync_points: Vec::new(),
+        }
+    }
+
+    // Suballocates a contiguous slice of descriptors from the transient ring buffer.
+    pub fn allocate(
+        &mut self,
+        count: usize,
+    ) -> Result<SuballocatedDescriptorRange, DescriptorSuballocatorError> {
+        if count == 0 || count > self.capacity_descriptors {
+            return Err(DescriptorSuballocatorError::InvalidDescriptorCount);
+        }
+
+        let mut alloc_pos = self.tail;
+        if alloc_pos + count > self.capacity_descriptors {
+            if self.head <= count {
+                return Err(DescriptorSuballocatorError::BufferOverflow);
+            }
+            alloc_pos = 0;
+        } else if alloc_pos < self.head && alloc_pos + count >= self.head {
+            return Err(DescriptorSuballocatorError::BufferOverflow);
+        }
+
+        self.tail = alloc_pos + count;
+
+        let base_cpu = self.base_cpu_handle.offset(alloc_pos, self.descriptor_size);
+        let base_gpu = self.base_gpu_handle.offset(alloc_pos, self.descriptor_size);
+
+        Ok(SuballocatedDescriptorRange {
+            chunk_index: 0,
+            offset_in_chunk: alloc_pos,
+            count,
+            base_cpu_handle: base_cpu,
+            base_gpu_handle: base_gpu,
+        })
+    }
+
+    // Records the current tail offset associated with a frame completion fence.
+    pub fn mark_frame_fence(&mut self, fence_value: u64) {
+        self.frame_sync_points.push((fence_value, self.tail));
+    }
+
+    // Advances head pointer based on signaled GPU fence, recycling completed segments.
+    pub fn on_frame_fence_signaled(&mut self, signaled_fence: u64) {
+        let mut new_head = self.head;
+        let mut remove_count = 0;
+
+        for &(fence, tail_pos) in &self.frame_sync_points {
+            if fence <= signaled_fence {
+                new_head = tail_pos;
+                remove_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        if remove_count > 0 {
+            self.frame_sync_points.drain(0..remove_count);
+            self.head = new_head;
+        }
+    }
+}
+
 // Temporary stub for subsystem self-test during incremental commits.
 pub fn test_descriptor_suballocator_subsystem() -> bool {
     true
