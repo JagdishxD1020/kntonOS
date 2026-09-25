@@ -562,3 +562,23 @@ pub fn verify_surprise_disconnect_fallback() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor.
+pub fn test_egpu_manager_subsystem() -> bool {
+    crate::serial_write_str("[KNT-BUS] Testing Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor...\r\n");
+    if !verify_egpu_state_machine() {
+        return false;
+    }
+    if !verify_bar_rebalancing_allocator() {
+        return false;
+    }
+    if !verify_gpu_handover_coordinator() {
+        return false;
+    }
+    if !verify_surprise_disconnect_fallback() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-EGPU-MGR-PASS] Handheld eGPU hot-plug and PCIe bus rebalancing governor verified\r\n");
+    true
+}

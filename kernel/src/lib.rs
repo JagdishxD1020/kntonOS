@@ -782,6 +782,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] USB4 PCIe tunneling and eGPU governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld eGPU Hot-Plug & PCIe Bus Rebalancing Governor (TASK-KNT-206)
+    if !drivers::bus::test_egpu_manager_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld eGPU hot-plug and PCIe rebalancing governor self-test failed!\r\n");
+    }
+
     // Initialize and verify USB Mass Storage Class (MSC) Bulk-Only Transport (BOT) Driver
     if !drivers::usb::test_usb_msc_subsystem() {
         serial_write_str("[KNT-PANIC] USB MSC BOT storage subsystem self-test failed!\r\n");
