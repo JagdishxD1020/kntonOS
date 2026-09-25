@@ -416,3 +416,149 @@ pub fn verify_gpu_handover_coordinator() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Sudden Disconnect Safety Fallback and DMA Isolation Governor
+// ============================================================================
+
+/// Safety governor managing unexpected physical cable disconnection events.
+#[derive(Debug, Clone)]
+pub struct DisconnectSafetyFallback {
+    /// Whether in-flight DMA submissions to the eGPU bus have been halted.
+    pub dma_halted: bool,
+    /// Whether root-port bus master bit and MMIO access have been revoked.
+    pub bus_master_isolated: bool,
+    /// Whether the graphics pipeline is currently held in a paused failsafe state.
+    pub failsafe_active: bool,
+    /// Number of surprise disconnect events intercepted.
+    pub disconnect_count: u32,
+    /// Number of aborted DMA queue submissions.
+    pub dma_aborts_count: u32,
+    /// Number of recovery completions back to APU.
+    pub recovery_count: u32,
+}
+
+impl DisconnectSafetyFallback {
+    pub const fn new() -> Self {
+        Self {
+            dma_halted: false,
+            bus_master_isolated: false,
+            failsafe_active: false,
+            disconnect_count: 0,
+            dma_aborts_count: 0,
+            recovery_count: 0,
+        }
+    }
+
+    /// Intercepts physical cable disconnect and executes sudden disconnect safety fallback.
+    pub fn handle_surprise_disconnect(
+        &mut self,
+        controller: &mut EgpuController,
+        coordinator: &mut GpuHandoverCoordinator,
+        allocator: &mut BarRebalancingAllocator,
+    ) -> bool {
+        // 1. Immediately halt in-flight DMA submissions to avoid memory bus timeouts
+        self.dma_halted = true;
+        self.dma_aborts_count += 1;
+
+        // 2. Isolate PCIe Root Port bus mastering and revoke MMIO apertures
+        self.bus_master_isolated = true;
+        allocator.reset();
+
+        // 3. Mark eGPU controller in SurpriseRemoval state
+        controller.on_surprise_removal();
+
+        // 4. Enter paused failsafe state
+        self.failsafe_active = true;
+        self.disconnect_count += 1;
+
+        // 5. Trigger emergency fallback of rendering engine back to internal APU
+        coordinator.initiate_fallback_to_apu();
+        coordinator.complete_fallback_to_apu();
+
+        true
+    }
+
+    /// Recovers graphics pipeline from paused failsafe state once APU is confirmed active.
+    pub fn recover_to_safe_state(
+        &mut self,
+        controller: &mut EgpuController,
+        coordinator: &GpuHandoverCoordinator,
+    ) -> Result<(), &'static str> {
+        if !self.failsafe_active {
+            return Err("Failsafe not active");
+        }
+        if coordinator.active_adapter != GpuAdapterType::InternalApu {
+            return Err("APU not active");
+        }
+
+        // Clean up controller to Disconnected
+        controller.complete_disconnect();
+
+        // Release failsafe and reset DMA isolation flags
+        self.failsafe_active = false;
+        self.dma_halted = false;
+        self.bus_master_isolated = false;
+        self.recovery_count += 1;
+        Ok(())
+    }
+}
+
+/// Unit test verifying sudden disconnect safety fallback and DMA isolation.
+pub fn verify_surprise_disconnect_fallback() -> bool {
+    let mut controller = EgpuController::new();
+    let mut allocator = BarRebalancingAllocator::default_handheld();
+    let mut coordinator = GpuHandoverCoordinator::new();
+    let mut fallback = DisconnectSafetyFallback::new();
+
+    // Setup active state: insert cable, negotiate tunnel, allocate BAR, handover to eGPU
+    controller.on_cable_insert();
+    if controller.complete_tunnel_training(0x10DE, 0x2782).is_err() {
+        return false;
+    }
+    if allocator.allocate_bar(0, 16 * 1024 * 1024 * 1024, true).is_err() {
+        return false;
+    }
+    if controller.mark_active_primary().is_err() {
+        return false;
+    }
+    if coordinator.initiate_handover_to_egpu().is_err() || coordinator.complete_handover_to_egpu().is_err() {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::ExternalEgpu {
+        return false;
+    }
+
+    // Trigger sudden disconnect
+    if !fallback.handle_surprise_disconnect(&mut controller, &mut coordinator, &mut allocator) {
+        return false;
+    }
+
+    // Verify post-disconnect safety state
+    if !fallback.dma_halted || !fallback.bus_master_isolated || !fallback.failsafe_active {
+        return false;
+    }
+    if controller.state != EgpuHotplugState::SurpriseRemoval {
+        return false;
+    }
+    if allocator.allocation_count != 0 {
+        return false;
+    }
+    if coordinator.active_adapter != GpuAdapterType::InternalApu || coordinator.status != HandoverStatus::ApuOnly {
+        return false;
+    }
+
+    // Recover from failsafe state
+    if fallback.recover_to_safe_state(&mut controller, &coordinator).is_err() {
+        return false;
+    }
+    if fallback.failsafe_active || fallback.dma_halted || fallback.bus_master_isolated {
+        return false;
+    }
+    if controller.state != EgpuHotplugState::Disconnected {
+        return false;
+    }
+
+    true
+}
