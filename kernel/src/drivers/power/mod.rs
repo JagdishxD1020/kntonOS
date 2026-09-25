@@ -8,8 +8,10 @@ pub mod battery_gauge;
 pub mod whisper_mode;
 pub mod quick_suspend;
 pub mod rgb_aura;
+pub mod bypass_charging;
 
 pub use battery_balance::*;
+pub use bypass_charging::*;
 pub use battery_gauge::*;
 pub use whisper_mode::*;
 pub use quick_suspend::*;
