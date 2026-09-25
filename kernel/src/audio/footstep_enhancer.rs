@@ -326,9 +326,10 @@ pub fn verify_fast_drc_and_limiter() -> bool {
     }
 
     // 3. Steady high amplitude signal (0.80): compressed according to 4:1 ratio
+    let mut drc_steady = FastDrcLimiter::default_gaming();
     let mut steady_out = 0.0f32;
     for _ in 0..30 {
-        steady_out = drc.process_sample(0.80);
+        steady_out = drc_steady.process_sample(0.80);
     }
     // threshold = 0.35, excess = 0.45, compressed = 0.35 + 0.45/4 = 0.4625
     if (steady_out - 0.4625).abs() > 0.08 {

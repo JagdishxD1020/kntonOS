@@ -389,3 +389,98 @@ pub fn iocp_get_active_threads(CompletionPort: HANDLE) -> u32 {
         .map(|p| p.active_threads.load(Ordering::SeqCst))
         .unwrap_or(0)
 }
+
+/// Comprehensive self-test for Win32 I/O completion ports and async packet dispatcher.
+pub fn test_win32_iocp_subsystem() -> bool {
+    unsafe {
+        // 1. Create a new I/O completion port with 4 concurrent worker threads.
+        let port = CreateIoCompletionPort(INVALID_HANDLE_VALUE as HANDLE, 0, 0, 4);
+        if port == 0 {
+            return false;
+        }
+
+        // 2. Associate a simulated file handle with completion key 0xABCD.
+        let dummy_handle = 0x5001 as HANDLE;
+        let completion_key = 0xABCDusize;
+        if CreateIoCompletionPort(dummy_handle, port, completion_key, 0) != port {
+            return false;
+        }
+
+        // 3. Post and retrieve a single completion packet.
+        let mut ov1 = OVERLAPPED::default();
+        if PostQueuedCompletionStatus(port, 1024, completion_key, &mut ov1 as LPOVERLAPPED) != TRUE {
+            return false;
+        }
+
+        let mut bytes = 0u32;
+        let mut key = 0usize;
+        let mut lp_ov = core::ptr::null_mut();
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 100) != TRUE {
+            return false;
+        }
+
+        if bytes != 1024
+            || key != completion_key
+            || lp_ov != (&mut ov1 as LPOVERLAPPED)
+            || ov1.InternalHigh != 1024
+        {
+            return false;
+        }
+
+        // 4. Batch packet posting and GetQueuedCompletionStatusEx dequeue.
+        let mut ov_batch = [OVERLAPPED::default(), OVERLAPPED::default(), OVERLAPPED::default()];
+        PostQueuedCompletionStatus(port, 128, 0x100, &mut ov_batch[0] as LPOVERLAPPED);
+        PostQueuedCompletionStatus(port, 256, 0x200, &mut ov_batch[1] as LPOVERLAPPED);
+        PostQueuedCompletionStatus(port, 512, 0x300, &mut ov_batch[2] as LPOVERLAPPED);
+
+        let mut entries = [OVERLAPPED_ENTRY::default(); 4];
+        let mut removed = 0u32;
+        if GetQueuedCompletionStatusEx(port, entries.as_mut_ptr(), 4, &mut removed, 100, FALSE) != TRUE {
+            return false;
+        }
+
+        if removed != 3 {
+            return false;
+        }
+        if entries[0].dwNumberOfBytesTransferred != 128 || entries[0].lpCompletionKey != 0x100 {
+            return false;
+        }
+        if entries[1].dwNumberOfBytesTransferred != 256 || entries[1].lpCompletionKey != 0x200 {
+            return false;
+        }
+        if entries[2].dwNumberOfBytesTransferred != 512 || entries[2].lpCompletionKey != 0x300 {
+            return false;
+        }
+
+        // 5. Test empty queue timeout.
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 0) != FALSE {
+            return false;
+        }
+        if !lp_ov.is_null() {
+            return false;
+        }
+
+        // 6. Test automatic completion notification via iocp_notify_completion.
+        let mut ov_notify = OVERLAPPED::default();
+        if iocp_notify_completion(dummy_handle, 2048, &mut ov_notify as LPOVERLAPPED, 0) != TRUE {
+            return false;
+        }
+
+        if GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut lp_ov, 100) != TRUE {
+            return false;
+        }
+        if bytes != 2048 || key != completion_key || lp_ov != (&mut ov_notify as LPOVERLAPPED) {
+            return false;
+        }
+
+        // 7. Close completion port.
+        if win32_close_iocp(port) != TRUE {
+            return false;
+        }
+
+        crate::serial_write_str(
+            "[KNT-WIN32-IOCP-OK] Win32 I/O completion ports (IOCP) and async packet dispatcher verified\r\n",
+        );
+        true
+    }
+}
