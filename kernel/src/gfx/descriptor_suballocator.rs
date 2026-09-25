@@ -98,6 +98,137 @@ impl DescriptorChunk {
     }
 }
 
+// Chunked Descriptor Pool Manager managing fixed 64-descriptor blocks.
+#[derive(Debug)]
+pub struct ChunkedDescriptorPool {
+    pub heap_type: D3D12_DESCRIPTOR_HEAP_TYPE,
+    pub total_chunks: usize,
+    pub descriptor_size: usize,
+    pub base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+    pub base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    pub chunks: Vec<DescriptorChunk>,
+    pub free_list: Vec<usize>,
+    pub active_chunk_index: Option<usize>,
+    pub total_allocated_chunks: usize,
+}
+
+impl ChunkedDescriptorPool {
+    // Creates a new chunked descriptor pool with fixed 64-descriptor chunks.
+    pub fn new(
+        base_cpu_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+        base_gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+        heap_type: D3D12_DESCRIPTOR_HEAP_TYPE,
+        total_chunks: usize,
+        descriptor_size: usize,
+    ) -> Result<Self, DescriptorSuballocatorError> {
+        if total_chunks == 0 {
+            return Err(DescriptorSuballocatorError::PoolExhausted);
+        }
+
+        let mut chunks = Vec::with_capacity(total_chunks);
+        let mut free_list = Vec::with_capacity(total_chunks);
+
+        for i in 0..total_chunks {
+            chunks.push(DescriptorChunk::new(
+                i,
+                base_cpu_handle,
+                base_gpu_handle,
+                descriptor_size,
+            ));
+            free_list.push(total_chunks - 1 - i);
+        }
+
+        Ok(Self {
+            heap_type,
+            total_chunks,
+            descriptor_size,
+            base_cpu_handle,
+            base_gpu_handle,
+            chunks,
+            free_list,
+            active_chunk_index: None,
+            total_allocated_chunks: 0,
+        })
+    }
+
+    // Allocates a dedicated 64-descriptor chunk from the pool.
+    pub fn allocate_chunk(&mut self) -> Result<usize, DescriptorSuballocatorError> {
+        if let Some(chunk_idx) = self.free_list.pop() {
+            self.chunks[chunk_idx].is_free = false;
+            self.chunks[chunk_idx].allocated_descriptors = 0;
+            self.total_allocated_chunks = self.total_allocated_chunks.saturating_add(1);
+            Ok(chunk_idx)
+        } else {
+            Err(DescriptorSuballocatorError::PoolExhausted)
+        }
+    }
+
+    // Returns a previously allocated chunk back to the pool free list.
+    pub fn release_chunk(&mut self, chunk_index: usize) -> Result<(), DescriptorSuballocatorError> {
+        if chunk_index >= self.total_chunks {
+            return Err(DescriptorSuballocatorError::InvalidChunkIndex);
+        }
+        if self.chunks[chunk_index].is_free {
+            return Ok(());
+        }
+
+        self.chunks[chunk_index].reset();
+        self.free_list.push(chunk_index);
+        self.total_allocated_chunks = self.total_allocated_chunks.saturating_sub(1);
+        if self.active_chunk_index == Some(chunk_index) {
+            self.active_chunk_index = None;
+        }
+        Ok(())
+    }
+
+    // Suballocates a contiguous range of descriptors from the pool's current active chunk.
+    pub fn suballocate(
+        &mut self,
+        count: usize,
+    ) -> Result<SuballocatedDescriptorRange, DescriptorSuballocatorError> {
+        if count == 0 || count > DESCRIPTOR_CHUNK_SIZE {
+            return Err(DescriptorSuballocatorError::InvalidDescriptorCount);
+        }
+
+        let chunk_idx = match self.active_chunk_index {
+            Some(idx) => {
+                if self.chunks[idx].allocated_descriptors + count <= DESCRIPTOR_CHUNK_SIZE {
+                    idx
+                } else {
+                    let new_idx = self.allocate_chunk()?;
+                    self.active_chunk_index = Some(new_idx);
+                    new_idx
+                }
+            }
+            None => {
+                let new_idx = self.allocate_chunk()?;
+                self.active_chunk_index = Some(new_idx);
+                new_idx
+            }
+        };
+
+        let chunk = &mut self.chunks[chunk_idx];
+        let offset = chunk.allocated_descriptors;
+        chunk.allocated_descriptors += count;
+
+        let base_cpu = chunk.base_cpu_handle.offset(offset, self.descriptor_size);
+        let base_gpu = chunk.base_gpu_handle.offset(offset, self.descriptor_size);
+
+        Ok(SuballocatedDescriptorRange {
+            chunk_index: chunk_idx,
+            offset_in_chunk: offset,
+            count,
+            base_cpu_handle: base_cpu,
+            base_gpu_handle: base_gpu,
+        })
+    }
+
+    // Returns the number of currently available chunks in the pool.
+    pub fn available_chunks(&self) -> usize {
+        self.free_list.len()
+    }
+}
+
 // Temporary stub for subsystem self-test during incremental commits.
 pub fn test_descriptor_suballocator_subsystem() -> bool {
     true
