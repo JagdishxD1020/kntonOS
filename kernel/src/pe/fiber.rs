@@ -293,3 +293,72 @@ pub unsafe extern "system" fn GetFiberData() -> *mut c_void {
         .map(|f| f.fiber_data as *mut c_void)
         .unwrap_or(core::ptr::null_mut())
 }
+
+static TOTAL_FIBER_SWITCHES: Spinlock<usize> = Spinlock::new(0);
+
+/// Switches execution cooperatively to the designated target fiber.
+pub unsafe extern "system" fn SwitchToFiber(lpFiber: *mut c_void) {
+    if lpFiber.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let target_handle = lpFiber as usize;
+    let tid = get_current_thread_id();
+    let cur_handle = {
+        let lock = THREAD_CURRENT_FIBER.lock();
+        match lock.get(&tid) {
+            Some(&h) => h,
+            None => {
+                win32_set_last_error(ERROR_INVALID_PARAMETER);
+                return;
+            }
+        }
+    };
+
+    if cur_handle == target_handle {
+        return;
+    }
+
+    let mut dummy_local: usize = 0;
+    let local_sp = &mut dummy_local as *mut _ as usize;
+
+    let mut fibers_lock = FIBERS.lock();
+    if let Some(cur) = fibers_lock.get_mut(&cur_handle) {
+        cur.context.rsp = local_sp;
+        cur.context.rbp = local_sp;
+    }
+
+    let (target_fiber_data, target_base, target_limit, target_routine, target_param) = {
+        match fibers_lock.get_mut(&target_handle) {
+            Some(target) => (
+                target.fiber_data,
+                target.stack_base,
+                target.stack_limit,
+                target.start_routine.take(),
+                target.fiber_data as *mut c_void,
+            ),
+            None => {
+                win32_set_last_error(ERROR_INVALID_HANDLE);
+                return;
+            }
+        }
+    };
+    drop(fibers_lock);
+
+    THREAD_CURRENT_FIBER.lock().insert(tid, target_handle);
+    *TOTAL_FIBER_SWITCHES.lock() += 1;
+
+    update_teb_fiber_state(target_fiber_data as *mut c_void, target_base, target_limit);
+
+    if let Some(routine) = target_routine {
+        routine(target_param);
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+}
+
+/// Returns the total count of cooperative fiber context switches.
+pub fn win32_fiber_switch_count() -> usize {
+    *TOTAL_FIBER_SWITCHES.lock()
+}
