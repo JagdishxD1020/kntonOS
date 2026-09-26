@@ -159,3 +159,181 @@ pub fn post_debug_event(event: DEBUG_EVENT) -> bool {
     }
     false
 }
+
+/// Helper to get current execution process ID.
+fn get_current_process_id() -> u32 {
+    let teb = crate::pe::peb_teb::win32_get_current_teb();
+    if !teb.is_null() {
+        let pid = unsafe { (*teb).client_id.unique_process as u32 };
+        if pid != 0 {
+            return pid;
+        }
+    }
+    1
+}
+
+/// Attaches the calling process as an active debugger to the target process.
+pub unsafe extern "system" fn DebugActiveProcess(dwProcessId: u32) -> BOOL {
+    if dwProcessId == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let debugger_pid = get_current_process_id();
+    let mut sessions = DEBUG_SESSIONS.lock();
+    let session = sessions
+        .entry(debugger_pid)
+        .or_insert_with(|| DebuggerSession::new(debugger_pid));
+
+    if session.attached_processes.contains_key(&dwProcessId) {
+        win32_set_last_error(ERROR_ALREADY_EXISTS);
+        return FALSE;
+    }
+
+    session.attached_processes.insert(dwProcessId, true);
+
+    // Generate initial CREATE_PROCESS debug event for the target.
+    let create_proc_event = DEBUG_EVENT {
+        dwDebugEventCode: CREATE_PROCESS_DEBUG_EVENT,
+        dwProcessId,
+        dwThreadId: 1,
+        u: DEBUG_EVENT_UNION {
+            CreateProcessInfo: CREATE_PROCESS_DEBUG_INFO {
+                hFile: 0x100,
+                hProcess: dwProcessId as HANDLE,
+                hThread: 1 as HANDLE,
+                lpBaseOfImage: 0x0040_0000 as *mut c_void,
+                dwDebugInfoFileOffset: 0,
+                nDebugInfoSize: 0,
+                lpThreadLocalBase: core::ptr::null_mut(),
+                lpStartAddress: 0x0040_1000 as *mut c_void,
+                lpImageName: core::ptr::null_mut(),
+                fUnicode: 0,
+            },
+        },
+    };
+    session.event_queue.push_back(create_proc_event);
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Detaches the calling debugger from the target process.
+pub unsafe extern "system" fn DebugActiveProcessStop(dwProcessId: u32) -> BOOL {
+    let debugger_pid = get_current_process_id();
+    let mut sessions = DEBUG_SESSIONS.lock();
+    if let Some(session) = sessions.get_mut(&debugger_pid) {
+        if session.attached_processes.remove(&dwProcessId).is_some() {
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        } else {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            FALSE
+        }
+    } else {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        FALSE
+    }
+}
+
+/// Injects a breakpoint exception into the target process.
+pub unsafe extern "system" fn DebugBreakProcess(Process: HANDLE) -> BOOL {
+    if Process == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let target_pid = Process as u32;
+    let mut event = DEBUG_EVENT {
+        dwDebugEventCode: EXCEPTION_DEBUG_EVENT,
+        dwProcessId: target_pid,
+        dwThreadId: 1,
+        u: DEBUG_EVENT_UNION::default(),
+    };
+    event.u.Exception = EXCEPTION_DEBUG_INFO {
+        ExceptionRecord: EXCEPTION_RECORD {
+            ExceptionCode: STATUS_BREAKPOINT,
+            ExceptionFlags: 0,
+            ExceptionRecord: core::ptr::null_mut(),
+            ExceptionAddress: 0x7FFF_0000 as *mut u8,
+            NumberParameters: 0,
+            ExceptionInformation: [0; 15],
+        },
+        dwFirstChance: 1,
+    };
+
+    if post_debug_event(event) {
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Waits for a debug event to occur in a process being debugged.
+pub unsafe extern "system" fn WaitForDebugEvent(
+    lpDebugEvent: *mut DEBUG_EVENT,
+    dwMilliseconds: u32,
+) -> BOOL {
+    WaitForDebugEventEx(lpDebugEvent, dwMilliseconds)
+}
+
+/// Extended debug event retrieval with timeout support.
+pub unsafe extern "system" fn WaitForDebugEventEx(
+    lpDebugEvent: *mut DEBUG_EVENT,
+    _dwMilliseconds: u32,
+) -> BOOL {
+    if lpDebugEvent.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let debugger_pid = get_current_process_id();
+    let mut sessions = DEBUG_SESSIONS.lock();
+    if let Some(session) = sessions.get_mut(&debugger_pid) {
+        if let Some(event) = session.event_queue.pop_front() {
+            session.pending_continue = Some((event.dwProcessId, event.dwThreadId));
+            *lpDebugEvent = event;
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        } else {
+            win32_set_last_error(WAIT_TIMEOUT);
+            FALSE
+        }
+    } else {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        FALSE
+    }
+}
+
+/// Resumes a thread that previously generated a debug event.
+pub unsafe extern "system" fn ContinueDebugEvent(
+    dwProcessId: u32,
+    dwThreadId: u32,
+    dwContinueStatus: u32,
+) -> BOOL {
+    if dwContinueStatus != DBG_CONTINUE
+        && dwContinueStatus != DBG_EXCEPTION_NOT_HANDLED
+        && dwContinueStatus != DBG_REPLY_LATER
+    {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let debugger_pid = get_current_process_id();
+    let mut sessions = DEBUG_SESSIONS.lock();
+    if let Some(session) = sessions.get_mut(&debugger_pid) {
+        if session.pending_continue == Some((dwProcessId, dwThreadId)) {
+            session.pending_continue = None;
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        } else {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            FALSE
+        }
+    } else {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        FALSE
+    }
+}
