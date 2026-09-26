@@ -452,3 +452,129 @@ pub fn verify_thermal_bypass_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Battery Lifespan Extender Governor with Configurable Charge Threshold
+// ============================================================================
+
+/// Preset or custom operational modes for battery lifespan preservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifespanPreset {
+    /// No threshold limitation (charges to 100%).
+    FullCapacity,
+    /// Balanced lifespan mode (limits to 80%).
+    Balanced80,
+    /// Maximum preservation mode for desktop/dock use (limits to 60%).
+    MaxLongevity60,
+    /// User-configured custom percentage threshold.
+    Custom(u8),
+}
+
+/// Governor enforcing battery state-of-charge thresholds to extend cell longevity.
+#[derive(Debug, Clone)]
+pub struct LifespanExtenderGovernor {
+    /// Active preset mode.
+    pub preset: LifespanPreset,
+    /// Target maximum State-of-Charge percentage (50% to 95%).
+    pub max_soc_threshold: u8,
+    /// Hysteresis recovery delta percentage (typically 5%).
+    pub hysteresis_delta: u8,
+    /// Whether lifespan limit has engaged 100% direct passthrough bypass.
+    pub limit_bypass_active: bool,
+    /// Count of times bypass was engaged due to reaching charge limit.
+    pub limit_engagement_count: u32,
+}
+
+impl LifespanExtenderGovernor {
+    pub const fn new() -> Self {
+        Self {
+            preset: LifespanPreset::Balanced80,
+            max_soc_threshold: 80,
+            hysteresis_delta: 5,
+            limit_bypass_active: false,
+            limit_engagement_count: 0,
+        }
+    }
+
+    /// Sets lifespan preservation mode and adjusts max SoC threshold accordingly.
+    pub fn set_preset(&mut self, preset: LifespanPreset) {
+        self.preset = preset;
+        self.max_soc_threshold = match preset {
+            LifespanPreset::FullCapacity => 100,
+            LifespanPreset::Balanced80 => 80,
+            LifespanPreset::MaxLongevity60 => 60,
+            LifespanPreset::Custom(val) => val.clamp(50, 95),
+        };
+        self.limit_bypass_active = false;
+    }
+
+    /// Evaluates current battery SoC and determines if charging must be bypassed.
+    pub fn evaluate_soc(&mut self, ac_connected: bool, battery_soc_pct: u8) -> bool {
+        if !ac_connected || self.preset == LifespanPreset::FullCapacity {
+            self.limit_bypass_active = false;
+            return false;
+        }
+
+        if battery_soc_pct >= self.max_soc_threshold {
+            if !self.limit_bypass_active {
+                self.limit_engagement_count += 1;
+            }
+            self.limit_bypass_active = true;
+        } else {
+            let resume_threshold = self.max_soc_threshold.saturating_sub(self.hysteresis_delta);
+            if battery_soc_pct <= resume_threshold {
+                self.limit_bypass_active = false;
+            }
+        }
+
+        self.limit_bypass_active
+    }
+}
+
+/// Unit test verifying battery lifespan extender governor threshold and hysteresis.
+pub fn verify_lifespan_extender_governor() -> bool {
+    let mut gov = LifespanExtenderGovernor::new();
+    if gov.max_soc_threshold != 80 || gov.preset != LifespanPreset::Balanced80 {
+        return false;
+    }
+
+    // 1. Unplugged: bypass not active
+    if gov.evaluate_soc(false, 85) {
+        return false;
+    }
+
+    // 2. Plugged in, SoC below threshold (75% < 80%): charging allowed
+    if gov.evaluate_soc(true, 75) || gov.limit_bypass_active {
+        return false;
+    }
+
+    // 3. Reaches threshold (80%): auto-switch to 100% bypass
+    if !gov.evaluate_soc(true, 80) || !gov.limit_bypass_active {
+        return false;
+    }
+    if gov.limit_engagement_count != 1 {
+        return false;
+    }
+
+    // 4. Hysteresis band: SoC at 78% (above 80 - 5 = 75%): bypass remains active
+    if !gov.evaluate_soc(true, 78) || !gov.limit_bypass_active {
+        return false;
+    }
+
+    // 5. Drops to 74% (below 75%): bypass releases, charging resumes
+    if gov.evaluate_soc(true, 74) || gov.limit_bypass_active {
+        return false;
+    }
+
+    // 6. Test MaxLongevity60 preset
+    gov.set_preset(LifespanPreset::MaxLongevity60);
+    if gov.max_soc_threshold != 60 {
+        return false;
+    }
+    if !gov.evaluate_soc(true, 62) || !gov.limit_bypass_active {
+        return false;
+    }
+
+    true
+}
