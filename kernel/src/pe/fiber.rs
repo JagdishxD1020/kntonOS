@@ -166,7 +166,7 @@ pub unsafe extern "system" fn ConvertFiberToThread() -> BOOL {
     let mut current_map = THREAD_CURRENT_FIBER.lock();
     if let Some(handle) = current_map.remove(&tid) {
         if let Some(fiber) = FIBERS.lock().remove(&handle) {
-            // Invoke FLS termination callbacks for thread fiber.
+            invoke_fls_destruction_callbacks(&fiber.fls_slots);
             drop(fiber);
         }
         update_teb_fiber_state(core::ptr::null_mut(), 0, 0);
@@ -262,6 +262,7 @@ pub unsafe extern "system" fn DeleteFiber(lpFiber: *mut c_void) {
     }
 
     if let Some(fiber) = FIBERS.lock().remove(&handle) {
+        invoke_fls_destruction_callbacks(&fiber.fls_slots);
         drop(fiber);
         win32_set_last_error(ERROR_SUCCESS);
     } else {
@@ -361,4 +362,143 @@ pub unsafe extern "system" fn SwitchToFiber(lpFiber: *mut c_void) {
 /// Returns the total count of cooperative fiber context switches.
 pub fn win32_fiber_switch_count() -> usize {
     *TOTAL_FIBER_SWITCHES.lock()
+}
+
+/// Descriptor for an allocated Fiber Local Storage (FLS) slot.
+#[derive(Clone, Copy)]
+pub struct FlsSlotDescriptor {
+    pub in_use: bool,
+    pub callback: usize,
+}
+
+impl FlsSlotDescriptor {
+    pub const fn empty() -> Self {
+        Self {
+            in_use: false,
+            callback: 0,
+        }
+    }
+}
+
+pub static FLS_REGISTRY: Spinlock<[FlsSlotDescriptor; MAX_FLS_SLOTS]> =
+    Spinlock::new([FlsSlotDescriptor::empty(); MAX_FLS_SLOTS]);
+
+/// Invokes registered FLS callbacks for non-null slot values during fiber deletion.
+pub unsafe fn invoke_fls_destruction_callbacks(slots: &[usize; MAX_FLS_SLOTS]) {
+    let registry = FLS_REGISTRY.lock();
+    for (idx, &slot_val) in slots.iter().enumerate() {
+        if slot_val != 0 && registry[idx].in_use && registry[idx].callback != 0 {
+            let cb: unsafe extern "system" fn(*mut c_void) =
+                core::mem::transmute(registry[idx].callback);
+            cb(slot_val as *mut c_void);
+        }
+    }
+}
+
+/// Allocates a Fiber Local Storage (FLS) slot with optional destruction callback.
+pub unsafe extern "system" fn FlsAlloc(lpCallback: PFLS_CALLBACK_FUNCTION) -> u32 {
+    let mut registry = FLS_REGISTRY.lock();
+    for (idx, slot) in registry.iter_mut().enumerate() {
+        if !slot.in_use {
+            slot.in_use = true;
+            slot.callback = core::mem::transmute(lpCallback);
+
+            // Reset this slot in all currently active fibers.
+            let mut fibers = FIBERS.lock();
+            for fiber in fibers.values_mut() {
+                fiber.fls_slots[idx] = 0;
+            }
+
+            win32_set_last_error(ERROR_SUCCESS);
+            return idx as u32;
+        }
+    }
+
+    win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+    FLS_OUT_OF_INDEXES
+}
+
+/// Releases an allocated Fiber Local Storage (FLS) slot.
+pub unsafe extern "system" fn FlsFree(dwFlsIndex: u32) -> BOOL {
+    let idx = dwFlsIndex as usize;
+    if idx >= MAX_FLS_SLOTS {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut registry = FLS_REGISTRY.lock();
+    if !registry[idx].in_use {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let cb_addr = registry[idx].callback;
+    registry[idx].in_use = false;
+    registry[idx].callback = 0;
+    drop(registry);
+
+    // If a callback is registered, invoke it for fibers with non-null values.
+    if cb_addr != 0 {
+        let cb: unsafe extern "system" fn(*mut c_void) = core::mem::transmute(cb_addr);
+        let mut fibers = FIBERS.lock();
+        for fiber in fibers.values_mut() {
+            let val = fiber.fls_slots[idx];
+            if val != 0 {
+                fiber.fls_slots[idx] = 0;
+                cb(val as *mut c_void);
+            }
+        }
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Retrieves the value stored in the calling fiber's FLS slot.
+pub unsafe extern "system" fn FlsGetValue(dwFlsIndex: u32) -> *mut c_void {
+    let idx = dwFlsIndex as usize;
+    if idx >= MAX_FLS_SLOTS {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let current_fiber = GetCurrentFiber() as usize;
+    if current_fiber == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let fibers = FIBERS.lock();
+    if let Some(fiber) = fibers.get(&current_fiber) {
+        win32_set_last_error(ERROR_SUCCESS);
+        fiber.fls_slots[idx] as *mut c_void
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        core::ptr::null_mut()
+    }
+}
+
+/// Stores a value in the calling fiber's FLS slot.
+pub unsafe extern "system" fn FlsSetValue(dwFlsIndex: u32, lpFlsData: *mut c_void) -> BOOL {
+    let idx = dwFlsIndex as usize;
+    if idx >= MAX_FLS_SLOTS {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let current_fiber = GetCurrentFiber() as usize;
+    if current_fiber == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut fibers = FIBERS.lock();
+    if let Some(fiber) = fibers.get_mut(&current_fiber) {
+        fiber.fls_slots[idx] = lpFlsData as usize;
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
 }
