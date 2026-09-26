@@ -100,3 +100,196 @@ pub unsafe fn update_teb_fiber_state(fiber_data: *mut c_void, stack_base: usize,
         }
     }
 }
+
+/// Helper to get current execution thread ID.
+fn get_current_thread_id() -> u32 {
+    let tid = crate::process::scheduler::current_thread_id() as u32;
+    if tid == 0 { 1 } else { tid }
+}
+
+/// Converts the calling thread into a Win32 fiber with optional flags.
+pub unsafe extern "system" fn ConvertThreadToFiberEx(
+    lpParameter: *mut c_void,
+    dwFlags: u32,
+) -> *mut c_void {
+    let tid = get_current_thread_id();
+    let mut current_map = THREAD_CURRENT_FIBER.lock();
+    if current_map.contains_key(&tid) {
+        win32_set_last_error(ERROR_ALREADY_EXISTS);
+        return core::ptr::null_mut();
+    }
+
+    let fiber_id = NEXT_FIBER_ID.fetch_add(1, Ordering::SeqCst);
+    let handle = fiber_id as usize;
+
+    let teb = crate::pe::peb_teb::win32_get_current_teb();
+    let (s_base, s_limit) = if !teb.is_null() {
+        ((*teb).tib.stack_base as usize, (*teb).tib.stack_limit as usize)
+    } else {
+        (0, 0)
+    };
+
+    let state = Win32FiberState {
+        fiber_id,
+        fiber_data: lpParameter as usize,
+        stack_base: s_base,
+        stack_limit: s_limit,
+        stack_size: s_base.saturating_sub(s_limit),
+        dealloc_stack: false,
+        is_thread_fiber: true,
+        start_routine: None,
+        context: Win32FiberContext {
+            flags: dwFlags,
+            ..Default::default()
+        },
+        fls_slots: [0; MAX_FLS_SLOTS],
+        flags: dwFlags,
+        stack_allocation: None,
+    };
+
+    FIBERS.lock().insert(handle, state);
+    current_map.insert(tid, handle);
+    update_teb_fiber_state(lpParameter, s_base, s_limit);
+
+    win32_set_last_error(ERROR_SUCCESS);
+    handle as *mut c_void
+}
+
+/// Converts the calling thread into a Win32 fiber.
+pub unsafe extern "system" fn ConvertThreadToFiber(lpParameter: *mut c_void) -> *mut c_void {
+    ConvertThreadToFiberEx(lpParameter, 0)
+}
+
+/// Converts the active fiber back to a standard thread.
+pub unsafe extern "system" fn ConvertFiberToThread() -> BOOL {
+    let tid = get_current_thread_id();
+    let mut current_map = THREAD_CURRENT_FIBER.lock();
+    if let Some(handle) = current_map.remove(&tid) {
+        if let Some(fiber) = FIBERS.lock().remove(&handle) {
+            // Invoke FLS termination callbacks for thread fiber.
+            drop(fiber);
+        }
+        update_teb_fiber_state(core::ptr::null_mut(), 0, 0);
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        FALSE
+    }
+}
+
+/// Creates a new cooperative fiber with specified stack size and flags.
+pub unsafe extern "system" fn CreateFiberEx(
+    dwStackCommitSize: usize,
+    dwStackReserveSize: usize,
+    dwFlags: u32,
+    lpStartAddress: LPFIBER_START_ROUTINE,
+    lpParameter: *mut c_void,
+) -> *mut c_void {
+    let mut stack_size = if dwStackCommitSize > 0 {
+        dwStackCommitSize
+    } else if dwStackReserveSize > 0 {
+        dwStackReserveSize
+    } else {
+        DEFAULT_FIBER_STACK_SIZE
+    };
+    if stack_size < 4096 {
+        stack_size = 4096;
+    }
+
+    let mut stack_buf = Vec::with_capacity(stack_size);
+    stack_buf.resize(stack_size, 0);
+
+    let stack_limit = stack_buf.as_ptr() as usize;
+    let stack_base = stack_limit + stack_size;
+    let initial_rsp = ((stack_base - 128) & !15) as usize;
+
+    let fiber_id = NEXT_FIBER_ID.fetch_add(1, Ordering::SeqCst);
+    let handle = fiber_id as usize;
+
+    let mut context = Win32FiberContext {
+        rip: lpStartAddress as usize,
+        rsp: initial_rsp,
+        rbp: initial_rsp,
+        flags: dwFlags,
+        ..Default::default()
+    };
+    context.rdi = lpParameter as usize;
+
+    let state = Win32FiberState {
+        fiber_id,
+        fiber_data: lpParameter as usize,
+        stack_base,
+        stack_limit,
+        stack_size,
+        dealloc_stack: true,
+        is_thread_fiber: false,
+        start_routine: Some(lpStartAddress),
+        context,
+        fls_slots: [0; MAX_FLS_SLOTS],
+        flags: dwFlags,
+        stack_allocation: Some(stack_buf),
+    };
+
+    FIBERS.lock().insert(handle, state);
+    win32_set_last_error(ERROR_SUCCESS);
+    handle as *mut c_void
+}
+
+/// Creates a new cooperative fiber with default settings.
+pub unsafe extern "system" fn CreateFiber(
+    dwStackSize: usize,
+    lpStartAddress: LPFIBER_START_ROUTINE,
+    lpParameter: *mut c_void,
+) -> *mut c_void {
+    CreateFiberEx(dwStackSize, dwStackSize, 0, lpStartAddress, lpParameter)
+}
+
+/// Deletes an existing fiber and releases its execution stack.
+pub unsafe extern "system" fn DeleteFiber(lpFiber: *mut c_void) {
+    if lpFiber.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return;
+    }
+
+    let handle = lpFiber as usize;
+    let tid = get_current_thread_id();
+    let current_handle = THREAD_CURRENT_FIBER.lock().get(&tid).copied();
+
+    if current_handle == Some(handle) {
+        // Deleting current fiber converts thread or exits fiber.
+        THREAD_CURRENT_FIBER.lock().remove(&tid);
+    }
+
+    if let Some(fiber) = FIBERS.lock().remove(&handle) {
+        drop(fiber);
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+    }
+}
+
+/// Returns the handle of the currently executing fiber.
+pub unsafe extern "system" fn GetCurrentFiber() -> *mut c_void {
+    let tid = get_current_thread_id();
+    THREAD_CURRENT_FIBER
+        .lock()
+        .get(&tid)
+        .copied()
+        .map(|h| h as *mut c_void)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// Retrieves caller-defined fiber data for the active fiber.
+pub unsafe extern "system" fn GetFiberData() -> *mut c_void {
+    let handle = GetCurrentFiber() as usize;
+    if handle == 0 {
+        return core::ptr::null_mut();
+    }
+
+    FIBERS
+        .lock()
+        .get(&handle)
+        .map(|f| f.fiber_data as *mut c_void)
+        .unwrap_or(core::ptr::null_mut())
+}
