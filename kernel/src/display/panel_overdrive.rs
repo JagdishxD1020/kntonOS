@@ -391,3 +391,137 @@ pub fn verify_variable_overdrive() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// HDR10 Peak Brightness Boost Governor with Junction Thermal Throttling
+// ============================================================================
+
+/// Maximum HDR10 specular highlight burst luminance in nits.
+pub const HDR10_PEAK_BURST_NITS: f32 = 1000.0;
+/// Sustained thermal equilibrium luminance ceiling in nits.
+pub const HDR10_SUSTAINED_CEILING_NITS: f32 = 500.0;
+/// Critical junction temperature threshold in Celsius (°C).
+pub const JUNCTION_TEMP_CRITICAL_C: f32 = 55.0;
+/// Thermal throttling onset temperature in Celsius (°C).
+pub const JUNCTION_TEMP_THROTTLE_C: f32 = 45.0;
+/// Thermal recovery threshold in Celsius (°C).
+pub const JUNCTION_TEMP_RECOVERY_C: f32 = 42.0;
+
+/// Display panel thermal health status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrThermalState {
+    /// Junction temperature safe (<45°C); full 1000-nit bursts allowed.
+    Normal,
+    /// Junction warm (45°C to 55°C); peak brightness throttled.
+    WarmThrottling,
+    /// Junction critical (>55°C); clamped to sustained 450-500 nits.
+    CriticalOverheat,
+}
+
+/// Governor managing 1000-nit HDR highlight bursts and junction thermal safety.
+#[derive(Debug, Clone)]
+pub struct HdrPeakBoostGovernor {
+    pub current_peak_cap_nits: f32,
+    pub junction_temp_c: f32,
+    pub thermal_state: HdrThermalState,
+    pub burst_energy_capacity: f32,
+    pub burst_energy_consumed: f32,
+    pub throttle_event_count: u32,
+}
+
+impl HdrPeakBoostGovernor {
+    pub const fn new() -> Self {
+        Self {
+            current_peak_cap_nits: HDR10_PEAK_BURST_NITS,
+            junction_temp_c: 35.0,
+            thermal_state: HdrThermalState::Normal,
+            burst_energy_capacity: 5.0, // 5.0 seconds at peak 1000 nits
+            burst_energy_consumed: 0.0,
+            throttle_event_count: 0,
+        }
+    }
+
+    /// Evaluates requested brightness against junction thermals and burst budget.
+    pub fn update(&mut self, requested_nits: f32, junction_temp_c: f32, delta_sec: f32) -> f32 {
+        self.junction_temp_c = junction_temp_c;
+
+        // 1. Evaluate junction thermal safety state
+        if junction_temp_c >= JUNCTION_TEMP_CRITICAL_C {
+            if self.thermal_state != HdrThermalState::CriticalOverheat {
+                self.throttle_event_count += 1;
+            }
+            self.thermal_state = HdrThermalState::CriticalOverheat;
+            self.current_peak_cap_nits = 450.0;
+        } else if junction_temp_c >= JUNCTION_TEMP_THROTTLE_C {
+            if self.thermal_state == HdrThermalState::Normal {
+                self.throttle_event_count += 1;
+            }
+            self.thermal_state = HdrThermalState::WarmThrottling;
+            let factor = (junction_temp_c - JUNCTION_TEMP_THROTTLE_C) / (JUNCTION_TEMP_CRITICAL_C - JUNCTION_TEMP_THROTTLE_C);
+            self.current_peak_cap_nits = HDR10_PEAK_BURST_NITS - factor * (HDR10_PEAK_BURST_NITS - HDR10_SUSTAINED_CEILING_NITS);
+        } else if junction_temp_c <= JUNCTION_TEMP_RECOVERY_C {
+            self.thermal_state = HdrThermalState::Normal;
+            self.current_peak_cap_nits = HDR10_PEAK_BURST_NITS;
+        }
+
+        // 2. Track burst energy budget when driving above sustained ceiling
+        let target_clamp = requested_nits.clamp(MIN_NIGHT_NITS, self.current_peak_cap_nits);
+
+        if target_clamp > HDR10_SUSTAINED_CEILING_NITS {
+            let excess_ratio = (target_clamp - HDR10_SUSTAINED_CEILING_NITS) / (HDR10_PEAK_BURST_NITS - HDR10_SUSTAINED_CEILING_NITS);
+            self.burst_energy_consumed += excess_ratio * delta_sec;
+
+            if self.burst_energy_consumed >= self.burst_energy_capacity {
+                self.current_peak_cap_nits = HDR10_SUSTAINED_CEILING_NITS;
+                return HDR10_SUSTAINED_CEILING_NITS;
+            }
+        } else {
+            // Replenish burst energy when operating at or below sustained ceiling
+            let recharge_rate = 0.5 * delta_sec;
+            self.burst_energy_consumed = (self.burst_energy_consumed - recharge_rate).max(0.0);
+        }
+
+        target_clamp.min(self.current_peak_cap_nits)
+    }
+}
+
+/// Unit test verifying HDR10 peak brightness boost governor and thermal back-off.
+pub fn verify_hdr_boost_governor() -> bool {
+    let mut gov = HdrPeakBoostGovernor::new();
+
+    // 1. Normal thermals (38°C) + brief burst: full 1000 nits granted
+    let out1 = gov.update(1000.0, 38.0, 0.1);
+    if (out1 - 1000.0).abs() > 0.1 || gov.thermal_state != HdrThermalState::Normal {
+        return false;
+    }
+
+    // 2. Warm thermals (50°C, midway between 45°C and 55°C): throttles to ~750 nits
+    let out2 = gov.update(1000.0, 50.0, 0.1);
+    if out2 > 800.0 || out2 < 700.0 || gov.thermal_state != HdrThermalState::WarmThrottling {
+        return false;
+    }
+
+    // 3. Critical overheat (57°C > 55°C): hard clamped <= 450 nits
+    let out3 = gov.update(1000.0, 57.0, 0.1);
+    if out3 > 450.0 || gov.thermal_state != HdrThermalState::CriticalOverheat {
+        return false;
+    }
+
+    // 4. Recovery below 42°C: resets to Normal
+    gov.update(400.0, 40.0, 1.0);
+    if gov.thermal_state != HdrThermalState::Normal || gov.current_peak_cap_nits < 999.0 {
+        return false;
+    }
+
+    // 5. Burst energy exhaustion: 6.0 seconds continuous at 1000 nits
+    let mut out_burst = 0.0f32;
+    for _ in 0..60 {
+        out_burst = gov.update(1000.0, 40.0, 0.1);
+    }
+    if out_burst > HDR10_SUSTAINED_CEILING_NITS {
+        return false;
+    }
+
+    true
+}
