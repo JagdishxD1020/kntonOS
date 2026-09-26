@@ -769,6 +769,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld RGB lighting and per-game aura controller self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Power Supply (PD 3.1) Passthrough Charging & Thermal Bypass Governor (TASK-KNT-209)
+    if !drivers::power::test_bypass_charging_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld PD 3.1 passthrough charging and thermal bypass governor self-test failed!\r\n");
+    }
+
 
 
 

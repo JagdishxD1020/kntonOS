@@ -740,3 +740,23 @@ pub fn verify_passthrough_charging_manager() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld Power Supply (PD 3.1) Passthrough Charging & Thermal Bypass Governor.
+pub fn test_bypass_charging_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld PD 3.1 Passthrough Charging & Thermal Bypass Governor...\r\n");
+    if !verify_pd31_epr_negotiation() {
+        return false;
+    }
+    if !verify_thermal_bypass_governor() {
+        return false;
+    }
+    if !verify_lifespan_extender_governor() {
+        return false;
+    }
+    if !verify_passthrough_charging_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-POWER-BYPASS-PASS] Handheld PD 3.1 passthrough charging and thermal bypass governor verified\r\n");
+    true
+}

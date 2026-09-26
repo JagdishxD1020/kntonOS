@@ -326,6 +326,7 @@ pub fn verify_fast_drc_and_limiter() -> bool {
     }
 
     // 3. Steady high amplitude signal (0.80): compressed according to 4:1 ratio
+    drc.envelope = 0.0;
     let mut steady_out = 0.0f32;
     for _ in 0..30 {
         steady_out = drc.process_sample(0.80);
