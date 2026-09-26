@@ -502,3 +502,94 @@ pub unsafe extern "system" fn FlsSetValue(dwFlsIndex: u32, lpFlsData: *mut c_voi
         FALSE
     }
 }
+
+static TEST_FIBER_EXEC_FLAG: AtomicU32 = AtomicU32::new(0);
+static TEST_FLS_CLEANUP_FLAG: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_fiber_worker_entry(param: *mut c_void) {
+    let val = param as usize as u32;
+    TEST_FIBER_EXEC_FLAG.store(val, Ordering::SeqCst);
+}
+
+unsafe extern "system" fn test_fls_callback(fls_data: *mut c_void) {
+    let val = fls_data as usize as u32;
+    TEST_FLS_CLEANUP_FLAG.store(val, Ordering::SeqCst);
+}
+
+/// Comprehensive self-test for Win32 fibers, context switching, and FLS lifecycle.
+pub fn test_win32_fibers_subsystem() -> bool {
+    unsafe {
+        // 1. Convert calling thread into primary fiber.
+        let primary_param = 0x1122_3344usize as *mut c_void;
+        let primary_fiber = ConvertThreadToFiber(primary_param);
+        if primary_fiber.is_null() {
+            return false;
+        }
+
+        if GetCurrentFiber() != primary_fiber || GetFiberData() != primary_param {
+            return false;
+        }
+
+        // 2. Allocate and verify Fiber Local Storage (FLS) slot.
+        TEST_FLS_CLEANUP_FLAG.store(0, Ordering::SeqCst);
+        let fls_slot = FlsAlloc(Some(test_fls_callback));
+        if fls_slot == FLS_OUT_OF_INDEXES {
+            return false;
+        }
+
+        let fls_test_val = 0x55AA_1234usize as *mut c_void;
+        if FlsSetValue(fls_slot, fls_test_val) != TRUE {
+            return false;
+        }
+
+        if FlsGetValue(fls_slot) != fls_test_val {
+            return false;
+        }
+
+        // 3. Create and cooperatively switch to secondary worker fiber.
+        TEST_FIBER_EXEC_FLAG.store(0, Ordering::SeqCst);
+        let worker_param = 0xCAFE_BABEusize as *mut c_void;
+        let worker_fiber = CreateFiber(16384, test_fiber_worker_entry, worker_param);
+        if worker_fiber.is_null() {
+            return false;
+        }
+
+        SwitchToFiber(worker_fiber);
+        if TEST_FIBER_EXEC_FLAG.load(Ordering::SeqCst) != 0xCAFE_BABE {
+            return false;
+        }
+
+        if win32_fiber_switch_count() == 0 {
+            return false;
+        }
+
+        // Switch back to primary fiber.
+        SwitchToFiber(primary_fiber);
+        if GetCurrentFiber() != primary_fiber {
+            return false;
+        }
+
+        // 4. Delete worker fiber and release FLS slot with callback verification.
+        DeleteFiber(worker_fiber);
+
+        if FlsFree(fls_slot) != TRUE {
+            return false;
+        }
+        if TEST_FLS_CLEANUP_FLAG.load(Ordering::SeqCst) != 0x55AA_1234 {
+            return false;
+        }
+
+        // 5. Convert primary fiber back to standard thread.
+        if ConvertFiberToThread() != TRUE {
+            return false;
+        }
+        if !GetCurrentFiber().is_null() {
+            return false;
+        }
+
+        crate::serial_write_str(
+            "[KNT-WIN32-FIBER-PASS] Win32 fibers and lightweight UMS engine verified\r\n",
+        );
+        true
+    }
+}
