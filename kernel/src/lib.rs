@@ -1029,6 +1029,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 IOCP and async packet dispatcher self-test failed!\r\n");
     }
 
+    // Verify Win32 Fibers & Lightweight User-Mode Scheduling Engine (TASK-KNT-210)
+    if !pe::test_win32_fibers_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 fibers and lightweight UMS engine self-test failed!\r\n");
+    }
+
     // Verify Milestone 200 Unified Gaming Runtime Supervisor & Health Matrix (TASK-KNT-200)
     if !sys::test_milestone_200_supervisor() {
         serial_write_str("[KNT-PANIC] Milestone 200 supervisor self-test failed!\r\n");
