@@ -482,6 +482,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 descriptor suballocator self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Async Compute & High-Priority Graphics Queue Scheduler (TASK-KNT-211)
+    if !gfx::test_d3d12_async_compute_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 async compute scheduler self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Graphics PSO & Shader Bytecode Cache Engine (TASK-KNT-145)
     if !gfx::test_pso_cache_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 graphics PSO cache subsystem self-test failed!\r\n");
