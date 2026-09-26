@@ -578,3 +578,165 @@ pub fn verify_lifespan_extender_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Integrated Passthrough Charging Manager
+// ============================================================================
+
+/// Primary active reason for engaging direct passthrough bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BypassReason {
+    /// No bypass active; normal charging or battery discharge.
+    None,
+    /// Direct bypass active due to heavy APU gaming load (>25W).
+    HighApuTdp,
+    /// Direct bypass active due to elevated battery cell temperature (>42°C).
+    BatteryThermalProtection,
+    /// Direct bypass active due to reaching lifespan SoC threshold (e.g. 80%).
+    LifespanThresholdReached,
+}
+
+/// Integrated Passthrough Charging & Thermal Bypass Manager.
+#[derive(Debug, Clone)]
+pub struct PassthroughChargingManager {
+    /// USB-PD 3.1 EPR contract negotiator.
+    pub epr_negotiator: EprContractNegotiator,
+    /// Thermal bypass governor.
+    pub thermal_governor: ThermalBypassGovernor,
+    /// Battery lifespan extender governor.
+    pub lifespan_governor: LifespanExtenderGovernor,
+    /// Currently effective power routing mode.
+    pub effective_mode: BypassPowerMode,
+    /// Specific reason for engaging bypass.
+    pub active_bypass_reason: BypassReason,
+    /// Active hardware switch configuration.
+    pub switches: PowerPathSwitchState,
+}
+
+impl PassthroughChargingManager {
+    pub const fn new() -> Self {
+        Self {
+            epr_negotiator: EprContractNegotiator::new(),
+            thermal_governor: ThermalBypassGovernor::new(),
+            lifespan_governor: LifespanExtenderGovernor::new(),
+            effective_mode: BypassPowerMode::BatteryDischarge,
+            active_bypass_reason: BypassReason::None,
+            switches: PowerPathSwitchState::new(),
+        }
+    }
+
+    /// Evaluates all power, thermal, and battery metrics to enforce policy.
+    pub fn evaluate_tick(
+        &mut self,
+        ac_connected: bool,
+        apu_tdp_w: f32,
+        batt_temp_c: f32,
+        battery_soc_pct: u8,
+    ) -> BypassPowerMode {
+        if !ac_connected {
+            self.epr_negotiator.on_detach();
+            self.thermal_governor.evaluate(false, 0.0, apu_tdp_w, batt_temp_c);
+            self.lifespan_governor.evaluate_soc(false, battery_soc_pct);
+            self.effective_mode = BypassPowerMode::BatteryDischarge;
+            self.active_bypass_reason = BypassReason::None;
+            self.switches.ac_input_closed = false;
+            self.switches.batt_charge_closed = false;
+            self.switches.batt_discharge_closed = true;
+            return self.effective_mode;
+        }
+
+        let ac_watts = if self.epr_negotiator.negotiated_power_w > 0.0 {
+            self.epr_negotiator.negotiated_power_w
+        } else {
+            65.0
+        };
+
+        let thermal_mode = self.thermal_governor.evaluate(true, ac_watts, apu_tdp_w, batt_temp_c);
+        let lifespan_bypass = self.lifespan_governor.evaluate_soc(true, battery_soc_pct);
+
+        if thermal_mode == BypassPowerMode::DirectBypass {
+            self.effective_mode = BypassPowerMode::DirectBypass;
+            self.active_bypass_reason = if batt_temp_c >= self.thermal_governor.batt_temp_threshold_c {
+                BypassReason::BatteryThermalProtection
+            } else {
+                BypassReason::HighApuTdp
+            };
+        } else if lifespan_bypass {
+            self.effective_mode = BypassPowerMode::DirectBypass;
+            self.active_bypass_reason = BypassReason::LifespanThresholdReached;
+        } else {
+            self.effective_mode = BypassPowerMode::SimultaneousCharge;
+            self.active_bypass_reason = BypassReason::None;
+        }
+
+        self.switches.ac_input_closed = true;
+        self.switches.batt_discharge_closed = false;
+        self.switches.batt_charge_closed = self.effective_mode == BypassPowerMode::SimultaneousCharge;
+
+        self.effective_mode
+    }
+}
+
+/// Unit test verifying integrated passthrough charging manager coordination.
+pub fn verify_passthrough_charging_manager() -> bool {
+    let mut mgr = PassthroughChargingManager::new();
+
+    // Setup 140W EPR contract
+    let caps = [
+        PdPowerDataObject::new_fixed(1, 5_000, 3_000),
+        PdPowerDataObject::new_fixed(2, 20_000, 5_000),
+        PdPowerDataObject::epr_140w(3),
+    ];
+    if mgr.epr_negotiator.receive_source_capabilities(&caps).is_err() {
+        return false;
+    }
+    if mgr.epr_negotiator.negotiate_optimal_contract(100.0).is_err() {
+        return false;
+    }
+
+    // 1. Light load (15W TDP, 32°C, 50% SoC): Simultaneous charging
+    let m1 = mgr.evaluate_tick(true, 15.0, 32.0, 50);
+    if m1 != BypassPowerMode::SimultaneousCharge || mgr.active_bypass_reason != BypassReason::None {
+        return false;
+    }
+    if !mgr.switches.batt_charge_closed || !mgr.switches.ac_input_closed {
+        return false;
+    }
+
+    // 2. High gaming load (28W TDP > 25W): HighApuTdp bypass
+    let m2 = mgr.evaluate_tick(true, 28.0, 35.0, 50);
+    if m2 != BypassPowerMode::DirectBypass || mgr.active_bypass_reason != BypassReason::HighApuTdp {
+        return false;
+    }
+    if mgr.switches.batt_charge_closed {
+        return false;
+    }
+
+    // 3. APU cools down (15W), but battery gets hot (43°C): BatteryThermalProtection bypass
+    let m3 = mgr.evaluate_tick(true, 15.0, 43.0, 50);
+    if m3 != BypassPowerMode::DirectBypass || mgr.active_bypass_reason != BypassReason::BatteryThermalProtection {
+        return false;
+    }
+
+    // 4. Cool conditions (34°C, 15W TDP), but battery reaches 80% SoC: LifespanThresholdReached bypass
+    // First clear thermal recovery
+    mgr.thermal_governor.evaluate(true, 140.0, 15.0, 34.0);
+    mgr.thermal_governor.evaluate(true, 140.0, 15.0, 34.0);
+    mgr.thermal_governor.evaluate(true, 140.0, 15.0, 34.0);
+    let m4 = mgr.evaluate_tick(true, 15.0, 34.0, 80);
+    if m4 != BypassPowerMode::DirectBypass || mgr.active_bypass_reason != BypassReason::LifespanThresholdReached {
+        return false;
+    }
+
+    // 5. Cable disconnect: battery discharge
+    let m5 = mgr.evaluate_tick(false, 15.0, 34.0, 80);
+    if m5 != BypassPowerMode::BatteryDischarge || mgr.active_bypass_reason != BypassReason::None {
+        return false;
+    }
+    if !mgr.switches.batt_discharge_closed || mgr.switches.ac_input_closed {
+        return false;
+    }
+
+    true
+}
