@@ -15,3 +15,5 @@ pub use font::{FONT_HEIGHT, FONT_WIDTH};
 pub use framebuffer::{FramebufferInfo, LinearFramebuffer};
 pub use vrr_pacer::*;
 pub use dock_manager::*;
+pub mod panel_overdrive;
+pub use panel_overdrive::*;
