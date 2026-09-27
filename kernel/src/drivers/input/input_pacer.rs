@@ -207,3 +207,159 @@ pub fn verify_high_poll_aggregator() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Microsecond Hardware Timestamping & Circular Jitter Buffer
+// ============================================================================
+
+/// Maximum capacity of the input pacer circular jitter ring buffer.
+pub const JITTER_BUFFER_CAPACITY: usize = 32;
+
+/// Circular jitter smoothing queue decoupling USB interrupts from game engine pulls.
+#[derive(Debug, Clone)]
+pub struct InputJitterBuffer {
+    pub ring: [AggregatedInputPacket; JITTER_BUFFER_CAPACITY],
+    pub head: usize,
+    pub tail: usize,
+    pub count: usize,
+    pub last_arrival_ts_us: u64,
+    pub expected_interval_us: u32,
+    pub jitter_samples: u32,
+    pub total_jitter_us: u64,
+    pub max_jitter_us: u32,
+}
+
+impl InputJitterBuffer {
+    pub const fn new(expected_interval_us: u32) -> Self {
+        Self {
+            ring: [AggregatedInputPacket::empty(); JITTER_BUFFER_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+            last_arrival_ts_us: 0,
+            expected_interval_us,
+            jitter_samples: 0,
+            total_jitter_us: 0,
+            max_jitter_us: 0,
+        }
+    }
+
+    /// Updates expected interval when polling rate changes.
+    pub fn set_expected_interval(&mut self, interval_us: u32) {
+        self.expected_interval_us = interval_us;
+    }
+
+    /// Pushes a newly aggregated packet into the ring buffer with jitter tracking.
+    pub fn push(&mut self, packet: AggregatedInputPacket) {
+        if self.last_arrival_ts_us > 0 && packet.timestamp_us > self.last_arrival_ts_us {
+            let actual_delta_us = (packet.timestamp_us - self.last_arrival_ts_us) as u32;
+            let jitter = if actual_delta_us > self.expected_interval_us {
+                actual_delta_us - self.expected_interval_us
+            } else {
+                self.expected_interval_us - actual_delta_us
+            };
+
+            self.total_jitter_us += jitter as u64;
+            self.jitter_samples += 1;
+            if jitter > self.max_jitter_us {
+                self.max_jitter_us = jitter;
+            }
+        }
+        self.last_arrival_ts_us = packet.timestamp_us;
+
+        // If ring buffer is full, advance tail to drop oldest frame (drop-oldest policy for low latency)
+        if self.count == JITTER_BUFFER_CAPACITY {
+            self.tail = (self.tail + 1) % JITTER_BUFFER_CAPACITY;
+        } else {
+            self.count += 1;
+        }
+
+        self.ring[self.head] = packet;
+        self.head = (self.head + 1) % JITTER_BUFFER_CAPACITY;
+    }
+
+    /// Pops the oldest smoothed input packet for game engine dispatch.
+    pub fn pop(&mut self) -> Option<AggregatedInputPacket> {
+        if self.count == 0 {
+            return None;
+        }
+
+        let pkt = self.ring[self.tail];
+        self.tail = (self.tail + 1) % JITTER_BUFFER_CAPACITY;
+        self.count -= 1;
+        Some(pkt)
+    }
+
+    /// Peeks at the next available packet without consuming it.
+    pub fn peek(&self) -> Option<&AggregatedInputPacket> {
+        if self.count == 0 {
+            None
+        } else {
+            Some(&self.ring[self.tail])
+        }
+    }
+
+    /// Computes average inter-arrival jitter in microseconds.
+    pub fn average_jitter_us(&self) -> u32 {
+        if self.jitter_samples == 0 {
+            0
+        } else {
+            (self.total_jitter_us / self.jitter_samples as u64) as u32
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+}
+
+/// Unit test verifying microsecond hardware timestamping and circular jitter buffer.
+pub fn verify_jitter_buffer() -> bool {
+    let mut jb = InputJitterBuffer::new(1000); // 1000us (1000Hz) expected interval
+    if !jb.is_empty() || jb.len() != 0 {
+        return false;
+    }
+
+    // 1. Push 4 packets with synthetic USB jitter (expected 1000us delta)
+    let mut agg = HighPollRateAggregator::new(POLL_RATE_1000HZ);
+    let p1 = agg.aggregate_sample(1000, BTN_A, (0, 0), (0, 0), (0, 0), (0, 0, 0, false), (0, 0, 0, false));
+    let p2 = agg.aggregate_sample(1950, BTN_B, (0, 0), (0, 0), (0, 0), (0, 0, 0, false), (0, 0, 0, false)); // delta 950 (jitter 50)
+    let p3 = agg.aggregate_sample(3100, BTN_X, (0, 0), (0, 0), (0, 0), (0, 0, 0, false), (0, 0, 0, false)); // delta 1150 (jitter 150)
+    let p4 = agg.aggregate_sample(4080, BTN_Y, (0, 0), (0, 0), (0, 0), (0, 0, 0, false), (0, 0, 0, false)); // delta 980 (jitter 20)
+
+    jb.push(p1);
+    jb.push(p2);
+    jb.push(p3);
+    jb.push(p4);
+
+    if jb.len() != 4 || jb.max_jitter_us != 150 {
+        return false;
+    }
+    // Average jitter: (50 + 150 + 20) / 3 = 220 / 3 = 73 us
+    if jb.average_jitter_us() != 73 {
+        return false;
+    }
+
+    // 2. FIFO order verification
+    let out1 = match jb.pop() { Some(p) => p, None => return false };
+    let out2 = match jb.pop() { Some(p) => p, None => return false };
+    if out1.buttons != BTN_A || out2.buttons != BTN_B || jb.len() != 2 {
+        return false;
+    }
+
+    // 3. Ring buffer wrap-around test
+    for i in 0..40 {
+        let pkt = agg.aggregate_sample((5000 + i * 1000) as u64, BTN_A, (0, 0), (0, 0), (0, 0), (0, 0, 0, false), (0, 0, 0, false));
+        jb.push(pkt);
+    }
+    if jb.len() != JITTER_BUFFER_CAPACITY {
+        return false;
+    }
+
+    true
+}
