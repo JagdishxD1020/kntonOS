@@ -642,3 +642,23 @@ pub fn verify_panel_overdrive_manager() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
+pub fn test_panel_overdrive_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
+    if !verify_dc_dimming_curve() {
+        return false;
+    }
+    if !verify_variable_overdrive() {
+        return false;
+    }
+    if !verify_hdr_boost_governor() {
+        return false;
+    }
+    if !verify_panel_overdrive_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-DISPLAY-OVERDRIVE-PASS] Handheld direct display DC dimming and variable overdrive controller verified\r\n");
+    true
+}
