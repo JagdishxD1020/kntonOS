@@ -280,7 +280,131 @@ impl HandheldVrsAdaptiveGovernor {
     }
 }
 
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 VRS Tier 2 Combiners & Per-Draw Rate Multiplier.
 pub fn test_vrs_combiners_subsystem() -> bool {
+    // 1. Verify single-stage combiner evaluation rules
+    let p_pass = MultiStageCombinerEvaluator::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+    );
+    if p_pass != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1 {
+        return false;
+    }
+
+    let p_over = MultiStageCombinerEvaluator::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+    );
+    if p_over != D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2 {
+        return false;
+    }
+
+    let p_min = MultiStageCombinerEvaluator::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X2,
+    );
+    if p_min != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let p_max = MultiStageCombinerEvaluator::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+    );
+    if p_max != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let p_sum = MultiStageCombinerEvaluator::evaluate_combiner(
+        D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_SUM,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+    );
+    if p_sum != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    // 2. Verify multi-stage pipeline evaluation and per-draw multiplier
+    let evaluator = MultiStageCombinerEvaluator::new(VrsCombinerStageConfig {
+        combiner_primitive_image: D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+        combiner_result_base: D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+    });
+
+    let res_no_mult = evaluator.evaluate_full(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        None,
+    );
+    if res_no_mult != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    let res_mult = evaluator.evaluate_full(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        Some(VrsRateMultiplier::new(2, 1)),
+    );
+    if res_mult != D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X2 {
+        return false;
+    }
+
+    // 3. Verify dynamic rate clamping against device capabilities
+    let clamper_no_additional = VrsRateClamper::new(D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier1(false));
+    if clamper_no_additional.is_rate_supported(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4) {
+        return false;
+    }
+    if !clamper_no_additional.is_rate_supported(D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2) {
+        return false;
+    }
+    if clamper_no_additional.clamp_rate(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+        != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2
+    {
+        return false;
+    }
+
+    let clamper_with_additional = VrsRateClamper::new(D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier1(true));
+    if !clamper_with_additional.is_rate_supported(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4) {
+        return false;
+    }
+    if clamper_with_additional.clamp_rate(D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4)
+        != D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4
+    {
+        return false;
+    }
+
+    // 4. Verify handheld adaptive governor policies
+    let governor = HandheldVrsAdaptiveGovernor::new(HandheldVrsProfile::Balanced, clamper_with_additional);
+
+    // High contrast edge tile: must resolve to 1x1
+    let edge_class = VrsTileClassification::new(true, false, 0.0, false);
+    let edge_rate = governor.resolve_adaptive_rate(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        edge_class,
+    );
+    if edge_rate != D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1 {
+        return false;
+    }
+
+    // Motion blurred tile: maximizes coarse shading
+    let motion_class = VrsTileClassification::new(false, true, 8.0, false);
+    let motion_rate = governor.resolve_adaptive_rate(
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1,
+        D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1,
+        motion_class,
+    );
+    if motion_rate != D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-VRS-COMBINERS-PASS] Direct3D 12 VRS Tier 2 combiners and per-draw rate multiplier verified\r\n");
     true
 }
