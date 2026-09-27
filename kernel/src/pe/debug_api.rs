@@ -537,3 +537,119 @@ pub fn CheckHardwareBreakpointTrigger(tid: u32, address: usize, is_write: bool) 
     }
     None
 }
+
+/// Comprehensive self-test for Win32 debugging, exception trapping, and hardware watchpoints.
+pub fn test_win32_debug_subsystem() -> bool {
+    unsafe {
+        let test_pid = 0x4242u32;
+        let test_hprocess = test_pid as HANDLE;
+
+        // 1. Attach debugger to target process.
+        if DebugActiveProcess(test_pid) != TRUE {
+            return false;
+        }
+
+        // 2. Wait for initial CREATE_PROCESS debug event.
+        let mut event = DEBUG_EVENT::default();
+        if WaitForDebugEvent(&mut event, 100) != TRUE {
+            return false;
+        }
+
+        if event.dwDebugEventCode != CREATE_PROCESS_DEBUG_EVENT || event.dwProcessId != test_pid {
+            return false;
+        }
+
+        // 3. Continue debug event.
+        if ContinueDebugEvent(test_pid, event.dwThreadId, DBG_CONTINUE) != TRUE {
+            return false;
+        }
+
+        // 4. Cross-process memory inspection and modification.
+        let target_addr = 0x0040_5000usize as *mut c_void;
+        let write_pattern: [u8; 8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
+        let mut bytes_written = 0usize;
+        if WriteProcessMemory(
+            test_hprocess,
+            target_addr,
+            write_pattern.as_ptr() as *const c_void,
+            8,
+            &mut bytes_written,
+        ) != TRUE {
+            return false;
+        }
+
+        if bytes_written != 8 {
+            return false;
+        }
+
+        let mut read_buf = [0u8; 8];
+        let mut bytes_read = 0usize;
+        if ReadProcessMemory(
+            test_hprocess,
+            target_addr as *const c_void,
+            read_buf.as_mut_ptr() as *mut c_void,
+            8,
+            &mut bytes_read,
+        ) != TRUE {
+            return false;
+        }
+
+        if bytes_read != 8 || read_buf != write_pattern {
+            return false;
+        }
+
+        // 5. Hardware debug registers and watchpoint trapping.
+        let thread_id = 1u32;
+        let watch_addr = 0x0040_5000usize;
+        if !SetHardwareBreakpoint(thread_id, 0, watch_addr, HwBpCondition::Write, HwBpSize::Byte4) {
+            return false;
+        }
+
+        let hw_regs = GetHardwareBreakpoints(thread_id);
+        if hw_regs.dr0 != watch_addr || (hw_regs.dr7 & 0x1) == 0 {
+            return false;
+        }
+
+        if CheckHardwareBreakpointTrigger(thread_id, watch_addr, true) != Some(0) {
+            return false;
+        }
+
+        if !ClearHardwareBreakpoint(thread_id, 0) {
+            return false;
+        }
+
+        let cleared_regs = GetHardwareBreakpoints(thread_id);
+        if cleared_regs.dr0 != 0 || (cleared_regs.dr7 & 0x1) != 0 {
+            return false;
+        }
+
+        // 6. Breakpoint injection and exception handling.
+        if DebugBreakProcess(test_hprocess) != TRUE {
+            return false;
+        }
+
+        if WaitForDebugEvent(&mut event, 100) != TRUE {
+            return false;
+        }
+
+        if event.dwDebugEventCode != EXCEPTION_DEBUG_EVENT
+            || event.u.Exception.ExceptionRecord.ExceptionCode != STATUS_BREAKPOINT
+        {
+            return false;
+        }
+
+        if ContinueDebugEvent(test_pid, event.dwThreadId, DBG_CONTINUE) != TRUE {
+            return false;
+        }
+
+        // 7. Detach debugger session.
+        if DebugActiveProcessStop(test_pid) != TRUE {
+            return false;
+        }
+
+        crate::serial_write_str(
+            "[KNT-WIN32-DEBUG-PASS] Win32 debugging and exception instrumentation subsystem verified\r\n",
+        );
+        true
+    }
+}
