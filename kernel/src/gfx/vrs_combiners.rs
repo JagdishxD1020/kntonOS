@@ -124,6 +124,69 @@ impl MultiStageCombinerEvaluator {
     }
 }
 
+// Dynamic rate clamping engine ensuring calculated coarse rates adhere to hardware limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrsRateClamper {
+    pub caps: D3D12_FEATURE_DATA_D3D12_OPTIONS6,
+    pub max_width: u32,
+    pub max_height: u32,
+}
+
+impl Default for VrsRateClamper {
+    fn default() -> Self {
+        Self {
+            caps: D3D12_FEATURE_DATA_D3D12_OPTIONS6::tier1(true),
+            max_width: 4,
+            max_height: 4,
+        }
+    }
+}
+
+impl VrsRateClamper {
+    // Creates a new clamper bound to specific device capabilities.
+    pub const fn new(caps: D3D12_FEATURE_DATA_D3D12_OPTIONS6) -> Self {
+        let (max_w, max_h) = if caps.AdditionalShadingRatesSupported {
+            (4, 4)
+        } else {
+            (2, 2)
+        };
+        Self {
+            caps,
+            max_width: max_w,
+            max_height: max_h,
+        }
+    }
+
+    // Clamps an input shading rate against hardware limits and capability flags.
+    pub fn clamp_rate(&self, rate: D3D12_SHADING_RATE) -> D3D12_SHADING_RATE {
+        let w = rate.width().min(self.max_width);
+        let h = rate.height().min(self.max_height);
+
+        if !self.caps.AdditionalShadingRatesSupported && (w > 2 || h > 2) {
+            return D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2;
+        }
+
+        let w_val = if w >= 4 { 4 } else if w >= 2 { 2 } else { 1 };
+        let h_val = if h >= 4 { 4 } else if h >= 2 { 2 } else { 1 };
+
+        D3D12_SHADING_RATE::from_dimensions(w_val, h_val)
+            .unwrap_or(D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1)
+    }
+
+    // Validates whether a specific shading rate is natively supported by the device.
+    pub fn is_rate_supported(&self, rate: D3D12_SHADING_RATE) -> bool {
+        match rate {
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_1X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X1
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X2 => true,
+            D3D12_SHADING_RATE::D3D12_SHADING_RATE_2X4
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X2
+            | D3D12_SHADING_RATE::D3D12_SHADING_RATE_4X4 => self.caps.AdditionalShadingRatesSupported,
+        }
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_vrs_combiners_subsystem() -> bool {
     true
