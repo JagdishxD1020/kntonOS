@@ -187,6 +187,99 @@ impl VrsRateClamper {
     }
 }
 
+// Handheld gaming power and thermal VRS operating profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HandheldVrsProfile {
+    Performance,
+    #[default]
+    Balanced,
+    BatterySaver,
+}
+
+// Surface tile classification flags for adaptive policy selection.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VrsTileClassification {
+    pub is_high_contrast_edge: bool,
+    pub is_motion_blurred: bool,
+    pub motion_magnitude_pixels: f32,
+    pub is_ui_or_hud: bool,
+}
+
+impl VrsTileClassification {
+    pub const fn new(is_edge: bool, is_motion: bool, motion_pixels: f32, is_ui: bool) -> Self {
+        Self {
+            is_high_contrast_edge: is_edge,
+            is_motion_blurred: is_motion,
+            motion_magnitude_pixels: motion_pixels,
+            is_ui_or_hud: is_ui,
+        }
+    }
+}
+
+// Adaptive Handheld VRS Governor applying policy-based rate adjustments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandheldVrsAdaptiveGovernor {
+    pub profile: HandheldVrsProfile,
+    pub clamper: VrsRateClamper,
+}
+
+impl HandheldVrsAdaptiveGovernor {
+    // Creates a new adaptive governor with given power profile and hardware clamper.
+    pub const fn new(profile: HandheldVrsProfile, clamper: VrsRateClamper) -> Self {
+        Self { profile, clamper }
+    }
+
+    // Selects combiner modes based on tile classification (Min on edges, Max on motion blur).
+    pub fn select_combiner_policy(
+        &self,
+        classification: VrsTileClassification,
+    ) -> (D3D12_SHADING_RATE_COMBINER, D3D12_SHADING_RATE_COMBINER) {
+        if classification.is_ui_or_hud || classification.is_high_contrast_edge {
+            (
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MIN,
+            )
+        } else if classification.is_motion_blurred || classification.motion_magnitude_pixels >= 4.0 {
+            (
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_MAX,
+            )
+        } else {
+            (
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+                D3D12_SHADING_RATE_COMBINER::D3D12_SHADING_RATE_COMBINER_OVERRIDE,
+            )
+        }
+    }
+
+    // Resolves final coarse shading rate for a tile using adaptive policy and hardware clamping.
+    pub fn resolve_adaptive_rate(
+        &self,
+        primitive_rate: D3D12_SHADING_RATE,
+        image_rate: D3D12_SHADING_RATE,
+        draw_base_rate: D3D12_SHADING_RATE,
+        classification: VrsTileClassification,
+    ) -> D3D12_SHADING_RATE {
+        let (comb0, comb1) = self.select_combiner_policy(classification);
+        let evaluator = MultiStageCombinerEvaluator::new(VrsCombinerStageConfig {
+            combiner_primitive_image: comb0,
+            combiner_result_base: comb1,
+        });
+
+        let multiplier = if self.profile == HandheldVrsProfile::BatterySaver
+            && !classification.is_high_contrast_edge
+            && !classification.is_ui_or_hud
+        {
+            Some(VrsRateMultiplier::new(2, 2))
+        } else {
+            None
+        };
+
+        let raw_rate = evaluator.evaluate_full(primitive_rate, image_rate, draw_base_rate, multiplier);
+        self.clamper.clamp_rate(raw_rate)
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_vrs_combiners_subsystem() -> bool {
     true
