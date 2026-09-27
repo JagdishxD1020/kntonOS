@@ -525,3 +525,120 @@ pub fn verify_hdr_boost_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Unified Handheld Panel Overdrive & Illumination Manager
+// ============================================================================
+
+/// Active display illumination mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IlluminationMode {
+    /// Standard dynamic range with pure PWM-free DC dimming.
+    SdrDcDimming,
+    /// High dynamic range with 1000-nit highlight burst governor.
+    Hdr10Boost,
+}
+
+/// Unified Display Panel Overdrive & Illumination Manager.
+#[derive(Debug, Clone)]
+pub struct PanelOverdriveManager {
+    pub mode: IlluminationMode,
+    pub dc_dimming: DcDimmingCurve,
+    pub als_adapter: AlsAutoAdapter,
+    pub overdrive_engine: VariableOverdriveEngine,
+    pub hdr_governor: HdrPeakBoostGovernor,
+    pub active_level: DcDimmingLevel,
+    pub current_refresh_hz: f32,
+}
+
+impl PanelOverdriveManager {
+    pub const fn new() -> Self {
+        Self {
+            mode: IlluminationMode::SdrDcDimming,
+            dc_dimming: DcDimmingCurve::new(),
+            als_adapter: AlsAutoAdapter::new(),
+            overdrive_engine: VariableOverdriveEngine::new(),
+            hdr_governor: HdrPeakBoostGovernor::new(),
+            active_level: DcDimmingLevel {
+                nits: 120.0,
+                dac_code: 980,
+                pwm_flicker_hz: 0,
+            },
+            current_refresh_hz: 60.0,
+        }
+    }
+
+    /// Evaluates display tick updating illumination and thermal state.
+    pub fn update_tick(
+        &mut self,
+        ambient_lux: f32,
+        junction_temp_c: f32,
+        current_refresh_hz: f32,
+        delta_sec: f32,
+    ) -> DcDimmingLevel {
+        self.current_refresh_hz = current_refresh_hz;
+
+        match self.mode {
+            IlluminationMode::SdrDcDimming => {
+                self.active_level = self.als_adapter.update(ambient_lux);
+            }
+            IlluminationMode::Hdr10Boost => {
+                let target_nits = self.als_adapter.lux_to_target_nits(ambient_lux);
+                // Allow specular highlight boost up to 1000 nits when ambient or content requests it
+                let requested_nits = if ambient_lux > 1000.0 {
+                    HDR10_PEAK_BURST_NITS
+                } else {
+                    target_nits.max(HDR10_SUSTAINED_CEILING_NITS)
+                };
+                let effective_nits = self.hdr_governor.update(requested_nits, junction_temp_c, delta_sec);
+                self.active_level = self.dc_dimming.generate_level(effective_nits);
+            }
+        }
+
+        self.active_level
+    }
+
+    /// Computes pixel transition overdrive value using instantaneous VRR frequency.
+    pub fn compute_pixel_overdrive(&self, from_gray: u8, to_gray: u8) -> u8 {
+        self.overdrive_engine.compute_overdrive(from_gray, to_gray, self.current_refresh_hz)
+    }
+}
+
+/// Unit test verifying unified panel overdrive manager.
+pub fn verify_panel_overdrive_manager() -> bool {
+    let mut mgr = PanelOverdriveManager::new();
+
+    // 1. SDR Mode at 60Hz in dark room
+    mgr.mode = IlluminationMode::SdrDcDimming;
+    for _ in 0..25 {
+        mgr.update_tick(0.0, 36.0, 60.0, 0.1);
+    }
+    if mgr.active_level.nits > 5.0 || mgr.active_level.pwm_flicker_hz != 0 {
+        return false;
+    }
+    // 60Hz overdrive must have zero flicker and suppressed overshoot
+    let od_60 = mgr.compute_pixel_overdrive(0, 128);
+    if od_60 < 128 {
+        return false;
+    }
+
+    // 2. Switch to HDR10 Mode at 144Hz with bright highlights
+    mgr.mode = IlluminationMode::Hdr10Boost;
+    let hdr_level = mgr.update_tick(2000.0, 38.0, 144.0, 0.1);
+    if hdr_level.nits < 480.0 {
+        return false;
+    }
+    let od_144 = mgr.compute_pixel_overdrive(0, 128);
+    if od_144 <= od_60 {
+        return false;
+    }
+
+    // 3. Thermal back-off under high junction temperature (58°C)
+    let hot_level = mgr.update_tick(2000.0, 58.0, 144.0, 0.1);
+    if hot_level.nits > 500.0 || mgr.hdr_governor.thermal_state != HdrThermalState::CriticalOverheat {
+        return false;
+    }
+
+    true
+}
