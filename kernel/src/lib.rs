@@ -755,6 +755,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld USB-C docking station and DP MST manager self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller (TASK-KNT-212)
+    if !display::test_panel_overdrive_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld direct display DC dimming and variable overdrive self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)
