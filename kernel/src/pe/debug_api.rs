@@ -410,3 +410,130 @@ pub unsafe extern "system" fn WriteProcessMemory(
     win32_set_last_error(ERROR_SUCCESS);
     TRUE
 }
+
+/// Breakpoint trigger condition for x86-64 debug registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwBpCondition {
+    Execute = 0b00,
+    Write = 0b01,
+    IoPort = 0b10,
+    ReadWrite = 0b11,
+}
+
+/// Watchpoint data size for x86-64 debug registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HwBpSize {
+    Byte1 = 0b00,
+    Byte2 = 0b01,
+    Byte8 = 0b10,
+    Byte4 = 0b11,
+}
+
+/// Virtualized x86-64 hardware debug registers (DR0-DR3, DR6, DR7).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HardwareDebugRegisters {
+    pub dr0: usize,
+    pub dr1: usize,
+    pub dr2: usize,
+    pub dr3: usize,
+    pub dr6: usize,
+    pub dr7: usize,
+}
+
+pub static THREAD_HW_BREAKPOINTS: Spinlock<BTreeMap<u32, HardwareDebugRegisters>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Configures an x86-64 hardware watchpoint register for the specified thread.
+pub fn SetHardwareBreakpoint(
+    tid: u32,
+    dr_index: usize,
+    address: usize,
+    condition: HwBpCondition,
+    size: HwBpSize,
+) -> bool {
+    if dr_index >= 4 {
+        return false;
+    }
+
+    let mut lock = THREAD_HW_BREAKPOINTS.lock();
+    let regs = lock.entry(tid).or_insert_with(HardwareDebugRegisters::default);
+
+    match dr_index {
+        0 => regs.dr0 = address,
+        1 => regs.dr1 = address,
+        2 => regs.dr2 = address,
+        3 => regs.dr3 = address,
+        _ => unreachable!(),
+    }
+
+    // Enable local breakpoint in DR7 (bit 0, 2, 4, 6) and LE (bit 8).
+    regs.dr7 |= (1 << (dr_index * 2)) | (1 << 8);
+
+    // Set condition (R/W) and size (LEN) fields in DR7.
+    let rw_shift = 16 + (dr_index * 4);
+    let len_shift = 18 + (dr_index * 4);
+    regs.dr7 = (regs.dr7 & !(0x3 << rw_shift)) | ((condition as usize) << rw_shift);
+    regs.dr7 = (regs.dr7 & !(0x3 << len_shift)) | ((size as usize) << len_shift);
+
+    true
+}
+
+/// Disables an x86-64 hardware watchpoint register for the specified thread.
+pub fn ClearHardwareBreakpoint(tid: u32, dr_index: usize) -> bool {
+    if dr_index >= 4 {
+        return false;
+    }
+
+    let mut lock = THREAD_HW_BREAKPOINTS.lock();
+    if let Some(regs) = lock.get_mut(&tid) {
+        match dr_index {
+            0 => regs.dr0 = 0,
+            1 => regs.dr1 = 0,
+            2 => regs.dr2 = 0,
+            3 => regs.dr3 = 0,
+            _ => unreachable!(),
+        }
+
+        // Disable local and global enable bits for this DR.
+        regs.dr7 &= !((1 << (dr_index * 2)) | (1 << (dr_index * 2 + 1)));
+
+        // Clear R/W and LEN fields.
+        let rw_shift = 16 + (dr_index * 4);
+        regs.dr7 &= !(0xF << rw_shift);
+
+        true
+    } else {
+        false
+    }
+}
+
+/// Retrieves the current hardware debug register configuration for a thread.
+pub fn GetHardwareBreakpoints(tid: u32) -> HardwareDebugRegisters {
+    let lock = THREAD_HW_BREAKPOINTS.lock();
+    lock.get(&tid).copied().unwrap_or_default()
+}
+
+/// Checks if an address access triggers any active hardware watchpoint.
+pub fn CheckHardwareBreakpointTrigger(tid: u32, address: usize, is_write: bool) -> Option<usize> {
+    let mut lock = THREAD_HW_BREAKPOINTS.lock();
+    let regs = lock.get_mut(&tid)?;
+
+    let addresses = [regs.dr0, regs.dr1, regs.dr2, regs.dr3];
+    for (i, &watch_addr) in addresses.iter().enumerate() {
+        let is_enabled = (regs.dr7 & (1 << (i * 2))) != 0;
+        if is_enabled && watch_addr == address {
+            let rw = (regs.dr7 >> (16 + i * 4)) & 0x3;
+            let triggered = match rw {
+                0b00 => !is_write,              // Execute
+                0b01 => is_write,               // Write only
+                0b11 => true,                   // Read/Write
+                _ => false,
+            };
+            if triggered {
+                regs.dr6 |= 1 << i;
+                return Some(i);
+            }
+        }
+    }
+    None
+}
