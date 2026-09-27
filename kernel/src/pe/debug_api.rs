@@ -337,3 +337,76 @@ pub unsafe extern "system" fn ContinueDebugEvent(
         FALSE
     }
 }
+
+pub static PROCESS_DEBUG_MEMORY: Spinlock<BTreeMap<HANDLE, BTreeMap<usize, Vec<u8>>>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Reads memory from the virtual address space of a specified process.
+pub unsafe extern "system" fn ReadProcessMemory(
+    hProcess: HANDLE,
+    lpBaseAddress: *const c_void,
+    lpBuffer: *mut c_void,
+    nSize: usize,
+    lpNumberOfBytesRead: *mut usize,
+) -> BOOL {
+    if hProcess == 0 || lpBaseAddress.is_null() || lpBuffer.is_null() || nSize == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let addr = lpBaseAddress as usize;
+
+    let mem_lock = PROCESS_DEBUG_MEMORY.lock();
+    if let Some(pages) = mem_lock.get(&hProcess) {
+        if let Some(data) = pages.get(&addr) {
+            let copy_len = nSize.min(data.len());
+            core::ptr::copy_nonoverlapping(data.as_ptr(), lpBuffer as *mut u8, copy_len);
+            if !lpNumberOfBytesRead.is_null() {
+                *lpNumberOfBytesRead = copy_len;
+            }
+            win32_set_last_error(ERROR_SUCCESS);
+            return TRUE;
+        }
+    }
+    drop(mem_lock);
+
+    // Fallback: direct virtual memory read.
+    core::ptr::copy_nonoverlapping(lpBaseAddress as *const u8, lpBuffer as *mut u8, nSize);
+    if !lpNumberOfBytesRead.is_null() {
+        *lpNumberOfBytesRead = nSize;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Writes memory to the virtual address space of a specified process.
+pub unsafe extern "system" fn WriteProcessMemory(
+    hProcess: HANDLE,
+    lpBaseAddress: *mut c_void,
+    lpBuffer: *const c_void,
+    nSize: usize,
+    lpNumberOfBytesWritten: *mut usize,
+) -> BOOL {
+    if hProcess == 0 || lpBaseAddress.is_null() || lpBuffer.is_null() || nSize == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let addr = lpBaseAddress as usize;
+    let mut slice = Vec::with_capacity(nSize);
+    slice.resize(nSize, 0);
+    core::ptr::copy_nonoverlapping(lpBuffer as *const u8, slice.as_mut_ptr(), nSize);
+
+    let mut mem_lock = PROCESS_DEBUG_MEMORY.lock();
+    let proc_pages = mem_lock.entry(hProcess).or_insert_with(BTreeMap::new);
+    proc_pages.insert(addr, slice);
+    drop(mem_lock);
+
+    if !lpNumberOfBytesWritten.is_null() {
+        *lpNumberOfBytesWritten = nSize;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
