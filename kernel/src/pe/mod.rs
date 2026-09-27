@@ -24,6 +24,7 @@ pub mod wait;
 pub mod threadpool;
 pub mod iocp;
 pub mod fiber;
+pub mod debug_api;
 
 pub use header::*;
 pub use ntdll::*;
@@ -47,6 +48,7 @@ pub use wait::*;
 pub use threadpool::*;
 pub use iocp::*;
 pub use fiber::*;
+pub use debug_api::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
