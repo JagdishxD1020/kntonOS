@@ -261,6 +261,150 @@ impl D3D12_ROOT_PARAMETER1_2 {
     }
 }
 
+
+// Filtering reduction and interpolation modes.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D3D12_FILTER {
+    MinMagMipPoint = 0,
+    MinMagPointMipLinear = 0x1,
+    MinPointMagLinearMipPoint = 0x4,
+    MinPointMagMipLinear = 0x5,
+    MinLinearMagMipPoint = 0x10,
+    MinLinearMagPointMipLinear = 0x11,
+    MinMagLinearMipPoint = 0x14,
+    MinMagMipLinear = 0x15,
+    Anisotropic = 0x55,
+    ComparisonMinMagMipPoint = 0x80,
+    ComparisonMinMagMipLinear = 0x95,
+    ComparisonAnisotropic = 0xd5,
+}
+
+// Texture coordinate wrap and clamping modes.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D3D12_TEXTURE_ADDRESS_MODE {
+    Wrap = 1,
+    Mirror = 2,
+    Clamp = 3,
+    Border = 4,
+    MirrorOnce = 5,
+}
+
+// Predefined static sampler border colors with high precision.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D3D12_STATIC_BORDER_COLOR {
+    TransparentBlack = 0,
+    OpaqueBlack = 1,
+    OpaqueWhite = 2,
+    UIntOpaqueBlack = 3,
+    UIntOpaqueWhite = 4,
+}
+
+// Extended flags for static samplers in Root Signature 1.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct D3D12_STATIC_SAMPLER_FLAGS(pub u32);
+
+impl D3D12_STATIC_SAMPLER_FLAGS {
+    pub const NONE: Self = Self(0);
+    pub const UINT_BORDER_COLOR: Self = Self(1 << 0);
+    pub const NON_NORMALIZED_COORDINATES: Self = Self(1 << 1);
+}
+
+// Static sampler specification with extended border color precision and anisotropy limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3D12_STATIC_SAMPLER_DESC1 {
+    pub filter: D3D12_FILTER,
+    pub address_u: D3D12_TEXTURE_ADDRESS_MODE,
+    pub address_v: D3D12_TEXTURE_ADDRESS_MODE,
+    pub address_w: D3D12_TEXTURE_ADDRESS_MODE,
+    pub mip_lod_bias_fixed: i16,
+    pub max_anisotropy: u32,
+    pub comparison_func: super::pso::D3D12_COMPARISON_FUNC,
+    pub border_color: D3D12_STATIC_BORDER_COLOR,
+    pub min_lod_fixed: u16,
+    pub max_lod_fixed: u16,
+    pub shader_register: u32,
+    pub register_space: u32,
+    pub shader_visibility: super::root_signature::D3D12_SHADER_VISIBILITY,
+    pub flags: D3D12_STATIC_SAMPLER_FLAGS,
+}
+
+impl D3D12_STATIC_SAMPLER_DESC1 {
+    // Validates static sampler configuration against Direct3D 12 specifications.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_anisotropy > 16 {
+            return Err("Max anisotropy cannot exceed 16");
+        }
+        if matches!(self.filter, D3D12_FILTER::Anisotropic | D3D12_FILTER::ComparisonAnisotropic)
+            && (self.max_anisotropy < 1 || self.max_anisotropy > 16)
+        {
+            return Err("Anisotropic filtering requires max_anisotropy between 1 and 16");
+        }
+        if self.min_lod_fixed > self.max_lod_fixed {
+            return Err("min_lod cannot exceed max_lod");
+        }
+        Ok(())
+    }
+
+    // Compiles static sampler into 128-bit hardware sampler descriptor table entry.
+    pub fn compile_hardware_descriptor(&self) -> CompiledHardwareSampler {
+        let w0 = (self.filter as u32 & 0xff)
+            | ((self.address_u as u32 & 0x7) << 8)
+            | ((self.address_v as u32 & 0x7) << 11)
+            | ((self.address_w as u32 & 0x7) << 14)
+            | ((self.max_anisotropy.min(16) & 0x1f) << 17);
+
+        let w1 = (self.mip_lod_bias_fixed as u16 as u32)
+            | ((self.comparison_func as u32 & 0xf) << 16)
+            | ((self.border_color as u32 & 0xf) << 20)
+            | ((self.flags.0 & 0xf) << 24);
+
+        let w2 = (self.min_lod_fixed as u32) | ((self.max_lod_fixed as u32) << 16);
+        let w3 = self.shader_register | (self.register_space << 16);
+
+        CompiledHardwareSampler {
+            words: [w0, w1, w2, w3],
+        }
+    }
+}
+
+// Compiled 128-bit hardware sampler descriptor word representation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompiledHardwareSampler {
+    pub words: [u32; 4],
+}
+
+// Specification descriptor for Root Signature version 1.2 with extended static samplers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct D3D12_ROOT_SIGNATURE_DESC2 {
+    pub parameters: Vec<D3D12_ROOT_PARAMETER1_2>,
+    pub static_samplers: Vec<D3D12_STATIC_SAMPLER_DESC1>,
+    pub flags: D3D12_ROOT_SIGNATURE_FLAGS_V1_2,
+}
+
+impl D3D12_ROOT_SIGNATURE_DESC2 {
+    // Constructs an empty root signature 1.2 descriptor with flags.
+    pub fn new(flags: D3D12_ROOT_SIGNATURE_FLAGS_V1_2) -> Self {
+        Self {
+            parameters: Vec::new(),
+            static_samplers: Vec::new(),
+            flags,
+        }
+    }
+
+    // Appends a root parameter slot.
+    pub fn add_parameter(&mut self, param: D3D12_ROOT_PARAMETER1_2) {
+        self.parameters.push(param);
+    }
+
+    // Appends an extended static sampler.
+    pub fn add_static_sampler(&mut self, sampler: D3D12_STATIC_SAMPLER_DESC1) {
+        self.static_samplers.push(sampler);
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_root_signature_v1_2_subsystem() -> bool {
     true
