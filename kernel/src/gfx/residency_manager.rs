@@ -415,7 +415,141 @@ impl HeapCompactionEngine {
     }
 }
 
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Enhanced Memory Pools & Residency Governor.
 pub fn test_residency_manager_subsystem() -> bool {
+    // 1. Verify memory pool and page property descriptors
+    let l0_props = D3D12_HEAP_PROPERTIES::default_l0_vram();
+    if l0_props.memory_pool_preference != D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0
+        || l0_props.cpu_page_property != D3D12_CPU_PAGE_PROPERTY::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE
+    {
+        return false;
+    }
+
+    let l1_props = D3D12_HEAP_PROPERTIES::default_l1_upload();
+    if l1_props.memory_pool_preference != D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L1
+        || l1_props.cpu_page_property != D3D12_CPU_PAGE_PROPERTY::D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+    {
+        return false;
+    }
+
+    // 2. Verify priority-based LRU eviction and priority protection
+    let mb: u64 = 1024 * 1024;
+    let mut manager = ResidencyManager::new(100 * mb);
+
+    // Alloc 1: 40MB Low priority
+    manager.register_allocation(ManagedHeapAllocation::new(
+        1,
+        40 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_LOW,
+        false,
+    ));
+
+    // Alloc 2: 40MB Normal priority
+    manager.register_allocation(ManagedHeapAllocation::new(
+        2,
+        40 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_NORMAL,
+        false,
+    ));
+
+    // Alloc 3: 15MB Critical priority (e.g. active swapchain backbuffer)
+    manager.register_allocation(ManagedHeapAllocation::new(
+        3,
+        15 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_CRITICAL,
+        false,
+    ));
+
+    // Make allocations 1, 2, 3 resident (total 95MB <= 100MB budget)
+    if manager.EnqueueMakeResident(&[1, 2, 3]).is_err() {
+        return false;
+    }
+    if manager.current_vram_resident_bytes != 95 * mb {
+        return false;
+    }
+
+    // Alloc 4: 20MB High priority. Demands eviction of 15MB to fit in 100MB budget.
+    manager.register_allocation(ManagedHeapAllocation::new(
+        4,
+        20 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_HIGH,
+        false,
+    ));
+
+    if manager.EnqueueMakeResident(&[4]).is_err() {
+        return false;
+    }
+
+    // Alloc 1 (Low) must have been evicted. Alloc 2 (Normal), 3 (Critical), 4 (High) must remain resident.
+    let a1 = manager.allocations.iter().find(|a| a.allocation_id == 1).unwrap();
+    let a2 = manager.allocations.iter().find(|a| a.allocation_id == 2).unwrap();
+    let a3 = manager.allocations.iter().find(|a| a.allocation_id == 3).unwrap();
+    let a4 = manager.allocations.iter().find(|a| a.allocation_id == 4).unwrap();
+
+    if a1.is_resident || !a2.is_resident || !a3.is_resident || !a4.is_resident {
+        return false;
+    }
+    // Resident: 40MB + 15MB + 20MB = 75MB
+    if manager.current_vram_resident_bytes != 75 * mb {
+        return false;
+    }
+
+    // 3. Verify APU memory budget governor and background proactive paging
+    let mut governor = ApuMemoryBudgetGovernor::new();
+    // 75MB / 100MB = 75% -> Warning level
+    if governor.assess_pressure(&manager) != ApuMemoryPressureLevel::Warning {
+        return false;
+    }
+
+    // Register and make resident Alloc 5 (18MB Normal) -> 75 + 18 = 93MB (93% > 90% Critical)
+    manager.register_allocation(ManagedHeapAllocation::new(
+        5,
+        18 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_NORMAL,
+        false,
+    ));
+    if manager.EnqueueMakeResident(&[5]).is_err() {
+        return false;
+    }
+    if governor.assess_pressure(&manager) != ApuMemoryPressureLevel::Critical {
+        return false;
+    }
+
+    // Background paging worker must trim down to target headroom (<= 85MB)
+    let paged = governor.run_background_paging_worker(&mut manager);
+    if paged == 0 || manager.current_vram_resident_bytes > 85 * mb {
+        return false;
+    }
+    if governor.assess_pressure(&manager) != ApuMemoryPressureLevel::Normal {
+        return false;
+    }
+
+    // 4. Verify memory compaction of stale aliased transient render targets
+    manager.register_allocation(ManagedHeapAllocation::new(
+        6,
+        10 * mb,
+        D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0,
+        D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_NORMAL,
+        true,
+    ));
+    if manager.EnqueueMakeResident(&[6]).is_err() {
+        return false;
+    }
+
+    // Advance timestamp to simulate stale render target
+    manager.current_timestamp = manager.current_timestamp.saturating_add(25);
+
+    let mut compactor = HeapCompactionEngine::new();
+    let (trimmed_bytes, purged) = compactor.execute_full_compaction(&mut manager, 10);
+    if trimmed_bytes != 10 * mb || purged != 1 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-RESIDENCY-PASS] Direct3D 12 enhanced memory pools & VRAM residency governor verified\r\n");
     true
 }

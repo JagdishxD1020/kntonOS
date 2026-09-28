@@ -467,6 +467,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 VRS combiners self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Enhanced Memory Pools & Dedicated VRAM Heap Residency Governor (TASK-KNT-217)
+    if !gfx::test_residency_manager_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 residency manager self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 variable rate shading engine self-test failed!\r\n");
