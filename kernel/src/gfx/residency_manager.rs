@@ -357,6 +357,64 @@ impl ApuMemoryBudgetGovernor {
     }
 }
 
+// Heap compaction engine trimming stale aliased render targets and consolidating memory gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeapCompactionEngine {
+    pub total_compaction_passes: u64,
+    pub total_bytes_reclaimed: u64,
+}
+
+impl HeapCompactionEngine {
+    // Creates a new compaction engine instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Trims stale aliased transient render targets that have not been touched recently.
+    pub fn trim_stale_aliased_targets(
+        &mut self,
+        manager: &mut ResidencyManager,
+        stale_threshold_ticks: u64,
+    ) -> u64 {
+        let current_time = manager.current_timestamp;
+        let mut stale_ids = Vec::new();
+
+        for alloc in &manager.allocations {
+            if alloc.is_aliased_transient
+                && alloc.is_resident
+                && current_time.saturating_sub(alloc.last_used_timestamp) >= stale_threshold_ticks
+            {
+                stale_ids.push(alloc.allocation_id);
+            }
+        }
+
+        let reclaimed = manager.Evict(&stale_ids).unwrap_or(0);
+        if reclaimed > 0 {
+            self.total_compaction_passes = self.total_compaction_passes.saturating_add(1);
+            self.total_bytes_reclaimed = self.total_bytes_reclaimed.saturating_add(reclaimed);
+        }
+        reclaimed
+    }
+
+    // Unregisters completely stale evicted transient allocations to free tracking metadata.
+    pub fn purge_evicted_transients(&mut self, manager: &mut ResidencyManager) -> usize {
+        let before_count = manager.allocations.len();
+        manager.allocations.retain(|a| !(a.is_aliased_transient && !a.is_resident));
+        before_count.saturating_sub(manager.allocations.len())
+    }
+
+    // Performs full heap compaction: trims stale transients and purges evicted slots.
+    pub fn execute_full_compaction(
+        &mut self,
+        manager: &mut ResidencyManager,
+        stale_threshold_ticks: u64,
+    ) -> (u64, usize) {
+        let bytes_trimmed = self.trim_stale_aliased_targets(manager, stale_threshold_ticks);
+        let purged_count = self.purge_evicted_transients(manager);
+        (bytes_trimmed, purged_count)
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_residency_manager_subsystem() -> bool {
     true
