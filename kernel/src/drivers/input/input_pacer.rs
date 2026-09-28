@@ -628,3 +628,23 @@ pub fn verify_input_pacer_manager() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld Sub-Millisecond Input Aggregator & High-Poll-Rate HID Pacer.
+pub fn test_input_pacer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Sub-Millisecond Input Aggregator & High-Poll-Rate HID Pacer...\r\n");
+    if !verify_high_poll_aggregator() {
+        return false;
+    }
+    if !verify_jitter_buffer() {
+        return false;
+    }
+    if !verify_power_aware_scaler() {
+        return false;
+    }
+    if !verify_input_pacer_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-INPUT-PACER-PASS] Handheld sub-millisecond input aggregator and high-poll-rate HID pacer verified\r\n");
+    true
+}

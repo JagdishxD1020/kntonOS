@@ -712,6 +712,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld controller profile and remapping daemon self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Sub-Millisecond Input Aggregator & High-Poll-Rate HID Pacer (TASK-KNT-215)
+    if !drivers::input::test_input_pacer_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld input aggregator and high-poll-rate HID pacer self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");
