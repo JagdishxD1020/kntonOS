@@ -363,3 +363,126 @@ pub fn verify_jitter_buffer() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Power-Aware Dynamic Polling Scaler
+// ============================================================================
+
+/// Low-battery polling rate throttling threshold percentage.
+pub const LOW_BATTERY_THROTTLE_SOC: u8 = 20;
+/// Critical battery polling rate throttling threshold percentage.
+pub const CRITICAL_BATTERY_THROTTLE_SOC: u8 = 10;
+/// SoC hysteresis buffer percentage to prevent rapid frequency oscillation.
+pub const BATTERY_HYSTERESIS_DELTA_SOC: u8 = 3;
+
+/// Dynamic Polling Scaler adjusting HID poll rates based on thermal and battery state.
+#[derive(Debug, Clone)]
+pub struct PowerAwarePollingScaler {
+    pub preferred_rate_hz: u16,
+    pub current_rate_hz: u16,
+    pub low_power_downscaled: bool,
+    pub scale_transitions_count: u32,
+}
+
+impl PowerAwarePollingScaler {
+    pub const fn new(preferred_rate_hz: u16) -> Self {
+        Self {
+            preferred_rate_hz,
+            current_rate_hz: preferred_rate_hz,
+            low_power_downscaled: false,
+            scale_transitions_count: 0,
+        }
+    }
+
+    /// Evaluates system power metrics and determines optimal polling frequency.
+    pub fn evaluate_rate(
+        &mut self,
+        battery_soc_pct: u8,
+        whisper_mode: bool,
+        ac_connected: bool,
+    ) -> u16 {
+        let target_rate = if ac_connected {
+            if whisper_mode {
+                POLL_RATE_500HZ
+            } else {
+                self.preferred_rate_hz
+            }
+        } else if whisper_mode {
+            if battery_soc_pct < CRITICAL_BATTERY_THROTTLE_SOC {
+                POLL_RATE_250HZ
+            } else {
+                POLL_RATE_500HZ
+            }
+        } else if battery_soc_pct < CRITICAL_BATTERY_THROTTLE_SOC {
+            POLL_RATE_250HZ
+        } else if self.low_power_downscaled {
+            // Hysteresis: must recover above (LOW_BATTERY_THROTTLE_SOC + BATTERY_HYSTERESIS_DELTA_SOC)
+            if battery_soc_pct >= (LOW_BATTERY_THROTTLE_SOC + BATTERY_HYSTERESIS_DELTA_SOC) {
+                self.low_power_downscaled = false;
+                self.preferred_rate_hz
+            } else {
+                POLL_RATE_500HZ
+            }
+        } else if battery_soc_pct < LOW_BATTERY_THROTTLE_SOC {
+            self.low_power_downscaled = true;
+            POLL_RATE_500HZ
+        } else {
+            self.preferred_rate_hz
+        };
+
+        if target_rate != self.current_rate_hz {
+            self.current_rate_hz = target_rate;
+            self.scale_transitions_count += 1;
+        }
+
+        self.current_rate_hz
+    }
+
+    pub fn is_downscaled(&self) -> bool {
+        self.current_rate_hz < self.preferred_rate_hz
+    }
+}
+
+/// Unit test verifying power-aware dynamic polling rate scaler.
+pub fn verify_power_aware_scaler() -> bool {
+    let mut scaler = PowerAwarePollingScaler::new(POLL_RATE_1000HZ);
+
+    // 1. AC connected, normal battery: full 1000Hz
+    let r1 = scaler.evaluate_rate(80, false, true);
+    if r1 != POLL_RATE_1000HZ || scaler.is_downscaled() {
+        return false;
+    }
+
+    // 2. Unplugged on battery, drops below 20% (18%): downscales to 500Hz
+    let r2 = scaler.evaluate_rate(18, false, false);
+    if r2 != POLL_RATE_500HZ || !scaler.is_downscaled() {
+        return false;
+    }
+
+    // 3. Drops to critical battery (8% < 10%): downscales to 250Hz
+    let r3 = scaler.evaluate_rate(8, false, false);
+    if r3 != POLL_RATE_250HZ || !scaler.is_downscaled() {
+        return false;
+    }
+
+    // 4. Charges up slightly to 21% (between 20% and 23% recovery): remains 500Hz due to hysteresis
+    let r4 = scaler.evaluate_rate(21, false, false);
+    if r4 != POLL_RATE_500HZ {
+        return false;
+    }
+
+    // 5. Charges past 23% (25%): recovers full 1000Hz
+    let r5 = scaler.evaluate_rate(25, false, false);
+    if r5 != POLL_RATE_1000HZ || scaler.is_downscaled() {
+        return false;
+    }
+
+    // 6. Whisper mode active on AC: throttles to 500Hz for acoustic governor
+    let r_whisper = scaler.evaluate_rate(100, true, true);
+    if r_whisper != POLL_RATE_500HZ || !scaler.is_downscaled() {
+        return false;
+    }
+
+    true
+}
