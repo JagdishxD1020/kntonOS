@@ -270,6 +270,93 @@ impl ResidencyManager {
     }
 }
 
+// Pressure classification for handheld APU shared memory architecture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApuMemoryPressureLevel {
+    Normal,
+    Warning,
+    Critical,
+}
+
+// Background memory governor preventing frame hitching under handheld APU budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApuMemoryBudgetGovernor {
+    pub warning_threshold_pct: u32,
+    pub critical_threshold_pct: u32,
+    pub target_headroom_pct: u32,
+    pub total_background_paged_bytes: u64,
+}
+
+impl Default for ApuMemoryBudgetGovernor {
+    fn default() -> Self {
+        Self {
+            warning_threshold_pct: 75,
+            critical_threshold_pct: 90,
+            target_headroom_pct: 15,
+            total_background_paged_bytes: 0,
+        }
+    }
+}
+
+impl ApuMemoryBudgetGovernor {
+    // Creates a new APU memory budget governor with default handheld thresholds.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Assesses live memory pressure level against configured budget thresholds.
+    pub fn assess_pressure(&self, manager: &ResidencyManager) -> ApuMemoryPressureLevel {
+        if manager.vram_budget_bytes == 0 {
+            return ApuMemoryPressureLevel::Normal;
+        }
+        let usage_pct = (manager.current_vram_resident_bytes.saturating_mul(100)) / manager.vram_budget_bytes;
+        if usage_pct >= self.critical_threshold_pct as u64 {
+            ApuMemoryPressureLevel::Critical
+        } else if usage_pct >= self.warning_threshold_pct as u64 {
+            ApuMemoryPressureLevel::Warning
+        } else {
+            ApuMemoryPressureLevel::Normal
+        }
+    }
+
+    // Runs a background proactive paging pass to reclaim headroom before allocations fail.
+    pub fn run_background_paging_worker(&mut self, manager: &mut ResidencyManager) -> u64 {
+        let pressure = self.assess_pressure(manager);
+        if pressure == ApuMemoryPressureLevel::Normal {
+            return 0;
+        }
+
+        let target_bytes = manager.vram_budget_bytes
+            .saturating_sub((manager.vram_budget_bytes * self.target_headroom_pct as u64) / 100);
+
+        let mut paged_out: u64 = 0;
+        while manager.current_vram_resident_bytes > target_bytes {
+            if let Some(candidate_id) = manager.find_eviction_candidate() {
+                if let Ok(evicted) = manager.Evict(&[candidate_id]) {
+                    paged_out = paged_out.saturating_add(evicted);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        self.total_background_paged_bytes = self.total_background_paged_bytes.saturating_add(paged_out);
+        paged_out
+    }
+
+    // Queries budget metrics: total budget, resident VRAM, and percentage utilized.
+    pub fn query_budget_statistics(&self, manager: &ResidencyManager) -> (u64, u64, u32) {
+        let usage_pct = if manager.vram_budget_bytes > 0 {
+            (manager.current_vram_resident_bytes.saturating_mul(100)) / manager.vram_budget_bytes
+        } else {
+            0
+        } as u32;
+        (manager.vram_budget_bytes, manager.current_vram_resident_bytes, usage_pct)
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_residency_manager_subsystem() -> bool {
     true
