@@ -58,6 +58,24 @@ pub static TIMER_QUEUES: Spinlock<BTreeMap<HANDLE, TimerQueueInner>> =
 pub static TIMER_QUEUE_TIMERS: Spinlock<BTreeMap<HANDLE, TimerQueueTimerInner>> =
     Spinlock::new(BTreeMap::new());
 
+pub const DEFAULT_TIMER_QUEUE: HANDLE = 0x000E_0001;
+
+/// Ensures the default process timer queue is registered and available.
+fn ensure_default_timer_queue() -> HANDLE {
+    let mut queues = TIMER_QUEUES.lock();
+    if !queues.contains_key(&DEFAULT_TIMER_QUEUE) {
+        queues.insert(
+            DEFAULT_TIMER_QUEUE,
+            TimerQueueInner {
+                id: DEFAULT_TIMER_QUEUE,
+                timers: Vec::new(),
+                closed: false,
+            },
+        );
+    }
+    DEFAULT_TIMER_QUEUE
+}
+
 /// Creates a queue for timer callbacks executed by worker threads.
 pub unsafe extern "system" fn CreateTimerQueue() -> HANDLE {
     let id = NEXT_TIMER_QUEUE_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
@@ -70,4 +88,162 @@ pub unsafe extern "system" fn CreateTimerQueue() -> HANDLE {
     TIMER_QUEUES.lock().insert(id, queue);
     win32_set_last_error(ERROR_SUCCESS);
     id
+}
+
+/// Creates a timer-queue timer and assigns it to the designated timer queue.
+pub unsafe extern "system" fn CreateTimerQueueTimer(
+    phNewTimer: *mut HANDLE,
+    TimerQueue: HANDLE,
+    Callback: WAITORTIMERCALLBACK,
+    Parameter: *mut c_void,
+    DueTime: u32,
+    Period: u32,
+    Flags: u32,
+) -> BOOL {
+    if phNewTimer.is_null() || Callback.is_none() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let q_id = if TimerQueue == 0 {
+        ensure_default_timer_queue()
+    } else {
+        TimerQueue
+    };
+
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let timer_id = NEXT_TIMER_QUEUE_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+
+    let timer = TimerQueueTimerInner {
+        id: timer_id,
+        queue_id: q_id,
+        callback: core::mem::transmute(Callback),
+        parameter: Parameter as usize,
+        due_time_ms: DueTime,
+        period_ms: Period,
+        flags: Flags,
+        next_fire_tick: now + DueTime as u64,
+        fired_count: 0,
+        is_active: true,
+        deleted: false,
+    };
+
+    TIMER_QUEUE_TIMERS.lock().insert(timer_id, timer);
+
+    let mut queues = TIMER_QUEUES.lock();
+    if let Some(queue) = queues.get_mut(&q_id) {
+        queue.timers.push(timer_id);
+    } else {
+        let mut new_queue = TimerQueueInner {
+            id: q_id,
+            timers: Vec::new(),
+            closed: false,
+        };
+        new_queue.timers.push(timer_id);
+        queues.insert(q_id, new_queue);
+    }
+
+    *phNewTimer = timer_id;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Updates the due time and period of an active timer-queue timer.
+pub unsafe extern "system" fn ChangeTimerQueueTimer(
+    _TimerQueue: HANDLE,
+    Timer: HANDLE,
+    DueTime: u32,
+    Period: u32,
+) -> BOOL {
+    if Timer == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut timers = TIMER_QUEUE_TIMERS.lock();
+    if let Some(timer) = timers.get_mut(&Timer) {
+        if timer.deleted {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+
+        let now = crate::pe::perf_counter::win32_get_tick_count64();
+        timer.due_time_ms = DueTime;
+        timer.period_ms = Period;
+        timer.next_fire_tick = now + DueTime as u64;
+        timer.is_active = true;
+
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Cancels and deletes a timer-queue timer, optionally signaling a completion event.
+pub unsafe extern "system" fn DeleteTimerQueueTimer(
+    TimerQueue: HANDLE,
+    Timer: HANDLE,
+    CompletionEvent: HANDLE,
+) -> BOOL {
+    if Timer == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let q_id = if TimerQueue == 0 {
+        DEFAULT_TIMER_QUEUE
+    } else {
+        TimerQueue
+    };
+
+    let removed = TIMER_QUEUE_TIMERS.lock().remove(&Timer);
+    if removed.is_some() {
+        let mut queues = TIMER_QUEUES.lock();
+        if let Some(queue) = queues.get_mut(&q_id) {
+            queue.timers.retain(|&id| id != Timer);
+        }
+        drop(queues);
+
+        if CompletionEvent != 0 && CompletionEvent != (INVALID_HANDLE_VALUE as HANDLE) {
+            crate::pe::synch::win32_set_event(CompletionEvent);
+        }
+
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+/// Destroys a timer queue and cancels all associated timers.
+pub unsafe extern "system" fn DeleteTimerQueueEx(
+    TimerQueue: HANDLE,
+    CompletionEvent: HANDLE,
+) -> BOOL {
+    if TimerQueue == 0 {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut queues = TIMER_QUEUES.lock();
+    if let Some(queue) = queues.remove(&TimerQueue) {
+        let mut timers = TIMER_QUEUE_TIMERS.lock();
+        for tid in queue.timers {
+            timers.remove(&tid);
+        }
+        drop(timers);
+
+        if CompletionEvent != 0 && CompletionEvent != (INVALID_HANDLE_VALUE as HANDLE) {
+            crate::pe::synch::win32_set_event(CompletionEvent);
+        }
+
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
 }
