@@ -300,3 +300,148 @@ pub fn win32_is_timer_active(Timer: HANDLE) -> bool {
     let timers = TIMER_QUEUE_TIMERS.lock();
     timers.get(&Timer).map(|t| t.is_active && !t.deleted).unwrap_or(false)
 }
+
+pub use crate::pe::perf_counter::{TIMERR_NOCANDO, TIMERR_NOERROR, TIMERR_STRUCT};
+
+pub const TIME_ONESHOT: u32 = 0x0000;
+pub const TIME_PERIODIC: u32 = 0x0001;
+pub const TIME_CALLBACK_FUNCTION: u32 = 0x0000;
+pub const TIME_CALLBACK_EVENT_SET: u32 = 0x0010;
+pub const TIME_CALLBACK_EVENT_PULSE: u32 = 0x0020;
+pub const TIME_KILL_SYNCHRONOUS: u32 = 0x0100;
+
+pub type LPTIMECALLBACK = Option<
+    unsafe extern "system" fn(
+        uTimerID: u32,
+        uMsg: u32,
+        dwUser: usize,
+        dw1: usize,
+        dw2: usize,
+    ),
+>;
+
+pub struct MultimediaTimerInner {
+    pub id: u32,
+    pub delay_ms: u32,
+    pub resolution_ms: u32,
+    pub callback: usize,
+    pub user_data: usize,
+    pub event_type: u32,
+    pub next_fire_tick: u64,
+    pub is_active: bool,
+    pub fired_count: u32,
+}
+
+static MM_MIN_PERIOD_MS: Spinlock<u32> = Spinlock::new(1);
+static MM_NEXT_TIMER_ID: AtomicU32 = AtomicU32::new(1001);
+static MM_TIMERS: Spinlock<BTreeMap<u32, MultimediaTimerInner>> = Spinlock::new(BTreeMap::new());
+
+/// Requests a minimum resolution for periodic timers.
+pub unsafe extern "system" fn timeBeginPeriod(uPeriod: u32) -> u32 {
+    let mut min_period = MM_MIN_PERIOD_MS.lock();
+    if uPeriod >= 1 && uPeriod <= 1000 {
+        if uPeriod < *min_period {
+            *min_period = uPeriod;
+        }
+        TIMERR_NOERROR
+    } else {
+        TIMERR_NOCANDO
+    }
+}
+
+/// Clears a previously set minimum timer resolution.
+pub unsafe extern "system" fn timeEndPeriod(uPeriod: u32) -> u32 {
+    if uPeriod >= 1 && uPeriod <= 1000 {
+        let mut min_period = MM_MIN_PERIOD_MS.lock();
+        if *min_period == uPeriod {
+            *min_period = 1;
+        }
+        TIMERR_NOERROR
+    } else {
+        TIMERR_NOCANDO
+    }
+}
+
+/// Starts a specified multimedia timer event.
+pub unsafe extern "system" fn timeSetEvent(
+    uDelay: u32,
+    uResolution: u32,
+    lpTimeProc: LPTIMECALLBACK,
+    dwUser: usize,
+    fuEvent: u32,
+) -> u32 {
+    let id = MM_NEXT_TIMER_ID.fetch_add(1, Ordering::SeqCst);
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let delay = if uDelay == 0 { 1 } else { uDelay };
+    let cb_addr = match lpTimeProc {
+        Some(f) => f as usize,
+        None => 0,
+    };
+
+    let timer = MultimediaTimerInner {
+        id,
+        delay_ms: delay,
+        resolution_ms: uResolution,
+        callback: cb_addr,
+        user_data: dwUser,
+        event_type: fuEvent,
+        next_fire_tick: now + delay as u64,
+        is_active: true,
+        fired_count: 0,
+    };
+
+    MM_TIMERS.lock().insert(id, timer);
+    id
+}
+
+/// Cancels a specified multimedia timer event.
+pub unsafe extern "system" fn timeKillEvent(uTimerID: u32) -> u32 {
+    let mut timers = MM_TIMERS.lock();
+    if timers.remove(&uTimerID).is_some() {
+        TIMERR_NOERROR
+    } else {
+        TIMERR_NOCANDO
+    }
+}
+
+/// Scans and executes callbacks for due multimedia timers.
+pub fn dispatch_multimedia_timers(current_tick: u64) -> usize {
+    let mut due_callbacks = Vec::new();
+
+    let mut timers = MM_TIMERS.lock();
+    for timer in timers.values_mut() {
+        if timer.is_active && current_tick >= timer.next_fire_tick {
+            timer.fired_count += 1;
+            due_callbacks.push((timer.id, timer.callback, timer.user_data, timer.event_type));
+
+            if (timer.event_type & TIME_PERIODIC) != 0 {
+                timer.next_fire_tick = current_tick + timer.delay_ms as u64;
+            } else {
+                timer.is_active = false;
+            }
+        }
+    }
+    drop(timers);
+
+    let fired_count = due_callbacks.len();
+    for (tid, cb_addr, user_data, ev_type) in due_callbacks {
+        if (ev_type & TIME_CALLBACK_EVENT_SET) != 0 {
+            if cb_addr != 0 {
+                crate::pe::synch::win32_set_event(cb_addr as HANDLE);
+            }
+        } else if cb_addr != 0 {
+            unsafe {
+                let cb: unsafe extern "system" fn(u32, u32, usize, usize, usize) =
+                    core::mem::transmute(cb_addr);
+                cb(tid, 0, user_data, 0, 0);
+            }
+        }
+    }
+
+    fired_count
+}
+
+/// Returns the current minimum period governor resolution in milliseconds.
+pub fn win32_get_multimedia_period_governor() -> u32 {
+    *MM_MIN_PERIOD_MS.lock()
+}
