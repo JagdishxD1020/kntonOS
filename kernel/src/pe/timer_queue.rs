@@ -247,3 +247,56 @@ pub unsafe extern "system" fn DeleteTimerQueueEx(
         FALSE
     }
 }
+
+static TOTAL_TIMERS_DISPATCHED: AtomicU64 = AtomicU64::new(0);
+
+/// Scans timer queues and executes callbacks for all timers that have reached due time.
+pub fn dispatch_timer_queue_timers(current_tick: u64) -> usize {
+    let mut due_callbacks = Vec::new();
+
+    let mut timers = TIMER_QUEUE_TIMERS.lock();
+    for timer in timers.values_mut() {
+        if timer.is_active && !timer.deleted && current_tick >= timer.next_fire_tick {
+            timer.fired_count += 1;
+            due_callbacks.push((timer.callback, timer.parameter));
+
+            if (timer.flags & WT_EXECUTEONLYONCE) != 0 || timer.period_ms == 0 {
+                timer.is_active = false;
+            } else {
+                timer.next_fire_tick = current_tick + timer.period_ms as u64;
+            }
+        }
+    }
+    drop(timers);
+
+    let fired_count = due_callbacks.len();
+    for (cb_addr, param) in due_callbacks {
+        if cb_addr != 0 {
+            unsafe {
+                let cb: unsafe extern "system" fn(*mut c_void, BOOL) = core::mem::transmute(cb_addr);
+                cb(param as *mut c_void, TRUE);
+            }
+            TOTAL_TIMERS_DISPATCHED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fired_count
+}
+
+/// Advances virtual timer tick count and executes due timer queue callbacks.
+pub fn win32_step_timer_queue_ticks(step_ms: u32) -> usize {
+    let now = crate::pe::perf_counter::win32_get_tick_count64() + step_ms as u64;
+    dispatch_timer_queue_timers(now)
+}
+
+/// Returns the number of times a timer-queue timer callback has fired.
+pub fn win32_get_timer_fired_count(Timer: HANDLE) -> u32 {
+    let timers = TIMER_QUEUE_TIMERS.lock();
+    timers.get(&Timer).map(|t| t.fired_count).unwrap_or(0)
+}
+
+/// Returns whether a timer-queue timer is currently armed and active.
+pub fn win32_is_timer_active(Timer: HANDLE) -> bool {
+    let timers = TIMER_QUEUE_TIMERS.lock();
+    timers.get(&Timer).map(|t| t.is_active && !t.deleted).unwrap_or(false)
+}
