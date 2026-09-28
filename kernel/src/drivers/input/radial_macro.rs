@@ -585,3 +585,141 @@ pub fn verify_macro_sequencer() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Unified Gamepad Chord Remapping & Radial Macro Coordinator
+// ============================================================================
+
+/// Output frame produced by the unified radial macro coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessedInputFrame {
+    /// Final remapped and macro-augmented button bitmask.
+    pub output_buttons: u32,
+    /// Virtual radial menu action triggered this frame (if any).
+    pub radial_action_triggered: Option<u16>,
+    /// Whether the virtual radial overlay is currently visible.
+    pub radial_overlay_active: bool,
+    /// Currently highlighted radial slot index.
+    pub highlighted_slot: Option<u8>,
+}
+
+/// Unified Gamepad Chord Remapping, Macro Sequencer & Radial Menu Coordinator.
+#[derive(Debug, Clone)]
+pub struct RadialMacroManager {
+    pub remapper: ButtonRemapper,
+    pub radial_menu: VirtualRadialMenu,
+    pub sequencer: MacroSequencer,
+    pub radial_activation_chord: u32,
+}
+
+impl RadialMacroManager {
+    pub const fn new(radial_activation_chord: u32) -> Self {
+        Self {
+            remapper: ButtonRemapper::new(),
+            radial_menu: VirtualRadialMenu::new(RadialSlotCount::Slots8, 8000),
+            sequencer: MacroSequencer::new(),
+            radial_activation_chord,
+        }
+    }
+
+    /// Evaluates all chord remappings, radial deflection, and macro timelines for a frame.
+    pub fn process_frame(
+        &mut self,
+        raw_buttons: u32,
+        stick_x: i16,
+        stick_y: i16,
+        timestamp_us: u64,
+    ) -> ProcessedInputFrame {
+        let mut radial_action = None;
+
+        // 1. Radial menu chord detection
+        let chord_pressed = (raw_buttons & self.radial_activation_chord) == self.radial_activation_chord
+            && self.radial_activation_chord != 0;
+
+        if chord_pressed {
+            if !self.radial_menu.is_open {
+                self.radial_menu.open();
+            }
+            self.radial_menu.resolve_deflection(stick_x, stick_y);
+        } else if self.radial_menu.is_open {
+            // Chord released: commit highlighted action
+            radial_action = self.radial_menu.confirm_selection();
+        }
+
+        // 2. Evaluate macro triggers if radial menu is not holding the chord
+        if !chord_pressed {
+            self.sequencer.evaluate_triggers(raw_buttons, timestamp_us);
+        }
+
+        // 3. Advance macro playback tick
+        let macro_simulated = self.sequencer.tick(timestamp_us);
+
+        // 4. Strip the radial activation chord from standard button forwarding
+        let buttons_for_remapping = if chord_pressed {
+            raw_buttons & !self.radial_activation_chord
+        } else {
+            raw_buttons
+        };
+
+        // 5. Apply remappings and turbo toggles
+        let mut final_buttons = self.remapper.process_buttons(buttons_for_remapping, timestamp_us);
+        final_buttons |= macro_simulated;
+
+        ProcessedInputFrame {
+            output_buttons: final_buttons,
+            radial_action_triggered: radial_action,
+            radial_overlay_active: self.radial_menu.is_open,
+            highlighted_slot: self.radial_menu.active_slot,
+        }
+    }
+}
+
+/// Unit test verifying unified gamepad chord remapping and radial macro coordinator.
+pub fn verify_radial_macro_manager() -> bool {
+    let mut mgr = RadialMacroManager::new(PAD_BTN_R5);
+
+    // Bind radial slot 0 to action 201
+    if mgr.radial_menu.bind_action(0, 201).is_err() {
+        return false;
+    }
+
+    // Remap L4 -> BTN_B
+    if mgr.remapper.add_mapping(PAD_BTN_L4, PAD_BTN_B, false).is_err() {
+        return false;
+    }
+
+    // Register simple macro on L5
+    let steps = [
+        MacroStep { press_buttons: PAD_BTN_X, hold_duration_us: 10_000, delay_after_us: 0 },
+    ];
+    if mgr.sequencer.register_macro(PAD_BTN_L5, &steps).is_err() {
+        return false;
+    }
+
+    // 1. Regular remapping test: press L4 -> output BTN_B
+    let f1 = mgr.process_frame(PAD_BTN_L4, 0, 0, 1000);
+    if f1.output_buttons != PAD_BTN_B || f1.radial_overlay_active {
+        return false;
+    }
+
+    // 2. Radial menu chord engagement: hold R5 + deflect East (+20000, 0)
+    let f2 = mgr.process_frame(PAD_BTN_R5, 20000, 0, 2000);
+    if !f2.radial_overlay_active || f2.highlighted_slot != Some(0) || f2.output_buttons != 0 {
+        return false;
+    }
+
+    // 3. Release R5 chord: commits action 201 and closes overlay
+    let f3 = mgr.process_frame(0, 0, 0, 3000);
+    if f3.radial_overlay_active || f3.radial_action_triggered != Some(201) {
+        return false;
+    }
+
+    // 4. Macro playback: trigger L5
+    let f4 = mgr.process_frame(PAD_BTN_L5, 0, 0, 4000);
+    if f4.output_buttons != PAD_BTN_X || !mgr.sequencer.is_playing {
+        return false;
+    }
+
+    true
+}
