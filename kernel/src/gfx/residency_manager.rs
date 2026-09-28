@@ -120,6 +120,156 @@ pub enum ResidencyError {
     InvalidPriority,
 }
 
+// Residency manager orchestrating VRAM budget tracking and priority LRU eviction.
+#[derive(Debug, Clone)]
+pub struct ResidencyManager {
+    pub allocations: Vec<ManagedHeapAllocation>,
+    pub vram_budget_bytes: u64,
+    pub current_vram_resident_bytes: u64,
+    pub current_system_resident_bytes: u64,
+    pub current_timestamp: u64,
+    pub total_evictions_count: u64,
+    pub total_promotions_count: u64,
+}
+
+impl ResidencyManager {
+    // Creates a new residency manager with a designated VRAM byte budget.
+    pub fn new(vram_budget_bytes: u64) -> Self {
+        Self {
+            allocations: Vec::new(),
+            vram_budget_bytes,
+            current_vram_resident_bytes: 0,
+            current_system_resident_bytes: 0,
+            current_timestamp: 1,
+            total_evictions_count: 0,
+            total_promotions_count: 0,
+        }
+    }
+
+    // Registers a newly created heap allocation into the tracked pool.
+    pub fn register_allocation(&mut self, alloc: ManagedHeapAllocation) {
+        self.allocations.push(alloc);
+    }
+
+    // Updates residency priority ranking for a tracked allocation.
+    pub fn set_residency_priority(
+        &mut self,
+        allocation_id: u64,
+        priority: D3D12_RESIDENCY_PRIORITY,
+    ) -> Result<(), ResidencyError> {
+        let alloc = self
+            .allocations
+            .iter_mut()
+            .find(|a| a.allocation_id == allocation_id)
+            .ok_or(ResidencyError::AllocationNotFound)?;
+        alloc.priority = priority;
+        Ok(())
+    }
+
+    // Marks an allocation as recently used to update its LRU status.
+    pub fn touch_allocation(&mut self, allocation_id: u64) {
+        self.current_timestamp = self.current_timestamp.saturating_add(1);
+        if let Some(alloc) = self.allocations.iter_mut().find(|a| a.allocation_id == allocation_id) {
+            alloc.last_used_timestamp = self.current_timestamp;
+        }
+    }
+
+    // Finds the best candidate allocation to evict: lowest priority, then oldest LRU timestamp.
+    pub fn find_eviction_candidate(&self) -> Option<u64> {
+        self.allocations
+            .iter()
+            .filter(|a| a.is_resident && a.pool == D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0)
+            .filter(|a| a.priority < D3D12_RESIDENCY_PRIORITY::D3D12_RESIDENCY_PRIORITY_CRITICAL)
+            .min_by(|a, b| {
+                match a.priority.cmp(&b.priority) {
+                    core::cmp::Ordering::Equal => a.last_used_timestamp.cmp(&b.last_used_timestamp),
+                    other => other,
+                }
+            })
+            .map(|a| a.allocation_id)
+    }
+
+    // Direct3D 12 ID3D12Device::Evict: evicts allocations from VRAM back to non-resident status.
+    pub fn Evict(&mut self, allocation_ids: &[u64]) -> Result<u64, ResidencyError> {
+        let mut bytes_evicted: u64 = 0;
+        for &id in allocation_ids {
+            let alloc = self
+                .allocations
+                .iter_mut()
+                .find(|a| a.allocation_id == id)
+                .ok_or(ResidencyError::AllocationNotFound)?;
+
+            if alloc.is_resident {
+                alloc.is_resident = false;
+                if alloc.pool == D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0 {
+                    self.current_vram_resident_bytes = self
+                        .current_vram_resident_bytes
+                        .saturating_sub(alloc.size_in_bytes);
+                } else {
+                    self.current_system_resident_bytes = self
+                        .current_system_resident_bytes
+                        .saturating_sub(alloc.size_in_bytes);
+                }
+                bytes_evicted = bytes_evicted.saturating_add(alloc.size_in_bytes);
+                self.total_evictions_count = self.total_evictions_count.saturating_add(1);
+            }
+        }
+        Ok(bytes_evicted)
+    }
+
+    // Direct3D 12 ID3D12Device::EnqueueMakeResident: ensures allocations reside in VRAM.
+    pub fn EnqueueMakeResident(&mut self, allocation_ids: &[u64]) -> Result<u64, ResidencyError> {
+        for &id in allocation_ids {
+            self.current_timestamp = self.current_timestamp.saturating_add(1);
+            let (size, pool) = {
+                let alloc = self
+                    .allocations
+                    .iter_mut()
+                    .find(|a| a.allocation_id == id)
+                    .ok_or(ResidencyError::AllocationNotFound)?;
+
+                if alloc.is_resident {
+                    alloc.last_used_timestamp = self.current_timestamp;
+                    continue;
+                }
+                (alloc.size_in_bytes, alloc.pool)
+            };
+
+            // If local VRAM allocation, evict candidates until budget accommodates new allocation
+            if pool == D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0 {
+                while self.current_vram_resident_bytes.saturating_add(size) > self.vram_budget_bytes {
+                    if let Some(candidate_id) = self.find_eviction_candidate() {
+                        self.Evict(&[candidate_id])?;
+                    } else {
+                        return Err(ResidencyError::BudgetExceeded);
+                    }
+                }
+            }
+
+            let alloc = self
+                .allocations
+                .iter_mut()
+                .find(|a| a.allocation_id == id)
+                .ok_or(ResidencyError::AllocationNotFound)?;
+
+            alloc.is_resident = true;
+            alloc.last_used_timestamp = self.current_timestamp;
+            if pool == D3D12_MEMORY_POOL::D3D12_MEMORY_POOL_L0 {
+                self.current_vram_resident_bytes = self
+                    .current_vram_resident_bytes
+                    .saturating_add(size);
+            } else {
+                self.current_system_resident_bytes = self
+                    .current_system_resident_bytes
+                    .saturating_add(size);
+            }
+            self.total_promotions_count = self.total_promotions_count.saturating_add(1);
+        }
+
+        Ok(self.current_vram_resident_bytes)
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_residency_manager_subsystem() -> bool {
     true
