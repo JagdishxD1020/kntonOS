@@ -172,3 +172,190 @@ pub fn verify_button_remapper_and_turbo() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Sub-Millisecond Virtual Radial Menu Angular Deflection Resolver
+// ============================================================================
+
+/// Number of slots for radial selection wheel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RadialSlotCount {
+    Slots8 = 8,
+    Slots16 = 16,
+}
+
+/// Angular deflection resolver and virtual radial menu (weapon wheel / hotkeys).
+#[derive(Debug, Clone)]
+pub struct VirtualRadialMenu {
+    pub slot_count: RadialSlotCount,
+    pub deadzone_radius: i32,
+    pub is_open: bool,
+    pub active_slot: Option<u8>,
+    pub slot_actions: [u16; 16],
+}
+
+impl VirtualRadialMenu {
+    pub const fn new(slot_count: RadialSlotCount, deadzone_radius: i32) -> Self {
+        Self {
+            slot_count,
+            deadzone_radius,
+            is_open: false,
+            active_slot: None,
+            slot_actions: [0; 16],
+        }
+    }
+
+    /// Assigns a virtual hotkey action code to a radial slot.
+    pub fn bind_action(&mut self, slot_index: usize, action_code: u16) -> Result<(), &'static str> {
+        if slot_index >= (self.slot_count as usize) {
+            return Err("Slot index out of bounds");
+        }
+        self.slot_actions[slot_index] = action_code;
+        Ok(())
+    }
+
+    pub fn open(&mut self) {
+        self.is_open = true;
+        self.active_slot = None;
+    }
+
+    pub fn close(&mut self) {
+        self.is_open = false;
+        self.active_slot = None;
+    }
+
+    /// Approximates angle in degrees [0, 360) from stick/trackpad X and Y coordinates.
+    pub fn compute_angle_deg(x: i32, y: i32) -> u16 {
+        if x == 0 && y == 0 {
+            return 0;
+        }
+
+        // Fast fixed-point rational atan2 approximation
+        let abs_x = x.abs();
+        let abs_y = y.abs();
+
+        let ratio = if abs_x >= abs_y {
+            (abs_y * 1024) / abs_x
+        } else {
+            (abs_x * 1024) / abs_y
+        };
+
+        // Linear interpolation for octant angle (0 to 45 deg, where 1024 ratio = 45 deg)
+        let octant_deg = (ratio * 45) / 1024;
+
+        let base_deg = if abs_x >= abs_y {
+            octant_deg
+        } else {
+            90 - octant_deg
+        };
+
+        // Map to full 360 degrees based on quadrant
+        let full_deg = if x >= 0 && y >= 0 {
+            base_deg // Quadrant 1 (0 to 90 deg)
+        } else if x < 0 && y >= 0 {
+            180 - base_deg // Quadrant 2 (90 to 180 deg)
+        } else if x < 0 && y < 0 {
+            180 + base_deg // Quadrant 3 (180 to 270 deg)
+        } else {
+            360 - base_deg // Quadrant 4 (270 to 360 deg)
+        };
+
+        (full_deg % 360) as u16
+    }
+
+    /// Resolves stick/trackpad deflection into an active radial slot.
+    pub fn resolve_deflection(&mut self, stick_x: i16, stick_y: i16) -> Option<u8> {
+        if !self.is_open {
+            return None;
+        }
+
+        let sx = stick_x as i32;
+        let sy = stick_y as i32;
+        let dist_sq = sx * sx + sy * sy;
+        let deadzone_sq = self.deadzone_radius * self.deadzone_radius;
+
+        if dist_sq < deadzone_sq {
+            // Stick within deadzone: keep previous active slot or None
+            return self.active_slot;
+        }
+
+        let angle_deg = Self::compute_angle_deg(sx, sy);
+        let n_slots = self.slot_count as u16;
+        let sector_width = 360 / n_slots;
+        let half_sector = sector_width / 2;
+
+        // Center slot 0 on East (0 deg) with half-sector offset
+        let slot = ((angle_deg + half_sector) % 360) / sector_width;
+        let slot_u8 = slot as u8;
+        self.active_slot = Some(slot_u8);
+        Some(slot_u8)
+    }
+
+    /// Confirms and commits the currently highlighted slot upon button release.
+    pub fn confirm_selection(&mut self) -> Option<u16> {
+        if let Some(slot) = self.active_slot {
+            let action = self.slot_actions[slot as usize];
+            self.close();
+            Some(action)
+        } else {
+            self.close();
+            None
+        }
+    }
+}
+
+/// Unit test verifying virtual radial menu angular resolution and slot selection.
+pub fn verify_virtual_radial_menu() -> bool {
+    let mut menu = VirtualRadialMenu::new(RadialSlotCount::Slots8, 8000);
+
+    // Bind action codes (e.g. 101 to 108 for weapons)
+    for i in 0..8 {
+        if menu.bind_action(i, (100 + i) as u16).is_err() {
+            return false;
+        }
+    }
+
+    menu.open();
+    if !menu.is_open || menu.active_slot.is_some() {
+        return false;
+    }
+
+    // 1. Inside deadzone: returns None
+    let s_deadzone = menu.resolve_deflection(3000, -2000);
+    if s_deadzone.is_some() {
+        return false;
+    }
+
+    // 2. East deflection (+20000, 0): angle ~0 deg -> Slot 0
+    let s_east = menu.resolve_deflection(20000, 0);
+    if s_east != Some(0) {
+        return false;
+    }
+
+    // 3. North-East deflection (+18000, +18000): angle ~45 deg -> Slot 1
+    let s_ne = menu.resolve_deflection(18000, 18000);
+    if s_ne != Some(1) {
+        return false;
+    }
+
+    // 4. North deflection (0, +22000): angle ~90 deg -> Slot 2
+    let s_north = menu.resolve_deflection(0, 22000);
+    if s_north != Some(2) {
+        return false;
+    }
+
+    // 5. West deflection (-20000, 0): angle ~180 deg -> Slot 4
+    let s_west = menu.resolve_deflection(-20000, 0);
+    if s_west != Some(4) {
+        return false;
+    }
+
+    // 6. Confirm selection: returns action code for Slot 4 (104) and closes menu
+    let action = menu.confirm_selection();
+    if action != Some(104) || menu.is_open {
+        return false;
+    }
+
+    true
+}
