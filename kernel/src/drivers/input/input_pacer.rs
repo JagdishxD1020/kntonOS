@@ -486,3 +486,145 @@ pub fn verify_power_aware_scaler() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Integrated HID Input Pacer Dispatching to Win32 Raw Input Buffers
+// ============================================================================
+
+/// Win32 Raw Input device class constant for HID Gamepad / Joystick.
+pub const RIM_TYPEHID: u32 = 2;
+
+/// Standardized Win32 Raw Input packet structure consumed by game loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Win32RawInputPacket {
+    /// RAWINPUTHEADER dwType (RIM_TYPEHID = 2).
+    pub header_type: u32,
+    /// Handle to simulated hardware input device.
+    pub device_handle: u64,
+    /// wParam input message code (e.g. RIM_INPUT = 0).
+    pub wparam: usize,
+    /// Aggregated handheld input payload.
+    pub payload: AggregatedInputPacket,
+}
+
+/// Integrated Sub-Millisecond Input Aggregator & High-Poll-Rate HID Pacer.
+#[derive(Debug, Clone)]
+pub struct InputPacerManager {
+    pub aggregator: HighPollRateAggregator,
+    pub jitter_buffer: InputJitterBuffer,
+    pub scaler: PowerAwarePollingScaler,
+    pub total_dispatched_to_raw_input: u64,
+    pub device_handle: u64,
+}
+
+impl InputPacerManager {
+    pub const fn new(preferred_rate_hz: u16) -> Self {
+        let expected_interval_us = match preferred_rate_hz {
+            POLL_RATE_2000HZ => 500,
+            POLL_RATE_1000HZ => 1000,
+            POLL_RATE_500HZ => 2000,
+            _ => 4000,
+        };
+
+        Self {
+            aggregator: HighPollRateAggregator::new(preferred_rate_hz),
+            jitter_buffer: InputJitterBuffer::new(expected_interval_us),
+            scaler: PowerAwarePollingScaler::new(preferred_rate_hz),
+            total_dispatched_to_raw_input: 0,
+            device_handle: 0xDEAD_BEEF_0001,
+        }
+    }
+
+    /// Evaluates system power state and dynamically adjusts aggregator and jitter buffer.
+    pub fn update_power_policy(&mut self, battery_soc_pct: u8, whisper_mode: bool, ac_connected: bool) {
+        let effective_rate = self.scaler.evaluate_rate(battery_soc_pct, whisper_mode, ac_connected);
+        if effective_rate != self.aggregator.poll_rate_hz {
+            self.aggregator.set_poll_rate(effective_rate);
+            self.jitter_buffer.set_expected_interval(self.aggregator.expected_interval_us);
+        }
+    }
+
+    /// Ingests raw hardware controller event at sub-millisecond precision.
+    pub fn ingest_sample(
+        &mut self,
+        timestamp_us: u64,
+        buttons: u16,
+        left_stick: (i16, i16),
+        right_stick: (i16, i16),
+        triggers: (u16, u16),
+        left_trackpad: (i16, i16, u8, bool),
+        right_trackpad: (i16, i16, u8, bool),
+    ) {
+        let packet = self.aggregator.aggregate_sample(
+            timestamp_us,
+            buttons,
+            left_stick,
+            right_stick,
+            triggers,
+            left_trackpad,
+            right_trackpad,
+        );
+        self.jitter_buffer.push(packet);
+    }
+
+    /// Dispatches the next smoothed packet formatted for Win32 Raw Input API.
+    pub fn dispatch_to_raw_input(&mut self) -> Option<Win32RawInputPacket> {
+        let pkt = self.jitter_buffer.pop()?;
+        self.total_dispatched_to_raw_input += 1;
+        Some(Win32RawInputPacket {
+            header_type: RIM_TYPEHID,
+            device_handle: self.device_handle,
+            wparam: 0,
+            payload: pkt,
+        })
+    }
+}
+
+/// Unit test verifying integrated HID input pacer dispatching to Win32 Raw Input.
+pub fn verify_input_pacer_manager() -> bool {
+    let mut pacer = InputPacerManager::new(POLL_RATE_1000HZ);
+
+    // 1. Ingest 5 packets at 1000Hz (1ms spacing)
+    for i in 1..=5 {
+        pacer.ingest_sample(
+            (i * 1000) as u64,
+            BTN_A | BTN_X,
+            (1000 * i as i16, -1000 * i as i16),
+            (0, 0),
+            (250 * i as u16, 500),
+            (10, 5, 100, true),
+            (0, 0, 0, false),
+        );
+    }
+
+    if pacer.jitter_buffer.len() != 5 {
+        return false;
+    }
+
+    // 2. Dispatch all 5 to Win32 Raw Input
+    for i in 1..=5 {
+        let raw = match pacer.dispatch_to_raw_input() {
+            Some(r) => r,
+            None => return false,
+        };
+        if raw.header_type != RIM_TYPEHID || raw.payload.sequence != i {
+            return false;
+        }
+        if raw.payload.left_stick_x != (1000 * i as i16) {
+            return false;
+        }
+    }
+
+    if !pacer.jitter_buffer.is_empty() || pacer.total_dispatched_to_raw_input != 5 {
+        return false;
+    }
+
+    // 3. Power downscaling to 500Hz on low battery (15% SoC on battery)
+    pacer.update_power_policy(15, false, false);
+    if pacer.aggregator.poll_rate_hz != POLL_RATE_500HZ || pacer.jitter_buffer.expected_interval_us != 2000 {
+        return false;
+    }
+
+    true
+}
