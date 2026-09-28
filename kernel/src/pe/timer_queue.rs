@@ -445,3 +445,122 @@ pub fn dispatch_multimedia_timers(current_tick: u64) -> usize {
 pub fn win32_get_multimedia_period_governor() -> u32 {
     *MM_MIN_PERIOD_MS.lock()
 }
+
+static TEST_TIMER_CALLBACK_FIRED: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_timer_callback(_param: *mut c_void, _timer_or_wait: BOOL) {
+    TEST_TIMER_CALLBACK_FIRED.fetch_add(1, Ordering::SeqCst);
+}
+
+static TEST_MM_CALLBACK_FIRED: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_mm_callback(
+    _timer_id: u32,
+    _msg: u32,
+    _user: usize,
+    _dw1: usize,
+    _dw2: usize,
+) {
+    TEST_MM_CALLBACK_FIRED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Self-test suite verifying Win32 timer queues and multimedia timer synchronization.
+pub fn test_win32_timer_queue_subsystem() -> bool {
+    unsafe {
+        // 1. Test CreateTimerQueue
+        let tq = CreateTimerQueue();
+        if tq == 0 {
+            return false;
+        }
+
+        // 2. Test CreateTimerQueueTimer with periodic firing
+        let mut timer_handle: HANDLE = 0;
+        let created = CreateTimerQueueTimer(
+            &mut timer_handle,
+            tq,
+            Some(test_timer_callback),
+            core::ptr::null_mut(),
+            10,
+            20,
+            WT_EXECUTEDEFAULT,
+        );
+        if created != TRUE || timer_handle == 0 {
+            return false;
+        }
+
+        if !win32_is_timer_active(timer_handle) {
+            return false;
+        }
+
+        // 3. Step virtual ticks and verify callback dispatching
+        let initial_fires = win32_step_timer_queue_ticks(5);
+        if initial_fires != 0 {
+            return false;
+        }
+
+        let due_fires = win32_step_timer_queue_ticks(15);
+        if due_fires != 1 || TEST_TIMER_CALLBACK_FIRED.load(Ordering::SeqCst) < 1 {
+            return false;
+        }
+
+        // 4. Test ChangeTimerQueueTimer
+        let changed = ChangeTimerQueueTimer(tq, timer_handle, 5, 10);
+        if changed != TRUE {
+            return false;
+        }
+
+        // 5. Test DeleteTimerQueueTimer with event notification
+        let comp_event = crate::pe::synch::win32_create_event(0, false, false, None);
+        let deleted = DeleteTimerQueueTimer(tq, timer_handle, comp_event);
+        if deleted != TRUE {
+            return false;
+        }
+
+        if win32_is_timer_active(timer_handle) {
+            return false;
+        }
+
+        // Verify completion event was signaled
+        if crate::pe::synch::win32_wait_for_single_object(comp_event, 0) != 0 {
+            return false;
+        }
+
+        // 6. Test DeleteTimerQueueEx
+        let tq_del = DeleteTimerQueueEx(tq, 0);
+        if tq_del != TRUE {
+            return false;
+        }
+
+        // 7. Test Multimedia Timer period governor
+        if timeBeginPeriod(1) != TIMERR_NOERROR {
+            return false;
+        }
+        if win32_get_multimedia_period_governor() != 1 {
+            return false;
+        }
+        if timeEndPeriod(1) != TIMERR_NOERROR {
+            return false;
+        }
+
+        // 8. Test timeSetEvent and timeKillEvent
+        let mm_id = timeSetEvent(10, 1, Some(test_mm_callback), 42, TIME_PERIODIC);
+        if mm_id == 0 {
+            return false;
+        }
+
+        let now = crate::pe::perf_counter::win32_get_tick_count64() + 25;
+        dispatch_multimedia_timers(now);
+        if TEST_MM_CALLBACK_FIRED.load(Ordering::SeqCst) < 1 {
+            return false;
+        }
+
+        if timeKillEvent(mm_id) != TIMERR_NOERROR {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-TIMER-QUEUE-PASS] Win32 timer queue and multimedia timer subsystem verified\r\n",
+    );
+    true
+}

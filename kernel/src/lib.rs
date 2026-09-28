@@ -1049,6 +1049,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Timer Queues & Multimedia Synchronization (TASK-KNT-216)
+    if !pe::test_win32_timer_queue_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 timer queue self-test failed!\r\n");
+    }
+
     // Verify Milestone 200 Unified Gaming Runtime Supervisor & Health Matrix (TASK-KNT-200)
     if !sys::test_milestone_200_supervisor() {
         serial_write_str("[KNT-PANIC] Milestone 200 supervisor self-test failed!\r\n");
