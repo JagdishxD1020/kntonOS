@@ -359,3 +359,229 @@ pub fn verify_virtual_radial_menu() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Deterministic Microsecond Macro Sequencer with Recursion Lockout
+// ============================================================================
+
+/// Execution phase of a single macro step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepPhase {
+    /// Button(s) actively pressed for hold duration.
+    Holding,
+    /// Button(s) released for delay duration before next step.
+    InterStepDelay,
+    /// Macro sequence complete.
+    Completed,
+}
+
+/// A single step within an input macro sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroStep {
+    /// Buttons to simulate pressed during this step.
+    pub press_buttons: u32,
+    /// Duration to hold buttons in microseconds.
+    pub hold_duration_us: u32,
+    /// Delay in microseconds before advancing to the next step.
+    pub delay_after_us: u32,
+}
+
+/// Macro definition binding a physical trigger to a sequence of timed steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroDefinition {
+    pub trigger_button: u32,
+    pub steps: [MacroStep; 8],
+    pub step_count: usize,
+}
+
+/// Deterministic Microsecond Macro Sequencer with anti-recursion lockout.
+#[derive(Debug, Clone)]
+pub struct MacroSequencer {
+    pub macros: [MacroDefinition; 4],
+    pub macro_count: usize,
+    pub is_playing: bool,
+    pub active_macro_index: usize,
+    pub current_step_index: usize,
+    pub current_phase: StepPhase,
+    pub phase_start_ts_us: u64,
+    pub simulated_buttons: u32,
+    pub recursion_lockout: bool,
+    pub sequences_completed_count: u32,
+}
+
+impl MacroSequencer {
+    pub const fn new() -> Self {
+        Self {
+            macros: [MacroDefinition {
+                trigger_button: 0,
+                steps: [MacroStep { press_buttons: 0, hold_duration_us: 0, delay_after_us: 0 }; 8],
+                step_count: 0,
+            }; 4],
+            macro_count: 0,
+            is_playing: false,
+            active_macro_index: 0,
+            current_step_index: 0,
+            current_phase: StepPhase::Completed,
+            phase_start_ts_us: 0,
+            simulated_buttons: 0,
+            recursion_lockout: false,
+            sequences_completed_count: 0,
+        }
+    }
+
+    /// Registers a new timed macro sequence.
+    pub fn register_macro(&mut self, trigger_button: u32, steps: &[MacroStep]) -> Result<(), &'static str> {
+        if self.macro_count >= self.macros.len() {
+            return Err("Macro registry full");
+        }
+        if steps.is_empty() || steps.len() > 8 {
+            return Err("Invalid step count");
+        }
+
+        let mut def = MacroDefinition {
+            trigger_button,
+            steps: [MacroStep { press_buttons: 0, hold_duration_us: 0, delay_after_us: 0 }; 8],
+            step_count: steps.len(),
+        };
+        for (i, s) in steps.iter().enumerate() {
+            def.steps[i] = *s;
+        }
+
+        self.macros[self.macro_count] = def;
+        self.macro_count += 1;
+        Ok(())
+    }
+
+    /// Checks if raw hardware inputs contain a macro trigger (with recursion lockout).
+    pub fn evaluate_triggers(&mut self, raw_buttons: u32, timestamp_us: u64) -> bool {
+        // Anti-recursion lockout: ignore triggers if already executing a sequence
+        if self.is_playing || self.recursion_lockout {
+            return false;
+        }
+
+        for i in 0..self.macro_count {
+            let m = &self.macros[i];
+            if (raw_buttons & m.trigger_button) == m.trigger_button && m.trigger_button != 0 {
+                self.is_playing = true;
+                self.recursion_lockout = true;
+                self.active_macro_index = i;
+                self.current_step_index = 0;
+                self.current_phase = StepPhase::Holding;
+                self.phase_start_ts_us = timestamp_us;
+                self.simulated_buttons = m.steps[0].press_buttons;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Advances the active macro playback timeline and returns simulated button outputs.
+    pub fn tick(&mut self, current_ts_us: u64) -> u32 {
+        if !self.is_playing {
+            self.simulated_buttons = 0;
+            return 0;
+        }
+
+        let macro_def = &self.macros[self.active_macro_index];
+        let step = &macro_def.steps[self.current_step_index];
+        let elapsed_us = current_ts_us.saturating_sub(self.phase_start_ts_us);
+
+        match self.current_phase {
+            StepPhase::Holding => {
+                if elapsed_us >= (step.hold_duration_us as u64) {
+                    if step.delay_after_us > 0 {
+                        self.current_phase = StepPhase::InterStepDelay;
+                        self.phase_start_ts_us = current_ts_us;
+                        self.simulated_buttons = 0;
+                    } else {
+                        self.advance_step(current_ts_us);
+                    }
+                } else {
+                    self.simulated_buttons = step.press_buttons;
+                }
+            }
+            StepPhase::InterStepDelay => {
+                if elapsed_us >= (step.delay_after_us as u64) {
+                    self.advance_step(current_ts_us);
+                } else {
+                    self.simulated_buttons = 0;
+                }
+            }
+            StepPhase::Completed => {
+                self.simulated_buttons = 0;
+            }
+        }
+
+        self.simulated_buttons
+    }
+
+    fn advance_step(&mut self, current_ts_us: u64) {
+        let macro_def = &self.macros[self.active_macro_index];
+        self.current_step_index += 1;
+        if self.current_step_index >= macro_def.step_count {
+            self.is_playing = false;
+            self.recursion_lockout = false;
+            self.current_phase = StepPhase::Completed;
+            self.simulated_buttons = 0;
+            self.sequences_completed_count += 1;
+        } else {
+            self.current_phase = StepPhase::Holding;
+            self.phase_start_ts_us = current_ts_us;
+            self.simulated_buttons = macro_def.steps[self.current_step_index].press_buttons;
+        }
+    }
+}
+
+/// Unit test verifying deterministic macro sequencer and recursion lockout.
+pub fn verify_macro_sequencer() -> bool {
+    let mut seq = MacroSequencer::new();
+
+    // 2-step combo: Step 1 = DPAD_DOWN (30ms hold, 20ms delay), Step 2 = BTN_A (40ms hold)
+    let combo = [
+        MacroStep { press_buttons: PAD_BTN_DPAD_DOWN, hold_duration_us: 30_000, delay_after_us: 20_000 },
+        MacroStep { press_buttons: PAD_BTN_A, hold_duration_us: 40_000, delay_after_us: 0 },
+    ];
+    if seq.register_macro(PAD_BTN_L5, &combo).is_err() {
+        return false;
+    }
+
+    // 1. Trigger with L5 at t=1000
+    if !seq.evaluate_triggers(PAD_BTN_L5, 1000) || !seq.is_playing {
+        return false;
+    }
+
+    // 2. Step 1 holding: t=10,000us
+    let b1 = seq.tick(10_000);
+    if b1 != PAD_BTN_DPAD_DOWN || seq.current_phase != StepPhase::Holding {
+        return false;
+    }
+
+    // 3. Recursion prevention check: attempt to trigger while playing
+    if seq.evaluate_triggers(PAD_BTN_L5, 15_000) {
+        return false;
+    }
+
+    // 4. Inter-step delay: t=32,000us (31ms after start -> in delay phase)
+    let b2 = seq.tick(32_000);
+    if b2 != 0 || seq.current_phase != StepPhase::InterStepDelay {
+        return false;
+    }
+
+    // 5. Advance to Step 2: t=52,000us (20ms delay finished -> BTN_A)
+    let b3 = seq.tick(52_000);
+    if b3 != PAD_BTN_A || seq.current_phase != StepPhase::Holding {
+        return false;
+    }
+
+    // 6. Complete sequence: t=95,000us (43ms elapsed in step 2)
+    let b4 = seq.tick(95_000);
+    if b4 != 0 || seq.is_playing || seq.recursion_lockout {
+        return false;
+    }
+    if seq.sequences_completed_count != 1 {
+        return false;
+    }
+
+    true
+}
