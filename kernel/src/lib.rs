@@ -727,6 +727,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld input aggregator and high-poll-rate HID pacer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Gamepad Dynamic Button Remapping, Macro Sequencer & Virtual Radial Menu (TASK-KNT-218)
+    if !drivers::input::test_radial_macro_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld dynamic remapping, macro sequencer and radial menu self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");
