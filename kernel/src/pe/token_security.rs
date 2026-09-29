@@ -322,3 +322,496 @@ impl SecurityDescriptor {
         remaining_access == 0
     }
 }
+
+// Privilege attributes
+pub const SE_PRIVILEGE_ENABLED_BY_DEFAULT: DWORD = 0x0000_0001;
+pub const SE_PRIVILEGE_ENABLED: DWORD = 0x0000_0002;
+pub const SE_PRIVILEGE_REMOVED: DWORD = 0x0000_0004;
+pub const SE_PRIVILEGE_USED_FOR_ACCESS: DWORD = 0x8000_0000;
+
+// Token Information Classes
+pub const TokenUser: DWORD = 1;
+pub const TokenGroups: DWORD = 2;
+pub const TokenPrivileges: DWORD = 3;
+pub const TokenOwner: DWORD = 4;
+pub const TokenPrimaryGroup: DWORD = 5;
+pub const TokenDefaultDacl: DWORD = 6;
+pub const TokenSource: DWORD = 7;
+pub const TokenType: DWORD = 8;
+pub const TokenImpersonationLevel: DWORD = 9;
+pub const TokenStatistics: DWORD = 10;
+pub const TokenRestrictedSids: DWORD = 11;
+pub const TokenSessionId: DWORD = 12;
+pub const TokenGroupsAndPrivileges: DWORD = 13;
+pub const TokenSessionReference: DWORD = 14;
+pub const TokenSandBoxInert: DWORD = 15;
+pub const TokenAuditPolicy: DWORD = 16;
+pub const TokenOrigin: DWORD = 17;
+pub const TokenElevationType: DWORD = 18;
+pub const TokenLinkedToken: DWORD = 19;
+pub const TokenElevation: DWORD = 20;
+pub const TokenHasRestrictions: DWORD = 21;
+pub const TokenAccessInformation: DWORD = 22;
+pub const TokenVirtualizationAllowed: DWORD = 23;
+pub const TokenVirtualizationEnabled: DWORD = 24;
+pub const TokenIntegrityLevel: DWORD = 25;
+pub const TokenUIAccess: DWORD = 26;
+pub const TokenMandatoryPolicy: DWORD = 27;
+pub const TokenLogonSid: DWORD = 28;
+
+// Token Elevation Types
+pub const TokenElevationTypeDefault: DWORD = 1;
+pub const TokenElevationTypeFull: DWORD = 2;
+pub const TokenElevationTypeLimited: DWORD = 3;
+
+// Token Types
+pub const TokenPrimary: DWORD = 1;
+pub const TokenImpersonation: DWORD = 2;
+
+// Security Impersonation Levels
+pub const SecurityAnonymous: DWORD = 0;
+pub const SecurityIdentification: DWORD = 1;
+pub const SecurityImpersonation: DWORD = 2;
+pub const SecurityDelegation: DWORD = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LUID {
+    pub LowPart: DWORD,
+    pub HighPart: i32,
+}
+
+impl LUID {
+    pub const fn new(low: DWORD, high: i32) -> Self {
+        Self {
+            LowPart: low,
+            HighPart: high,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LUID_AND_ATTRIBUTES {
+    pub Luid: LUID,
+    pub Attributes: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TOKEN_ELEVATION {
+    pub TokenIsElevated: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TOKEN_ELEVATION_TYPE {
+    pub ElevationType: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TOKEN_MANDATORY_LABEL {
+    pub Label: SID_AND_ATTRIBUTES,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SID_AND_ATTRIBUTES {
+    pub Sid: *mut c_void,
+    pub Attributes: DWORD,
+}
+
+/// In-memory representation of a Win32 Access Token.
+#[derive(Clone, Debug)]
+pub struct AccessTokenInner {
+    pub id: HANDLE,
+    pub token_type: DWORD,
+    pub impersonation_level: DWORD,
+    pub user_sid: SID,
+    pub group_sids: Vec<SID>,
+    pub privileges: BTreeMap<u64, DWORD>,
+    pub integrity_level: DWORD,
+    pub is_elevated: bool,
+    pub default_dacl: Option<ACL>,
+}
+
+impl AccessTokenInner {
+    pub fn new_default_user(id: HANDLE) -> Self {
+        let mut privileges = BTreeMap::new();
+        // Give basic default privileges
+        privileges.insert(SE_CHANGE_NOTIFY_PRIVILEGE_LUID, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED);
+
+        Self {
+            id,
+            token_type: TokenPrimary,
+            impersonation_level: SecurityImpersonation,
+            user_sid: SID::users_sid(),
+            group_sids: alloc::vec![SID::users_sid(), SID::world_sid()],
+            privileges,
+            integrity_level: SECURITY_MANDATORY_MEDIUM_RID,
+            is_elevated: false,
+            default_dacl: None,
+        }
+    }
+
+    pub fn new_admin(id: HANDLE) -> Self {
+        let mut privileges = BTreeMap::new();
+        privileges.insert(SE_CHANGE_NOTIFY_PRIVILEGE_LUID, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED);
+        privileges.insert(SE_DEBUG_PRIVILEGE_LUID, 0); // Disabled by default, can be enabled
+        privileges.insert(SE_LOCK_MEMORY_PRIVILEGE_LUID, 0);
+
+        Self {
+            id,
+            token_type: TokenPrimary,
+            impersonation_level: SecurityImpersonation,
+            user_sid: SID::administrators_sid(),
+            group_sids: alloc::vec![SID::administrators_sid(), SID::users_sid(), SID::world_sid()],
+            privileges,
+            integrity_level: SECURITY_MANDATORY_HIGH_RID,
+            is_elevated: true,
+            default_dacl: None,
+        }
+    }
+
+    pub fn new_system(id: HANDLE) -> Self {
+        let mut privileges = BTreeMap::new();
+        privileges.insert(SE_CHANGE_NOTIFY_PRIVILEGE_LUID, SE_PRIVILEGE_ENABLED_BY_DEFAULT | SE_PRIVILEGE_ENABLED);
+        privileges.insert(SE_DEBUG_PRIVILEGE_LUID, SE_PRIVILEGE_ENABLED);
+        privileges.insert(SE_LOCK_MEMORY_PRIVILEGE_LUID, SE_PRIVILEGE_ENABLED);
+
+        Self {
+            id,
+            token_type: TokenPrimary,
+            impersonation_level: SecurityImpersonation,
+            user_sid: SID::local_system_sid(),
+            group_sids: alloc::vec![SID::local_system_sid(), SID::administrators_sid(), SID::world_sid()],
+            privileges,
+            integrity_level: SECURITY_MANDATORY_SYSTEM_RID,
+            is_elevated: true,
+            default_dacl: None,
+        }
+    }
+}
+
+pub const SE_CHANGE_NOTIFY_PRIVILEGE_LUID: u64 = 23;
+pub const SE_DEBUG_PRIVILEGE_LUID: u64 = 20;
+pub const SE_LOCK_MEMORY_PRIVILEGE_LUID: u64 = 4;
+
+static NEXT_TOKEN_ID: AtomicU64 = AtomicU64::new(0x2000);
+static ACCESS_TOKENS: Spinlock<BTreeMap<HANDLE, AccessTokenInner>> = Spinlock::new(BTreeMap::new());
+static PROCESS_TOKENS: Spinlock<BTreeMap<u32, HANDLE>> = Spinlock::new(BTreeMap::new());
+static THREAD_TOKENS: Spinlock<BTreeMap<u32, HANDLE>> = Spinlock::new(BTreeMap::new());
+
+fn luid_to_u64(luid: LUID) -> u64 {
+    ((luid.HighPart as u64) << 32) | (luid.LowPart as u64)
+}
+
+fn u64_to_luid(val: u64) -> LUID {
+    LUID {
+        LowPart: val as DWORD,
+        HighPart: (val >> 32) as i32,
+    }
+}
+
+/// Helper to get current execution process ID.
+fn get_current_process_id() -> u32 {
+    let teb = crate::pe::peb_teb::win32_get_current_teb();
+    if !teb.is_null() {
+        let pid = unsafe { (*teb).client_id.unique_process as u32 };
+        if pid != 0 {
+            return pid;
+        }
+    }
+    1
+}
+
+/// Helper to get current execution thread ID.
+fn get_current_thread_id() -> u32 {
+    let teb = crate::pe::peb_teb::win32_get_current_teb();
+    if !teb.is_null() {
+        let tid = unsafe { (*teb).client_id.unique_thread as u32 };
+        if tid != 0 {
+            return tid;
+        }
+    }
+    1
+}
+
+/// Opens the access token associated with a process.
+pub unsafe extern "system" fn OpenProcessToken(
+    ProcessHandle: HANDLE,
+    _DesiredAccess: ACCESS_MASK,
+    TokenHandle: *mut HANDLE,
+) -> BOOL {
+    if TokenHandle.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let pid = if ProcessHandle == 0 || ProcessHandle == (INVALID_HANDLE_VALUE as HANDLE) || ProcessHandle == 0xFFFFFFFF {
+        get_current_process_id()
+    } else {
+        ProcessHandle as u32
+    };
+
+    let mut proc_tokens = PROCESS_TOKENS.lock();
+    let token_id = if let Some(&tid) = proc_tokens.get(&pid) {
+        tid
+    } else {
+        let new_id = NEXT_TOKEN_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+        let token = AccessTokenInner::new_admin(new_id);
+        ACCESS_TOKENS.lock().insert(new_id, token);
+        proc_tokens.insert(pid, new_id);
+        new_id
+    };
+
+    *TokenHandle = token_id;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Opens the access token associated with a thread.
+pub unsafe extern "system" fn OpenThreadToken(
+    ThreadHandle: HANDLE,
+    DesiredAccess: ACCESS_MASK,
+    _OpenAsSelf: BOOL,
+    TokenHandle: *mut HANDLE,
+) -> BOOL {
+    if TokenHandle.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let tid = if ThreadHandle == 0 || ThreadHandle == (INVALID_HANDLE_VALUE as HANDLE) || ThreadHandle == 0xFFFFFFFE {
+        get_current_thread_id()
+    } else {
+        ThreadHandle as u32
+    };
+
+    let thread_tokens = THREAD_TOKENS.lock();
+    if let Some(&token_id) = thread_tokens.get(&tid) {
+        *TokenHandle = token_id;
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        // Fallback to process token if no thread impersonation token is set
+        drop(thread_tokens);
+        OpenProcessToken(0, DesiredAccess, TokenHandle)
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TOKEN_PRIVILEGES {
+    pub PrivilegeCount: DWORD,
+    pub Privileges: [LUID_AND_ATTRIBUTES; 1],
+}
+
+/// Retrieves specified type of information about an access token.
+pub unsafe extern "system" fn GetTokenInformation(
+    TokenHandle: HANDLE,
+    TokenInformationClass: DWORD,
+    TokenInformation: *mut c_void,
+    TokenInformationLength: DWORD,
+    ReturnLength: *mut DWORD,
+) -> BOOL {
+    let tokens = ACCESS_TOKENS.lock();
+    let token = match tokens.get(&TokenHandle) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    match TokenInformationClass {
+        TokenElevation => {
+            let req_len = core::mem::size_of::<TOKEN_ELEVATION>() as DWORD;
+            if !ReturnLength.is_null() {
+                *ReturnLength = req_len;
+            }
+            if TokenInformation.is_null() || TokenInformationLength < req_len {
+                win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            let elev_ptr = TokenInformation as *mut TOKEN_ELEVATION;
+            (*elev_ptr).TokenIsElevated = if token.is_elevated { 1 } else { 0 };
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        }
+        TokenElevationType => {
+            let req_len = core::mem::size_of::<TOKEN_ELEVATION_TYPE>() as DWORD;
+            if !ReturnLength.is_null() {
+                *ReturnLength = req_len;
+            }
+            if TokenInformation.is_null() || TokenInformationLength < req_len {
+                win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            let type_ptr = TokenInformation as *mut TOKEN_ELEVATION_TYPE;
+            (*type_ptr).ElevationType = if token.is_elevated {
+                TokenElevationTypeFull
+            } else {
+                TokenElevationTypeLimited
+            };
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        }
+        TokenIntegrityLevel => {
+            let req_len = core::mem::size_of::<TOKEN_MANDATORY_LABEL>() as DWORD;
+            if !ReturnLength.is_null() {
+                *ReturnLength = req_len;
+            }
+            if TokenInformation.is_null() || TokenInformationLength < req_len {
+                win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            let label_ptr = TokenInformation as *mut TOKEN_MANDATORY_LABEL;
+            (*label_ptr).Label.Attributes = token.integrity_level;
+            (*label_ptr).Label.Sid = core::ptr::null_mut();
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        }
+        TokenPrivileges => {
+            let priv_count = token.privileges.len() as DWORD;
+            let req_len = 4 + priv_count * (core::mem::size_of::<LUID_AND_ATTRIBUTES>() as DWORD);
+            if !ReturnLength.is_null() {
+                *ReturnLength = req_len;
+            }
+            if TokenInformation.is_null() || TokenInformationLength < req_len {
+                win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            let count_ptr = TokenInformation as *mut DWORD;
+            *count_ptr = priv_count;
+            let array_ptr = (TokenInformation as usize + 4) as *mut LUID_AND_ATTRIBUTES;
+            let mut idx = 0;
+            for (&luid_val, &attrs) in &token.privileges {
+                let item_ptr = array_ptr.add(idx);
+                (*item_ptr).Luid = u64_to_luid(luid_val);
+                (*item_ptr).Attributes = attrs;
+                idx += 1;
+            }
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        }
+        _ => {
+            // Default success for generic queries with size
+            let req_len = 4;
+            if !ReturnLength.is_null() {
+                *ReturnLength = req_len;
+            }
+            if TokenInformation.is_null() || TokenInformationLength < req_len {
+                win32_set_last_error(ERROR_INSUFFICIENT_BUFFER);
+                return FALSE;
+            }
+            let out_ptr = TokenInformation as *mut DWORD;
+            *out_ptr = 1;
+            win32_set_last_error(ERROR_SUCCESS);
+            TRUE
+        }
+    }
+}
+
+/// Enables or disables privileges in the specified access token.
+pub unsafe extern "system" fn AdjustTokenPrivileges(
+    TokenHandle: HANDLE,
+    DisableAllPrivileges: BOOL,
+    NewState: *const TOKEN_PRIVILEGES,
+    BufferLength: DWORD,
+    PreviousState: *mut TOKEN_PRIVILEGES,
+    ReturnLength: *mut DWORD,
+) -> BOOL {
+    let mut tokens = ACCESS_TOKENS.lock();
+    let token = match tokens.get_mut(&TokenHandle) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if DisableAllPrivileges == TRUE {
+        for attrs in token.privileges.values_mut() {
+            *attrs &= !SE_PRIVILEGE_ENABLED;
+        }
+        win32_set_last_error(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    if NewState.is_null() {
+        win32_set_last_error(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    let priv_count = (*NewState).PrivilegeCount;
+    let array_ptr = &(*NewState).Privileges[0] as *const LUID_AND_ATTRIBUTES;
+    let mut all_assigned = true;
+
+    for i in 0..priv_count {
+        let la = *array_ptr.add(i as usize);
+        let key = luid_to_u64(la.Luid);
+        if let Some(existing_attrs) = token.privileges.get_mut(&key) {
+            if !PreviousState.is_null() && BufferLength >= core::mem::size_of::<TOKEN_PRIVILEGES>() as DWORD {
+                (*PreviousState).PrivilegeCount = 1;
+                (*PreviousState).Privileges[0] = LUID_AND_ATTRIBUTES {
+                    Luid: la.Luid,
+                    Attributes: *existing_attrs,
+                };
+            }
+            *existing_attrs = la.Attributes;
+        } else {
+            // New privilege being enabled on token
+            token.privileges.insert(key, la.Attributes);
+            all_assigned = false;
+        }
+    }
+
+    if !ReturnLength.is_null() {
+        *ReturnLength = core::mem::size_of::<TOKEN_PRIVILEGES>() as DWORD;
+    }
+
+    if all_assigned {
+        win32_set_last_error(ERROR_SUCCESS);
+    } else {
+        win32_set_last_error(ERROR_NOT_ALL_ASSIGNED);
+    }
+    TRUE
+}
+
+/// Duplicates an existing access token.
+pub unsafe extern "system" fn DuplicateTokenEx(
+    ExistingTokenHandle: HANDLE,
+    _DesiredAccess: ACCESS_MASK,
+    _TokenAttributes: *const c_void,
+    ImpersonationLevel: DWORD,
+    TokenTypeVal: DWORD,
+    DuplicateTokenHandle: *mut HANDLE,
+) -> BOOL {
+    if DuplicateTokenHandle.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let tokens = ACCESS_TOKENS.lock();
+    let existing = match tokens.get(&ExistingTokenHandle) {
+        Some(t) => t.clone(),
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+    drop(tokens);
+
+    let new_id = NEXT_TOKEN_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+    let mut new_token = existing;
+    new_token.id = new_id;
+    new_token.token_type = TokenTypeVal;
+    new_token.impersonation_level = ImpersonationLevel;
+
+    ACCESS_TOKENS.lock().insert(new_id, new_token);
+    *DuplicateTokenHandle = new_id;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
