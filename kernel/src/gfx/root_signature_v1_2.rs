@@ -730,7 +730,143 @@ impl RootSignature12Compiler {
         })
     }
 }
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Root Signature 1.2 & Local Shader Records.
 pub fn test_root_signature_v1_2_subsystem() -> bool {
+    // 1. Verify Root Signature 1.2 bindless direct indexing flags and compilation
+    let flags = D3D12_ROOT_SIGNATURE_FLAGS_V1_2::CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+        .union(D3D12_ROOT_SIGNATURE_FLAGS_V1_2::SAMPLER_HEAP_DIRECTLY_INDEXED);
+
+    if !flags.is_bindless_resources_enabled() || !flags.is_bindless_samplers_enabled() {
+        return false;
+    }
+
+    let mut desc = D3D12_ROOT_SIGNATURE_DESC2::new(flags);
+
+    // Param 0: 4 DWORD inline constants (push constants)
+    desc.add_parameter(D3D12_ROOT_PARAMETER1_2::constants(
+        super::root_signature::D3D12_SHADER_VISIBILITY::All,
+        0,
+        0,
+        4,
+    ));
+
+    // Param 1: Root CBV descriptor (2 DWORDs)
+    desc.add_parameter(D3D12_ROOT_PARAMETER1_2::cbv(
+        super::root_signature::D3D12_SHADER_VISIBILITY::All,
+        1,
+        0,
+        D3D12_ROOT_DESCRIPTOR_FLAGS_V1_2::DATA_STATIC,
+    ));
+
+    // Extended static sampler: Anisotropic x16 with border color
+    let sampler = D3D12_STATIC_SAMPLER_DESC1 {
+        filter: D3D12_FILTER::Anisotropic,
+        address_u: D3D12_TEXTURE_ADDRESS_MODE::Clamp,
+        address_v: D3D12_TEXTURE_ADDRESS_MODE::Clamp,
+        address_w: D3D12_TEXTURE_ADDRESS_MODE::Clamp,
+        mip_lod_bias_fixed: 0,
+        max_anisotropy: 16,
+        comparison_func: super::pso::D3D12_COMPARISON_FUNC::Always,
+        border_color: D3D12_STATIC_BORDER_COLOR::OpaqueBlack,
+        min_lod_fixed: 0,
+        max_lod_fixed: 16 << 8,
+        shader_register: 0,
+        register_space: 0,
+        shader_visibility: super::root_signature::D3D12_SHADER_VISIBILITY::Pixel,
+        flags: D3D12_STATIC_SAMPLER_FLAGS::NONE,
+    };
+    desc.add_static_sampler(sampler);
+
+    let compiled = match RootSignature12Compiler::compile(&desc) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if compiled.total_dwords != 6 || compiled.num_parameters() != 2 {
+        return false;
+    }
+    if compiled.get_parameter_offset(0) != Some(0) || compiled.get_parameter_offset(1) != Some(4) {
+        return false;
+    }
+    if !compiled.is_bindless_resources || !compiled.is_bindless_samplers {
+        return false;
+    }
+
+    // Verify invalid sampler rejection (anisotropy > 16)
+    let invalid_sampler = D3D12_STATIC_SAMPLER_DESC1 {
+        max_anisotropy: 32,
+        ..sampler
+    };
+    if invalid_sampler.validate().is_ok() {
+        return false;
+    }
+
+    // 2. Verify Local Root Signature Shader Record Table packing and alignment
+    let shader_id_raygen = [0x11u8; 32];
+    let shader_id_hit = [0x22u8; 32];
+
+    let mut raygen_args = [0u8; 16];
+    raygen_args[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+
+    let raygen_rec = match LocalRootRecordLayout::new(shader_id_raygen, &raygen_args) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    // 32 ID + 16 args = 48 bytes -> aligns to 64 bytes (multiple of 32)
+    if raygen_rec.packed_record_size() != 64 {
+        return false;
+    }
+
+    let mut sbt_buf = [0u8; 64];
+    if raygen_rec.serialize(&mut sbt_buf).is_err() {
+        return false;
+    }
+    if sbt_buf[0..32] != shader_id_raygen || sbt_buf[32..36] != 0xDEADBEEFu32.to_le_bytes() {
+        return false;
+    }
+
+    // Test LocalRootShaderTableBuilder
+    let mut sbt_builder = LocalRootShaderTableBuilder::new();
+    sbt_builder.add_raygen(raygen_rec);
+
+    let hit_args = [0xAAu8; 24]; // 32 + 24 = 56 -> aligns to 64
+    let hit_rec = LocalRootRecordLayout::new(shader_id_hit, &hit_args).unwrap();
+    sbt_builder.add_hit_group(hit_rec);
+
+    let sbt_layout = sbt_builder.build_layout();
+    if sbt_layout.raygen.record_count != 1 || sbt_layout.raygen.stride_in_bytes != 64 {
+        return false;
+    }
+    if sbt_layout.hit_group.record_count != 1 || sbt_layout.hit_group.stride_in_bytes != 64 {
+        return false;
+    }
+    // Each section base offset must be 64-byte aligned
+    if (sbt_layout.raygen.buffer_offset % 64) != 0 || (sbt_layout.hit_group.buffer_offset % 64) != 0 {
+        return false;
+    }
+
+    // 3. Verify Work Graph autonomous node record packing
+    let node_rec = WorkGraphNodeRecord::new(
+        101,
+        0, // Broadcasting
+        0x1,
+        &[1, 2, 3, 4],
+        &[0x55, 0x66],
+    );
+    // 8 header + 4 payload + 2 args = 14 bytes -> aligns to 32 bytes
+    let stride = node_rec.compute_record_stride();
+    if stride != 32 {
+        return false;
+    }
+
+    let mut node_buf = [0u8; 32];
+    if node_rec.pack_record(&mut node_buf).is_err() {
+        return false;
+    }
+    if &node_buf[0..4] != &101u32.to_le_bytes() || node_buf[4] != 0 || node_buf[5] != 0x1 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-ROOT-SIG-1-2-PASS] Direct3D 12 root signature 1.2 & local shader record table verified\r\n");
     true
 }
