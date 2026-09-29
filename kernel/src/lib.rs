@@ -472,6 +472,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 residency manager self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Root Signature Version 1.2 & Local Shader Records (TASK-KNT-219)
+    if !gfx::test_root_signature_v1_2_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 root signature 1.2 self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 variable rate shading engine self-test failed!\r\n");
