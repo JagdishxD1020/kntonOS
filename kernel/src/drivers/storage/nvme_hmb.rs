@@ -630,3 +630,23 @@ pub fn verify_nvme_hmb_manager() -> bool {
 
     true
 }
+
+
+/// Comprehensive verification self-test suite for Handheld Direct NVMe Host Memory Buffer (HMB) Dynamic Allocator & DirectStorage IO Ring.
+pub fn test_nvme_hmb_subsystem() -> bool {
+    crate::serial_write_str("[KNT-STORAGE] Testing Direct NVMe Host Memory Buffer & DirectStorage IO Ring...\r\n");
+    if !verify_nvme_hmb_negotiation() {
+        return false;
+    }
+    if !verify_directstorage_bypass_ring() {
+        return false;
+    }
+    if !verify_hmb_power_state_eviction() {
+        return false;
+    }
+    if !verify_nvme_hmb_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-STORAGE-HMB-PASS] Handheld direct NVMe host memory buffer and DirectStorage IO ring verified\r\n");
+    true
+}

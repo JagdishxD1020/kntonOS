@@ -552,6 +552,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] NVMe ZNS and copy offload self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Direct NVMe Host Memory Buffer (HMB) & DirectStorage IO Ring (TASK-KNT-220)
+    if !drivers::storage::test_nvme_hmb_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld direct NVMe HMB and DirectStorage IO ring self-test failed!\r\n");
+    }
+
     // Initialize Embedded Network Protocol Stack (ARP, IPv4, ICMP, UDP, TCP)
     net::init();
     if !net::test_network_stack() {
