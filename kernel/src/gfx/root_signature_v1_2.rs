@@ -612,6 +612,124 @@ impl WorkGraphNodeRecord {
         Ok(stride)
     }
 }
+
+// Maximum allowable root signature size in 32-bit DWORDs (256 bytes).
+pub const D3D12_ROOT_SIGNATURE_MAX_COST_DWORDS: u32 = 64;
+
+// Maximum allowable static samplers in a single root signature.
+pub const D3D12_MAX_STATIC_SAMPLERS: usize = 128;
+
+// Compiled hardware layout for a Direct3D 12 Root Signature Version 1.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledRootSignature12 {
+    pub version: D3D_ROOT_SIGNATURE_VERSION,
+    pub flags: D3D12_ROOT_SIGNATURE_FLAGS_V1_2,
+    pub total_dwords: u32,
+    pub parameter_offsets: Vec<u32>,
+    pub parameter_dwords: Vec<u32>,
+    pub compiled_samplers: Vec<CompiledHardwareSampler>,
+    pub is_bindless_resources: bool,
+    pub is_bindless_samplers: bool,
+    pub is_local: bool,
+}
+
+impl CompiledRootSignature12 {
+    // Returns the total number of parameter slots in the compiled signature.
+    #[inline(always)]
+    pub fn num_parameters(&self) -> usize {
+        self.parameter_offsets.len()
+    }
+
+    // Returns the root DWORD offset for the given parameter slot.
+    #[inline(always)]
+    pub fn get_parameter_offset(&self, slot: usize) -> Option<u32> {
+        self.parameter_offsets.get(slot).copied()
+    }
+
+    // Returns the DWORD footprint for the given parameter slot.
+    #[inline(always)]
+    pub fn get_parameter_dwords(&self, slot: usize) -> Option<u32> {
+        self.parameter_dwords.get(slot).copied()
+    }
+}
+
+// Compiler engine converting Root Signature 1.2 descriptors to hardware execution states.
+pub struct RootSignature12Compiler;
+
+impl RootSignature12Compiler {
+    // Compiles and validates Root Signature 1.2 descriptor against Agility SDK rules.
+    pub fn compile(desc: &D3D12_ROOT_SIGNATURE_DESC2) -> Result<CompiledRootSignature12, &'static str> {
+        if desc.static_samplers.len() > D3D12_MAX_STATIC_SAMPLERS {
+            return Err("Static samplers count exceeds hardware maximum 128");
+        }
+
+        let mut compiled_samplers = Vec::with_capacity(desc.static_samplers.len());
+        for sampler in &desc.static_samplers {
+            sampler.validate()?;
+            compiled_samplers.push(sampler.compile_hardware_descriptor());
+        }
+
+        let mut total_dwords = 0u32;
+        let mut parameter_offsets = Vec::with_capacity(desc.parameters.len());
+        let mut parameter_dwords = Vec::with_capacity(desc.parameters.len());
+
+        for param in &desc.parameters {
+            parameter_offsets.push(total_dwords);
+
+            let dwords = match &param.payload {
+                RootParameter12Payload::DescriptorTable(table) => {
+                    for range in &table.descriptor_ranges {
+                        if range.num_descriptors == 0 {
+                            return Err("Descriptor range cannot contain 0 descriptors");
+                        }
+                    }
+                    // Descriptor table handle occupies 1 DWORD (32-bit offset)
+                    1
+                }
+                RootParameter12Payload::Constants32Bit(c) => {
+                    if c.num_32bit_values == 0 {
+                        return Err("Root constants count must be greater than 0");
+                    }
+                    c.num_32bit_values
+                }
+                RootParameter12Payload::Cbv(_)
+                | RootParameter12Payload::Srv(_)
+                | RootParameter12Payload::Uav(_) => {
+                    // Direct 64-bit GPU virtual address occupies 2 DWORDs
+                    2
+                }
+            };
+
+            parameter_dwords.push(dwords);
+            total_dwords = total_dwords.saturating_add(dwords);
+
+            if total_dwords > D3D12_ROOT_SIGNATURE_MAX_COST_DWORDS {
+                return Err("Root signature exceeds maximum 64 DWORD hardware budget");
+            }
+        }
+
+        let is_bindless_resources = desc.flags.is_bindless_resources_enabled();
+        let is_bindless_samplers = desc.flags.is_bindless_samplers_enabled();
+        let is_local = desc.flags.is_local_root_signature();
+
+        // Agility SDK validation: Local root signatures cannot define static samplers
+        if is_local && !desc.static_samplers.is_empty() {
+            return Err("Local root signatures cannot contain static samplers");
+        }
+
+        Ok(CompiledRootSignature12 {
+            version: D3D_ROOT_SIGNATURE_VERSION::Version_1_2,
+            flags: desc.flags,
+            total_dwords,
+            parameter_offsets,
+            parameter_dwords,
+            compiled_samplers,
+            is_bindless_resources,
+            is_bindless_samplers,
+            is_local,
+        })
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_root_signature_v1_2_subsystem() -> bool {
     true
