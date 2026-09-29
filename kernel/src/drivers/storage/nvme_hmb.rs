@@ -515,3 +515,118 @@ pub fn verify_hmb_power_state_eviction() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Integrated NVMe HMB Allocator & DirectStorage IO Coordinator
+// ============================================================================
+
+/// Integrated Handheld Direct NVMe Host Memory Buffer & DirectStorage IO Coordinator.
+#[derive(Debug, Clone)]
+pub struct NvmeHmbManager {
+    pub allocator: HmbAllocator,
+    pub io_ring: DirectStorageBypassRing,
+    pub power_governor: HmbPowerGovernor,
+}
+
+impl NvmeHmbManager {
+    pub const fn new() -> Self {
+        Self {
+            allocator: HmbAllocator::new(64 * 1024 * 1024, 4 * 1024 * 1024),
+            io_ring: DirectStorageBypassRing::new(),
+            power_governor: HmbPowerGovernor::new(),
+        }
+    }
+
+    /// Initializes HMB allocation and configures FTL host cache.
+    pub fn initialize(&mut self, requested_bytes: u64) -> Result<HmbFeatureCommand, &'static str> {
+        self.allocator.allocate_hmb(requested_bytes)
+    }
+
+    /// Queues a zero-copy DirectStorage asset read directly into GPU VRAM/GTT memory.
+    pub fn submit_asset_stream(
+        &mut self,
+        nsid: u32,
+        start_lba: u64,
+        sector_count: u32,
+        gpu_staging_phys_addr: u64,
+        asset_id: u32,
+    ) -> Result<u16, &'static str> {
+        if self.power_governor.power_state != HandheldStoragePowerState::AwakeActive {
+            return Err("Storage device suspended");
+        }
+        self.io_ring.submit_gpu_read(nsid, start_lba, sector_count, gpu_staging_phys_addr, asset_id)
+    }
+
+    /// Handles NVMe DMA completion for an asset stream.
+    pub fn process_completion(&mut self, command_id: u16, asset_id: u32) -> Result<(), &'static str> {
+        self.io_ring.complete_command(command_id, 0, asset_id)
+    }
+
+    /// Executes safe instant suspend sequence.
+    pub fn suspend(&mut self) -> Result<HmbFeatureCommand, &'static str> {
+        let cmd = self.power_governor.prepare_for_suspend(&mut self.allocator)?;
+        self.power_governor.complete_suspend()?;
+        Ok(cmd)
+    }
+
+    /// Restores HMB upon wake from suspend.
+    pub fn resume(&mut self, requested_bytes: u64) -> Result<HmbFeatureCommand, &'static str> {
+        self.power_governor.resume_from_suspend(&mut self.allocator, requested_bytes)
+    }
+}
+
+/// Unit test verifying integrated NVMe HMB allocator and DirectStorage coordinator.
+pub fn verify_nvme_hmb_manager() -> bool {
+    let mut mgr = NvmeHmbManager::new();
+
+    // 1. Initialize HMB with 64 MiB
+    let init_cmd = match mgr.initialize(64 * 1024 * 1024) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if !init_cmd.enable_hmb || mgr.allocator.state != HmbState::Active {
+        return false;
+    }
+
+    // 2. Stream game texture asset (ID 777)
+    let cid = match mgr.submit_asset_stream(1, 500_000, 4096, 0x0000_3800_2000_0000, 777) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    if cid != 1 || mgr.io_ring.sq_count != 1 {
+        return false;
+    }
+
+    // 3. Complete transfer and poll completion
+    if mgr.process_completion(cid, 777).is_err() {
+        return false;
+    }
+    let cpl = match mgr.io_ring.poll_completion() {
+        Some(c) => c,
+        None => return false,
+    };
+    if cpl.command_id != 1 || cpl.asset_id != 777 {
+        return false;
+    }
+
+    // 4. Suspend system: HMB evicted
+    if mgr.suspend().is_err() || mgr.allocator.state != HmbState::Disabled {
+        return false;
+    }
+    // Submitting reads while suspended must fail
+    if mgr.submit_asset_stream(1, 500_000, 4096, 0x0000_3800_2000_0000, 778).is_ok() {
+        return false;
+    }
+
+    // 5. Resume system: HMB restored
+    let res_cmd = match mgr.resume(64 * 1024 * 1024) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if !res_cmd.enable_hmb || mgr.allocator.state != HmbState::Active {
+        return false;
+    }
+
+    true
+}
