@@ -405,6 +405,213 @@ impl D3D12_ROOT_SIGNATURE_DESC2 {
         self.static_samplers.push(sampler);
     }
 }
+
+// Import raytracing alignments from dispatch_rays module to avoid ambiguous glob re-exports.
+use super::dispatch_rays::{
+    D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT,
+    D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT,
+    D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES,
+};
+
+// Maximum allowed byte size of local root arguments in a shader record (4 KiB).
+pub const D3D12_MAX_LOCAL_ROOT_ARGUMENTS_SIZE_BYTES: usize = 4096;
+
+// Local root record packing and layout for raytracing shader binding tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRootRecordLayout {
+    pub shader_id: [u8; D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES],
+    pub local_root_arguments: Vec<u8>,
+}
+
+impl LocalRootRecordLayout {
+    // Creates a new local root shader record.
+    pub fn new(shader_id: [u8; 32], local_args: &[u8]) -> Result<Self, &'static str> {
+        if local_args.len() > D3D12_MAX_LOCAL_ROOT_ARGUMENTS_SIZE_BYTES {
+            return Err("Local root arguments exceed maximum 4096 bytes");
+        }
+        Ok(Self {
+            shader_id,
+            local_root_arguments: local_args.to_vec(),
+        })
+    }
+
+    // Calculates record byte size aligned to 32 bytes.
+    #[inline(always)]
+    pub fn packed_record_size(&self) -> usize {
+        let raw = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES + self.local_root_arguments.len();
+        (raw + ((D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT as usize) - 1))
+            & !((D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT as usize) - 1)
+    }
+
+    // Serializes shader record into target memory buffer.
+    pub fn serialize(&self, buffer: &mut [u8]) -> Result<usize, &'static str> {
+        let stride = self.packed_record_size();
+        if buffer.len() < stride {
+            return Err("Destination buffer too small for packed shader record");
+        }
+        buffer[..32].copy_from_slice(&self.shader_id);
+        buffer[32..32 + self.local_root_arguments.len()]
+            .copy_from_slice(&self.local_root_arguments);
+        // Zero pad remainder
+        for b in &mut buffer[32 + self.local_root_arguments.len()..stride] {
+            *b = 0;
+        }
+        Ok(stride)
+    }
+}
+
+// Section layout description for a shader binding table range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShaderTableSectionInfo {
+    pub buffer_offset: u64,
+    pub size_in_bytes: u64,
+    pub stride_in_bytes: u64,
+    pub record_count: usize,
+}
+
+// Compiled layout of a multi-section shader binding table.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShaderTableLayout {
+    pub raygen: ShaderTableSectionInfo,
+    pub miss: ShaderTableSectionInfo,
+    pub hit_group: ShaderTableSectionInfo,
+    pub callable: ShaderTableSectionInfo,
+    pub total_sbt_bytes: u64,
+}
+
+// Helper builder to compile and pack shader binding table sections.
+#[derive(Debug, Clone, Default)]
+pub struct LocalRootShaderTableBuilder {
+    raygen_records: Vec<LocalRootRecordLayout>,
+    miss_records: Vec<LocalRootRecordLayout>,
+    hit_group_records: Vec<LocalRootRecordLayout>,
+    callable_records: Vec<LocalRootRecordLayout>,
+}
+
+impl LocalRootShaderTableBuilder {
+    // Creates a new empty shader table builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Adds a RayGen shader record.
+    pub fn add_raygen(&mut self, record: LocalRootRecordLayout) {
+        self.raygen_records.push(record);
+    }
+
+    // Adds a Miss shader record.
+    pub fn add_miss(&mut self, record: LocalRootRecordLayout) {
+        self.miss_records.push(record);
+    }
+
+    // Adds a HitGroup shader record.
+    pub fn add_hit_group(&mut self, record: LocalRootRecordLayout) {
+        self.hit_group_records.push(record);
+    }
+
+    // Adds a Callable shader record.
+    pub fn add_callable(&mut self, record: LocalRootRecordLayout) {
+        self.callable_records.push(record);
+    }
+
+    // Calculates section stride and total size.
+    fn calculate_section_info(records: &[LocalRootRecordLayout], current_offset: &mut u64) -> ShaderTableSectionInfo {
+        if records.is_empty() {
+            return ShaderTableSectionInfo::default();
+        }
+
+        // Section base must align to 64 bytes
+        *current_offset = (*current_offset + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1) & !(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1);
+        let base_offset = *current_offset;
+
+        // Max record stride in section, aligned to 32 bytes
+        let mut max_stride = 32usize;
+        for r in records {
+            max_stride = max_stride.max(r.packed_record_size());
+        }
+
+        let section_size = (max_stride * records.len()) as u64;
+        *current_offset = current_offset.saturating_add(section_size);
+
+        ShaderTableSectionInfo {
+            buffer_offset: base_offset,
+            size_in_bytes: section_size,
+            stride_in_bytes: max_stride as u64,
+            record_count: records.len(),
+        }
+    }
+
+    // Compiles table layout calculating offsets and strides.
+    pub fn build_layout(&self) -> ShaderTableLayout {
+        let mut offset = 0u64;
+        let raygen = Self::calculate_section_info(&self.raygen_records, &mut offset);
+        let miss = Self::calculate_section_info(&self.miss_records, &mut offset);
+        let hit_group = Self::calculate_section_info(&self.hit_group_records, &mut offset);
+        let callable = Self::calculate_section_info(&self.callable_records, &mut offset);
+
+        ShaderTableLayout {
+            raygen,
+            miss,
+            hit_group,
+            callable,
+            total_sbt_bytes: (offset + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1) & !(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1),
+        }
+    }
+}
+
+// Work graph autonomous node record packing and offset descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkGraphNodeRecord {
+    pub node_id: u32,
+    pub node_type: u8,
+    pub flags: u8,
+    pub payload: Vec<u8>,
+    pub local_root_arguments: Vec<u8>,
+}
+
+impl WorkGraphNodeRecord {
+    // Creates a new work graph node record.
+    pub fn new(node_id: u32, node_type: u8, flags: u8, payload: &[u8], local_args: &[u8]) -> Self {
+        Self {
+            node_id,
+            node_type,
+            flags,
+            payload: payload.to_vec(),
+            local_root_arguments: local_args.to_vec(),
+        }
+    }
+
+    // Calculates aligned record stride (32-byte alignment).
+    #[inline(always)]
+    pub fn compute_record_stride(&self) -> usize {
+        let raw = 8 + self.payload.len() + self.local_root_arguments.len();
+        (raw + 31) & !31
+    }
+
+    // Packs node record into buffer.
+    pub fn pack_record(&self, out: &mut [u8]) -> Result<usize, &'static str> {
+        let stride = self.compute_record_stride();
+        if out.len() < stride {
+            return Err("Buffer too small for work graph node record");
+        }
+        out[0..4].copy_from_slice(&self.node_id.to_le_bytes());
+        out[4] = self.node_type;
+        out[5] = self.flags;
+        out[6..8].copy_from_slice(&(self.payload.len() as u16).to_le_bytes());
+
+        let payload_end = 8 + self.payload.len();
+        out[8..payload_end].copy_from_slice(&self.payload);
+
+        let args_end = payload_end + self.local_root_arguments.len();
+        out[payload_end..args_end].copy_from_slice(&self.local_root_arguments);
+
+        // Zero out padding
+        for b in &mut out[args_end..stride] {
+            *b = 0;
+        }
+        Ok(stride)
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_root_signature_v1_2_subsystem() -> bool {
     true
