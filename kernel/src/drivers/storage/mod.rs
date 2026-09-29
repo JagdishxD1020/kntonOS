@@ -8,8 +8,10 @@ pub mod nvme_zns;
 pub mod copy_offload;
 pub mod sdcard;
 pub mod sdhci;
+pub mod nvme_hmb;
 
 pub use uring::*;
+pub use nvme_hmb::*;
 pub use direct_storage::*;
 pub use nvme_zns::*;
 pub use copy_offload::*;
