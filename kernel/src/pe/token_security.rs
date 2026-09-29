@@ -815,3 +815,73 @@ pub unsafe extern "system" fn DuplicateTokenEx(
     win32_set_last_error(ERROR_SUCCESS);
     TRUE
 }
+
+pub const SE_DEBUG_NAME: &str = "SeDebugPrivilege";
+pub const SE_LOCK_MEMORY_NAME: &str = "SeLockMemoryPrivilege";
+pub const SE_CHANGE_NOTIFY_NAME: &str = "SeChangeNotifyPrivilege";
+pub const SE_INCREASE_QUOTA_NAME: &str = "SeIncreaseQuotaPrivilege";
+pub const SE_ASSIGNPRIMARYTOKEN_NAME: &str = "SeAssignPrimaryTokenPrivilege";
+
+/// Maps a well-known privilege name to its corresponding 64-bit LUID identifier.
+pub fn win32_lookup_privilege_value(name: &str) -> Option<LUID> {
+    match name {
+        SE_DEBUG_NAME => Some(u64_to_luid(SE_DEBUG_PRIVILEGE_LUID)),
+        SE_LOCK_MEMORY_NAME => Some(u64_to_luid(SE_LOCK_MEMORY_PRIVILEGE_LUID)),
+        SE_CHANGE_NOTIFY_NAME => Some(u64_to_luid(SE_CHANGE_NOTIFY_PRIVILEGE_LUID)),
+        _ => None,
+    }
+}
+
+/// Verifies whether an access token possesses an actively enabled privilege.
+pub fn win32_check_token_privilege(token_handle: HANDLE, privilege_luid: u64) -> bool {
+    let tokens = ACCESS_TOKENS.lock();
+    if let Some(token) = tokens.get(&token_handle) {
+        if let Some(&attrs) = token.privileges.get(&privilege_luid) {
+            return (attrs & SE_PRIVILEGE_ENABLED) != 0;
+        }
+    }
+    false
+}
+
+/// Gates cross-process inspection based on anti-cheat integrity levels and SeDebugPrivilege.
+pub fn win32_verify_anti_cheat_cross_process_access(
+    caller_token: HANDLE,
+    target_token: HANDLE,
+    desired_access: ACCESS_MASK,
+) -> bool {
+    let tokens = ACCESS_TOKENS.lock();
+    let caller = match tokens.get(&caller_token) {
+        Some(t) => t,
+        None => return false,
+    };
+    let target = match tokens.get(&target_token) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Caller integrity level must be greater than or equal to target integrity level
+    if caller.integrity_level < target.integrity_level {
+        return false;
+    }
+
+    // High or System level callers with SeDebugPrivilege can access lower or equal targets
+    if caller.integrity_level >= SECURITY_MANDATORY_HIGH_RID {
+        if let Some(&attrs) = caller.privileges.get(&SE_DEBUG_PRIVILEGE_LUID) {
+            if (attrs & SE_PRIVILEGE_ENABLED) != 0 {
+                return true;
+            }
+        }
+    }
+
+    // Otherwise apply default standard access masking
+    if (desired_access & (GENERIC_WRITE | WRITE_DAC | WRITE_OWNER)) != 0 {
+        caller.integrity_level > target.integrity_level
+    } else {
+        true
+    }
+}
+
+/// Gates large page and locked physical memory allocation for game performance runtimes.
+pub fn win32_verify_lock_memory_privilege(caller_token: HANDLE) -> bool {
+    win32_check_token_privilege(caller_token, SE_LOCK_MEMORY_PRIVILEGE_LUID)
+}
