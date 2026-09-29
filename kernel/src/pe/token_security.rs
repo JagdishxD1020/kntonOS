@@ -885,3 +885,121 @@ pub fn win32_verify_anti_cheat_cross_process_access(
 pub fn win32_verify_lock_memory_privilege(caller_token: HANDLE) -> bool {
     win32_check_token_privilege(caller_token, SE_LOCK_MEMORY_PRIVILEGE_LUID)
 }
+
+/// Self-test suite verifying Win32 SIDs, DACLs, access tokens, and anti-cheat privilege gating.
+pub fn test_win32_token_security_subsystem() -> bool {
+    // 1. Verify SID construction and string conversion
+    let admin_sid = SID::administrators_sid();
+    let str_sid = admin_sid.to_string_sid();
+    if str_sid.as_str() != "S-1-5-32-544" {
+        return false;
+    }
+
+    let user_sid = SID::users_sid();
+    let world_sid = SID::world_sid();
+
+    // 2. Verify Security Descriptor DACL access evaluation
+    let mut sd = SecurityDescriptor::new();
+    let mut dacl = ACL::new();
+    dacl.add_allowed_ace(READ_CONTROL | SYNCHRONIZE, user_sid.clone());
+    dacl.add_allowed_ace(GENERIC_ALL, admin_sid.clone());
+    sd.set_dacl(Some(dacl), false);
+
+    // User should have READ_CONTROL but not WRITE_DAC
+    let user_sids = alloc::vec![user_sid.clone(), world_sid.clone()];
+    if !sd.evaluate_access(&user_sids, READ_CONTROL) {
+        return false;
+    }
+    if sd.evaluate_access(&user_sids, WRITE_DAC) {
+        return false;
+    }
+
+    // Admin should have GENERIC_ALL
+    let admin_sids = alloc::vec![admin_sid.clone(), user_sid.clone()];
+    if !sd.evaluate_access(&admin_sids, GENERIC_ALL) {
+        return false;
+    }
+
+    // 3. Verify OpenProcessToken and GetTokenInformation
+    let mut htoken: HANDLE = 0;
+    unsafe {
+        if OpenProcessToken(0, TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &mut htoken) != TRUE {
+            return false;
+        }
+
+        let mut elev: TOKEN_ELEVATION = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut ret_len: DWORD = 0;
+        if GetTokenInformation(
+            htoken,
+            TokenElevation,
+            &mut elev as *mut _ as *mut c_void,
+            core::mem::size_of::<TOKEN_ELEVATION>() as DWORD,
+            &mut ret_len,
+        ) != TRUE {
+            return false;
+        }
+        if elev.TokenIsElevated != 1 {
+            return false;
+        }
+
+        // 4. Verify AdjustTokenPrivileges enabling SeDebugPrivilege
+        let tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: u64_to_luid(SE_DEBUG_PRIVILEGE_LUID),
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        if AdjustTokenPrivileges(
+            htoken,
+            FALSE,
+            &tp,
+            core::mem::size_of::<TOKEN_PRIVILEGES>() as DWORD,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) != TRUE {
+            return false;
+        }
+
+        if !win32_check_token_privilege(htoken, SE_DEBUG_PRIVILEGE_LUID) {
+            return false;
+        }
+
+        // 5. Verify DuplicateTokenEx
+        let mut hdup: HANDLE = 0;
+        if DuplicateTokenEx(
+            htoken,
+            TOKEN_ALL_ACCESS,
+            core::ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut hdup,
+        ) != TRUE {
+            return false;
+        }
+        if hdup == 0 {
+            return false;
+        }
+
+        // 6. Verify Anti-Cheat Integrity Level gating
+        let medium_id = NEXT_TOKEN_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+        let medium_token = AccessTokenInner::new_default_user(medium_id);
+        ACCESS_TOKENS.lock().insert(medium_id, medium_token);
+
+        // Medium token cannot access High token with write access
+        if win32_verify_anti_cheat_cross_process_access(medium_id, htoken, GENERIC_WRITE) {
+            return false;
+        }
+
+        // High token with SeDebugPrivilege CAN access Medium token
+        if !win32_verify_anti_cheat_cross_process_access(htoken, medium_id, GENERIC_WRITE) {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-SECURITY-PASS] Win32 access tokens and security descriptor subsystem verified\r\n",
+    );
+    true
+}
