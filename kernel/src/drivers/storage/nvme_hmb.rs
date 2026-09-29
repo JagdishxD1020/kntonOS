@@ -192,3 +192,192 @@ pub fn verify_nvme_hmb_negotiation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// DirectStorage NVMe Lock-Free Submission & Completion Bypass Rings
+// ============================================================================
+
+/// Maximum capacity of DirectStorage lock-free bypass submission/completion queues.
+pub const DIRECT_STORAGE_RING_SIZE: usize = 64;
+
+/// DirectStorage NVMe read command targeting GPU staging physical memory directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectStorageBypassCommand {
+    pub command_id: u16,
+    pub nsid: u32,
+    pub start_lba: u64,
+    pub sector_count: u32,
+    pub gpu_staging_phys_addr: u64,
+    pub asset_id: u32,
+}
+
+impl DirectStorageBypassCommand {
+    pub const fn empty() -> Self {
+        Self {
+            command_id: 0,
+            nsid: 0,
+            start_lba: 0,
+            sector_count: 0,
+            gpu_staging_phys_addr: 0,
+            asset_id: 0,
+        }
+    }
+}
+
+/// Completion event from NVMe DMA transfer directly into GPU staging buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectStorageBypassCompletion {
+    pub command_id: u16,
+    pub sq_head: u16,
+    pub status: u16,
+    pub asset_id: u32,
+}
+
+/// Lock-free high-throughput submission and completion rings (SQ/CQ).
+#[derive(Debug, Clone)]
+pub struct DirectStorageBypassRing {
+    pub sq: [DirectStorageBypassCommand; DIRECT_STORAGE_RING_SIZE],
+    pub sq_head: u16,
+    pub sq_tail: u16,
+    pub sq_count: usize,
+    pub cq: [DirectStorageBypassCompletion; DIRECT_STORAGE_RING_SIZE],
+    pub cq_head: u16,
+    pub cq_tail: u16,
+    pub cq_count: usize,
+    pub next_command_id: u16,
+    pub total_submitted: u64,
+    pub total_completed: u64,
+}
+
+impl DirectStorageBypassRing {
+    pub const fn new() -> Self {
+        Self {
+            sq: [DirectStorageBypassCommand::empty(); DIRECT_STORAGE_RING_SIZE],
+            sq_head: 0,
+            sq_tail: 0,
+            sq_count: 0,
+            cq: [DirectStorageBypassCompletion { command_id: 0, sq_head: 0, status: 0, asset_id: 0 }; DIRECT_STORAGE_RING_SIZE],
+            cq_head: 0,
+            cq_tail: 0,
+            cq_count: 0,
+            next_command_id: 1,
+            total_submitted: 0,
+            total_completed: 0,
+        }
+    }
+
+    /// Submits a raw compressed game asset read bypassing VFS syscall overhead.
+    pub fn submit_gpu_read(
+        &mut self,
+        nsid: u32,
+        start_lba: u64,
+        sector_count: u32,
+        gpu_staging_phys_addr: u64,
+        asset_id: u32,
+    ) -> Result<u16, &'static str> {
+        if self.sq_count >= DIRECT_STORAGE_RING_SIZE {
+            return Err("Submission queue full");
+        }
+
+        let cid = self.next_command_id;
+        self.next_command_id = if self.next_command_id == u16::MAX { 1 } else { self.next_command_id + 1 };
+
+        let cmd = DirectStorageBypassCommand {
+            command_id: cid,
+            nsid,
+            start_lba,
+            sector_count,
+            gpu_staging_phys_addr,
+            asset_id,
+        };
+
+        self.sq[self.sq_tail as usize] = cmd;
+        self.sq_tail = (self.sq_tail + 1) % (DIRECT_STORAGE_RING_SIZE as u16);
+        self.sq_count += 1;
+        self.total_submitted += 1;
+
+        Ok(cid)
+    }
+
+    /// Records hardware completion from NVMe DMA controller.
+    pub fn complete_command(&mut self, command_id: u16, status: u16, asset_id: u32) -> Result<(), &'static str> {
+        if self.cq_count >= DIRECT_STORAGE_RING_SIZE {
+            return Err("Completion queue full");
+        }
+
+        let cpl = DirectStorageBypassCompletion {
+            command_id,
+            sq_head: self.sq_head,
+            status,
+            asset_id,
+        };
+
+        self.cq[self.cq_tail as usize] = cpl;
+        self.cq_tail = (self.cq_tail + 1) % (DIRECT_STORAGE_RING_SIZE as u16);
+        self.cq_count += 1;
+        self.total_completed += 1;
+
+        // Advance SQ head if matching front command
+        if self.sq_count > 0 && self.sq[self.sq_head as usize].command_id == command_id {
+            self.sq_head = (self.sq_head + 1) % (DIRECT_STORAGE_RING_SIZE as u16);
+            self.sq_count -= 1;
+        }
+
+        Ok(())
+    }
+
+    /// Polls next completion event without blocking.
+    pub fn poll_completion(&mut self) -> Option<DirectStorageBypassCompletion> {
+        if self.cq_count == 0 {
+            return None;
+        }
+
+        let cpl = self.cq[self.cq_head as usize];
+        self.cq_head = (self.cq_head + 1) % (DIRECT_STORAGE_RING_SIZE as u16);
+        self.cq_count -= 1;
+        Some(cpl)
+    }
+}
+
+/// Unit test verifying DirectStorage NVMe lock-free bypass ring.
+pub fn verify_directstorage_bypass_ring() -> bool {
+    let mut ring = DirectStorageBypassRing::new();
+
+    // 1. Submit 3 GPU-direct asset reads (e.g. 4K texture, mesh, audio bank)
+    let cid1 = ring.submit_gpu_read(1, 100_000, 2048, 0x0000_3800_1000_0000, 501);
+    let cid2 = ring.submit_gpu_read(1, 102_048, 1024, 0x0000_3800_1040_0000, 502);
+    let cid3 = ring.submit_gpu_read(1, 103_072, 4096, 0x0000_3800_1060_0000, 503);
+
+    if cid1 != Ok(1) || cid2 != Ok(2) || cid3 != Ok(3) {
+        return false;
+    }
+    if ring.sq_count != 3 || ring.total_submitted != 3 {
+        return false;
+    }
+
+    // 2. Complete first two commands
+    if ring.complete_command(1, 0, 501).is_err() {
+        return false;
+    }
+    if ring.complete_command(2, 0, 502).is_err() {
+        return false;
+    }
+
+    // 3. Poll completions
+    let cpl1 = match ring.poll_completion() { Some(c) => c, None => return false };
+    let cpl2 = match ring.poll_completion() { Some(c) => c, None => return false };
+
+    if cpl1.command_id != 1 || cpl1.asset_id != 501 || cpl1.status != 0 {
+        return false;
+    }
+    if cpl2.command_id != 2 || cpl2.asset_id != 502 || cpl2.status != 0 {
+        return false;
+    }
+
+    if ring.cq_count != 0 || ring.total_completed != 2 {
+        return false;
+    }
+
+    true
+}
