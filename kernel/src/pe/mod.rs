@@ -26,6 +26,7 @@ pub mod iocp;
 pub mod fiber;
 pub mod debug_api;
 pub mod timer_queue;
+pub mod token_security;
 
 pub use header::*;
 pub use ntdll::*;
@@ -51,6 +52,7 @@ pub use iocp::*;
 pub use fiber::*;
 pub use debug_api::*;
 pub use timer_queue::*;
+pub use token_security::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
