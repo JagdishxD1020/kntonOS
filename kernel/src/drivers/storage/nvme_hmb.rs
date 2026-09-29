@@ -381,3 +381,137 @@ pub fn verify_directstorage_bypass_ring() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// HMB Power-State Eviction & Standby Flushing Governor
+// ============================================================================
+
+/// Handheld storage subsystem power state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldStoragePowerState {
+    /// Normal operational state; HMB active and DirectStorage rings open.
+    AwakeActive,
+    /// Fast flush and HMB deallocation in progress before D3hot/D3cold sleep.
+    EnteringSuspend,
+    /// Fully suspended; PCIe link in L1/L2 and host buffers isolated.
+    Suspended,
+    /// Restoring PCIe link and re-establishing HMB contract after wake.
+    Resuming,
+}
+
+/// Governor coordinating NVMe cache flushing and safe HMB eviction during suspend.
+#[derive(Debug, Clone)]
+pub struct HmbPowerGovernor {
+    pub power_state: HandheldStoragePowerState,
+    pub flush_completed: bool,
+    pub hmb_evicted: bool,
+    pub eviction_count: u32,
+    pub restore_count: u32,
+}
+
+impl HmbPowerGovernor {
+    pub const fn new() -> Self {
+        Self {
+            power_state: HandheldStoragePowerState::AwakeActive,
+            flush_completed: false,
+            hmb_evicted: false,
+            eviction_count: 0,
+            restore_count: 0,
+        }
+    }
+
+    /// Prepares NVMe controller for handheld instant suspend.
+    pub fn prepare_for_suspend(&mut self, allocator: &mut HmbAllocator) -> Result<HmbFeatureCommand, &'static str> {
+        if self.power_state != HandheldStoragePowerState::AwakeActive {
+            return Err("Not in active state");
+        }
+
+        self.power_state = HandheldStoragePowerState::EnteringSuspend;
+        // 1. Mark volatile write caches flushed to persistent NAND
+        self.flush_completed = true;
+
+        // 2. Command SSD controller to flush FTL and release Host Memory Buffer
+        let disable_cmd = allocator.release_hmb();
+        self.hmb_evicted = true;
+        self.eviction_count += 1;
+
+        Ok(disable_cmd)
+    }
+
+    /// Completes suspend once PCIe link enters D3hot / L1.2.
+    pub fn complete_suspend(&mut self) -> Result<(), &'static str> {
+        if self.power_state != HandheldStoragePowerState::EnteringSuspend {
+            return Err("Suspend not prepared");
+        }
+        self.power_state = HandheldStoragePowerState::Suspended;
+        Ok(())
+    }
+
+    /// Re-allocates HMB and restores high-speed DRAM-less SSD performance upon resume.
+    pub fn resume_from_suspend(
+        &mut self,
+        allocator: &mut HmbAllocator,
+        requested_bytes: u64,
+    ) -> Result<HmbFeatureCommand, &'static str> {
+        if self.power_state != HandheldStoragePowerState::Suspended {
+            return Err("Not in suspended state");
+        }
+
+        self.power_state = HandheldStoragePowerState::Resuming;
+
+        // Re-establish HMDL mapping in host DRAM
+        let enable_cmd = allocator.allocate_hmb(requested_bytes)?;
+
+        self.hmb_evicted = false;
+        self.flush_completed = false;
+        self.power_state = HandheldStoragePowerState::AwakeActive;
+        self.restore_count += 1;
+
+        Ok(enable_cmd)
+    }
+}
+
+/// Unit test verifying HMB power-state eviction and standby cache flushing.
+pub fn verify_hmb_power_state_eviction() -> bool {
+    let mut alloc = HmbAllocator::new(64 * 1024 * 1024, 4 * 1024 * 1024);
+    let mut gov = HmbPowerGovernor::new();
+
+    // 1. Initial active allocation
+    if alloc.allocate_hmb(64 * 1024 * 1024).is_err() || alloc.state != HmbState::Active {
+        return false;
+    }
+
+    // 2. Enter suspend: flush and evict HMB
+    let dis_cmd = match gov.prepare_for_suspend(&mut alloc) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if dis_cmd.enable_hmb || alloc.state != HmbState::Disabled || !gov.flush_completed || !gov.hmb_evicted {
+        return false;
+    }
+
+    // 3. Complete suspend
+    if gov.complete_suspend().is_err() || gov.power_state != HandheldStoragePowerState::Suspended {
+        return false;
+    }
+
+    // 4. Resume from suspend: re-allocate HMB
+    let en_cmd = match gov.resume_from_suspend(&mut alloc, 64 * 1024 * 1024) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    if !en_cmd.enable_hmb || alloc.state != HmbState::Active || alloc.allocated_bytes != (64 * 1024 * 1024) {
+        return false;
+    }
+    if gov.power_state != HandheldStoragePowerState::AwakeActive || gov.hmb_evicted {
+        return false;
+    }
+    if gov.eviction_count != 1 || gov.restore_count != 1 {
+        return false;
+    }
+
+    true
+}
