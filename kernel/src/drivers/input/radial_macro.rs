@@ -648,19 +648,23 @@ impl RadialMacroManager {
         }
 
         // 2. Evaluate macro triggers if radial menu is not holding the chord
+        let mut macro_trigger_consumed = 0u32;
         if !chord_pressed {
-            self.sequencer.evaluate_triggers(raw_buttons, timestamp_us);
+            if self.sequencer.evaluate_triggers(raw_buttons, timestamp_us) {
+                macro_trigger_consumed = self.sequencer.macros[self.sequencer.active_macro_index].trigger_button;
+            } else if self.sequencer.is_playing {
+                macro_trigger_consumed = self.sequencer.macros[self.sequencer.active_macro_index].trigger_button;
+            }
         }
 
         // 3. Advance macro playback tick
         let macro_simulated = self.sequencer.tick(timestamp_us);
 
-        // 4. Strip the radial activation chord from standard button forwarding
-        let buttons_for_remapping = if chord_pressed {
-            raw_buttons & !self.radial_activation_chord
-        } else {
-            raw_buttons
-        };
+        // 4. Strip radial chord and macro triggers from standard button forwarding
+        let mut buttons_for_remapping = raw_buttons & !macro_trigger_consumed;
+        if chord_pressed {
+            buttons_for_remapping &= !self.radial_activation_chord;
+        }
 
         // 5. Apply remappings and turbo toggles
         let mut final_buttons = self.remapper.process_buttons(buttons_for_remapping, timestamp_us);
@@ -721,5 +725,25 @@ pub fn verify_radial_macro_manager() -> bool {
         return false;
     }
 
+    true
+}
+
+
+/// Comprehensive verification self-test suite for Handheld Gamepad Dynamic Button Remapping, Macro Sequencer & Virtual Radial Menu.
+pub fn test_radial_macro_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Gamepad Remapping, Macro Sequencer & Virtual Radial Menu...\r\n");
+    if !verify_button_remapper_and_turbo() {
+        return false;
+    }
+    if !verify_virtual_radial_menu() {
+        return false;
+    }
+    if !verify_macro_sequencer() {
+        return false;
+    }
+    if !verify_radial_macro_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-INPUT-RADIAL-PASS] Handheld dynamic remapping, macro sequencer and radial menu verified\r\n");
     true
 }
