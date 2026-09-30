@@ -1094,6 +1094,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Access Tokens & Security Descriptors (TASK-KNT-221)
+    if !pe::test_win32_token_security_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 token security self-test failed!\r\n");
+    }
+
     // Verify Win32 Timer Queues & Multimedia Synchronization (TASK-KNT-216)
     if !pe::test_win32_timer_queue_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 timer queue self-test failed!\r\n");
