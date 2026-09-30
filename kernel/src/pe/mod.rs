@@ -27,6 +27,7 @@ pub mod fiber;
 pub mod debug_api;
 pub mod timer_queue;
 pub mod token_security;
+pub mod srw_futex;
 
 pub use header::*;
 pub use ntdll::*;
@@ -53,6 +54,7 @@ pub use fiber::*;
 pub use debug_api::*;
 pub use timer_queue::*;
 pub use token_security::*;
+pub use srw_futex::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
