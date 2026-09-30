@@ -1,7 +1,7 @@
 //! Direct3D 12 Agility SDK SM 6.8 Extended Shader Capabilities & Wave MMA Engine.
 //! Matrix multiply-accumulate tile operations and RDNA 3/3.5 Wave64 SIMD lane optimizers.
 
-#![allow(dead_code, non_camel_case_types, unused_imports)]
+#![allow(dead_code, non_camel_case_types, non_snake_case, unused_imports)]
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -117,6 +117,166 @@ impl WaveMatrixDescriptor {
     }
 }
 
+
+// In-register cooperative wave matrix fragment holding local tile elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooperativeWaveMatrixTile {
+    pub desc: WaveMatrixDescriptor,
+    pub elements: Vec<i32>,
+}
+
+impl CooperativeWaveMatrixTile {
+    // Allocates a new zero-initialized matrix tile.
+    pub fn new_zeroed(desc: WaveMatrixDescriptor) -> Self {
+        let count = match desc.role {
+            WaveMatrixRole::MatrixA => desc.tile_dims.matrix_a_elements(),
+            WaveMatrixRole::MatrixB => desc.tile_dims.matrix_b_elements(),
+            WaveMatrixRole::Accumulator => desc.tile_dims.accumulator_elements(),
+        };
+        Self {
+            desc,
+            elements: alloc::vec![0i32; count],
+        }
+    }
+
+    // Loads a cooperative wave matrix tile from linear memory or threadgroup shared memory.
+    pub fn WaveMatrixLoad(
+        desc: WaveMatrixDescriptor,
+        src: &[i32],
+        stride_elements: usize,
+    ) -> Result<Self, &'static str> {
+        let (rows, cols) = match desc.role {
+            WaveMatrixRole::MatrixA => {
+                let (m, _, k) = desc.tile_dims.dimensions();
+                (m, k)
+            }
+            WaveMatrixRole::MatrixB => {
+                let (_, n, k) = desc.tile_dims.dimensions();
+                (k, n)
+            }
+            WaveMatrixRole::Accumulator => {
+                let (m, n, _) = desc.tile_dims.dimensions();
+                (m, n)
+            }
+        };
+
+        if stride_elements < cols {
+            return Err("Source stride cannot be smaller than matrix columns");
+        }
+        let total_required = (rows.saturating_sub(1) * stride_elements).saturating_add(cols);
+        if src.len() < total_required {
+            return Err("Source buffer too small for matrix tile load");
+        }
+
+        let mut elements = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            let row_offset = r * stride_elements;
+            for c in 0..cols {
+                match desc.layout {
+                    WaveMatrixLayout::RowMajor => {
+                        elements.push(src[row_offset + c]);
+                    }
+                    WaveMatrixLayout::ColumnMajor => {
+                        let col_offset = c * stride_elements;
+                        elements.push(src[col_offset + r]);
+                    }
+                }
+            }
+        }
+
+        Ok(Self { desc, elements })
+    }
+
+    // Stores cooperative wave matrix tile into destination buffer.
+    pub fn WaveMatrixStore(
+        &self,
+        dst: &mut [i32],
+        stride_elements: usize,
+    ) -> Result<(), &'static str> {
+        let (rows, cols) = match self.desc.role {
+            WaveMatrixRole::MatrixA => {
+                let (m, _, k) = self.desc.tile_dims.dimensions();
+                (m, k)
+            }
+            WaveMatrixRole::MatrixB => {
+                let (_, n, k) = self.desc.tile_dims.dimensions();
+                (k, n)
+            }
+            WaveMatrixRole::Accumulator => {
+                let (m, n, _) = self.desc.tile_dims.dimensions();
+                (m, n)
+            }
+        };
+
+        if stride_elements < cols {
+            return Err("Destination stride cannot be smaller than matrix columns");
+        }
+        let total_required = (rows.saturating_sub(1) * stride_elements).saturating_add(cols);
+        if dst.len() < total_required {
+            return Err("Destination buffer too small for matrix tile store");
+        }
+
+        for r in 0..rows {
+            let row_offset = r * stride_elements;
+            for c in 0..cols {
+                let val = self.elements[r * cols + c];
+                match self.desc.layout {
+                    WaveMatrixLayout::RowMajor => {
+                        dst[row_offset + c] = val;
+                    }
+                    WaveMatrixLayout::ColumnMajor => {
+                        let col_offset = c * stride_elements;
+                        dst[col_offset + r] = val;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // Executes fused cooperative matrix multiply-accumulate: D = A * B + C.
+    pub fn WaveMatrixMultiplyAccumulate(
+        matrix_a: &Self,
+        matrix_b: &Self,
+        matrix_c: &Self,
+    ) -> Result<Self, &'static str> {
+        if matrix_a.desc.tile_dims != matrix_b.desc.tile_dims
+            || matrix_a.desc.tile_dims != matrix_c.desc.tile_dims
+        {
+            return Err("Matrix tile dimension mismatch in MMA operation");
+        }
+
+        let (m, n, k) = matrix_a.desc.tile_dims.dimensions();
+        let mut d_elements = Vec::with_capacity(m * n);
+
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = matrix_c.elements[i * n + j] as i64;
+                for p in 0..k {
+                    let a_val = matrix_a.elements[i * k + p] as i64;
+                    let b_val = matrix_b.elements[p * n + j] as i64;
+                    acc = acc.saturating_add(a_val.saturating_mul(b_val));
+                }
+                // Clamp to 32-bit signed range
+                let clamped = acc.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                d_elements.push(clamped);
+            }
+        }
+
+        let d_desc = WaveMatrixDescriptor::new(
+            WaveMatrixRole::Accumulator,
+            matrix_a.desc.tile_dims,
+            matrix_c.desc.format,
+            matrix_c.desc.layout,
+        );
+
+        Ok(Self {
+            desc: d_desc,
+            elements: d_elements,
+        })
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_wave_mma_subsystem() -> bool {
     true
