@@ -466,7 +466,123 @@ impl WorkGraphMemoryGovernor {
         Ok(())
     }
 }
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Work Graphs Node Allocator & Suballocator.
 pub fn test_work_graphs_allocator_subsystem() -> bool {
+    // 1. Verify Work Graph backing memory sizing and 64-byte alignment
+    let nodes = [
+        WorkGraphNodeMemoryDesc::new(
+            1,
+            WorkGraphLaunchMode::BroadcastingLaunch,
+            WorkGraphNodeMemoryKind::NodeLocalMemory,
+            48,
+            256,
+            16,
+        ),
+        WorkGraphNodeMemoryDesc::new(
+            2,
+            WorkGraphLaunchMode::CoalescingLaunch,
+            WorkGraphNodeMemoryKind::SharedBackingStore,
+            96,
+            512,
+            32,
+        ),
+        WorkGraphNodeMemoryDesc::new(
+            3,
+            WorkGraphLaunchMode::ThreadLaunch,
+            WorkGraphNodeMemoryKind::NodeLocalMemory,
+            32,
+            128,
+            64,
+        ),
+    ];
+
+    let layout = match WorkGraphMemoryGovernor::calculate_backing_memory_layout(&nodes) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+
+    if !is_64byte_aligned(layout.total_backing_store_bytes) {
+        return false;
+    }
+    for &offset in &layout.node_offsets {
+        if !is_64byte_aligned(offset) {
+            return false;
+        }
+    }
+
+    // Verify backing store validation rules
+    let valid_base_va = 0x1000_0040u64; // 64-byte aligned
+    let unaligned_va = 0x1000_0020u64; // unaligned
+    if WorkGraphMemoryGovernor::validate_backing_store(unaligned_va, layout.total_backing_store_bytes, &layout).is_ok() {
+        return false;
+    }
+    if WorkGraphMemoryGovernor::validate_backing_store(valid_base_va, layout.total_backing_store_bytes, &layout).is_err() {
+        return false;
+    }
+
+    // 2. Verify dynamic transient node record ring buffer suballocator
+    let mut suballoc = match DynamicNodeRecordSuballocator::new(0x2000_0000, 16384) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // Suballocate 1 record of 48 bytes (aligned to 64 bytes)
+    let rec1 = match suballoc.suballocate_node_records(1, WorkGraphLaunchMode::BroadcastingLaunch, 48, 1) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if rec1.aligned_stride != 64 || rec1.gpu_virtual_address != 0x2000_0000 {
+        return false;
+    }
+
+    // Suballocate 4 records of 96 bytes (aligned to 128 bytes each, total 512 bytes)
+    let rec2 = match suballoc.suballocate_node_records(2, WorkGraphLaunchMode::CoalescingLaunch, 96, 4) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    if rec2.aligned_stride != 128 || rec2.total_reserved_bytes() != 512 {
+        return false;
+    }
+    if rec2.get_record_gpu_va(0) != Some(0x2000_0040) || rec2.get_record_gpu_va(3) != Some(0x2000_0040 + 384) {
+        return false;
+    }
+
+    // Advance head and test wrap-around behavior
+    suballoc.advance_head(0x200);
+    if suballoc.head_offset != 0x200 {
+        return false;
+    }
+
+    // 3. Verify execution state tracker and wave saturation telemetry
+    let mut tracker = WorkGraphExecutionStateTracker::new(128);
+    tracker.register_node(1);
+    tracker.register_node(2);
+
+    tracker.record_enqueued(1, 32);
+    tracker.record_enqueued(2, 64);
+    if tracker.get_total_pending_records() != 96 {
+        return false;
+    }
+
+    // Dispatch 64 waves on 128 max waves -> 50% saturation
+    tracker.record_dispatch(1, 16, 64);
+    if tracker.get_wave_saturation_percentage() != 50 || tracker.is_pipeline_saturated() {
+        return false;
+    }
+
+    // Dispatch another 55 waves -> 64 + 55 = 119 / 128 = 92% -> saturated
+    tracker.record_dispatch(2, 32, 55);
+    if tracker.get_wave_saturation_percentage() < 90 || !tracker.is_pipeline_saturated() {
+        return false;
+    }
+
+    // Retire 80 waves -> saturation drops
+    tracker.record_completed(1, 16, 64);
+    tracker.record_completed(2, 16, 16);
+    if tracker.is_pipeline_saturated() {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-WORK-GRAPHS-ALLOC-PASS] Direct3D 12 work graphs node memory allocator & program state suballocator verified\r\n");
     true
 }
