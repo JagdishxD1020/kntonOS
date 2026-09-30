@@ -481,3 +481,145 @@ pub fn verify_complementary_orientation_fusion() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Integrated Handheld Precision Gyroscope Calibration & Fusion Governor
+// ============================================================================
+
+/// Complete Integrated Handheld Precision Gyroscope Calibration & Fusion Governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldGyroCalibrator {
+    /// Motionless zero-point drift filter and stationary bias tracker.
+    pub drift_filter: DynamicZeroPointFilter,
+    /// Thermal scale factor and thermal zero-rate drift compensator.
+    pub thermal_comp: ThermalScaleCompensator,
+    /// 600Hz complementary quaternion attitude tracker.
+    pub orientation_tracker: ComplementaryOrientationTracker,
+    /// Latest calibrated, thermal-compensated angular velocity (rad/s).
+    pub calibrated_gyro: Vector3,
+    /// Latest orientation quaternion [w, x, y, z].
+    pub attitude: Quaternion,
+    /// Computed Euler roll angle in degrees.
+    pub roll_deg: f32,
+    /// Computed Euler pitch angle in degrees.
+    pub pitch_deg: f32,
+    /// Computed Euler yaw angle in degrees.
+    pub yaw_deg: f32,
+    /// Whether the handheld chassis is currently resting stationary.
+    pub is_stationary: bool,
+    /// Most recent chassis sensor temperature in degrees Celsius.
+    pub last_temp_celsius: f32,
+    /// Total number of telemetry samples ingested.
+    pub sample_count: u64,
+}
+
+impl HandheldGyroCalibrator {
+    /// Constructs a handheld gyro calibrator and fusion governor with standard defaults.
+    pub const fn new() -> Self {
+        Self {
+            drift_filter: DynamicZeroPointFilter::new(),
+            thermal_comp: ThermalScaleCompensator::new(),
+            orientation_tracker: ComplementaryOrientationTracker::new(),
+            calibrated_gyro: Vector3::zero(),
+            attitude: Quaternion::IDENTITY,
+            roll_deg: 0.0,
+            pitch_deg: 0.0,
+            yaw_deg: 0.0,
+            is_stationary: false,
+            last_temp_celsius: THERMAL_REF_TEMP_CELSIUS,
+            sample_count: 0,
+        }
+    }
+
+    /// Resets all filters, trackers, and counters to pristine initial states.
+    pub fn reset(&mut self) {
+        self.drift_filter.reset();
+        self.orientation_tracker.reset();
+        self.calibrated_gyro = Vector3::zero();
+        self.attitude = Quaternion::IDENTITY;
+        self.roll_deg = 0.0;
+        self.pitch_deg = 0.0;
+        self.yaw_deg = 0.0;
+        self.is_stationary = false;
+        self.last_temp_celsius = THERMAL_REF_TEMP_CELSIUS;
+        self.sample_count = 0;
+    }
+
+    /// Primary 600Hz pipeline telemetry update ingestion.
+    pub fn update_sample(
+        &mut self,
+        raw_gyro_rads: Vector3,
+        raw_accel_g: Vector3,
+        temp_celsius: f32,
+        dt_s: f32,
+    ) -> Vector3 {
+        // 1. Dynamic zero-point drift filtering & stationary bias tracking
+        let debiased_gyro = self.drift_filter.update(raw_gyro_rads, raw_accel_g);
+
+        // 2. Chassis thermal gradient scale factor & thermal bias compensation
+        let cal_gyro = self.thermal_comp.compensate(debiased_gyro, temp_celsius);
+
+        // 3. 600Hz complementary orientation fusion with gravity vector alignment
+        self.orientation_tracker.update(cal_gyro, raw_accel_g, dt_s);
+
+        // 4. Update cached telemetry states
+        self.calibrated_gyro = cal_gyro;
+        self.attitude = self.orientation_tracker.attitude;
+        let (roll, pitch, yaw) = self.orientation_tracker.to_euler_degrees();
+        self.roll_deg = roll;
+        self.pitch_deg = pitch;
+        self.yaw_deg = yaw;
+        self.is_stationary = self.drift_filter.is_stationary;
+        self.last_temp_celsius = temp_celsius;
+        self.sample_count = self.sample_count.saturating_add(1);
+
+        cal_gyro
+    }
+}
+
+/// Verification test for integrated handheld gyro calibrator and fusion governor.
+pub fn verify_gyro_calibrator_governor() -> bool {
+    let mut calibrator = HandheldGyroCalibrator::new();
+    let dt = 1.0 / 600.0;
+
+    // 1. Ingest 50 samples of stationary resting data at elevated APU temperature (50.0°C)
+    // with injected gyro bias [0.025, -0.015, 0.010] rad/s and static gravity [0, 0, 1]g
+    let injected_bias = Vector3::new(0.025, -0.015, 0.010);
+    let static_accel = Vector3::new(0.0, 0.0, 1.0);
+
+    for _ in 0..50 {
+        calibrator.update_sample(injected_bias, static_accel, 50.0, dt);
+    }
+
+    // Must be marked stationary
+    if !calibrator.is_stationary {
+        return false;
+    }
+    // Attitude must remain close to identity and unit normalized
+    if (calibrator.attitude.norm() - 1.0).abs() > 1e-4 {
+        return false;
+    }
+    if calibrator.roll_deg.abs() > 1.0 || calibrator.pitch_deg.abs() > 1.0 {
+        return false;
+    }
+
+    // Calibrated gyro output should have reduced residual bias
+    if calibrator.calibrated_gyro.norm() > 0.015 {
+        return false;
+    }
+
+    // 2. High-speed roll motion (1.5 rad/s) under gaming load (62.0°C)
+    let roll_motion = Vector3::new(1.5, 0.0, 0.0);
+    calibrator.update_sample(roll_motion, static_accel, 62.0, dt);
+
+    // Stationary flag should drop immediately
+    if calibrator.is_stationary {
+        return false;
+    }
+    if calibrator.sample_count != 51 {
+        return false;
+    }
+
+    true
+}
