@@ -389,6 +389,83 @@ impl WorkGraphExecutionStateTracker {
         self.node_telemetry.iter().map(|n| n.pending_records).sum()
     }
 }
+
+// Compiled layout of backing store memory sections across all work graph nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkGraphBackingMemoryLayout {
+    pub total_backing_store_bytes: u64,
+    pub shared_backing_store_bytes: u64,
+    pub node_local_scratch_bytes: u64,
+    pub node_input_rings_bytes: u64,
+    pub node_offsets: Vec<u64>,
+}
+
+// Memory requirements estimator and backing store layout governor.
+pub struct WorkGraphMemoryGovernor;
+
+impl WorkGraphMemoryGovernor {
+    // Calculates backing store layout, per-node offsets, and enforces 64-byte alignment.
+    pub fn calculate_backing_memory_layout(
+        nodes: &[WorkGraphNodeMemoryDesc],
+    ) -> Result<WorkGraphBackingMemoryLayout, &'static str> {
+        if nodes.is_empty() {
+            return Err("Work graph must contain at least one node");
+        }
+
+        let mut current_offset: u64 = 4096; // 4 KiB base graph state header
+        let mut shared_bytes: u64 = 0;
+        let mut local_scratch_bytes: u64 = 0;
+        let mut input_rings_bytes: u64 = 0;
+        let mut node_offsets = Vec::with_capacity(nodes.len());
+
+        for node in nodes {
+            current_offset = align_up_64(current_offset);
+            node_offsets.push(current_offset);
+
+            let aligned_record = node.aligned_record_bytes();
+            let ring_size = aligned_record * (node.max_in_flight_records as u64);
+            input_rings_bytes = input_rings_bytes.saturating_add(ring_size);
+
+            let scratch_aligned = align_up_64(node.local_scratch_bytes as u64);
+            match node.memory_kind {
+                WorkGraphNodeMemoryKind::NodeLocalMemory => {
+                    local_scratch_bytes = local_scratch_bytes.saturating_add(scratch_aligned);
+                }
+                WorkGraphNodeMemoryKind::SharedBackingStore => {
+                    shared_bytes = shared_bytes.saturating_add(scratch_aligned);
+                }
+            }
+
+            let node_total = ring_size.saturating_add(scratch_aligned);
+            current_offset = current_offset.saturating_add(node_total);
+        }
+
+        let total_bytes = align_up_64(current_offset);
+
+        Ok(WorkGraphBackingMemoryLayout {
+            total_backing_store_bytes: total_bytes,
+            shared_backing_store_bytes: shared_bytes,
+            node_local_scratch_bytes: local_scratch_bytes,
+            node_input_rings_bytes: input_rings_bytes,
+            node_offsets,
+        })
+    }
+
+    // Validates a runtime backing buffer allocation against the compiled layout.
+    pub fn validate_backing_store(
+        gpu_virtual_address: u64,
+        size_bytes: u64,
+        layout: &WorkGraphBackingMemoryLayout,
+    ) -> Result<(), &'static str> {
+        if !is_64byte_aligned(gpu_virtual_address) {
+            return Err("Work graph backing store GPU virtual address must be 64-byte aligned");
+        }
+        if size_bytes < layout.total_backing_store_bytes {
+            return Err("Allocated backing store is smaller than required layout size");
+        }
+        Ok(())
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_work_graphs_allocator_subsystem() -> bool {
     true
