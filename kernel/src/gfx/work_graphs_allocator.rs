@@ -265,6 +265,130 @@ impl DynamicNodeRecordSuballocator {
         self.allocated_bytes_current_frame = 0;
     }
 }
+
+// Execution lifecycle phases for work graph node payload packets.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkGraphPayloadPhase {
+    Allocated = 0,
+    Enqueued = 1,
+    Executing = 2,
+    Retired = 3,
+    Spilled = 4,
+}
+
+// Execution and queue occupancy telemetry for a specific work graph node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeQueueTelemetry {
+    pub node_id: u32,
+    pub pending_records: u32,
+    pub active_records: u32,
+    pub completed_records: u64,
+    pub spilled_records: u64,
+    pub peak_queue_depth: u32,
+    pub active_wavefronts: u32,
+}
+
+impl NodeQueueTelemetry {
+    // Creates a new telemetry entry for a node.
+    pub const fn new(node_id: u32) -> Self {
+        Self {
+            node_id,
+            pending_records: 0,
+            active_records: 0,
+            completed_records: 0,
+            spilled_records: 0,
+            peak_queue_depth: 0,
+            active_wavefronts: 0,
+        }
+    }
+}
+
+// Global execution state supervisor tracking wave saturation and node payloads.
+#[derive(Debug, Clone)]
+pub struct WorkGraphExecutionStateTracker {
+    pub total_dispatches: u64,
+    pub node_telemetry: Vec<NodeQueueTelemetry>,
+    pub max_supported_wavefronts: u32,
+    pub current_active_wavefronts: u32,
+}
+
+impl WorkGraphExecutionStateTracker {
+    // Creates a new execution state tracker.
+    pub fn new(max_supported_wavefronts: u32) -> Self {
+        Self {
+            total_dispatches: 0,
+            node_telemetry: Vec::new(),
+            max_supported_wavefronts: max_supported_wavefronts.max(1),
+            current_active_wavefronts: 0,
+        }
+    }
+
+    // Registers a node in the telemetry tracker.
+    pub fn register_node(&mut self, node_id: u32) {
+        if !self.node_telemetry.iter().any(|n| n.node_id == node_id) {
+            self.node_telemetry.push(NodeQueueTelemetry::new(node_id));
+        }
+    }
+
+    // Records incoming node records enqueued to a node's input ring.
+    pub fn record_enqueued(&mut self, node_id: u32, count: u32) {
+        if let Some(entry) = self.node_telemetry.iter_mut().find(|n| n.node_id == node_id) {
+            entry.pending_records = entry.pending_records.saturating_add(count);
+            if entry.pending_records > entry.peak_queue_depth {
+                entry.peak_queue_depth = entry.pending_records;
+            }
+        }
+    }
+
+    // Records dispatch of records into active GPU shader wavefronts.
+    pub fn record_dispatch(&mut self, node_id: u32, count: u32, waves_launched: u32) {
+        if let Some(entry) = self.node_telemetry.iter_mut().find(|n| n.node_id == node_id) {
+            let actual_dispatch = entry.pending_records.min(count);
+            entry.pending_records = entry.pending_records.saturating_sub(actual_dispatch);
+            entry.active_records = entry.active_records.saturating_add(actual_dispatch);
+            entry.active_wavefronts = entry.active_wavefronts.saturating_add(waves_launched);
+        }
+        self.current_active_wavefronts = self.current_active_wavefronts.saturating_add(waves_launched);
+        self.total_dispatches = self.total_dispatches.saturating_add(1);
+    }
+
+    // Records completion of active records and retirement of GPU wavefronts.
+    pub fn record_completed(&mut self, node_id: u32, count: u32, waves_retired: u32) {
+        if let Some(entry) = self.node_telemetry.iter_mut().find(|n| n.node_id == node_id) {
+            let actual_completed = entry.active_records.min(count);
+            entry.active_records = entry.active_records.saturating_sub(actual_completed);
+            entry.completed_records = entry.completed_records.saturating_add(actual_completed as u64);
+            entry.active_wavefronts = entry.active_wavefronts.saturating_sub(waves_retired);
+        }
+        self.current_active_wavefronts = self.current_active_wavefronts.saturating_sub(waves_retired);
+    }
+
+    // Records spilled payloads when a node input queue overflows capacity.
+    pub fn record_spilled(&mut self, node_id: u32, count: u32) {
+        if let Some(entry) = self.node_telemetry.iter_mut().find(|n| n.node_id == node_id) {
+            entry.spilled_records = entry.spilled_records.saturating_add(count as u64);
+        }
+    }
+
+    // Calculates current GPU wave saturation percentage (0 - 100%).
+    #[inline(always)]
+    pub fn get_wave_saturation_percentage(&self) -> u32 {
+        let pct = (self.current_active_wavefronts as u64 * 100) / (self.max_supported_wavefronts as u64);
+        (pct.min(100)) as u32
+    }
+
+    // Determines whether GPU compute units are fully saturated (>= 90%).
+    #[inline(always)]
+    pub fn is_pipeline_saturated(&self) -> bool {
+        self.get_wave_saturation_percentage() >= 90
+    }
+
+    // Returns aggregate pending records across all nodes in the work graph.
+    pub fn get_total_pending_records(&self) -> u32 {
+        self.node_telemetry.iter().map(|n| n.pending_records).sum()
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_work_graphs_allocator_subsystem() -> bool {
     true
