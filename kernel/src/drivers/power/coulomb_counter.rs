@@ -368,3 +368,122 @@ pub fn verify_playtime_predictor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Integrated Handheld Battery Discharge Curve Profiler
+// ============================================================================
+
+/// 11-point piecewise Open-Circuit Voltage (mV) vs State-of-Charge (0%..100%) table.
+pub const OCV_SOC_LUT_POINTS: [(f32, f32); 11] = [
+    (6000.0, 0.0),
+    (6800.0, 10.0),
+    (7200.0, 20.0),
+    (7360.0, 30.0),
+    (7460.0, 40.0),
+    (7560.0, 50.0),
+    (7700.0, 60.0),
+    (7860.0, 70.0),
+    (8040.0, 80.0),
+    (8220.0, 90.0),
+    (8400.0, 100.0),
+];
+
+/// Integrated Handheld Battery Discharge Curve Profiler & Coulomb Counter.
+#[derive(Debug, Clone)]
+pub struct BatteryDischargeProfilerManager {
+    pub coulomb_counter: MicroWattCoulombCounter,
+    pub esr_estimator: DynamicEsrEstimator,
+    pub playtime_predictor: PlaytimePredictor,
+    pub blended_soc_pct: f32,
+    pub ocv_soc_pct: f32,
+}
+
+impl BatteryDischargeProfilerManager {
+    pub const fn new() -> Self {
+        Self {
+            coulomb_counter: MicroWattCoulombCounter::new(),
+            esr_estimator: DynamicEsrEstimator::new(),
+            playtime_predictor: PlaytimePredictor::new(),
+            blended_soc_pct: 100.0,
+            ocv_soc_pct: 100.0,
+        }
+    }
+
+    /// Evaluates piecewise linear interpolation of SoC from compensated OCV.
+    pub fn ocv_to_soc(ocv_mv: f32) -> f32 {
+        if ocv_mv <= OCV_SOC_LUT_POINTS[0].0 {
+            return 0.0;
+        }
+        let last_idx = OCV_SOC_LUT_POINTS.len() - 1;
+        if ocv_mv >= OCV_SOC_LUT_POINTS[last_idx].0 {
+            return 100.0;
+        }
+
+        for i in 0..last_idx {
+            let (v_low, soc_low) = OCV_SOC_LUT_POINTS[i];
+            let (v_high, soc_high) = OCV_SOC_LUT_POINTS[i + 1];
+
+            if ocv_mv >= v_low && ocv_mv <= v_high {
+                let factor = (ocv_mv - v_low) / (v_high - v_low);
+                return soc_low + factor * (soc_high - soc_low);
+            }
+        }
+        100.0
+    }
+
+    /// Primary telemetry tick ingestion method.
+    pub fn update_telemetry(&mut self, voltage_mv: f32, current_ma: f32, delta_sec: f32) {
+        // 1. Update ESR estimator and compute compensated true OCV
+        let ocv_mv = self.esr_estimator.update_sample(voltage_mv, current_ma);
+        self.ocv_soc_pct = Self::ocv_to_soc(ocv_mv);
+
+        // 2. Coulomb and micro-watt-hour integration
+        self.coulomb_counter.integrate(voltage_mv, current_ma, delta_sec);
+
+        // 3. Sensor fusion: 90% coulomb counting + 10% OCV drift anchor
+        let coulomb_soc = self.coulomb_counter.state_of_charge_pct;
+        self.blended_soc_pct = 0.90 * coulomb_soc + 0.10 * self.ocv_soc_pct;
+
+        // 4. Update Kalman filter for remaining playtime forecasting
+        let is_charging = current_ma > 50.0;
+        self.playtime_predictor.update(
+            self.coulomb_counter.power_uw,
+            is_charging,
+            self.coulomb_counter.remaining_energy_uwh,
+            PACK_DESIGN_ENERGY_UWH,
+        );
+    }
+}
+
+/// Unit test verifying integrated battery discharge curve profiler and sensor fusion.
+pub fn verify_battery_profiler_manager() -> bool {
+    let mut mgr = BatteryDischargeProfilerManager::new();
+
+    // 1. OCV to SoC lookup test
+    let soc_half = BatteryDischargeProfilerManager::ocv_to_soc(7560.0);
+    if (soc_half - 50.0).abs() > 0.1 {
+        return false;
+    }
+    let soc_full = BatteryDischargeProfilerManager::ocv_to_soc(8400.0);
+    if (soc_full - 100.0).abs() > 0.1 {
+        return false;
+    }
+
+    // 2. Ingest 30 seconds of heavy gaming load (7500mV, -2500mA)
+    for _ in 0..30 {
+        mgr.update_telemetry(7500.0, -2500.0, 1.0);
+    }
+
+    if mgr.coulomb_counter.remaining_charge_mah >= 5000.0 {
+        return false;
+    }
+    if mgr.esr_estimator.open_circuit_voltage_mv <= 7500.0 {
+        return false;
+    }
+    if mgr.playtime_predictor.time_to_empty_sec.is_none() {
+        return false;
+    }
+
+    true
+}
