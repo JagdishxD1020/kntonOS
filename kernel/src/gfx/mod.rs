@@ -47,6 +47,7 @@ pub mod vrs_combiners;
 pub mod residency_manager;
 pub mod root_signature_v1_2;
 pub mod work_graphs_allocator;
+pub mod wave_mma;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -94,6 +95,7 @@ pub use vrs_combiners::*;
 pub use residency_manager::*;
 pub use root_signature_v1_2::*;
 pub use work_graphs_allocator::*;
+pub use wave_mma::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
