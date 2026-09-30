@@ -487,3 +487,23 @@ pub fn verify_battery_profiler_manager() -> bool {
 
     true
 }
+
+
+/// Comprehensive self-test suite for Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter.
+pub fn test_coulomb_counter_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Real-Time Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter...\r\n");
+    if !verify_coulomb_integration() {
+        return false;
+    }
+    if !verify_esr_estimator() {
+        return false;
+    }
+    if !verify_playtime_predictor() {
+        return false;
+    }
+    if !verify_battery_profiler_manager() {
+        return false;
+    }
+    crate::serial_write_str("[KNT-POWER-COULOMB-PASS] Handheld real-time battery discharge curve profiler and coulomb counter verified\r\n");
+    true
+}

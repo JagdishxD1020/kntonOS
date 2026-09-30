@@ -814,6 +814,16 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld PD 3.1 passthrough charging and thermal bypass governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Real-Time Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter (TASK-KNT-222)
+    if !drivers::power::test_coulomb_counter_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld coulomb counter and battery discharge profiler self-test failed!\r\n");
+    }
+
+    // Initialize and verify Handheld Real-Time Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter (TASK-KNT-222)
+    if !drivers::power::test_coulomb_counter_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld coulomb counter and battery discharge profiler self-test failed!\r\n");
+    }
+
 
 
 
