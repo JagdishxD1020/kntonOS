@@ -239,3 +239,132 @@ pub fn verify_esr_estimator() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Remaining Playtime Predictor with Kalman-Filtered TTE/TTF Forecasting
+// ============================================================================
+
+/// Workload-adaptive Kalman filter forecasting remaining playtime (TTE) and charge time (TTF).
+#[derive(Debug, Clone)]
+pub struct PlaytimePredictor {
+    /// Kalman state estimate: sustained power consumption in micro-watts (μW).
+    pub estimated_power_uw: f64,
+    /// Kalman error covariance estimate.
+    pub covariance: f64,
+    /// Process noise covariance Q.
+    pub process_noise_q: f64,
+    /// Measurement noise covariance R.
+    pub measurement_noise_r: f64,
+    /// Number of training samples ingested.
+    pub sample_count: u32,
+    /// Predicted Time-To-Empty in seconds (None when charging or idle).
+    pub time_to_empty_sec: Option<u32>,
+    /// Predicted Time-To-Full in seconds (None when discharging or fully charged).
+    pub time_to_full_sec: Option<u32>,
+    /// Workload prediction confidence factor (0.0 to 1.0).
+    pub confidence_factor: f32,
+}
+
+impl PlaytimePredictor {
+    pub const fn new() -> Self {
+        Self {
+            estimated_power_uw: 15_000_000.0, // Initial 15W baseline assumption
+            covariance: 50_000_000.0,
+            process_noise_q: 5_000.0,
+            measurement_noise_r: 20_000.0,
+            sample_count: 0,
+            time_to_empty_sec: None,
+            time_to_full_sec: None,
+            confidence_factor: 0.1,
+        }
+    }
+
+    /// Updates Kalman filter with instantaneous power and recomputes TTE / TTF.
+    pub fn update(
+        &mut self,
+        measured_power_uw: u64,
+        is_charging: bool,
+        remaining_energy_uwh: u64,
+        max_energy_uwh: u64,
+    ) {
+        let z = measured_power_uw as f64;
+
+        // 1. Prediction step
+        let p_prior = self.covariance + self.process_noise_q;
+
+        // 2. Measurement update
+        let kalman_gain = p_prior / (p_prior + self.measurement_noise_r);
+        self.estimated_power_uw = self.estimated_power_uw + kalman_gain * (z - self.estimated_power_uw);
+        self.covariance = (1.0 - kalman_gain) * p_prior;
+        self.sample_count = self.sample_count.saturating_add(1);
+
+        // 3. Confidence metric convergence
+        self.confidence_factor = (self.sample_count as f32 / 30.0).clamp(0.1, 1.0);
+
+        // 4. Time forecasting calculation
+        let sustained_power = self.estimated_power_uw.max(500_000.0); // Minimum 0.5W floor
+
+        if is_charging {
+            self.time_to_empty_sec = None;
+            let deficit_uwh = max_energy_uwh.saturating_sub(remaining_energy_uwh);
+            if deficit_uwh == 0 {
+                self.time_to_full_sec = Some(0);
+            } else {
+                let sec = ((deficit_uwh as f64 / sustained_power) * 3600.0) as u32;
+                self.time_to_full_sec = Some(sec);
+            }
+        } else {
+            self.time_to_full_sec = None;
+            if remaining_energy_uwh == 0 {
+                self.time_to_empty_sec = Some(0);
+            } else {
+                let sec = ((remaining_energy_uwh as f64 / sustained_power) * 3600.0) as u32;
+                self.time_to_empty_sec = Some(sec);
+            }
+        }
+    }
+}
+
+/// Unit test verifying playtime predictor Kalman filtering and TTE/TTF forecasts.
+pub fn verify_playtime_predictor() -> bool {
+    let mut predictor = PlaytimePredictor::new();
+
+    // 1. Simulate 40 samples of steady 19.25W gaming load (19,250,000 uW)
+    // Battery at 50% = 19,250,000 uWh (remaining 19.25 Wh)
+    // Expected TTE: 1.0 hour = 3600 seconds
+    for i in 0..40 {
+        // Add artificial synthetic ripple (+- 200,000 uW)
+        let ripple = if i % 2 == 0 { 200_000i64 } else { -200_000i64 };
+        let power_sample = (19_250_000i64 + ripple) as u64;
+        predictor.update(power_sample, false, 19_250_000, 38_500_000);
+    }
+
+    if predictor.time_to_full_sec.is_some() || predictor.time_to_empty_sec.is_none() {
+        return false;
+    }
+    let tte = predictor.time_to_empty_sec.unwrap();
+    // Must forecast approximately 3600s within +- 50s
+    if tte < 3550 || tte > 3650 {
+        return false;
+    }
+    if predictor.confidence_factor < 0.99 {
+        return false;
+    }
+
+    // 2. Switch to charging at 25W (25,000,000 uW) with 10,000,000 uWh deficit
+    // Expected TTF: (10,000,000 / 25,000,000) * 3600 = 1440 seconds (24 mins)
+    for _ in 0..40 {
+        predictor.update(25_000_000, true, 28_500_000, 38_500_000);
+    }
+
+    if predictor.time_to_empty_sec.is_some() || predictor.time_to_full_sec.is_none() {
+        return false;
+    }
+    let ttf = predictor.time_to_full_sec.unwrap();
+    if ttf < 1400 || ttf > 1480 {
+        return false;
+    }
+
+    true
+}
