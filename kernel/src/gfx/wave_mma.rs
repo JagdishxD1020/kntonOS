@@ -277,6 +277,94 @@ impl CooperativeWaveMatrixTile {
         })
     }
 }
+
+// Hardware SIMD wavefront execution mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveExecutionMode {
+    Wave32 = 32,
+    Wave64 = 64,
+}
+
+// Dual-issue VOPD instruction pairing configuration for RDNA 3/3.5 compute units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdnaDualIssuePair {
+    pub op_x_role: WaveMatrixRole,
+    pub op_y_role: WaveMatrixRole,
+    pub combined_vgpr_cost: u32,
+    pub is_dual_issue_eligible: bool,
+}
+
+// RDNA 3 / 3.5 Wave64 SIMD lane layout optimizer and VGPR budget governor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdnaSimdLayoutOptimizer {
+    pub wave_mode: WaveExecutionMode,
+    pub vgpr_budget_per_wave: u32,
+    pub current_allocated_vgprs: u32,
+    pub dual_issue_operations_count: u32,
+}
+
+impl RdnaSimdLayoutOptimizer {
+    // Creates a new RDNA SIMD layout optimizer.
+    pub fn new(wave_mode: WaveExecutionMode) -> Self {
+        Self {
+            wave_mode,
+            vgpr_budget_per_wave: 256, // 256 VGPRs per wave on RDNA 3/3.5
+            current_allocated_vgprs: 0,
+            dual_issue_operations_count: 0,
+        }
+    }
+
+    // Calculates elements assigned per SIMD lane and total lanes utilized.
+    pub fn calculate_lane_distribution(
+        &self,
+        tile_dims: WaveMmaTileDimensions,
+        role: WaveMatrixRole,
+    ) -> (usize, usize) {
+        let total_elements = match role {
+            WaveMatrixRole::MatrixA => tile_dims.matrix_a_elements(),
+            WaveMatrixRole::MatrixB => tile_dims.matrix_b_elements(),
+            WaveMatrixRole::Accumulator => tile_dims.accumulator_elements(),
+        };
+
+        let num_lanes = self.wave_mode as usize;
+        let elements_per_lane = (total_elements + num_lanes - 1) / num_lanes;
+        (num_lanes, elements_per_lane.max(1))
+    }
+
+    // Pairs two matrix operations into an RDNA 3 VOPD dual-issue packet.
+    pub fn pair_dual_issue_ops(
+        &mut self,
+        op_x: WaveMatrixRole,
+        op_y: WaveMatrixRole,
+        tile_dims: WaveMmaTileDimensions,
+    ) -> RdnaDualIssuePair {
+        let (_, x_per_lane) = self.calculate_lane_distribution(tile_dims, op_x);
+        let (_, y_per_lane) = self.calculate_lane_distribution(tile_dims, op_y);
+
+        // In RDNA 3, dual-issue allows VOPD co-issuing when VGPR ports don't conflict
+        let vgpr_cost = (x_per_lane as u32) + (y_per_lane as u32);
+        let eligible = (self.current_allocated_vgprs + vgpr_cost) <= self.vgpr_budget_per_wave;
+
+        if eligible {
+            self.current_allocated_vgprs += vgpr_cost;
+            self.dual_issue_operations_count += 1;
+        }
+
+        RdnaDualIssuePair {
+            op_x_role: op_x,
+            op_y_role: op_y,
+            combined_vgpr_cost: vgpr_cost,
+            is_dual_issue_eligible: eligible,
+        }
+    }
+
+    // Verifies whether current VGPR allocation stays within hardware budget limits.
+    #[inline(always)]
+    pub fn validate_vgpr_budget(&self) -> bool {
+        self.current_allocated_vgprs <= self.vgpr_budget_per_wave
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_wave_mma_subsystem() -> bool {
     true
