@@ -4,7 +4,7 @@
 //! compensation across chassis thermal gradients (30°C to 65°C), and low-overhead 600Hz
 //! complementary quaternion attitude fusion.
 
-use crate::drivers::input::imu::{sqrt_f32, Vector3};
+use crate::drivers::input::imu::{asin_f32, atan2_f32, sqrt_f32, Quaternion, Vector3, RAD_TO_DEG};
 
 /// Standard nominal gravity in g (1.0 g).
 pub const NOMINAL_GRAVITY_G: f32 = 1.0;
@@ -313,6 +313,169 @@ pub fn verify_thermal_scale_factor_compensation() -> bool {
     // 4. Test intermediate chassis gradient at 47.5°C
     let s_mid = comp.scale_factor(47.5);
     if s_mid <= 1.0 || s_mid >= s_65 {
+        return false;
+    }
+
+    true
+}
+
+
+// ============================================================================
+// Feature 3: Complementary Orientation Fusion (600Hz Quaternion Attitude Tracker)
+// ============================================================================
+
+/// 600Hz Complementary Quaternion Attitude Tracker with gravity vector alignment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComplementaryOrientationTracker {
+    /// 4D unit attitude quaternion [w, x, y, z].
+    pub attitude: Quaternion,
+    /// Proportional feedback gain for accelerometer gravity alignment (beta).
+    pub beta: f32,
+    /// Integration time step in seconds (dt ≈ 1 / 600 s).
+    pub sample_dt_s: f32,
+    /// Acceleration tolerance around 1.0g to qualify valid gravity measurement.
+    pub grav_tolerance_g: f32,
+}
+
+impl ComplementaryOrientationTracker {
+    /// Constructs a complementary orientation tracker initialized to identity rotation.
+    pub const fn new() -> Self {
+        Self {
+            attitude: Quaternion::IDENTITY,
+            beta: 1.25,
+            sample_dt_s: GYRO_SAMPLE_DT_S,
+            grav_tolerance_g: 0.15,
+        }
+    }
+
+    /// Resets the attitude quaternion to identity.
+    pub fn reset(&mut self) {
+        self.attitude = Quaternion::IDENTITY;
+    }
+
+    /// Computes estimated gravity direction in sensor frame [gx, gy, gz].
+    #[inline(always)]
+    pub fn estimate_gravity_direction(&self) -> Vector3 {
+        let q = self.attitude;
+        let gx = 2.0 * (q.x * q.z - q.w * q.y);
+        let gy = 2.0 * (q.y * q.z + q.w * q.x);
+        let gz = q.w * q.w - q.x * q.x - q.y * q.y + q.z * q.z;
+        Vector3::new(gx, gy, gz)
+    }
+
+    /// Ingests angular rate (rad/s) and linear acceleration (g), updating orientation at 600Hz.
+    pub fn update(&mut self, gyro_rads: Vector3, accel_g: Vector3, dt_s: f32) {
+        let mut wx = gyro_rads.x;
+        let mut wy = gyro_rads.y;
+        let mut wz = gyro_rads.z;
+
+        // 1. Accelerometer gravity alignment feedback
+        let accel_norm = accel_g.norm();
+        if accel_norm > 1e-4 {
+            let grav_dev = (accel_norm - NOMINAL_GRAVITY_G).abs();
+            if grav_dev <= self.grav_tolerance_g {
+                let inv_a = 1.0 / accel_norm;
+                let ax = accel_g.x * inv_a;
+                let ay = accel_g.y * inv_a;
+                let az = accel_g.z * inv_a;
+
+                // Estimated gravity vector from current quaternion
+                let g_est = self.estimate_gravity_direction();
+
+                // Direction error is cross product: e = a x g_est
+                let ex = ay * g_est.z - az * g_est.y;
+                let ey = az * g_est.x - ax * g_est.z;
+                let ez = ax * g_est.y - ay * g_est.x;
+
+                // Apply proportional complementary correction
+                wx += self.beta * ex;
+                wy += self.beta * ey;
+                wz += self.beta * ez;
+            }
+        }
+
+        // 2. Quaternion kinematic integration: dq/dt = 0.5 * q ⊗ [0, wx, wy, wz]
+        let q = self.attitude;
+        let half_dt = 0.5 * dt_s;
+
+        let q_w = q.w + half_dt * (-q.x * wx - q.y * wy - q.z * wz);
+        let q_x = q.x + half_dt * (q.w * wx + q.y * wz - q.z * wy);
+        let q_y = q.y + half_dt * (q.w * wy - q.x * wz + q.z * wx);
+        let q_z = q.z + half_dt * (q.w * wz + q.x * wy - q.y * wx);
+
+        // 3. Renormalize quaternion
+        let candidate = Quaternion {
+            w: q_w,
+            x: q_x,
+            y: q_y,
+            z: q_z,
+        };
+        self.attitude = candidate.normalize();
+    }
+
+    /// Converts current attitude quaternion into Tait-Bryan Euler angles (Roll, Pitch, Yaw) in degrees.
+    pub fn to_euler_degrees(&self) -> (f32, f32, f32) {
+        let q = self.attitude;
+
+        // Roll (X rotation)
+        let sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z);
+        let cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y);
+        let roll_deg = atan2_f32(sinr_cosp, cosr_cosp) * RAD_TO_DEG;
+
+        // Pitch (Y rotation)
+        let sinp = 2.0 * (q.w * q.y - q.z * q.x);
+        let pitch_deg = asin_f32(sinp) * RAD_TO_DEG;
+
+        // Yaw (Z rotation)
+        let siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+        let cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+        let yaw_deg = atan2_f32(siny_cosp, cosy_cosp) * RAD_TO_DEG;
+
+        (roll_deg, pitch_deg, yaw_deg)
+    }
+}
+
+/// Verification test for 600Hz complementary orientation fusion.
+pub fn verify_complementary_orientation_fusion() -> bool {
+    let mut tracker = ComplementaryOrientationTracker::new();
+
+    // 1. Initial state must be normalized identity rotation
+    if (tracker.attitude.norm() - 1.0).abs() > 1e-6 {
+        return false;
+    }
+    let (roll, pitch, yaw) = tracker.to_euler_degrees();
+    if roll.abs() > 1e-4 || pitch.abs() > 1e-4 || yaw.abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Pure Z-axis yaw rotation of 90 degrees at 600Hz for 1 second (dt = 1/600s)
+    let dt = 1.0 / 600.0;
+    let target_yaw_rad = 1.5707963; // 90 degrees in radians
+    let gyro_step = Vector3::new(0.0, 0.0, target_yaw_rad);
+    // Accelerometer only measures gravity on Z (no roll/pitch error to align)
+    let static_accel = Vector3::new(0.0, 0.0, 1.0);
+
+    for _ in 0..600 {
+        tracker.update(gyro_step, static_accel, dt);
+    }
+
+    // Must preserve unit quaternion length
+    if (tracker.attitude.norm() - 1.0).abs() > 1e-4 {
+        return false;
+    }
+
+    let (r_end, p_end, y_end) = tracker.to_euler_degrees();
+    if r_end.abs() > 1.0 || p_end.abs() > 1.0 {
+        return false;
+    }
+    if (y_end - 90.0).abs() > 1.5 {
+        return false;
+    }
+
+    // 3. Gravity vector estimation check on flat orientation
+    tracker.reset();
+    let g_vec = tracker.estimate_gravity_direction();
+    if (g_vec.z - 1.0).abs() > 1e-4 || g_vec.x.abs() > 1e-4 || g_vec.y.abs() > 1e-4 {
         return false;
     }
 
