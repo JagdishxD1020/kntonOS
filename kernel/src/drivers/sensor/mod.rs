@@ -4,11 +4,13 @@ pub mod als;
 pub mod als_governor;
 pub mod brightness;
 pub mod imu_fusion;
+pub mod gyro_calibrator;
 
 pub use als::*;
 pub use als_governor::*;
 pub use brightness::*;
 pub use imu_fusion::*;
+pub use gyro_calibrator::*;
 
 /// Verification self-test suite for Handheld Ambient Light Sensor (ALS) and HDR governor.
 pub fn test_als_and_brightness_subsystem() -> bool {
