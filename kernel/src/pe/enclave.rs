@@ -97,3 +97,184 @@ static ENCLAVES: Spinlock<BTreeMap<HANDLE, EnclaveInner>> = Spinlock::new(BTreeM
 static VIRTUAL_ENCLAVE_BASE: AtomicUsize = AtomicUsize::new(0x0000_7FF8_0000_0000);
 
 use core::sync::atomic::AtomicUsize;
+
+/// Creates a new uninitialized hardware/software enclave.
+pub unsafe extern "system" fn CreateEnclave(
+    hProcess: HANDLE,
+    lpAddress: LPVOID,
+    dwSize: SIZE_T,
+    dwInitialCommitment: SIZE_T,
+    flEnclaveType: DWORD,
+    _lpEnclaveInformation: *const c_void,
+    _dwInfoLength: DWORD,
+    lpEnclaveError: *mut DWORD,
+) -> PVOID {
+    if dwSize == 0 || (flEnclaveType != ENCLAVE_TYPE_VBS && flEnclaveType != ENCLAVE_TYPE_SGX) {
+        if !lpEnclaveError.is_null() {
+            *lpEnclaveError = ERROR_INVALID_PARAMETER;
+        }
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return core::ptr::null_mut();
+    }
+
+    let base = if lpAddress.is_null() {
+        VIRTUAL_ENCLAVE_BASE.fetch_add(dwSize + 0x10000, Ordering::SeqCst)
+    } else {
+        lpAddress as usize
+    };
+
+    let id = NEXT_ENCLAVE_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+    let enclave = EnclaveInner {
+        id,
+        process_handle: hProcess,
+        enclave_type: flEnclaveType,
+        base_address: base,
+        size: dwSize,
+        initial_commit_size: dwInitialCommitment,
+        state: ENCLAVE_STATE_CREATED,
+        sections: Vec::new(),
+        entry_point: base,
+        call_count: 0,
+    };
+
+    ENCLAVES.lock().insert(id, enclave);
+
+    if !lpEnclaveError.is_null() {
+        *lpEnclaveError = ERROR_SUCCESS;
+    }
+    win32_set_last_error(ERROR_SUCCESS);
+    base as PVOID
+}
+
+/// Loads a block of authenticated data/code into an uninitialized enclave.
+pub unsafe extern "system" fn LoadEnclaveData(
+    _hProcess: HANDLE,
+    lpAddress: LPVOID,
+    lpBuffer: *const c_void,
+    nNumberOfBytesToLoad: SIZE_T,
+    flProtect: DWORD,
+    _lpPageInformation: *const c_void,
+    _dwInfoLength: DWORD,
+    lpNumberOfBytesWritten: *mut SIZE_T,
+    lpEnclaveError: *mut DWORD,
+) -> BOOL {
+    if lpAddress.is_null() || lpBuffer.is_null() || nNumberOfBytesToLoad == 0 {
+        if !lpEnclaveError.is_null() {
+            *lpEnclaveError = ERROR_INVALID_PARAMETER;
+        }
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let target_addr = lpAddress as usize;
+    let mut enclaves = ENCLAVES.lock();
+    let mut found = false;
+
+    for enclave in enclaves.values_mut() {
+        if target_addr >= enclave.base_address && target_addr + nNumberOfBytesToLoad <= enclave.base_address + enclave.size {
+            if enclave.state != ENCLAVE_STATE_CREATED && enclave.state != ENCLAVE_STATE_INITIALIZING {
+                if !lpEnclaveError.is_null() {
+                    *lpEnclaveError = ERROR_ACCESS_DENIED;
+                }
+                win32_set_last_error(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+
+            let slice = core::slice::from_raw_parts(lpBuffer as *const u8, nNumberOfBytesToLoad);
+            let section = EnclaveMemorySection {
+                base_address: target_addr,
+                size: nNumberOfBytesToLoad,
+                protection: flProtect,
+                data: slice.to_vec(),
+            };
+            enclave.sections.push(section);
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        if !lpEnclaveError.is_null() {
+            *lpEnclaveError = ERROR_INVALID_PARAMETER;
+        }
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if !lpNumberOfBytesWritten.is_null() {
+        *lpNumberOfBytesWritten = nNumberOfBytesToLoad;
+    }
+    if !lpEnclaveError.is_null() {
+        *lpEnclaveError = ERROR_SUCCESS;
+    }
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Initializes an enclave with loaded sections, locking memory bounds and enabling entry.
+pub unsafe extern "system" fn InitializeEnclave(
+    _hProcess: HANDLE,
+    lpAddress: LPVOID,
+    _lpEnclaveInformation: *const c_void,
+    _dwInfoLength: DWORD,
+    lpEnclaveError: *mut DWORD,
+) -> BOOL {
+    if lpAddress.is_null() {
+        if !lpEnclaveError.is_null() {
+            *lpEnclaveError = ERROR_INVALID_PARAMETER;
+        }
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let base = lpAddress as usize;
+    let mut enclaves = ENCLAVES.lock();
+    for enclave in enclaves.values_mut() {
+        if enclave.base_address == base {
+            if enclave.state == ENCLAVE_STATE_TERMINATED {
+                if !lpEnclaveError.is_null() {
+                    *lpEnclaveError = ERROR_ACCESS_DENIED;
+                }
+                win32_set_last_error(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            enclave.state = ENCLAVE_STATE_RUNNING;
+            if !lpEnclaveError.is_null() {
+                *lpEnclaveError = ERROR_SUCCESS;
+            }
+            win32_set_last_error(ERROR_SUCCESS);
+            return TRUE;
+        }
+    }
+
+    if !lpEnclaveError.is_null() {
+        *lpEnclaveError = ERROR_INVALID_PARAMETER;
+    }
+    win32_set_last_error(ERROR_INVALID_PARAMETER);
+    FALSE
+}
+
+/// Terminates an active enclave and revokes all execution and memory mappings.
+pub unsafe extern "system" fn TerminateEnclave(
+    lpAddress: LPVOID,
+    _fWait: BOOL,
+) -> BOOL {
+    if lpAddress.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let base = lpAddress as usize;
+    let mut enclaves = ENCLAVES.lock();
+    for enclave in enclaves.values_mut() {
+        if enclave.base_address == base {
+            enclave.state = ENCLAVE_STATE_TERMINATED;
+            enclave.sections.clear();
+            win32_set_last_error(ERROR_SUCCESS);
+            return TRUE;
+        }
+    }
+
+    win32_set_last_error(ERROR_INVALID_PARAMETER);
+    FALSE
+}
