@@ -1,0 +1,99 @@
+//! Win32 Enclave Memory Isolation & Anti-Tamper Hardware Execution Enclave.
+//!
+//! Implements Windows NT enclaves (`ENCLAVE_TYPE_VBS` and `ENCLAVE_TYPE_SGX`) for
+//! anti-cheat integrity isolation, secure game code execution, and boundary context transitions.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, unused_imports, dead_code)]
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::memory::spinlock::Spinlock;
+use crate::pe::kernel32::{
+    win32_set_last_error, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY, ERROR_SUCCESS,
+};
+pub use crate::pe::synch::HANDLE;
+pub use crate::pe::threadpool::{BOOL, FALSE, TRUE};
+
+pub use crate::pe::srw_futex::{DWORD, PVOID, SIZE_T};
+pub use crate::pe::token_security::BYTE;
+pub type LPVOID = *mut c_void;
+
+pub const ENCLAVE_TYPE_SGX: DWORD = 0x0000_0001;
+pub const ENCLAVE_TYPE_SGX2: DWORD = 0x0000_0002;
+pub const ENCLAVE_TYPE_VBS: DWORD = 0x0000_0010;
+pub const ENCLAVE_TYPE_VBS_BASIC: DWORD = 0x0000_0011;
+
+pub const ENCLAVE_STATE_CREATED: u32 = 0;
+pub const ENCLAVE_STATE_INITIALIZING: u32 = 1;
+pub const ENCLAVE_STATE_RUNNING: u32 = 2;
+pub const ENCLAVE_STATE_TERMINATED: u32 = 3;
+
+// Enclave page protection flags
+pub const PAGE_ENCLAVE_THREAD_CONTROL: DWORD = 0x8000_0000;
+pub const PAGE_ENCLAVE_UNVALIDATED: DWORD = 0x2000_0000;
+pub const PAGE_ENCLAVE_DECOMMIT: DWORD = 0x1000_0000;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ENCLAVE_CREATE_INFO_VBS {
+    pub Flags: DWORD,
+    pub OwnerID: [BYTE; 32],
+}
+
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ENCLAVE_INIT_INFO_VBS {
+    pub Length: DWORD,
+    pub ThreadId: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ENCLAVE_CREATE_INFO_SGX {
+    pub Secs: [BYTE; 4096],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ENCLAVE_INIT_INFO_SGX {
+    pub SigStruct: [BYTE; 1808],
+    pub Reserved1: [BYTE; 240],
+    pub EInitToken: [BYTE; 304],
+    pub Reserved2: [BYTE; 1744],
+}
+
+/// Representation of an active memory region loaded within an enclave.
+#[derive(Clone, Debug)]
+pub struct EnclaveMemorySection {
+    pub base_address: usize,
+    pub size: usize,
+    pub protection: DWORD,
+    pub data: Vec<u8>,
+}
+
+/// Representation of an isolated hardware/VBS software enclave.
+#[derive(Clone, Debug)]
+pub struct EnclaveInner {
+    pub id: HANDLE,
+    pub process_handle: HANDLE,
+    pub enclave_type: DWORD,
+    pub base_address: usize,
+    pub size: usize,
+    pub initial_commit_size: usize,
+    pub state: u32,
+    pub sections: Vec<EnclaveMemorySection>,
+    pub entry_point: usize,
+    pub call_count: u32,
+}
+
+static NEXT_ENCLAVE_ID: AtomicU64 = AtomicU64::new(0x5000);
+static ENCLAVES: Spinlock<BTreeMap<HANDLE, EnclaveInner>> = Spinlock::new(BTreeMap::new());
+static VIRTUAL_ENCLAVE_BASE: AtomicUsize = AtomicUsize::new(0x0000_7FF8_0000_0000);
+
+use core::sync::atomic::AtomicUsize;
