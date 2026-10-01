@@ -306,3 +306,106 @@ pub unsafe extern "system" fn WakeByAddressAll(Address: *mut c_void) {
         w.clear();
     }
 }
+
+/// Self-test suite verifying Win32 SRW locks, condition variables, and futex wait/wake.
+pub fn test_win32_srw_futex_subsystem() -> bool {
+    unsafe {
+        // 1. Verify SRW Lock initialization and exclusive acquire/release
+        let mut srw = SRWLOCK_INIT;
+        InitializeSRWLock(&mut srw);
+
+        if TryAcquireSRWLockExclusive(&mut srw) != TRUE {
+            return false;
+        }
+
+        // Secondary exclusive acquire should fail without blocking
+        if TryAcquireSRWLockExclusive(&mut srw) != FALSE {
+            return false;
+        }
+
+        // Secondary shared acquire should fail while exclusive held
+        if TryAcquireSRWLockShared(&mut srw) != FALSE {
+            return false;
+        }
+
+        ReleaseSRWLockExclusive(&mut srw);
+
+        // 2. Verify shared reader mode concurrency
+        if TryAcquireSRWLockShared(&mut srw) != TRUE {
+            return false;
+        }
+        if TryAcquireSRWLockShared(&mut srw) != TRUE {
+            return false;
+        }
+
+        // Exclusive acquire should fail while readers are active
+        if TryAcquireSRWLockExclusive(&mut srw) != FALSE {
+            return false;
+        }
+
+        ReleaseSRWLockShared(&mut srw);
+        ReleaseSRWLockShared(&mut srw);
+
+        // 3. Verify Condition Variable lifecycle and dispatch
+        let mut cv = CONDITION_VARIABLE_INIT;
+        InitializeConditionVariable(&mut cv);
+
+        let mut cs = CriticalSection::default();
+        win32_enter_critical_section(&mut cs);
+
+        // Test SleepConditionVariableCS with simulated wake
+        WakeConditionVariable(&mut cv);
+        WakeAllConditionVariable(&mut cv);
+
+        let cv_cs_res = SleepConditionVariableCS(&mut cv, &mut cs, 10);
+        win32_leave_critical_section(&mut cs);
+
+        if cv_cs_res != TRUE {
+            return false;
+        }
+
+        // Test SleepConditionVariableSRW
+        AcquireSRWLockExclusive(&mut srw);
+        let cv_srw_res = SleepConditionVariableSRW(&mut cv, &mut srw, 10, 0);
+        ReleaseSRWLockExclusive(&mut srw);
+
+        if cv_srw_res != TRUE {
+            return false;
+        }
+
+        // 4. Verify Fast Userland Futex (WaitOnAddress / WakeByAddress)
+        let mut target_val: u32 = 0x1234_5678;
+        let diff_val: u32 = 0x9999_9999;
+        let same_val: u32 = 0x1234_5678;
+
+        // When values differ, WaitOnAddress should return immediately with TRUE
+        if WaitOnAddress(
+            &mut target_val as *mut _ as *mut c_void,
+            &diff_val as *const _ as *mut c_void,
+            core::mem::size_of::<u32>(),
+            0,
+        ) != TRUE {
+            return false;
+        }
+
+        // Wake functions
+        WakeByAddressSingle(&mut target_val as *mut _ as *mut c_void);
+        WakeByAddressAll(&mut target_val as *mut _ as *mut c_void);
+
+        // Immediate timeout check
+        let wait_res = WaitOnAddress(
+            &mut target_val as *mut _ as *mut c_void,
+            &same_val as *const _ as *mut c_void,
+            core::mem::size_of::<u32>(),
+            0,
+        );
+        if wait_res != FALSE {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-SRW-PASS] Win32 SRW locks, condition variables and futex service verified\r\n",
+    );
+    true
+}
