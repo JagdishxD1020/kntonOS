@@ -209,3 +209,100 @@ pub unsafe extern "system" fn SleepConditionVariableSRW(
     win32_set_last_error(ERROR_SUCCESS);
     TRUE
 }
+
+static FUTEX_WAITERS: Spinlock<BTreeMap<usize, Vec<usize>>> = Spinlock::new(BTreeMap::new());
+
+/// Waits on a memory address until the value changes or timeout expires (fast userland futex).
+pub unsafe extern "system" fn WaitOnAddress(
+    Address: *mut c_void,
+    CompareAddress: *mut c_void,
+    AddressSize: SIZE_T,
+    dwMilliseconds: DWORD,
+) -> BOOL {
+    if Address.is_null() || CompareAddress.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if AddressSize != 1 && AddressSize != 2 && AddressSize != 4 && AddressSize != 8 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    // Compare memory contents under safety
+    let matches = match AddressSize {
+        1 => *(Address as *const u8) == *(CompareAddress as *const u8),
+        2 => *(Address as *const u16) == *(CompareAddress as *const u16),
+        4 => *(Address as *const u32) == *(CompareAddress as *const u32),
+        8 => *(Address as *const u64) == *(CompareAddress as *const u64),
+        _ => false,
+    };
+
+    if !matches {
+        // Value already differs, return immediately
+        win32_set_last_error(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    // Register address in futex waiter registry
+    let addr_key = Address as usize;
+    let waiter_id = Address as usize; // marker
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        waiters.entry(addr_key).or_insert_with(Vec::new).push(waiter_id);
+    }
+
+    // Yield execution to allow writer threads to modify address and signal
+    crate::process::yield_now();
+
+    // Check if value changed after yield
+    let matches_after = match AddressSize {
+        1 => *(Address as *const u8) == *(CompareAddress as *const u8),
+        2 => *(Address as *const u16) == *(CompareAddress as *const u16),
+        4 => *(Address as *const u32) == *(CompareAddress as *const u32),
+        8 => *(Address as *const u64) == *(CompareAddress as *const u64),
+        _ => false,
+    };
+
+    // Remove waiter
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        if let Some(w) = waiters.get_mut(&addr_key) {
+            w.retain(|&id| id != waiter_id);
+        }
+    }
+
+    if matches_after && dwMilliseconds == 0 {
+        win32_set_last_error(ERROR_TIMEOUT);
+        FALSE
+    } else {
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    }
+}
+
+/// Wakes a single thread waiting on the specified memory address.
+pub unsafe extern "system" fn WakeByAddressSingle(Address: *mut c_void) {
+    if Address.is_null() {
+        return;
+    }
+    let addr_key = Address as usize;
+    let mut waiters = FUTEX_WAITERS.lock();
+    if let Some(w) = waiters.get_mut(&addr_key) {
+        if !w.is_empty() {
+            w.remove(0);
+        }
+    }
+}
+
+/// Wakes all threads waiting on the specified memory address.
+pub unsafe extern "system" fn WakeByAddressAll(Address: *mut c_void) {
+    if Address.is_null() {
+        return;
+    }
+    let addr_key = Address as usize;
+    let mut waiters = FUTEX_WAITERS.lock();
+    if let Some(w) = waiters.get_mut(&addr_key) {
+        w.clear();
+    }
+}
