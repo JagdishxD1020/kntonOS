@@ -418,7 +418,129 @@ impl NeuralUpscalerMmaPipeline {
         Ok(result)
     }
 }
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 SM 6.8 Wave MMA & Neural Upscaler.
 pub fn test_wave_mma_subsystem() -> bool {
+    // 1. Verify SM 6.8 matrix formats, tile dimensions, and validation
+    let dims16 = WaveMmaTileDimensions::Tile16x16x16;
+    if dims16.dimensions() != (16, 16, 16) || dims16.accumulator_elements() != 256 {
+        return false;
+    }
+
+    let invalid_desc = WaveMatrixDescriptor::new(
+        WaveMatrixRole::Accumulator,
+        WaveMmaTileDimensions::Tile16x16x16,
+        WAVE_MMA_ACCUMULATOR_FORMAT::INT8,
+        WaveMatrixLayout::RowMajor,
+    );
+    if invalid_desc.validate().is_ok() {
+        return false;
+    }
+
+    let valid_desc = WaveMatrixDescriptor::new(
+        WaveMatrixRole::Accumulator,
+        WaveMmaTileDimensions::Tile16x16x16,
+        WAVE_MMA_ACCUMULATOR_FORMAT::INT32,
+        WaveMatrixLayout::RowMajor,
+    );
+    if valid_desc.validate().is_err() {
+        return false;
+    }
+
+    // 2. Verify Cooperative Wave Matrix Load, Store, and Multiply-Accumulate
+    // Create Matrix A (16x16 identity scaled by 2)
+    let a_desc = WaveMatrixDescriptor::new(
+        WaveMatrixRole::MatrixA,
+        WaveMmaTileDimensions::Tile16x16x16,
+        WAVE_MMA_ACCUMULATOR_FORMAT::INT32,
+        WaveMatrixLayout::RowMajor,
+    );
+    let mut a_raw = [0i32; 256];
+    for i in 0..16 {
+        a_raw[i * 16 + i] = 2;
+    }
+    let mat_a = match CooperativeWaveMatrixTile::WaveMatrixLoad(a_desc, &a_raw, 16) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // Create Matrix B (16x16 filled with 3)
+    let b_desc = WaveMatrixDescriptor::new(
+        WaveMatrixRole::MatrixB,
+        WaveMmaTileDimensions::Tile16x16x16,
+        WAVE_MMA_ACCUMULATOR_FORMAT::INT32,
+        WaveMatrixLayout::RowMajor,
+    );
+    let b_raw = [3i32; 256];
+    let mat_b = match CooperativeWaveMatrixTile::WaveMatrixLoad(b_desc, &b_raw, 16) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // Create Matrix C (16x16 filled with 1)
+    let c_desc = WaveMatrixDescriptor::new(
+        WaveMatrixRole::Accumulator,
+        WaveMmaTileDimensions::Tile16x16x16,
+        WAVE_MMA_ACCUMULATOR_FORMAT::INT32,
+        WaveMatrixLayout::RowMajor,
+    );
+    let c_raw = [1i32; 256];
+    let mat_c = match CooperativeWaveMatrixTile::WaveMatrixLoad(c_desc, &c_raw, 16) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // D = A * B + C -> (2 * I) * 3 + 1 = 2 * 3 + 1 = 7 for all elements
+    let mat_d = match CooperativeWaveMatrixTile::WaveMatrixMultiplyAccumulate(&mat_a, &mat_b, &mat_c) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let mut d_out = [0i32; 256];
+    if mat_d.WaveMatrixStore(&mut d_out, 16).is_err() {
+        return false;
+    }
+    for val in &d_out {
+        if *val != 7 {
+            return false;
+        }
+    }
+
+    // 3. Verify RDNA 3/3.5 Wave64 SIMD layout optimizer and dual-issue pairing
+    let mut rdna_opt = RdnaSimdLayoutOptimizer::new(WaveExecutionMode::Wave64);
+    let (lanes, per_lane) = rdna_opt.calculate_lane_distribution(dims16, WaveMatrixRole::Accumulator);
+    if lanes != 64 || per_lane != 4 {
+        return false;
+    }
+
+    let pair = rdna_opt.pair_dual_issue_ops(WaveMatrixRole::MatrixA, WaveMatrixRole::MatrixB, dims16);
+    if !pair.is_dual_issue_eligible || pair.combined_vgpr_cost != 8 {
+        return false;
+    }
+    if !rdna_opt.validate_vgpr_budget() {
+        return false;
+    }
+
+    // 4. Verify Neural Upscaler Pipeline and activations
+    let pipeline = NeuralUpscalerMmaPipeline::new(2, 2, 0x0001_0000); // 1.0 in 16.16 fixed point
+    let inferred = match pipeline.execute_layer_inference(&mat_a, &mat_b, &mat_c) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if inferred.elements[0] != 7 {
+        return false;
+    }
+    let mut neg_tile = mat_d.clone();
+    for (idx, elem) in neg_tile.elements.iter_mut().enumerate() {
+        if (idx % 2) == 0 {
+            *elem = -16;
+        }
+    }
+    NeuralUpscalerMmaPipeline::apply_activation_leaky_relu(&mut neg_tile);
+    // Negative values (-16) divided by 8 become -2
+    if neg_tile.elements[0] != -2 || neg_tile.elements[1] != 7 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-WAVE-MMA-PASS] Direct3D 12 SM 6.8 wave MMA & neural upscaler verified\r\n");
     true
 }
