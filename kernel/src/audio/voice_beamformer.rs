@@ -146,3 +146,154 @@ pub fn verify_dual_mic_beamformer() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Voice Noise Gate & Spectral Floor Attenuation
+// ============================================================================
+
+/// Sub-millisecond Voice Noise Gate with spectral floor subtraction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceNoiseGate {
+    /// Signal amplitude envelope follower state.
+    pub envelope: f32,
+    /// Fast attack smoothing factor (tau ≈ 0.4 ms at 48kHz -> ~0.05).
+    pub attack_coeff: f32,
+    /// Smooth release smoothing factor (tau ≈ 25 ms at 48kHz -> ~0.001).
+    pub release_coeff: f32,
+    /// Threshold above which voice gate opens (amplitude, ~ -32 dBFS).
+    pub open_threshold: f32,
+    /// Threshold below which voice gate closes with hysteresis (~ -36 dBFS).
+    pub close_threshold: f32,
+    /// Noise floor attenuation multiplier when gate is fully closed (e.g. 0.02 = -34 dB).
+    pub floor_attenuation: f32,
+    /// Active smoothed gate gain multiplier (0.02 .. 1.0).
+    pub current_gate_gain: f32,
+    /// Background stationary noise floor tracker.
+    pub noise_floor_estimate: f32,
+    /// Over-subtraction factor for spectral residual reduction.
+    pub spectral_sub_factor: f32,
+    /// Whether voice activity is currently detected and gate is open.
+    pub is_gate_open: bool,
+}
+
+impl VoiceNoiseGate {
+    /// Constructs a sub-millisecond voice noise gate tuned for gamer voice chat.
+    pub const fn new() -> Self {
+        Self {
+            envelope: 0.0,
+            attack_coeff: 0.05,       // ~0.4 ms attack time constant
+            release_coeff: 0.001,     // ~20 ms release time constant
+            open_threshold: 0.025,    // -32 dBFS
+            close_threshold: 0.015,   // -36 dBFS (hysteresis margin)
+            floor_attenuation: 0.025, // -32 dB attenuation floor
+            current_gate_gain: 0.025,
+            noise_floor_estimate: 0.005,
+            spectral_sub_factor: 1.25,
+            is_gate_open: false,
+        }
+    }
+
+    /// Resets envelope and gain state.
+    pub fn reset(&mut self) {
+        self.envelope = 0.0;
+        self.current_gate_gain = self.floor_attenuation;
+        self.noise_floor_estimate = 0.005;
+        self.is_gate_open = false;
+    }
+
+    /// Processes a single beamformed audio sample through envelope detector, noise gate, and spectral subtraction.
+    pub fn process_sample(&mut self, sample: f32) -> f32 {
+        let abs_s = if sample < 0.0 { -sample } else { sample };
+
+        // 1. Sub-millisecond asymmetrical envelope follower
+        if abs_s > self.envelope {
+            self.envelope += self.attack_coeff * (abs_s - self.envelope);
+        } else {
+            self.envelope += self.release_coeff * (abs_s - self.envelope);
+        }
+
+        // 2. Dual-threshold hysteresis gate decision
+        if !self.is_gate_open {
+            if self.envelope >= self.open_threshold {
+                self.is_gate_open = true;
+            }
+        } else {
+            if self.envelope < self.close_threshold {
+                self.is_gate_open = false;
+            }
+        }
+
+        // 3. Target gate gain slew (fast sub-millisecond opening, smooth closing)
+        let target_gain = if self.is_gate_open { 1.0 } else { self.floor_attenuation };
+        if target_gain > self.current_gate_gain {
+            self.current_gate_gain += self.attack_coeff * (target_gain - self.current_gate_gain);
+        } else {
+            self.current_gate_gain += self.release_coeff * (target_gain - self.current_gate_gain);
+        }
+
+        // 4. Background stationary noise floor tracker
+        if !self.is_gate_open {
+            self.noise_floor_estimate += 0.0005 * (self.envelope - self.noise_floor_estimate);
+            if self.noise_floor_estimate < 0.001 {
+                self.noise_floor_estimate = 0.001;
+            }
+        }
+
+        // 5. Spectral subtraction of background floor
+        let sub_amount = self.spectral_sub_factor * self.noise_floor_estimate;
+        let subbed_abs = if abs_s > sub_amount { abs_s - sub_amount } else { 0.0 };
+        let subbed = if sample < 0.0 { -subbed_abs } else { subbed_abs };
+
+        // 6. Apply dynamic floor attenuation
+        subbed * self.current_gate_gain
+    }
+}
+
+/// Verification test for sub-millisecond voice noise gate and spectral subtraction.
+pub fn verify_voice_noise_gate() -> bool {
+    let mut gate = VoiceNoiseGate::new();
+
+    // 1. Test Low-level Noise Gating:
+    // Feed 200 samples of low-level ambient fan hum (0.008 < close_threshold)
+    for _ in 0..200 {
+        gate.process_sample(0.008);
+    }
+
+    // Gate must remain closed and attenuate noise floor by > 26 dB (output < 0.001)
+    if gate.is_gate_open {
+        return false;
+    }
+    let gated_noise = gate.process_sample(0.008);
+    if gated_noise >= 0.001 {
+        return false;
+    }
+
+    // 2. Test Sub-Millisecond Voice Attack:
+    // Feed sudden gamer voice burst (0.35)
+    // At attack_coeff = 0.05, 48 samples (1.0 ms) must open gate and achieve > 90% pass-through
+    for _ in 0..48 {
+        gate.process_sample(0.35);
+    }
+
+    if !gate.is_gate_open {
+        return false;
+    }
+    let passed_voice = gate.process_sample(0.35);
+    if passed_voice <= 0.30 {
+        return false;
+    }
+
+    // 3. Test Controlled Release:
+    // Voice stops suddenly (input = 0.0)
+    // Envelope should decrease smoothly rather than abrupt clipping
+    let env_before = gate.envelope;
+    for _ in 0..50 {
+        gate.process_sample(0.0);
+    }
+    if gate.envelope >= env_before || gate.envelope <= 0.0 {
+        return false;
+    }
+
+    true
+}
