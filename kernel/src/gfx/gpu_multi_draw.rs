@@ -133,6 +133,107 @@ impl MultiDrawBufferDesc {
     }
 }
 
+
+// 6 view frustum planes for GPU compute geometry culling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrustumPlanes {
+    pub planes: [[f32; 4]; 6], // Left, Right, Bottom, Top, Near, Far
+}
+
+impl FrustumPlanes {
+    // Creates frustum planes from 6 normalized plane equations.
+    pub const fn new(planes: [[f32; 4]; 6]) -> Self {
+        Self { planes }
+    }
+
+    // Default frustum looking down -Z axis with unit bounds.
+    pub const fn default_box() -> Self {
+        Self {
+            planes: [
+                [1.0, 0.0, 0.0, 10.0],  // Left: x >= -10
+                [-1.0, 0.0, 0.0, 10.0], // Right: x <= 10
+                [0.0, 1.0, 0.0, 10.0],  // Bottom: y >= -10
+                [0.0, -1.0, 0.0, 10.0], // Top: y <= 10
+                [0.0, 0.0, 1.0, 0.0],   // Near: z >= 0
+                [0.0, 0.0, -1.0, 100.0],// Far: z <= 100
+            ],
+        }
+    }
+
+    // Tests whether a bounding sphere is inside or intersects the frustum.
+    pub fn test_sphere(&self, sphere: &BoundingSphere) -> bool {
+        let (cx, cy, cz) = (sphere.center[0], sphere.center[1], sphere.center[2]);
+        let r = sphere.radius;
+
+        for plane in &self.planes {
+            let dist = plane[0] * cx + plane[1] * cy + plane[2] * cz + plane[3];
+            if dist < -r {
+                return false; // Completely outside plane
+            }
+        }
+        true
+    }
+}
+
+// Hierarchical-Z (Hi-Z) occlusion depth pyramid representation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HiZDepthPyramid {
+    pub width: usize,
+    pub height: usize,
+    pub depth_samples: Vec<f32>,
+}
+
+impl HiZDepthPyramid {
+    // Creates a new Hi-Z pyramid initialized to a clear depth.
+    pub fn new(width: usize, height: usize, clear_depth: f32) -> Self {
+        Self {
+            width,
+            height,
+            depth_samples: alloc::vec![clear_depth; width * height],
+        }
+    }
+
+    // Samples maximum depth at coordinate (x, y) clamped to bounds.
+    pub fn sample_max_depth(&self, x: usize, y: usize) -> f32 {
+        let cx = x.min(self.width.saturating_sub(1));
+        let cy = y.min(self.height.saturating_sub(1));
+        self.depth_samples[cy * self.width + cx]
+    }
+
+    // Tests if a bounding sphere is occluded behind the Hi-Z depth buffer.
+    pub fn is_occluded(&self, sphere: &BoundingSphere) -> bool {
+        // Simple projected z evaluation: if nearest point is behind depth sample, occlude
+        let nearest_z = sphere.center[2] - sphere.radius;
+        if nearest_z <= 0.0 {
+            return false;
+        }
+        let sample = self.sample_max_depth(self.width / 2, self.height / 2);
+        nearest_z > sample
+    }
+}
+
+// GPU Compute Meshlet Frustum & Occlusion Culler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GpuMeshletCuller;
+
+impl GpuMeshletCuller {
+    // Evaluates whether a meshlet passes frustum and Hi-Z occlusion tests.
+    pub fn evaluate_meshlet_visibility(
+        token: &MeshletDrawToken,
+        frustum: &FrustumPlanes,
+        hiz: Option<&HiZDepthPyramid>,
+    ) -> bool {
+        if !frustum.test_sphere(&token.bounding_sphere) {
+            return false;
+        }
+        if let Some(hiz_pyramid) = hiz {
+            if hiz_pyramid.is_occluded(&token.bounding_sphere) {
+                return false;
+            }
+        }
+        true
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_gpu_multi_draw_subsystem() -> bool {
     true
