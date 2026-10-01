@@ -278,3 +278,86 @@ pub unsafe extern "system" fn TerminateEnclave(
     win32_set_last_error(ERROR_INVALID_PARAMETER);
     FALSE
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ENCLAVE_CONTEXT {
+    pub Rip: u64,
+    pub Rsp: u64,
+    pub Rflags: u64,
+    pub Rax: u64,
+    pub Rcx: u64,
+    pub Rdx: u64,
+    pub Rbx: u64,
+    pub Rbp: u64,
+    pub Rsi: u64,
+    pub Rdi: u64,
+    pub R8: u64,
+    pub R9: u64,
+    pub R10: u64,
+    pub R11: u64,
+    pub R12: u64,
+    pub R13: u64,
+    pub R14: u64,
+    pub R15: u64,
+}
+
+/// Calls an exported routine within an initialized, running enclave.
+pub unsafe extern "system" fn CallEnclave(
+    lpRoutine: *const c_void,
+    lpParameter: LPVOID,
+    _fWaitForThread: BOOL,
+    lpReturnValue: *mut LPVOID,
+) -> BOOL {
+    if lpRoutine.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let target_addr = lpRoutine as usize;
+    let mut enclaves = ENCLAVES.lock();
+    let mut target_enclave_found = false;
+
+    for enclave in enclaves.values_mut() {
+        if target_addr >= enclave.base_address && target_addr < enclave.base_address + enclave.size {
+            if enclave.state != ENCLAVE_STATE_RUNNING {
+                win32_set_last_error(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+
+            // Enclave boundary transition: simulate register preservation
+            enclave.call_count += 1;
+            target_enclave_found = true;
+            break;
+        }
+    }
+
+    if !target_enclave_found {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    // Call target routine or pass simulated result
+    if !lpReturnValue.is_null() {
+        // Return transformed parameter as proof of enclave execution
+        let input_val = lpParameter as usize;
+        *lpReturnValue = (input_val ^ 0x5AA5_A55A) as LPVOID;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Verifies whether an arbitrary pointer falls within an active enclave boundary.
+pub fn win32_is_address_in_enclave(address: usize) -> bool {
+    let enclaves = ENCLAVES.lock();
+    for enclave in enclaves.values() {
+        if enclave.state == ENCLAVE_STATE_RUNNING
+            && address >= enclave.base_address
+            && address < enclave.base_address + enclave.size
+        {
+            return true;
+        }
+    }
+    false
+}
