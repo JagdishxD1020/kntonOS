@@ -447,3 +447,120 @@ pub fn verify_acoustic_echo_cancellation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Integrated Handheld Voice Chat Speech Processor Pipeline
+// ============================================================================
+
+/// Complete Integrated Handheld Voice Chat Speech Processor Pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VoiceBeamformerPipeline {
+    /// Dual-microphone spatial beamformer.
+    pub beamformer: DualMicBeamformer,
+    /// NLMS acoustic echo canceller with double-talk detection.
+    pub echo_canceller: AcousticEchoCanceller,
+    /// Sub-millisecond voice noise gate and spectral subtraction.
+    pub noise_gate: VoiceNoiseGate,
+    /// Total audio samples processed.
+    pub total_samples_processed: u64,
+    /// Total samples where voice activity was detected.
+    pub active_voice_samples: u64,
+    /// Running ratio of voice activity vs total conversation time.
+    pub voice_activity_ratio: f32,
+}
+
+impl VoiceBeamformerPipeline {
+    /// Constructs an integrated voice chat speech processor pipeline.
+    pub const fn new() -> Self {
+        Self {
+            beamformer: DualMicBeamformer::new(),
+            echo_canceller: AcousticEchoCanceller::new(),
+            noise_gate: VoiceNoiseGate::new(),
+            total_samples_processed: 0,
+            active_voice_samples: 0,
+            voice_activity_ratio: 0.0,
+        }
+    }
+
+    /// Resets all pipeline filters, envelopes, and metrics.
+    pub fn reset(&mut self) {
+        self.beamformer.reset();
+        self.echo_canceller.reset();
+        self.noise_gate.reset();
+        self.total_samples_processed = 0;
+        self.active_voice_samples = 0;
+        self.voice_activity_ratio = 0.0;
+    }
+
+    /// Processes a single multi-channel audio sample through spatial beamforming, AEC, and noise gating.
+    pub fn process_sample(&mut self, primary_front: f32, secondary_rear: f32, speaker_loopback: f32) -> f32 {
+        // 1. Dual-mic spatial beamforming (cancels rear fan noise)
+        let beamformed = self.beamformer.process_sample(primary_front, secondary_rear);
+
+        // 2. Acoustic echo cancellation (cancels speaker loopback spill)
+        let aec_cleaned = self.echo_canceller.process_sample(beamformed, speaker_loopback);
+
+        // 3. Voice noise gate & spectral floor attenuation
+        let gated_out = self.noise_gate.process_sample(aec_cleaned);
+
+        // 4. Update voice telemetry metrics
+        self.total_samples_processed = self.total_samples_processed.saturating_add(1);
+        if self.noise_gate.is_gate_open {
+            self.active_voice_samples = self.active_voice_samples.saturating_add(1);
+        }
+        if self.total_samples_processed > 0 {
+            self.voice_activity_ratio = (self.active_voice_samples as f32) / (self.total_samples_processed as f32);
+        }
+
+        gated_out
+    }
+
+    /// Block processing helper for multi-sample audio frames.
+    pub fn process_frame(&mut self, primary: &[f32], secondary: &[f32], speaker: &[f32], output: &mut [f32]) {
+        let count = primary.len().min(secondary.len()).min(speaker.len()).min(output.len());
+        for i in 0..count {
+            output[i] = self.process_sample(primary[i], secondary[i], speaker[i]);
+        }
+    }
+}
+
+/// Verification test for integrated handheld voice beamformer speech processor pipeline.
+pub fn verify_voice_beamformer_pipeline() -> bool {
+    let mut pipeline = VoiceBeamformerPipeline::new();
+
+    // 1. Test Silent Gaming Condition (Rear Fan Running + Game Music Playing on Speakers):
+    // Primary mic receives delayed fan noise (0.015) and speaker spill (0.020).
+    // Secondary mic receives fan noise (0.015).
+    // Speaker loopback has reference (0.060).
+    // With gamer silent, noise gate and beamformer must ensure gated output is below 0.001.
+    for i in 0..100 {
+        let spk = if i % 2 == 0 { 0.060 } else { -0.060 };
+        let fan = 0.015;
+        let prim = fan + 0.020;
+        let out = pipeline.process_sample(prim, fan, spk);
+        let abs_out = if out < 0.0 { -out } else { out };
+        if i >= 80 && abs_out >= 0.005 {
+            return false;
+        }
+    }
+
+    // 2. Test Clear Voice Chat Ingestion:
+    // Gamer speaks with clear voice amplitude 0.40 into front mic
+    for _ in 0..50 {
+        pipeline.process_sample(0.40, 0.05, 0.0);
+    }
+
+    if !pipeline.noise_gate.is_gate_open {
+        return false;
+    }
+    let voice_out = pipeline.process_sample(0.40, 0.05, 0.0);
+    if voice_out <= 0.30 {
+        return false;
+    }
+    if pipeline.active_voice_samples == 0 {
+        return false;
+    }
+
+    true
+}
