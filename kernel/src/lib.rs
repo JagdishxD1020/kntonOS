@@ -766,6 +766,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld IMU 6-DoF sensor fusion and thermal drift governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Precision Gyroscope Calibration & Complementary Orientation Fusion (TASK-KNT-224)
+    if !drivers::sensor::test_gyro_calibrator_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld gyro calibrator and complementary orientation fusion self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Backlight PWM Modulator & Flicker-Free DC Dimming Governor
     if !drivers::display::test_backlight_pwm_subsystem() {
         serial_write_str("[KNT-PANIC] Backlight PWM and DC dimming governor self-test failed!\r\n");
@@ -817,11 +822,6 @@ pub extern "C" fn kmain() -> ! {
     // Initialize and verify Handheld Power Supply (PD 3.1) Passthrough Charging & Thermal Bypass Governor (TASK-KNT-209)
     if !drivers::power::test_bypass_charging_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld PD 3.1 passthrough charging and thermal bypass governor self-test failed!\r\n");
-    }
-
-    // Initialize and verify Handheld Real-Time Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter (TASK-KNT-222)
-    if !drivers::power::test_coulomb_counter_subsystem() {
-        serial_write_str("[KNT-PANIC] Handheld coulomb counter and battery discharge profiler self-test failed!\r\n");
     }
 
     // Initialize and verify Handheld Real-Time Battery Discharge Curve Profiler & Micro-Watt Coulomb Counter (TASK-KNT-222)
