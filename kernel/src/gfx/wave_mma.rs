@@ -365,6 +365,59 @@ impl RdnaSimdLayoutOptimizer {
         self.current_allocated_vgprs <= self.vgpr_budget_per_wave
     }
 }
+
+// Neural reconstruction and temporal upscaler matrix accelerator pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NeuralUpscalerMmaPipeline {
+    pub scale_factor_x: u32,
+    pub scale_factor_y: u32,
+    pub temporal_weight_fixed: i32, // Fixed-point 16.16 weight for temporal history
+}
+
+impl NeuralUpscalerMmaPipeline {
+    // Creates a new neural upscaler accelerator pipeline.
+    pub const fn new(scale_factor_x: u32, scale_factor_y: u32, temporal_weight_fixed: i32) -> Self {
+        Self {
+            scale_factor_x,
+            scale_factor_y,
+            temporal_weight_fixed,
+        }
+    }
+
+    // Applies ReLU non-linear activation in-place to an accumulator tile.
+    pub fn apply_activation_relu(tile: &mut CooperativeWaveMatrixTile) {
+        for val in &mut tile.elements {
+            if *val < 0 {
+                *val = 0;
+            }
+        }
+    }
+
+    // Applies LeakyReLU (alpha = 0.125) non-linear activation in-place to an accumulator tile.
+    pub fn apply_activation_leaky_relu(tile: &mut CooperativeWaveMatrixTile) {
+        for val in &mut tile.elements {
+            if *val < 0 {
+                *val >>= 3; // Fast fixed-point divide by 8
+            }
+        }
+    }
+
+    // Executes a cooperative neural layer inference pass: Output = Act(Weights * Features + History).
+    pub fn execute_layer_inference(
+        &self,
+        weights: &CooperativeWaveMatrixTile,
+        features: &CooperativeWaveMatrixTile,
+        history: &CooperativeWaveMatrixTile,
+    ) -> Result<CooperativeWaveMatrixTile, &'static str> {
+        let mut result = CooperativeWaveMatrixTile::WaveMatrixMultiplyAccumulate(
+            weights,
+            features,
+            history,
+        )?;
+        Self::apply_activation_leaky_relu(&mut result);
+        Ok(result)
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_wave_mma_subsystem() -> bool {
     true
