@@ -297,3 +297,153 @@ pub fn verify_voice_noise_gate() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Acoustic Echo Cancellation (AEC) with NLMS Adaptive Filter
+// ============================================================================
+
+/// Number of FIR taps for chassis acoustic echo path modeling (32 taps ≈ 0.67 ms at 48kHz).
+pub const AEC_FILTER_TAPS: usize = 32;
+
+/// Acoustic Echo Canceller (AEC) removing speaker loopback spill from microphone signal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcousticEchoCanceller {
+    /// Circular buffer storing reference speaker playback samples.
+    pub speaker_history: [f32; AEC_FILTER_TAPS],
+    /// Adaptive FIR filter weight coefficients modeling the chassis acoustic impulse response.
+    pub filter_weights: [f32; AEC_FILTER_TAPS],
+    /// Current write index in the speaker history circular buffer.
+    pub history_head: usize,
+    /// NLMS normalized adaptation step size (mu).
+    pub step_size_mu: f32,
+    /// Power regularization constant preventing division by zero during silence.
+    pub regularization_eps: f32,
+    /// Estimated echo signal amplitude.
+    pub estimated_echo: f32,
+    /// Active double-talk flag preventing filter divergence during simultaneous gamer speech.
+    pub is_double_talk: bool,
+}
+
+impl AcousticEchoCanceller {
+    /// Constructs an acoustic echo canceller with calibrated parameters for handheld speakers.
+    pub const fn new() -> Self {
+        Self {
+            speaker_history: [0.0; AEC_FILTER_TAPS],
+            filter_weights: [0.0; AEC_FILTER_TAPS],
+            history_head: 0,
+            step_size_mu: 0.25,
+            regularization_eps: 1e-4,
+            estimated_echo: 0.0,
+            is_double_talk: false,
+        }
+    }
+
+    /// Resets filter history and learned weights.
+    pub fn reset(&mut self) {
+        self.speaker_history = [0.0; AEC_FILTER_TAPS];
+        self.filter_weights = [0.0; AEC_FILTER_TAPS];
+        self.history_head = 0;
+        self.estimated_echo = 0.0;
+        self.is_double_talk = false;
+    }
+
+    /// Processes microphone signal with speaker reference loopback, canceling acoustic echo.
+    pub fn process_sample(&mut self, mic_in: f32, speaker_ref: f32) -> f32 {
+        // 1. Ingest speaker reference sample into circular buffer
+        self.speaker_history[self.history_head] = speaker_ref;
+
+        // 2. Synthesize echo estimate via FIR convolution: d_hat = sum(w_k * x[n - k])
+        let mut echo_estimate = 0.0f32;
+        let mut ref_energy = 0.0f32;
+
+        for k in 0..AEC_FILTER_TAPS {
+            let idx = if self.history_head >= k {
+                self.history_head - k
+            } else {
+                (self.history_head + AEC_FILTER_TAPS) - k
+            };
+            let ref_sample = self.speaker_history[idx];
+            echo_estimate += self.filter_weights[k] * ref_sample;
+            ref_energy += ref_sample * ref_sample;
+        }
+
+        self.estimated_echo = echo_estimate;
+
+        // 3. Subtract estimated echo from microphone signal: e = mic - d_hat
+        let error = mic_in - echo_estimate;
+
+        // 4. Double-Talk Detection (DTD):
+        // If mic energy is substantially greater than the estimated echo and speaker reference,
+        // local gamer voice is active; freeze filter adaptation to avoid divergence.
+        let abs_mic = if mic_in < 0.0 { -mic_in } else { mic_in };
+        let abs_echo = if echo_estimate < 0.0 { -echo_estimate } else { echo_estimate };
+        self.is_double_talk = abs_mic > 0.06 && abs_mic > (2.5 * abs_echo + 0.02);
+
+        // 5. Normalized LMS weight update if no double-talk detected
+        if !self.is_double_talk && ref_energy > 1e-5 {
+            let normalized_step = (self.step_size_mu / (self.regularization_eps + ref_energy)) * error;
+
+            for k in 0..AEC_FILTER_TAPS {
+                let idx = if self.history_head >= k {
+                    self.history_head - k
+                } else {
+                    (self.history_head + AEC_FILTER_TAPS) - k
+                };
+                let ref_sample = self.speaker_history[idx];
+                self.filter_weights[k] += normalized_step * ref_sample;
+            }
+        }
+
+        // 6. Advance circular history head
+        self.history_head = (self.history_head + 1) % AEC_FILTER_TAPS;
+
+        error
+    }
+}
+
+/// Verification test for NLMS acoustic echo cancellation.
+pub fn verify_acoustic_echo_cancellation() -> bool {
+    let mut aec = AcousticEchoCanceller::new();
+
+    // 1. Simulated chassis echo path: acoustic delay of 2 samples with attenuation 0.35
+    // true impulse response: [0.0, 0.0, 0.35]
+    let mut speaker_history = [0.0f32; 100];
+    for i in 0..100 {
+        // Pseudo-random pseudo-noise speaker reference signal
+        speaker_history[i] = if i % 3 == 0 { 0.40 } else if i % 3 == 1 { -0.30 } else { 0.20 };
+    }
+
+    // Converge AEC over 90 iterations with echo only (no near-end gamer speech)
+    for i in 0..90 {
+        let spk = speaker_history[i];
+        let echo = if i >= 2 { 0.35 * speaker_history[i - 2] } else { 0.0 };
+        aec.process_sample(echo, spk);
+    }
+
+    // Test cancellation efficacy on subsequent samples: residual error must be < 0.05 (vs 0.14 raw echo)
+    let test_spk = speaker_history[92];
+    let test_echo = 0.35 * speaker_history[90];
+    let residual = aec.process_sample(test_echo, test_spk);
+
+    let abs_res = if residual < 0.0 { -residual } else { residual };
+    if abs_res >= 0.045 {
+        return false;
+    }
+
+    // 2. Double-Talk Verification:
+    // Gamer speaks simultaneously with loud voice (0.45) while echo is present (0.10)
+    let gamer_voice = 0.45;
+    let mic_with_speech = test_echo + gamer_voice;
+    let out_speech = aec.process_sample(mic_with_speech, test_spk);
+
+    // Filter must detect double-talk and preserve near-end gamer voice
+    if !aec.is_double_talk {
+        return false;
+    }
+    if out_speech <= 0.35 {
+        return false;
+    }
+
+    true
+}
