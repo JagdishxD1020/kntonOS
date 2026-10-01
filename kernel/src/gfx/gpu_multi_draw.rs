@@ -234,6 +234,48 @@ impl GpuMeshletCuller {
         true
     }
 }
+
+// Results summary from a GPU compute stream compaction pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GpuStreamCompactionResult {
+    pub total_input_meshlets: u32,
+    pub culled_meshlets: u32,
+    pub visible_draw_count: u32,
+}
+
+// GPU-driven indirect argument stream compactor.
+pub struct GpuDrawStreamCompactor;
+
+impl GpuDrawStreamCompactor {
+    // Compacts visible meshlets into a contiguous draw indexed indirect argument buffer.
+    pub fn compact_meshlet_stream(
+        input_tokens: &[MeshletDrawToken],
+        frustum: &FrustumPlanes,
+        hiz: Option<&HiZDepthPyramid>,
+        output_args: &mut [D3D12_DRAW_INDEXED_ARGUMENTS],
+        count_buf: &mut GpuDrawCountBuffer,
+    ) -> GpuStreamCompactionResult {
+        count_buf.reset();
+        let mut culled_count = 0u32;
+
+        for token in input_tokens {
+            if GpuMeshletCuller::evaluate_meshlet_visibility(token, frustum, hiz) {
+                let slot = count_buf.atomic_increment() as usize;
+                if slot < output_args.len() {
+                    output_args[slot] = token.draw_args;
+                }
+            } else {
+                culled_count = culled_count.saturating_add(1);
+            }
+        }
+
+        GpuStreamCompactionResult {
+            total_input_meshlets: input_tokens.len() as u32,
+            culled_meshlets: culled_count,
+            visible_draw_count: count_buf.current_draw_count,
+        }
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_gpu_multi_draw_subsystem() -> bool {
     true
