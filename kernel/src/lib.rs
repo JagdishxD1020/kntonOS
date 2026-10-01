@@ -1099,6 +1099,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 SRW Locks, Condition Variables & Futex (TASK-KNT-226)
+    if !pe::test_win32_srw_futex_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 SRW locks and futex self-test failed!\r\n");
+    }
+
     // Verify Win32 Access Tokens & Security Descriptors (TASK-KNT-221)
     if !pe::test_win32_token_security_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 token security self-test failed!\r\n");
