@@ -395,3 +395,101 @@ pub fn win32_get_enclave_call_count(base_address: usize) -> u32 {
     }
     0
 }
+
+/// Self-test suite verifying Win32 enclave creation, memory loading, initialization, boundary call, and termination.
+pub fn test_win32_enclave_subsystem() -> bool {
+    unsafe {
+        // 1. Create a VBS software enclave of 64 KiB
+        let mut err: DWORD = 0;
+        let enclave_base = CreateEnclave(
+            0,
+            core::ptr::null_mut(),
+            0x10000,
+            0x4000,
+            ENCLAVE_TYPE_VBS,
+            core::ptr::null(),
+            0,
+            &mut err,
+        );
+
+        if enclave_base.is_null() || err != ERROR_SUCCESS {
+            return false;
+        }
+
+        // 2. Load authenticated code / data section into the enclave
+        let test_code: [u8; 16] = [0x90, 0x90, 0xC3, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut bytes_written: SIZE_T = 0;
+        let loaded = LoadEnclaveData(
+            0,
+            enclave_base,
+            test_code.as_ptr() as *const c_void,
+            test_code.len(),
+            0x20, // PAGE_EXECUTE_READ
+            core::ptr::null(),
+            0,
+            &mut bytes_written,
+            &mut err,
+        );
+
+        if loaded != TRUE || bytes_written != test_code.len() {
+            return false;
+        }
+
+        // 3. Initialize the enclave
+        let init_ok = InitializeEnclave(0, enclave_base, core::ptr::null(), 0, &mut err);
+        if init_ok != TRUE {
+            return false;
+        }
+
+        // 4. Verify address boundary check and anti-cheat guard
+        let base_addr = enclave_base as usize;
+        if !win32_is_address_in_enclave(base_addr + 0x100) {
+            return false;
+        }
+        if win32_is_address_in_enclave(0x1000) {
+            return false;
+        }
+
+        // External injection without debugger privilege triggers access violation
+        if !win32_enclave_check_external_access_violation(base_addr + 0x20, false) {
+            return false;
+        }
+
+        // 5. Secure boundary entry call
+        let mut ret_val: LPVOID = core::ptr::null_mut();
+        let routine_ptr = (base_addr) as *const c_void;
+        let call_ok = CallEnclave(
+            routine_ptr,
+            0x1234_5678 as LPVOID,
+            TRUE,
+            &mut ret_val,
+        );
+
+        if call_ok != TRUE || ret_val != ((0x1234_5678 ^ 0x5AA5_A55A) as LPVOID) {
+            return false;
+        }
+
+        if win32_get_enclave_call_count(base_addr) != 1 {
+            return false;
+        }
+
+        // 6. Terminate enclave
+        let term_ok = TerminateEnclave(enclave_base, TRUE);
+        if term_ok != TRUE {
+            return false;
+        }
+
+        // After termination, boundary calls and memory presence must be revoked
+        if win32_is_address_in_enclave(base_addr + 0x100) {
+            return false;
+        }
+        if CallEnclave(routine_ptr, core::ptr::null_mut(), FALSE, core::ptr::null_mut()) != FALSE {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-ENCLAVE-PASS] Win32 enclave memory isolation and execution engine verified\r\n",
+    );
+    true
+}
