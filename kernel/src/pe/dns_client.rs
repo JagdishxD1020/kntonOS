@@ -179,3 +179,147 @@ pub fn win32_dns_cache_purge_expired() -> usize {
     cache.retain(|_, entry| now < entry.expires_at_tick);
     before - cache.len()
 }
+
+/// Synchronously queries DNS records for the specified ASCII domain name.
+pub unsafe extern "system" fn DnsQuery_A(
+    pszName: *const u8,
+    wType: u16,
+    Options: DWORD,
+    _pExtra: *const c_void,
+    ppQueryResults: *mut PDNS_RECORD,
+    _pReserved: *mut c_void,
+) -> DNS_STATUS {
+    if pszName.is_null() || ppQueryResults.is_null() {
+        return DNS_ERROR_INVALID_NAME;
+    }
+
+    let mut len = 0;
+    while *pszName.add(len) != 0 && len < 256 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(pszName, len);
+    let name = match core::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(_) => return DNS_ERROR_INVALID_NAME,
+    };
+
+    // 1. Check cache if not bypassed
+    let bypass_cache = (Options & DNS_QUERY_BYPASS_CACHE) != 0;
+    let mut resolved_records = if !bypass_cache {
+        win32_dns_cache_lookup(name, wType)
+    } else {
+        None
+    };
+
+    // 2. Fallback resolution / default loopback & matchmaking mock
+    if resolved_records.is_none() {
+        let mut mock_list = Vec::new();
+        if wType == DNS_TYPE_A {
+            if name == "localhost" {
+                mock_list.push(DnsRecordData::A { ip: [127, 0, 0, 1] });
+            } else {
+                // Synthesize deterministic IP for gaming servers
+                mock_list.push(DnsRecordData::A { ip: [192, 168, 1, 100] });
+            }
+        } else if wType == DNS_TYPE_AAAA {
+            let mut ip6 = [0u8; 16];
+            ip6[15] = 1;
+            mock_list.push(DnsRecordData::AAAA { ip: ip6 });
+        } else if wType == DNS_TYPE_SRV {
+            mock_list.push(DnsRecordData::SRV {
+                priority: 10,
+                weight: 60,
+                port: 27015,
+                target: String::from("matchmaking-us.knton.net"),
+            });
+        } else if wType == DNS_TYPE_TXT {
+            mock_list.push(DnsRecordData::TXT {
+                text: String::from("v=spf1 include:_spf.knton.net ~all"),
+            });
+        }
+
+        if !mock_list.is_empty() {
+            win32_dns_cache_insert(name, wType, mock_list.clone(), 300);
+            resolved_records = Some(mock_list);
+        }
+    }
+
+    let records = match resolved_records {
+        Some(r) => r,
+        None => return DNS_INFO_NO_RECORDS,
+    };
+
+    // Allocate DNS_RECORD linked list
+    let mut head: *mut DNS_RECORD = core::ptr::null_mut();
+    for rec in records.iter().rev() {
+        let node = Box::into_raw(Box::new(DNS_RECORD {
+            pNext: head,
+            pName: core::ptr::null_mut(),
+            wType,
+            wDataLength: 32,
+            Flags: 0,
+            dwTtl: 300,
+            dwReserved: 0,
+            Data: [0; 32],
+        }));
+
+        match rec {
+            DnsRecordData::A { ip } => {
+                let a_ptr = (*node).Data.as_mut_ptr() as *mut DNS_A_DATA;
+                (*a_ptr).IpAddress = u32::from_ne_bytes(*ip);
+            }
+            DnsRecordData::AAAA { ip } => {
+                let aaaa_ptr = (*node).Data.as_mut_ptr() as *mut DNS_AAAA_DATA;
+                (*aaaa_ptr).Ip6Address = *ip;
+            }
+            DnsRecordData::SRV { priority, weight, port, .. } => {
+                let srv_ptr = (*node).Data.as_mut_ptr() as *mut DNS_SRV_DATA;
+                (*srv_ptr).wPriority = *priority;
+                (*srv_ptr).wWeight = *weight;
+                (*srv_ptr).wPort = *port;
+            }
+            _ => {}
+        }
+        head = node;
+    }
+
+    *ppQueryResults = head;
+    DNS_STATUS_SUCCESS
+}
+
+/// Synchronously queries DNS records for the specified UTF-16 Unicode domain name.
+pub unsafe extern "system" fn DnsQuery_W(
+    pwszName: *const u16,
+    wType: u16,
+    Options: DWORD,
+    pExtra: *const c_void,
+    ppQueryResults: *mut PDNS_RECORD,
+    pReserved: *mut c_void,
+) -> DNS_STATUS {
+    if pwszName.is_null() {
+        return DNS_ERROR_INVALID_NAME;
+    }
+
+    let mut ascii_buf = [0u8; 256];
+    let mut idx = 0;
+    while *pwszName.add(idx) != 0 && idx < 255 {
+        ascii_buf[idx] = *pwszName.add(idx) as u8;
+        idx += 1;
+    }
+    ascii_buf[idx] = 0;
+
+    DnsQuery_A(ascii_buf.as_ptr(), wType, Options, pExtra, ppQueryResults, pReserved)
+}
+
+/// Frees a flat buffer or linked list of DNS_RECORD structures.
+pub unsafe extern "system" fn DnsRecordListFree(
+    pRecordList: PDNS_RECORD,
+    _FreeType: DWORD,
+) {
+    let mut curr = pRecordList;
+    while !curr.is_null() {
+        let next = (*curr).pNext;
+        let _ = Box::from_raw(curr);
+        curr = next;
+    }
+}
