@@ -107,6 +107,123 @@ impl EnhancedTextureBarrierDesc {
     }
 }
 
+
+// Virtual memory sub-allocated span within a shared physical heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubAllocatedHeapSpan {
+    pub resource_id: u32,
+    pub heap_id: u32,
+    pub offset_bytes: u64,
+    pub size_bytes: u64,
+    pub res_type: TransientResourceType,
+    pub is_active: bool,
+}
+
+impl SubAllocatedHeapSpan {
+    // Creates a new sub-allocated heap span.
+    pub const fn new(
+        resource_id: u32,
+        heap_id: u32,
+        offset_bytes: u64,
+        size_bytes: u64,
+        res_type: TransientResourceType,
+    ) -> Self {
+        Self {
+            resource_id,
+            heap_id,
+            offset_bytes,
+            size_bytes,
+            res_type,
+            is_active: false,
+        }
+    }
+
+    // Evaluates whether two spans in the same heap overlap in address space.
+    #[inline(always)]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        if self.heap_id != other.heap_id {
+            return false;
+        }
+        let self_end = self.offset_bytes.saturating_add(self.size_bytes);
+        let other_end = other.offset_bytes.saturating_add(other.size_bytes);
+        self.offset_bytes < other_end && other.offset_bytes < self_end
+    }
+}
+
+// Hardware aliasing barrier descriptor transitioning overlapping resources in a heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AliasingBarrierDescriptor {
+    pub heap_id: u32,
+    pub resource_before_id: Option<u32>,
+    pub resource_after_id: Option<u32>,
+    pub sync_before: u32,
+    pub sync_after: u32,
+    pub is_discard_enabled: bool,
+}
+
+// Sub-Allocation Aliasing Barrier Engine managing transient resource lifetimes in shared heaps.
+#[derive(Debug, Clone, Default)]
+pub struct SubAllocationAliasTracker {
+    pub spans: Vec<SubAllocatedHeapSpan>,
+    pub total_aliasing_transitions: u64,
+    pub total_discards_honored: u64,
+}
+
+impl SubAllocationAliasTracker {
+    // Creates a new alias tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Registers a sub-allocated resource span.
+    pub fn register_span(&mut self, span: SubAllocatedHeapSpan) {
+        if !self.spans.iter().any(|s| s.resource_id == span.resource_id) {
+            self.spans.push(span);
+        }
+    }
+
+    // Transitions a resource to active state, generating an aliasing barrier if it overlaps an existing active resource.
+    pub fn activate_resource(
+        &mut self,
+        resource_id: u32,
+        discard: bool,
+    ) -> Result<AliasingBarrierDescriptor, &'static str> {
+        let span_idx = self
+            .spans
+            .iter()
+            .position(|s| s.resource_id == resource_id)
+            .ok_or("Target resource not found in alias tracker")?;
+
+        let target_span = self.spans[span_idx];
+        let mut overlapping_before_id = None;
+
+        // Check for active overlapping resources in the same heap
+        for span in &mut self.spans {
+            if span.resource_id != resource_id && span.is_active && span.overlaps(&target_span) {
+                overlapping_before_id = Some(span.resource_id);
+                span.is_active = false; // Deactivate overlapping predecessor
+                break;
+            }
+        }
+
+        self.spans[span_idx].is_active = true;
+        self.total_aliasing_transitions = self.total_aliasing_transitions.saturating_add(1);
+
+        let is_discard_enabled = discard || target_span.res_type.is_naturally_discardable();
+        if is_discard_enabled {
+            self.total_discards_honored = self.total_discards_honored.saturating_add(1);
+        }
+
+        Ok(AliasingBarrierDescriptor {
+            heap_id: target_span.heap_id,
+            resource_before_id: overlapping_before_id,
+            resource_after_id: Some(resource_id),
+            sync_before: if is_discard_enabled { 0 } else { 0x1 }, // If discard, no before sync required
+            sync_after: 0x1,
+            is_discard_enabled,
+        })
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_barrier_discard_subsystem() -> bool {
     true
