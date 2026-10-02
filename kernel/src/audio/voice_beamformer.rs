@@ -564,3 +564,40 @@ pub fn verify_voice_beamformer_pipeline() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Voice Beamformer, Noise Gate & AEC Subsystem.
+pub fn test_voice_beamformer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-AUDIO] Testing Handheld Sub-Millisecond Voice Chat Noise Gate, AEC & Dual-Mic Beamformer...\r\n");
+
+    // 1. Verify dual-microphone delay-and-sum spatial beamformer
+    if !verify_dual_mic_beamformer() {
+        crate::serial_write_str("[KNT-PANIC] Dual-mic beamformer verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify sub-millisecond voice noise gate and spectral floor subtraction
+    if !verify_voice_noise_gate() {
+        crate::serial_write_str("[KNT-PANIC] Voice noise gate verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify acoustic echo cancellation (AEC) with NLMS adaptive filter
+    if !verify_acoustic_echo_cancellation() {
+        crate::serial_write_str("[KNT-PANIC] Acoustic echo cancellation verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify integrated voice chat speech processor pipeline
+    if !verify_voice_beamformer_pipeline() {
+        crate::serial_write_str("[KNT-PANIC] Voice beamformer pipeline verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-AUDIO-BEAMFORMER-PASS] Handheld voice chat noise gate, AEC and dual-mic beamformer verified\r\n");
+    true
+}

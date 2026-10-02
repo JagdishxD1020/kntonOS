@@ -948,6 +948,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld footstep audio enhancer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Sub-Millisecond Voice Chat Noise Gate, AEC & Dual-Mic Beamformer (TASK-KNT-227)
+    if !audio::test_voice_beamformer_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld voice chat beamformer, noise gate and AEC self-test failed!\r\n");
+    }
+
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
     if !crypto::test_crypto_rng_subsystem() {
