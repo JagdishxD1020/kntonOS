@@ -29,6 +29,7 @@ pub mod timer_queue;
 pub mod token_security;
 pub mod srw_futex;
 pub mod enclave;
+pub mod dns_client;
 
 pub use header::*;
 pub use ntdll::*;
@@ -57,6 +58,7 @@ pub use timer_queue::*;
 pub use token_security::*;
 pub use srw_futex::*;
 pub use enclave::*;
+pub use dns_client::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
