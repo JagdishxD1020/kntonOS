@@ -215,3 +215,319 @@ pub fn verify_vca_resonance_tracking() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Procedural Haptic Waveform Synthesizer with Tactile Envelopes
+// ============================================================================
+
+/// Fast polynomial approximation of e^(-x) for x >= 0 without external libm.
+#[inline(always)]
+pub fn exp_neg_f32(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x > 14.0 {
+        return 0.0;
+    }
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x2 * x2;
+    let denom = 1.0 + x + 0.5 * x2 + 0.1666667 * x3 + 0.0416667 * x4;
+    1.0 / denom
+}
+
+/// Category of procedural haptic tactile vibration effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HapticWaveformType {
+    /// Steady continuous or gated sinusoidal vibration.
+    Sine,
+    /// Dynamic frequency-swept vibration (e.g. accelerating engine or energy charge).
+    Chirp,
+    /// Rapid mechanical click or button press tactile feedback.
+    ExponentialDecay,
+    /// High-impact strike, recoil, or explosion with sharp initial impulse.
+    TactileImpact,
+}
+
+/// Configuration descriptor for procedural haptic tactile waveform generation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HapticEffectConfig {
+    /// Waveform synthesis pattern.
+    pub effect_type: HapticWaveformType,
+    /// Total effect duration in milliseconds.
+    pub duration_ms: u32,
+    /// Peak normalized amplitude [0.0 .. 1.0].
+    pub peak_amplitude: f32,
+    /// Starting frequency in Hz.
+    pub start_freq_hz: f32,
+    /// Ending frequency in Hz (used for frequency chirps).
+    pub end_freq_hz: f32,
+    /// Attack envelope duration in milliseconds.
+    pub attack_ms: u32,
+    /// Decay duration in milliseconds.
+    pub decay_ms: u32,
+    /// Sustain normalized level [0.0 .. 1.0].
+    pub sustain_level: f32,
+    /// Release duration in milliseconds.
+    pub release_ms: u32,
+}
+
+impl HapticEffectConfig {
+    /// Procedural crisp button click / tactile feedback pulse (15 ms).
+    pub const fn click() -> Self {
+        Self {
+            effect_type: HapticWaveformType::ExponentialDecay,
+            duration_ms: 15,
+            peak_amplitude: 0.90,
+            start_freq_hz: 180.0,
+            end_freq_hz: 180.0,
+            attack_ms: 2,
+            decay_ms: 13,
+            sustain_level: 0.0,
+            release_ms: 0,
+        }
+    }
+
+    /// Procedural sustained gaming rumble vibration.
+    pub const fn rumble(duration_ms: u32, intensity: f32) -> Self {
+        Self {
+            effect_type: HapticWaveformType::Sine,
+            duration_ms,
+            peak_amplitude: intensity,
+            start_freq_hz: 175.0,
+            end_freq_hz: 175.0,
+            attack_ms: 10,
+            decay_ms: 0,
+            sustain_level: 1.0,
+            release_ms: 15,
+        }
+    }
+
+    /// Procedural frequency chirp sweeping across the VCA operating band.
+    pub const fn chirp_sweep(duration_ms: u32, start_hz: f32, end_hz: f32) -> Self {
+        Self {
+            effect_type: HapticWaveformType::Chirp,
+            duration_ms,
+            peak_amplitude: 0.85,
+            start_freq_hz: start_hz,
+            end_freq_hz: end_hz,
+            attack_ms: 10,
+            decay_ms: 0,
+            sustain_level: 1.0,
+            release_ms: 10,
+        }
+    }
+
+    /// Procedural sharp weapon recoil or physical explosion impact.
+    pub const fn tactile_impact() -> Self {
+        Self {
+            effect_type: HapticWaveformType::TactileImpact,
+            duration_ms: 80,
+            peak_amplitude: 1.0,
+            start_freq_hz: 165.0,
+            end_freq_hz: 165.0,
+            attack_ms: 3,
+            decay_ms: 50,
+            sustain_level: 0.15,
+            release_ms: 27,
+        }
+    }
+}
+
+/// Real-time Procedural Haptic Waveform Synthesizer engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProceduralHapticSynthesizer {
+    /// Active effect configuration being rendered, if any.
+    pub current_effect: Option<HapticEffectConfig>,
+    /// Accumulated playback elapsed time in milliseconds.
+    pub elapsed_ms: f32,
+    /// Oscillator carrier phase in radians [0.0 .. TWO_PI).
+    pub phase_rad: f32,
+    /// Whether an effect is actively playing.
+    pub is_active: bool,
+}
+
+impl ProceduralHapticSynthesizer {
+    /// Constructs a procedural haptic synthesizer in idle state.
+    pub const fn new() -> Self {
+        Self {
+            current_effect: None,
+            elapsed_ms: 0.0,
+            phase_rad: 0.0,
+            is_active: false,
+        }
+    }
+
+    /// Triggers playback of a procedural haptic effect configuration.
+    pub fn trigger_effect(&mut self, effect: HapticEffectConfig) {
+        self.current_effect = Some(effect);
+        self.elapsed_ms = 0.0;
+        self.phase_rad = 0.0;
+        self.is_active = true;
+    }
+
+    /// Stops playback and resets synthesizer state.
+    pub fn stop(&mut self) {
+        self.current_effect = None;
+        self.elapsed_ms = 0.0;
+        self.phase_rad = 0.0;
+        self.is_active = false;
+    }
+
+    /// Computes the instantaneous amplitude envelope [0.0 .. 1.0] for the active effect.
+    pub fn evaluate_envelope(&self) -> f32 {
+        let effect = match self.current_effect {
+            Some(e) => e,
+            None => return 0.0,
+        };
+
+        let t = self.elapsed_ms;
+        let d = effect.duration_ms as f32;
+        if t >= d || d <= 0.0 {
+            return 0.0;
+        }
+
+        match effect.effect_type {
+            HapticWaveformType::ExponentialDecay => {
+                let norm_t = t / d;
+                effect.peak_amplitude * exp_neg_f32(3.5 * norm_t)
+            }
+            HapticWaveformType::TactileImpact => {
+                let a = effect.attack_ms as f32;
+                if t < a && a > 0.0 {
+                    // Fast rise to peak
+                    effect.peak_amplitude * (t / a)
+                } else {
+                    // Exponential tail decay from peak
+                    let post_t = (t - a) / (d - a);
+                    effect.peak_amplitude * exp_neg_f32(4.0 * post_t)
+                }
+            }
+            HapticWaveformType::Sine | HapticWaveformType::Chirp => {
+                let a = effect.attack_ms as f32;
+                let r = effect.release_ms as f32;
+                let _sustain_start = a;
+                let sustain_end = (d - r).max(a);
+
+                if t < a && a > 0.0 {
+                    // Attack ramp
+                    effect.peak_amplitude * (t / a)
+                } else if t <= sustain_end {
+                    // Sustain region
+                    effect.peak_amplitude * effect.sustain_level
+                } else if r > 0.0 {
+                    // Release fade-out
+                    let rel_t = (d - t) / r;
+                    effect.peak_amplitude * effect.sustain_level * rel_t.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    /// Computes the instantaneous frequency in Hz for the active effect.
+    pub fn evaluate_frequency(&self) -> f32 {
+        let effect = match self.current_effect {
+            Some(e) => e,
+            None => return 175.0,
+        };
+
+        let d = effect.duration_ms as f32;
+        if d <= 0.0 {
+            return effect.start_freq_hz;
+        }
+
+        let progress = (self.elapsed_ms / d).clamp(0.0, 1.0);
+        effect.start_freq_hz + progress * (effect.end_freq_hz - effect.start_freq_hz)
+    }
+
+    /// Synthesizes a single haptic output sample in [-1.0 .. 1.0], advancing time by dt_s.
+    pub fn synthesize_sample(&mut self, dt_s: f32) -> f32 {
+        if !self.is_active {
+            return 0.0;
+        }
+
+        let env = self.evaluate_envelope();
+        let freq = self.evaluate_frequency();
+
+        let sample = env * sin_f32(self.phase_rad);
+
+        // Advance phase
+        let phase_inc = TWO_PI * freq * dt_s;
+        self.phase_rad += phase_inc;
+        while self.phase_rad >= TWO_PI {
+            self.phase_rad -= TWO_PI;
+        }
+
+        // Advance time
+        self.elapsed_ms += dt_s * 1000.0;
+        if let Some(effect) = self.current_effect {
+            if self.elapsed_ms >= effect.duration_ms as f32 {
+                self.is_active = false;
+            }
+        }
+
+        sample
+    }
+}
+
+/// Verification test for procedural haptic waveform synthesizer and tactile envelopes.
+pub fn verify_procedural_waveform_synth() -> bool {
+    let mut synth = ProceduralHapticSynthesizer::new();
+    let dt = 0.001; // 1 ms update step
+
+    // 1. Verify Crisp Button Click Feedback (15 ms)
+    synth.trigger_effect(HapticEffectConfig::click());
+    if !synth.is_active {
+        return false;
+    }
+
+    // Peak envelope should be near 0.90 within the first 2 ms
+    synth.synthesize_sample(dt);
+    synth.synthesize_sample(dt);
+    let click_env = synth.evaluate_envelope();
+    if click_env <= 0.70 || click_env > 0.95 {
+        return false;
+    }
+
+    // Run until 15 ms duration completes
+    for _ in 0..15 {
+        synth.synthesize_sample(dt);
+    }
+    // Must be finished and inactive
+    if synth.is_active {
+        return false;
+    }
+
+    // 2. Verify Frequency Chirp Sweep (160 Hz -> 230 Hz over 50 ms)
+    synth.trigger_effect(HapticEffectConfig::chirp_sweep(50, 160.0, 230.0));
+    let f_start = synth.evaluate_frequency();
+    if (f_start - 160.0).abs() > 1.0 {
+        return false;
+    }
+
+    // Step 25 ms (halfway)
+    for _ in 0..25 {
+        synth.synthesize_sample(dt);
+    }
+    let f_mid = synth.evaluate_frequency();
+    if (f_mid - 195.0).abs() > 3.0 {
+        return false;
+    }
+
+    synth.stop();
+
+    // 3. Verify Tactile Impact Envelope
+    synth.trigger_effect(HapticEffectConfig::tactile_impact());
+    for _ in 0..3 {
+        synth.synthesize_sample(dt);
+    }
+    let impact_peak = synth.evaluate_envelope();
+    if (impact_peak - 1.0).abs() > 0.15 {
+        return false;
+    }
+
+    true
+}
