@@ -276,6 +276,109 @@ impl GpuDrawStreamCompactor {
         }
     }
 }
+
+// Predication evaluation mode for conditional indirect execution.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicationOp {
+    EqualZero = 0,
+    NotEqualZero = 1,
+}
+
+// Multi-draw execution batch with optional hardware predication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicatedDrawBatch {
+    pub signature: MultiDrawCommandSignatureDesc,
+    pub arguments: Vec<D3D12_DRAW_INDEXED_ARGUMENTS>,
+    pub count_buffer: GpuDrawCountBuffer,
+    pub predication_condition_va: u64,
+    pub predication_op: PredicationOp,
+    pub is_predicated: bool,
+}
+
+impl PredicatedDrawBatch {
+    // Creates a non-predicated multi-draw batch.
+    pub fn new_unpredicated(
+        signature: MultiDrawCommandSignatureDesc,
+        arguments: Vec<D3D12_DRAW_INDEXED_ARGUMENTS>,
+        count_buffer: GpuDrawCountBuffer,
+    ) -> Self {
+        Self {
+            signature,
+            arguments,
+            count_buffer,
+            predication_condition_va: 0,
+            predication_op: PredicationOp::EqualZero,
+            is_predicated: false,
+        }
+    }
+
+    // Creates a predicated multi-draw batch.
+    pub fn new_predicated(
+        signature: MultiDrawCommandSignatureDesc,
+        arguments: Vec<D3D12_DRAW_INDEXED_ARGUMENTS>,
+        count_buffer: GpuDrawCountBuffer,
+        condition_va: u64,
+        op: PredicationOp,
+    ) -> Self {
+        Self {
+            signature,
+            arguments,
+            count_buffer,
+            predication_condition_va: condition_va,
+            predication_op: op,
+            is_predicated: true,
+        }
+    }
+}
+
+// Non-blocking draw stream expander for handheld APU compute engines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PredicatedDrawExpander {
+    pub total_expanded_draws: u64,
+    pub total_batches_processed: u64,
+    pub total_bypassed_batches: u64,
+}
+
+impl PredicatedDrawExpander {
+    // Creates a new predicated draw expander.
+    pub const fn new() -> Self {
+        Self {
+            total_expanded_draws: 0,
+            total_batches_processed: 0,
+            total_bypassed_batches: 0,
+        }
+    }
+
+    // Evaluates predication and expands the indirect draw stream without CPU stalling.
+    pub fn expand_and_dispatch(
+        &mut self,
+        batch: &PredicatedDrawBatch,
+        condition_value: u64,
+    ) -> Result<u32, &'static str> {
+        self.total_batches_processed = self.total_batches_processed.saturating_add(1);
+
+        if batch.is_predicated {
+            let passes = match batch.predication_op {
+                PredicationOp::EqualZero => condition_value == 0,
+                PredicationOp::NotEqualZero => condition_value != 0,
+            };
+            if !passes {
+                self.total_bypassed_batches = self.total_bypassed_batches.saturating_add(1);
+                return Ok(0);
+            }
+        }
+
+        let effective_count = batch
+            .count_buffer
+            .current_draw_count
+            .min(batch.signature.max_draw_count)
+            .min(batch.arguments.len() as u32);
+
+        self.total_expanded_draws = self.total_expanded_draws.saturating_add(effective_count as u64);
+        Ok(effective_count)
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_gpu_multi_draw_subsystem() -> bool {
     true
