@@ -129,3 +129,53 @@ pub struct DNS_RECORD {
 }
 
 pub type PDNS_RECORD = *mut DNS_RECORD;
+
+/// Low-latency in-memory DNS cache entry.
+#[derive(Clone, Debug)]
+pub struct DnsCacheEntry {
+    pub name: String,
+    pub record_type: u16,
+    pub records: Vec<DnsRecordData>,
+    pub expires_at_tick: u64,
+    pub ttl_sec: u32,
+}
+
+static DNS_CACHE: Spinlock<BTreeMap<(String, u16), DnsCacheEntry>> = Spinlock::new(BTreeMap::new());
+
+/// Adds or updates a resolved DNS record set in the low-latency resolution cache.
+pub fn win32_dns_cache_insert(name: &str, rtype: u16, records: Vec<DnsRecordData>, ttl_sec: u32) {
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let ttl_ms = (ttl_sec as u64) * 1000;
+    let entry = DnsCacheEntry {
+        name: String::from(name),
+        record_type: rtype,
+        records,
+        expires_at_tick: now + ttl_ms,
+        ttl_sec,
+    };
+    DNS_CACHE.lock().insert((String::from(name), rtype), entry);
+}
+
+/// Lookups a cached DNS record set, validating TTL expiration.
+pub fn win32_dns_cache_lookup(name: &str, rtype: u16) -> Option<Vec<DnsRecordData>> {
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let mut cache = DNS_CACHE.lock();
+    let key = (String::from(name), rtype);
+    if let Some(entry) = cache.get(&key) {
+        if now < entry.expires_at_tick {
+            return Some(entry.records.clone());
+        }
+    }
+    // Expired or not found
+    cache.remove(&key);
+    None
+}
+
+/// Evicts expired records from the DNS cache.
+pub fn win32_dns_cache_purge_expired() -> usize {
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let mut cache = DNS_CACHE.lock();
+    let before = cache.len();
+    cache.retain(|_, entry| now < entry.expires_at_tick);
+    before - cache.len()
+}
