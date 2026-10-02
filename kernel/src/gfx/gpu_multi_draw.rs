@@ -379,7 +379,130 @@ impl PredicatedDrawExpander {
         Ok(effective_count)
     }
 }
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 GPU-Driven Multi-Draw & Meshlet Culler.
 pub fn test_gpu_multi_draw_subsystem() -> bool {
+    // 1. Verify Multi-Draw command signature and buffer descriptor validation
+    let sig = MultiDrawCommandSignatureDesc::standard_draw_indexed(64);
+    if sig.byte_stride != 20 || sig.max_draw_count != 64 || !sig.is_variable_count {
+        return false;
+    }
+
+    let count_buf = GpuDrawCountBuffer::new(0x1000_0000, 0);
+    let valid_buffer = MultiDrawBufferDesc::new(0x2000_0000, 64 * 20, count_buf, 64);
+    if valid_buffer.validate().is_err() {
+        return false;
+    }
+
+    let unaligned_buffer = MultiDrawBufferDesc::new(0x2000_0003, 64 * 20, count_buf, 64);
+    if unaligned_buffer.validate().is_ok() {
+        return false;
+    }
+
+    // 2. Verify Frustum and Hi-Z Occlusion Culling
+    let frustum = FrustumPlanes::default_box();
+
+    // Token 0: Inside frustum, unoccluded
+    let tok0 = MeshletDrawToken::new(
+        0,
+        128,
+        0,
+        0,
+        BoundingSphere::new([0.0, 0.0, 5.0], 1.0),
+    );
+    // Token 1: Outside frustum (x = 50.0 > 10.0)
+    let tok1 = MeshletDrawToken::new(
+        1,
+        128,
+        128,
+        0,
+        BoundingSphere::new([50.0, 0.0, 5.0], 1.0),
+    );
+    // Token 2: Inside frustum, behind occluder (z = 40.0)
+    let tok2 = MeshletDrawToken::new(
+        2,
+        128,
+        256,
+        0,
+        BoundingSphere::new([0.0, 0.0, 40.0], 1.0),
+    );
+    // Token 3: Inside frustum, in front of occluder (z = 2.0)
+    let tok3 = MeshletDrawToken::new(
+        3,
+        128,
+        384,
+        0,
+        BoundingSphere::new([0.0, 0.0, 2.0], 1.0),
+    );
+
+    // Hi-Z depth pyramid with depth occluder at depth 10.0
+    let hiz = HiZDepthPyramid::new(16, 16, 10.0);
+
+    if !GpuMeshletCuller::evaluate_meshlet_visibility(&tok0, &frustum, Some(&hiz)) {
+        return false;
+    }
+    if GpuMeshletCuller::evaluate_meshlet_visibility(&tok1, &frustum, Some(&hiz)) {
+        return false;
+    }
+    if GpuMeshletCuller::evaluate_meshlet_visibility(&tok2, &frustum, Some(&hiz)) {
+        return false; // Occluded behind 10.0
+    }
+    if !GpuMeshletCuller::evaluate_meshlet_visibility(&tok3, &frustum, Some(&hiz)) {
+        return false;
+    }
+
+    // 3. Verify GPU Argument Stream Compaction
+    let tokens = [tok0, tok1, tok2, tok3];
+    let mut out_args = [D3D12_DRAW_INDEXED_ARGUMENTS::default(); 4];
+    let mut count_buffer = GpuDrawCountBuffer::new(0x3000_0000, 0);
+
+    let comp_result = GpuDrawStreamCompactor::compact_meshlet_stream(
+        &tokens,
+        &frustum,
+        Some(&hiz),
+        &mut out_args,
+        &mut count_buffer,
+    );
+
+    if comp_result.total_input_meshlets != 4
+        || comp_result.culled_meshlets != 2
+        || comp_result.visible_draw_count != 2
+    {
+        return false;
+    }
+
+    // Output args must contain tok0 and tok3 arguments in slots 0 and 1
+    if out_args[0].start_index_location != 0 || out_args[1].start_index_location != 384 {
+        return false;
+    }
+
+    // 4. Verify Predicated Non-Blocking Draw Stream Expander
+    let mut expander = PredicatedDrawExpander::new();
+    let batch = PredicatedDrawBatch::new_predicated(
+        sig,
+        alloc::vec![out_args[0], out_args[1]],
+        count_buffer,
+        0x4000_0000,
+        PredicationOp::EqualZero,
+    );
+
+    // Dispatches when predicate condition == 0
+    let dispatched = match expander.expand_and_dispatch(&batch, 0) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if dispatched != 2 || expander.total_expanded_draws != 2 {
+        return false;
+    }
+
+    // Bypasses when predicate condition != 0
+    let bypassed = match expander.expand_and_dispatch(&batch, 1) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if bypassed != 0 || expander.total_bypassed_batches != 1 {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-MULTI-DRAW-PASS] Direct3D 12 GPU multi-draw expander & meshlet culling verified\r\n");
     true
 }
