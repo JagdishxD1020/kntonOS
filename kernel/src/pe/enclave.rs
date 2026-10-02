@@ -361,3 +361,37 @@ pub fn win32_is_address_in_enclave(address: usize) -> bool {
     }
     false
 }
+
+pub const ENCLAVE_FLAG_ANTI_CHEAT_GUARD: DWORD = 0x0000_0001;
+pub const ENCLAVE_FLAG_DYNAMIC_DEBUG: DWORD = 0x0000_0002;
+
+/// Checks if an external caller is permitted to read or inject code into an enclave region.
+pub fn win32_enclave_check_external_access_violation(
+    target_addr: usize,
+    caller_is_debugger: bool,
+) -> bool {
+    let enclaves = ENCLAVES.lock();
+    for enclave in enclaves.values() {
+        if enclave.state == ENCLAVE_STATE_RUNNING
+            && target_addr >= enclave.base_address
+            && target_addr < enclave.base_address + enclave.size
+        {
+            // Protected enclave strictly prohibits external read/write injection
+            if !caller_is_debugger {
+                return true; // Access violation
+            }
+        }
+    }
+    false
+}
+
+/// Returns the number of successful secure boundary entries executed for an enclave.
+pub fn win32_get_enclave_call_count(base_address: usize) -> u32 {
+    let enclaves = ENCLAVES.lock();
+    for enclave in enclaves.values() {
+        if enclave.base_address == base_address {
+            return enclave.call_count;
+        }
+    }
+    0
+}
