@@ -531,3 +531,172 @@ pub fn verify_procedural_waveform_synth() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Stereo Spatializer & Audio-to-Haptic Transcoder (<120Hz Bass Rumble)
+// ============================================================================
+
+/// Low-frequency cutoff frequency for audio-to-haptic rumble extraction (120 Hz).
+pub const HAPTIC_BASS_CUTOFF_HZ: f32 = 120.0;
+
+/// Stereo Haptic Spatializer computing equal-power left/right grip panning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HapticSpatializer;
+
+impl HapticSpatializer {
+    /// Computes equal-power panning gains (gain_left, gain_right) for pan in [-1.0 .. 1.0].
+    /// -1.0 = 100% Left grip, 0.0 = center balanced, +1.0 = 100% Right grip.
+    #[inline(always)]
+    pub fn compute_pan_gains(pan: f32) -> (f32, f32) {
+        let clamped_pan = pan.clamp(-1.0, 1.0);
+        // Angle theta in [0.0 .. PI/2]
+        let theta = (clamped_pan + 1.0) * (PI * 0.25);
+        let gain_left = cos_f32(theta);
+        let gain_right = sin_f32(theta);
+        (gain_left, gain_right)
+    }
+
+    /// Pans a mono haptic amplitude sample into stereo left/right grip actuator amplitudes.
+    #[inline(always)]
+    pub fn pan_sample(mono_sample: f32, pan: f32) -> (f32, f32) {
+        let (gl, gr) = Self::compute_pan_gains(pan);
+        (mono_sample * gl, mono_sample * gr)
+    }
+}
+
+/// Real-time Audio-to-Haptic Transcoder converting sub-120Hz bass frequencies to physical rumble.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioToHapticTranscoder {
+    /// Cascaded low-pass filter stage 1 state (Left).
+    pub lpf1_left: f32,
+    /// Cascaded low-pass filter stage 2 state (Left).
+    pub lpf2_left: f32,
+    /// Cascaded low-pass filter stage 1 state (Right).
+    pub lpf1_right: f32,
+    /// Cascaded low-pass filter stage 2 state (Right).
+    pub lpf2_right: f32,
+    /// Low-pass filter smoothing coefficient for 120Hz cutoff at 1000Hz sampling.
+    pub lpf_alpha: f32,
+    /// Transcoding sensitivity gain factor.
+    pub gain: f32,
+    /// Sub-bass noise gate threshold below which rumble is muted.
+    pub noise_threshold: f32,
+}
+
+impl AudioToHapticTranscoder {
+    /// Constructs an audio-to-haptic transcoder with calibrated 120Hz bass cutoff.
+    pub const fn new() -> Self {
+        // At fs = 1000 Hz, fc = 120 Hz:
+        // omega = 2 * PI * 120 / 1000 ≈ 0.75398
+        // alpha = omega / (1.0 + omega) ≈ 0.43
+        Self {
+            lpf1_left: 0.0,
+            lpf2_left: 0.0,
+            lpf1_right: 0.0,
+            lpf2_right: 0.0,
+            lpf_alpha: 0.43,
+            gain: 1.5,
+            noise_threshold: 0.02,
+        }
+    }
+
+    /// Resets all internal filter states to zero.
+    pub fn reset(&mut self) {
+        self.lpf1_left = 0.0;
+        self.lpf2_left = 0.0;
+        self.lpf1_right = 0.0;
+        self.lpf2_right = 0.0;
+    }
+
+    /// Filters stereo game audio samples and transcode sub-120Hz bass into haptic rumble intensities.
+    pub fn transcode_sample(&mut self, audio_left: f32, audio_right: f32) -> (f32, f32) {
+        // 1. Cascaded 2-pole low-pass filter for Left channel
+        self.lpf1_left += self.lpf_alpha * (audio_left - self.lpf1_left);
+        self.lpf2_left += self.lpf_alpha * (self.lpf1_left - self.lpf2_left);
+
+        // 2. Cascaded 2-pole low-pass filter for Right channel
+        self.lpf1_right += self.lpf_alpha * (audio_right - self.lpf1_right);
+        self.lpf2_right += self.lpf_alpha * (self.lpf1_right - self.lpf2_right);
+
+        // 3. Extract rectified envelope
+        let abs_l = if self.lpf2_left < 0.0 { -self.lpf2_left } else { self.lpf2_left };
+        let abs_r = if self.lpf2_right < 0.0 { -self.lpf2_right } else { self.lpf2_right };
+
+        // 4. Apply noise threshold gate and gain scaling with soft saturation
+        let rumble_l = if abs_l > self.noise_threshold {
+            let active = (abs_l - self.noise_threshold) * self.gain;
+            active.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let rumble_r = if abs_r > self.noise_threshold {
+            let active = (abs_r - self.noise_threshold) * self.gain;
+            active.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        (rumble_l, rumble_r)
+    }
+}
+
+/// Verification test for stereo haptic spatializer and audio-to-haptic transcoder.
+pub fn verify_audio_to_haptic_transcoder() -> bool {
+    // 1. Verify Constant Power Stereo Spatial Panning
+    // Hard left: pan = -1.0
+    let (gl_left, gr_left) = HapticSpatializer::compute_pan_gains(-1.0);
+    if (gl_left - 1.0).abs() > 1e-4 || gr_left.abs() > 1e-4 {
+        return false;
+    }
+
+    // Center: pan = 0.0 -> both sqrt(2)/2 ≈ 0.7071
+    let (gl_center, gr_center) = HapticSpatializer::compute_pan_gains(0.0);
+    if (gl_center - 0.7071).abs() > 0.005 || (gr_center - 0.7071).abs() > 0.005 {
+        return false;
+    }
+
+    // Hard right: pan = 1.0
+    let (gl_right, gr_right) = HapticSpatializer::compute_pan_gains(1.0);
+    if gl_right.abs() > 1e-4 || (gr_right - 1.0).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Verify Audio-to-Haptic Low-Pass Transcoding (<120 Hz)
+    let mut transcoder = AudioToHapticTranscoder::new();
+
+    // Pass 50 Hz sub-bass tone (period = 20 samples at 1000Hz)
+    // Low frequency must pass through and generate active rumble
+    let mut max_rumble_50hz = 0.0f32;
+    for i in 0..60 {
+        let angle = TWO_PI * 50.0 * (i as f32) / 1000.0;
+        let sample = sin_f32(angle) * 0.80;
+        let (rl, _) = transcoder.transcode_sample(sample, 0.0);
+        if rl > max_rumble_50hz {
+            max_rumble_50hz = rl;
+        }
+    }
+    if max_rumble_50hz <= 0.40 {
+        return false;
+    }
+
+    // Now test 400 Hz high-frequency tone (well above 120 Hz cutoff)
+    // Must be heavily attenuated by 2-pole filter
+    transcoder.reset();
+    let mut max_rumble_400hz = 0.0f32;
+    for i in 0..60 {
+        let angle = TWO_PI * 400.0 * (i as f32) / 1000.0;
+        let sample = sin_f32(angle) * 0.80;
+        let (rl, _) = transcoder.transcode_sample(sample, 0.0);
+        if rl > max_rumble_400hz {
+            max_rumble_400hz = rl;
+        }
+    }
+    // High frequency must be attenuated significantly compared to sub-bass
+    if max_rumble_400hz >= 0.18 {
+        return false;
+    }
+
+    true
+}
