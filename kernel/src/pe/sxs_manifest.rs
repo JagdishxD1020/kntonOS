@@ -98,3 +98,73 @@ static NEXT_ACTCTX_ID: AtomicU64 = AtomicU64::new(0x8000);
 static ACTIVATION_CONTEXTS: Spinlock<BTreeMap<HANDLE, ActivationContextInner>> = Spinlock::new(BTreeMap::new());
 static PROCESS_DEFAULT_ACTCTX: Spinlock<HANDLE> = Spinlock::new(0);
 static THREAD_ACTCTX_STACKS: Spinlock<BTreeMap<u32, Vec<HANDLE>>> = Spinlock::new(BTreeMap::new());
+
+/// Extracts the value of an attribute inside an XML tag string.
+fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let pattern = String::from(attr_name) + "=\"";
+    if let Some(pos) = tag.find(&pattern) {
+        let rest = &tag[pos + pattern.len()..];
+        if let Some(end_pos) = rest.find('"') {
+            return Some(String::from(&rest[..end_pos]));
+        }
+    }
+    None
+}
+
+/// Parses an XML assembly manifest string, extracting assembly identity and dependencies.
+pub fn parse_manifest_xml(xml: &str) -> (String, String, Vec<DependentAssembly>, Vec<BindingRedirect>) {
+    let mut assembly_name = String::new();
+    let mut assembly_version = String::new();
+    let mut dependent_assemblies = Vec::new();
+    let mut binding_redirects = Vec::new();
+
+    let mut cursor = 0;
+    while let Some(start) = xml[cursor..].find('<') {
+        let tag_start = cursor + start;
+        if let Some(end) = xml[tag_start..].find('>') {
+            let tag_end = tag_start + end;
+            let tag_content = &xml[tag_start + 1..tag_end];
+            cursor = tag_end + 1;
+
+            if tag_content.starts_with("assemblyIdentity") {
+                if let Some(name) = extract_xml_attr(tag_content, "name") {
+                    let version = extract_xml_attr(tag_content, "version").unwrap_or_default();
+                    let arch = extract_xml_attr(tag_content, "processorArchitecture").unwrap_or_default();
+                    let pkt = extract_xml_attr(tag_content, "publicKeyToken").unwrap_or_default();
+                    let lang = extract_xml_attr(tag_content, "language").unwrap_or_default();
+
+                    if assembly_name.is_empty() {
+                        assembly_name = name.clone();
+                        assembly_version = version.clone();
+                    } else {
+                        dependent_assemblies.push(DependentAssembly {
+                            name,
+                            version,
+                            processor_architecture: arch,
+                            public_key_token: pkt,
+                            language: lang,
+                        });
+                    }
+                }
+            } else if tag_content.starts_with("bindingRedirect") {
+                if let Some(old_ver) = extract_xml_attr(tag_content, "oldVersion") {
+                    let new_ver = extract_xml_attr(tag_content, "newVersion").unwrap_or_default();
+                    let mut parts = old_ver.split('-');
+                    let low = parts.next().unwrap_or(&old_ver);
+                    let high = parts.next().unwrap_or(low);
+
+                    binding_redirects.push(BindingRedirect {
+                        name: String::new(),
+                        old_version_low: String::from(low),
+                        old_version_high: String::from(high),
+                        new_version: new_ver,
+                    });
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    (assembly_name, assembly_version, dependent_assemblies, binding_redirects)
+}
