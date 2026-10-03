@@ -168,3 +168,197 @@ pub fn parse_manifest_xml(xml: &str) -> (String, String, Vec<DependentAssembly>,
 
     (assembly_name, assembly_version, dependent_assemblies, binding_redirects)
 }
+
+/// Creates an activation context from an ASCII manifest source path or XML buffer.
+pub unsafe extern "system" fn CreateActCtxA(pActCtx: *const ACTCTX_A) -> HANDLE {
+    if pActCtx.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return INVALID_ACTCTX;
+    }
+
+    let src = (*pActCtx).lpSource;
+    let mut source_str = String::new();
+    if !src.is_null() {
+        let mut len = 0;
+        while *src.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
+        let slice = core::slice::from_raw_parts(src, len);
+        if let Ok(s) = core::str::from_utf8(slice) {
+            source_str = String::from(s);
+        }
+    }
+
+    let is_proc_def = ((*pActCtx).dwFlags & ACTCTX_FLAG_SET_PROCESS_DEFAULT) != 0;
+    create_actctx_internal(source_str, is_proc_def)
+}
+
+/// Creates an activation context from a UTF-16 manifest source path or XML buffer.
+pub unsafe extern "system" fn CreateActCtxW(pActCtx: *const ACTCTX_W) -> HANDLE {
+    if pActCtx.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return INVALID_ACTCTX;
+    }
+
+    let src = (*pActCtx).lpSource;
+    let mut source_str = String::new();
+    if !src.is_null() {
+        let mut len = 0;
+        while *src.add(len) != 0 && len < 4096 {
+            source_str.push(*src.add(len) as u8 as char);
+            len += 1;
+        }
+    }
+
+    let is_proc_def = ((*pActCtx).dwFlags & ACTCTX_FLAG_SET_PROCESS_DEFAULT) != 0;
+    create_actctx_internal(source_str, is_proc_def)
+}
+
+fn create_actctx_internal(source_str: String, is_proc_def: bool) -> HANDLE {
+    let (name, ver, deps, redirects) = if source_str.contains('<') {
+        parse_manifest_xml(&source_str)
+    } else {
+        (String::from("app.exe"), String::from("1.0.0.0"), Vec::new(), Vec::new())
+    };
+
+    let mut redirections = BTreeMap::new();
+    for dep in &deps {
+        if dep.name.contains("ComCtl32") || dep.name.contains("Microsoft.Windows.Common-Controls") {
+            redirections.insert(String::from("comctl32.dll"), String::from("comctl32.v6.dll"));
+        } else if dep.name.contains("VC90.CRT") {
+            redirections.insert(String::from("msvcr90.dll"), String::from("winsxs/msvcr90.dll"));
+            redirections.insert(String::from("msvcp90.dll"), String::from("winsxs/msvcp90.dll"));
+        } else if dep.name.contains("VC80.CRT") {
+            redirections.insert(String::from("msvcr80.dll"), String::from("winsxs/msvcr80.dll"));
+            redirections.insert(String::from("msvcp80.dll"), String::from("winsxs/msvcp80.dll"));
+        }
+    }
+
+    let id = NEXT_ACTCTX_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+    let inner = ActivationContextInner {
+        id,
+        source_path: source_str,
+        assembly_name: name,
+        assembly_version: ver,
+        dependent_assemblies: deps,
+        binding_redirects: redirects,
+        dll_redirections: redirections,
+        ref_count: 1,
+        is_process_default: is_proc_def,
+    };
+
+    ACTIVATION_CONTEXTS.lock().insert(id, inner);
+    if is_proc_def {
+        *PROCESS_DEFAULT_ACTCTX.lock() = id;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    id
+}
+
+/// Activates an activation context for the calling thread, returning a cookie.
+pub unsafe extern "system" fn ActivateActCtx(hActCtx: HANDLE, lpCookie: *mut ULONG_PTR) -> BOOL {
+    if hActCtx == 0 || hActCtx == INVALID_ACTCTX || lpCookie.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let contexts = ACTIVATION_CONTEXTS.lock();
+    if !contexts.contains_key(&hActCtx) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    drop(contexts);
+
+    let tid = get_current_thread_id();
+    let mut stacks = THREAD_ACTCTX_STACKS.lock();
+    let stack = stacks.entry(tid).or_insert_with(Vec::new);
+    stack.push(hActCtx);
+    let cookie = stack.len();
+
+    *lpCookie = cookie;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Deactivates an activation context corresponding to a previously issued cookie.
+pub unsafe extern "system" fn DeactivateActCtx(_dwFlags: DWORD, ulCookie: ULONG_PTR) -> BOOL {
+    if ulCookie == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let tid = get_current_thread_id();
+    let mut stacks = THREAD_ACTCTX_STACKS.lock();
+    if let Some(stack) = stacks.get_mut(&tid) {
+        if !stack.is_empty() {
+            stack.pop();
+            win32_set_last_error(ERROR_SUCCESS);
+            return TRUE;
+        }
+    }
+
+    win32_set_last_error(ERROR_INVALID_PARAMETER);
+    FALSE
+}
+
+/// Increments the reference count of an activation context.
+pub unsafe extern "system" fn AddRefActCtx(hActCtx: HANDLE) {
+    if hActCtx != 0 && hActCtx != INVALID_ACTCTX {
+        let mut contexts = ACTIVATION_CONTEXTS.lock();
+        if let Some(ctx) = contexts.get_mut(&hActCtx) {
+            ctx.ref_count += 1;
+        }
+    }
+}
+
+/// Decrements the reference count of an activation context and frees it when zero.
+pub unsafe extern "system" fn ReleaseActCtx(hActCtx: HANDLE) {
+    if hActCtx != 0 && hActCtx != INVALID_ACTCTX {
+        let mut contexts = ACTIVATION_CONTEXTS.lock();
+        if let Some(ctx) = contexts.get_mut(&hActCtx) {
+            ctx.ref_count = ctx.ref_count.saturating_sub(1);
+            if ctx.ref_count == 0 {
+                contexts.remove(&hActCtx);
+            }
+        }
+    }
+}
+
+/// Retrieves the active activation context for the calling thread.
+pub unsafe extern "system" fn GetCurrentActCtx(lphActCtx: *mut HANDLE) -> BOOL {
+    if lphActCtx.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let tid = get_current_thread_id();
+    let stacks = THREAD_ACTCTX_STACKS.lock();
+    let active = if let Some(stack) = stacks.get(&tid) {
+        stack.last().copied().unwrap_or(0)
+    } else {
+        0
+    };
+    drop(stacks);
+
+    let result = if active != 0 {
+        active
+    } else {
+        *PROCESS_DEFAULT_ACTCTX.lock()
+    };
+
+    *lphActCtx = result;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+fn get_current_thread_id() -> u32 {
+    let teb = crate::pe::peb_teb::win32_get_current_teb();
+    if !teb.is_null() {
+        let tid = unsafe { (*teb).client_id.unique_thread as u32 };
+        if tid != 0 {
+            return tid;
+        }
+    }
+    1
+}
