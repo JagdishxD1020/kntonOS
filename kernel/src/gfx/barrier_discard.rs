@@ -276,6 +276,63 @@ impl RdnaCacheFlushMinimizer {
         }
     }
 }
+
+// Optimized hardware execution packet for a group of enhanced barriers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptimizedBarrierBatch {
+    pub hardware_sync_mask: u32,
+    pub hardware_flush: RdnaCacheFlushType,
+    pub barriers_count: usize,
+    pub discards_count: usize,
+}
+
+// Global enhanced barrier discard optimizer orchestrating aliasing and cache flush pruning.
+#[derive(Debug, Clone, Default)]
+pub struct EnhancedBarrierDiscardOptimizer {
+    pub alias_tracker: SubAllocationAliasTracker,
+    pub flush_minimizer: RdnaCacheFlushMinimizer,
+    pub total_optimized_batches: u64,
+    pub total_flushes_saved: u64,
+}
+
+impl EnhancedBarrierDiscardOptimizer {
+    // Creates a new enhanced barrier discard optimizer.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Optimizes a batch of texture barriers, pruning redundant cache flushes and writebacks.
+    pub fn optimize_barrier_group(
+        &mut self,
+        barriers: &[EnhancedTextureBarrierDesc],
+        stays_in_infinity_cache: bool,
+    ) -> OptimizedBarrierBatch {
+        self.total_optimized_batches = self.total_optimized_batches.saturating_add(1);
+
+        let mut discards = 0usize;
+        let mut max_flush = RdnaCacheFlushType::NoFlush;
+        let mut sync_mask = 0u32;
+
+        for barrier in barriers {
+            sync_mask |= barrier.sync_after;
+            let flush = self.flush_minimizer.evaluate_hardware_flush(barrier, stays_in_infinity_cache);
+            if barrier.can_skip_cache_flush() {
+                discards += 1;
+                self.total_flushes_saved = self.total_flushes_saved.saturating_add(1);
+            }
+            if (flush as u32) > (max_flush as u32) {
+                max_flush = flush;
+            }
+        }
+
+        OptimizedBarrierBatch {
+            hardware_sync_mask: sync_mask,
+            hardware_flush: max_flush,
+            barriers_count: barriers.len(),
+            discards_count: discards,
+        }
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_barrier_discard_subsystem() -> bool {
     true
