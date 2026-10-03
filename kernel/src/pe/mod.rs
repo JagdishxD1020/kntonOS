@@ -30,6 +30,7 @@ pub mod token_security;
 pub mod srw_futex;
 pub mod enclave;
 pub mod dns_client;
+pub mod sxs_manifest;
 
 pub use header::*;
 pub use ntdll::*;
@@ -59,6 +60,7 @@ pub use token_security::*;
 pub use srw_futex::*;
 pub use enclave::*;
 pub use dns_client::*;
+pub use sxs_manifest::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
