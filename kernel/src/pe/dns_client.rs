@@ -323,3 +323,156 @@ pub unsafe extern "system" fn DnsRecordListFree(
         curr = next;
     }
 }
+
+pub type DNS_QUERY_COMPLETION_ROUTINE = Option<
+    unsafe extern "system" fn(
+        pQueryContext: *mut c_void,
+        pQueryResults: *mut DNS_QUERY_RESULT,
+    ),
+>;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DNS_QUERY_REQUEST {
+    pub Version: DWORD,
+    pub pszQueryName: *const u16,
+    pub wType: u16,
+    pub queryOptions: u64,
+    pub pDnsServerList: *mut c_void,
+    pub InterfaceIndex: DWORD,
+    pub pQueryCompletionCallback: DNS_QUERY_COMPLETION_ROUTINE,
+    pub pQueryContext: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DNS_QUERY_RESULT {
+    pub Version: DWORD,
+    pub QueryStatus: DNS_STATUS,
+    pub QueryOptions: u64,
+    pub pQueryRecords: PDNS_RECORD,
+    pub Reserved: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DNS_QUERY_CANCEL {
+    pub Reserved: [u8; 32],
+}
+
+pub type PDNS_QUERY_CANCEL = *mut DNS_QUERY_CANCEL;
+
+#[derive(Clone, Debug)]
+pub struct AsyncDnsQueryInner {
+    pub id: u64,
+    pub name: String,
+    pub wType: u16,
+    pub cancelled: bool,
+    pub completed: bool,
+    pub status: DNS_STATUS,
+}
+
+static NEXT_ASYNC_QUERY_ID: AtomicU64 = AtomicU64::new(1);
+static ASYNC_DNS_QUERIES: Spinlock<BTreeMap<u64, AsyncDnsQueryInner>> = Spinlock::new(BTreeMap::new());
+
+/// Initiates an asynchronous DNS query with callback/completion notification.
+pub unsafe extern "system" fn DnsQueryEx(
+    pQueryRequest: *const DNS_QUERY_REQUEST,
+    pQueryResults: *mut DNS_QUERY_RESULT,
+    pCancelHandle: PDNS_QUERY_CANCEL,
+) -> DNS_STATUS {
+    if pQueryRequest.is_null() || pQueryResults.is_null() {
+        return DNS_ERROR_INVALID_NAME;
+    }
+
+    let req = &*pQueryRequest;
+    let query_id = NEXT_ASYNC_QUERY_ID.fetch_add(1, Ordering::SeqCst);
+
+    // Convert UTF-16 query name
+    let mut name = String::new();
+    if !req.pszQueryName.is_null() {
+        let mut idx = 0;
+        while *req.pszQueryName.add(idx) != 0 && idx < 256 {
+            name.push(*req.pszQueryName.add(idx) as u8 as char);
+            idx += 1;
+        }
+    }
+
+    if !pCancelHandle.is_null() {
+        let ptr_u64 = (*pCancelHandle).Reserved.as_mut_ptr() as *mut u64;
+        *ptr_u64 = query_id;
+    }
+
+    let inner = AsyncDnsQueryInner {
+        id: query_id,
+        name: name.clone(),
+        wType: req.wType,
+        cancelled: false,
+        completed: false,
+        status: DNS_STATUS_SUCCESS,
+    };
+    ASYNC_DNS_QUERIES.lock().insert(query_id, inner);
+
+    // Perform query resolution
+    let mut records_head: PDNS_RECORD = core::ptr::null_mut();
+    let status = if !name.is_empty() {
+        let ascii_bytes = name.as_bytes();
+        let mut zero_term = Vec::from(ascii_bytes);
+        zero_term.push(0);
+        DnsQuery_A(
+            zero_term.as_ptr(),
+            req.wType,
+            req.queryOptions as DWORD,
+            core::ptr::null(),
+            &mut records_head,
+            core::ptr::null_mut(),
+        )
+    } else {
+        DNS_ERROR_INVALID_NAME
+    };
+
+    (*pQueryResults).Version = 1;
+    (*pQueryResults).QueryStatus = status;
+    (*pQueryResults).QueryOptions = req.queryOptions;
+    (*pQueryResults).pQueryRecords = records_head;
+
+    if let Some(cb) = req.pQueryCompletionCallback {
+        cb(req.pQueryContext, pQueryResults);
+    }
+
+    if let Some(q) = ASYNC_DNS_QUERIES.lock().get_mut(&query_id) {
+        q.completed = true;
+        q.status = status;
+    }
+
+    status
+}
+
+/// Cancels a pending asynchronous DNS query.
+pub unsafe extern "system" fn DnsCancelQuery(
+    pCancelHandle: PDNS_QUERY_CANCEL,
+) -> DNS_STATUS {
+    if pCancelHandle.is_null() {
+        return DNS_ERROR_INVALID_NAME;
+    }
+
+    let ptr_u64 = (*pCancelHandle).Reserved.as_ptr() as *const u64;
+    let query_id = *ptr_u64;
+
+    let mut queries = ASYNC_DNS_QUERIES.lock();
+    if let Some(q) = queries.get_mut(&query_id) {
+        if !q.completed {
+            q.cancelled = true;
+            q.status = ERROR_CANCELLED;
+            return DNS_STATUS_SUCCESS;
+        }
+    }
+
+    ERROR_CANCELLED
+}
+
+/// Returns whether an async DNS query was cancelled.
+pub fn win32_is_dns_query_cancelled(query_id: u64) -> bool {
+    let queries = ASYNC_DNS_QUERIES.lock();
+    queries.get(&query_id).map(|q| q.cancelled).unwrap_or(false)
+}
