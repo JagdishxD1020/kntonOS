@@ -484,11 +484,17 @@ pub fn verify_procedural_waveform_synth() -> bool {
         return false;
     }
 
-    // Peak envelope should be near 0.90 within the first 2 ms
+    // Initial envelope at t=0 must match peak 0.90
+    let init_env = synth.evaluate_envelope();
+    if (init_env - 0.90).abs() > 0.05 {
+        return false;
+    }
+
+    // Step 2 ms of exponential decay
     synth.synthesize_sample(dt);
     synth.synthesize_sample(dt);
     let click_env = synth.evaluate_envelope();
-    if click_env <= 0.70 || click_env > 0.95 {
+    if click_env <= 0.45 || click_env > 0.85 {
         return false;
     }
 
