@@ -752,6 +752,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld dynamic remapping, macro sequencer and radial menu self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Direct Haptic Waveform Synthesizer & VCA Force Profiler (TASK-KNT-231)
+    if !drivers::input::test_haptic_synth_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld haptic waveform synthesizer and VCA force profiler self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");

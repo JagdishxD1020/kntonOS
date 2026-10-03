@@ -891,3 +891,40 @@ pub fn verify_haptic_governor_and_thermal_brake() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Direct Haptic Waveform Synthesizer & VCA Force Profiler.
+pub fn test_haptic_synth_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Direct Haptic Waveform Synthesizer & VCA Force Profiler...\r\n");
+
+    // 1. Verify dual-axis VCA closed-loop resonance frequency auto-tracking
+    if !verify_vca_resonance_tracking() {
+        crate::serial_write_str("[KNT-PANIC] VCA resonance auto-tracking verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify procedural haptic waveform synthesizer and tactile envelopes
+    if !verify_procedural_waveform_synth() {
+        crate::serial_write_str("[KNT-PANIC] Procedural haptic waveform synthesis verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify stereo spatializer and audio-to-haptic transcoder (<120Hz)
+    if !verify_audio_to_haptic_transcoder() {
+        crate::serial_write_str("[KNT-PANIC] Stereo spatializer and audio transcoder verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify integrated handheld haptic manager and thermal brake cutoff protection
+    if !verify_haptic_governor_and_thermal_brake() {
+        crate::serial_write_str("[KNT-PANIC] Haptic governor and thermal brake verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-INPUT-HAPTIC-SYNTH-PASS] Handheld direct haptic waveform synthesizer and VCA force profiler verified\r\n");
+    true
+}
