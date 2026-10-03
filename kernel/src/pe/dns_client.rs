@@ -476,3 +476,156 @@ pub fn win32_is_dns_query_cancelled(query_id: u64) -> bool {
     let queries = ASYNC_DNS_QUERIES.lock();
     queries.get(&query_id).map(|q| q.cancelled).unwrap_or(false)
 }
+
+static ASYNC_DNS_CALLBACK_FIRED: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn test_dns_callback(
+    _pQueryContext: *mut c_void,
+    pQueryResults: *mut DNS_QUERY_RESULT,
+) {
+    if !pQueryResults.is_null() && (*pQueryResults).QueryStatus == DNS_STATUS_SUCCESS {
+        ASYNC_DNS_CALLBACK_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Self-test suite verifying Win32 DNS queries, records, caching, and async completion.
+pub fn test_win32_dns_client_subsystem() -> bool {
+    unsafe {
+        // 1. Verify DnsQuery_A for IPv4 host
+        let mut results_a: PDNS_RECORD = core::ptr::null_mut();
+        let name_a = b"localhost\0";
+        let status_a = DnsQuery_A(
+            name_a.as_ptr(),
+            DNS_TYPE_A,
+            DNS_QUERY_STANDARD,
+            core::ptr::null(),
+            &mut results_a,
+            core::ptr::null_mut(),
+        );
+
+        if status_a != DNS_STATUS_SUCCESS || results_a.is_null() {
+            return false;
+        }
+
+        let a_data = (*results_a).Data.as_ptr() as *const DNS_A_DATA;
+        if (*a_data).IpAddress != u32::from_ne_bytes([127, 0, 0, 1]) {
+            DnsRecordListFree(results_a, DnsFreeRecordList);
+            return false;
+        }
+        DnsRecordListFree(results_a, DnsFreeRecordList);
+
+        // 2. Verify DnsQuery_A for SRV matchmaking record
+        let mut results_srv: PDNS_RECORD = core::ptr::null_mut();
+        let name_srv = b"_minecraft._tcp.knton.net\0";
+        let status_srv = DnsQuery_A(
+            name_srv.as_ptr(),
+            DNS_TYPE_SRV,
+            DNS_QUERY_STANDARD,
+            core::ptr::null(),
+            &mut results_srv,
+            core::ptr::null_mut(),
+        );
+
+        if status_srv != DNS_STATUS_SUCCESS || results_srv.is_null() {
+            return false;
+        }
+
+        let srv_data = (*results_srv).Data.as_ptr() as *const DNS_SRV_DATA;
+        if (*srv_data).wPort != 27015 {
+            DnsRecordListFree(results_srv, DnsFreeRecordList);
+            return false;
+        }
+        DnsRecordListFree(results_srv, DnsFreeRecordList);
+
+        // 3. Verify Cache Hit
+        let cached = win32_dns_cache_lookup("_minecraft._tcp.knton.net", DNS_TYPE_SRV);
+        if cached.is_none() {
+            return false;
+        }
+
+        // 4. Verify DnsQuery_W (Unicode)
+        let mut results_w: PDNS_RECORD = core::ptr::null_mut();
+        let name_w: [u16; 10] = [
+            'l' as u16, 'o' as u16, 'c' as u16, 'a' as u16, 'l' as u16,
+            'h' as u16, 'o' as u16, 's' as u16, 't' as u16, 0,
+        ];
+        let status_w = DnsQuery_W(
+            name_w.as_ptr(),
+            DNS_TYPE_A,
+            DNS_QUERY_STANDARD,
+            core::ptr::null(),
+            &mut results_w,
+            core::ptr::null_mut(),
+        );
+
+        if status_w != DNS_STATUS_SUCCESS || results_w.is_null() {
+            return false;
+        }
+        DnsRecordListFree(results_w, DnsFreeRecordList);
+
+        // 5. Verify DnsQueryEx with asynchronous callback completion
+        let mut query_results = DNS_QUERY_RESULT {
+            Version: 0,
+            QueryStatus: 0,
+            QueryOptions: 0,
+            pQueryRecords: core::ptr::null_mut(),
+            Reserved: core::ptr::null_mut(),
+        };
+
+        let mut cancel_handle = DNS_QUERY_CANCEL { Reserved: [0; 32] };
+
+        let query_req = DNS_QUERY_REQUEST {
+            Version: 1,
+            pszQueryName: name_w.as_ptr(),
+            wType: DNS_TYPE_A,
+            queryOptions: 0,
+            pDnsServerList: core::ptr::null_mut(),
+            InterfaceIndex: 0,
+            pQueryCompletionCallback: Some(test_dns_callback),
+            pQueryContext: core::ptr::null_mut(),
+        };
+
+        let status_ex = DnsQueryEx(&query_req, &mut query_results, &mut cancel_handle);
+        if status_ex != DNS_STATUS_SUCCESS {
+            return false;
+        }
+
+        if ASYNC_DNS_CALLBACK_FIRED.load(Ordering::SeqCst) < 1 {
+            return false;
+        }
+
+        if !query_results.pQueryRecords.is_null() {
+            DnsRecordListFree(query_results.pQueryRecords, DnsFreeRecordList);
+        }
+
+        // 6. Verify DnsCancelQuery
+        let mut cancel_target = DNS_QUERY_CANCEL { Reserved: [0; 32] };
+        let ptr_u64 = cancel_target.Reserved.as_mut_ptr() as *mut u64;
+        let mock_id = 99999u64;
+        *ptr_u64 = mock_id;
+
+        ASYNC_DNS_QUERIES.lock().insert(
+            mock_id,
+            AsyncDnsQueryInner {
+                id: mock_id,
+                name: String::from("pending.knton.net"),
+                wType: DNS_TYPE_A,
+                cancelled: false,
+                completed: false,
+                status: 0,
+            },
+        );
+
+        if DnsCancelQuery(&mut cancel_target) != DNS_STATUS_SUCCESS {
+            return false;
+        }
+        if !win32_is_dns_query_cancelled(mock_id) {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-DNS-PASS] Win32 asynchronous address resolution & DNS query service verified\r\n",
+    );
+    true
+}

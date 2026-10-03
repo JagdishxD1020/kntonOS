@@ -1099,6 +1099,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Asynchronous DNS Resolution Service (TASK-KNT-230)
+    if !pe::test_win32_dns_client_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 DNS client self-test failed!\r\n");
+    }
+
     // Verify Win32 Enclave Memory Isolation & Anti-Tamper Engine (TASK-KNT-229)
     if !pe::test_win32_enclave_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 enclave isolation self-test failed!\r\n");
