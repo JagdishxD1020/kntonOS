@@ -224,6 +224,58 @@ impl SubAllocationAliasTracker {
         })
     }
 }
+
+// Cache flush scope generated for hardware memory controllers.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdnaCacheFlushType {
+    NoFlush = 0,
+    L0L1Invalidate = 1,
+    L2FlushAndInvalidate = 2,
+    L3MallWriteback = 3,
+}
+
+// RDNA 3 Infinity Cache L2/L3 flush minimizer reducing cache flush overhead across render passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RdnaCacheFlushMinimizer {
+    pub total_barriers_evaluated: u64,
+    pub mall_writebacks_eliminated: u64,
+    pub l2_flushes_reduced: u64,
+}
+
+impl RdnaCacheFlushMinimizer {
+    // Creates a new RDNA 3 cache flush minimizer.
+    pub const fn new() -> Self {
+        Self {
+            total_barriers_evaluated: 0,
+            mall_writebacks_eliminated: 0,
+            l2_flushes_reduced: 0,
+        }
+    }
+
+    // Evaluates the minimum necessary hardware cache flush for an enhanced barrier.
+    pub fn evaluate_hardware_flush(
+        &mut self,
+        barrier: &EnhancedTextureBarrierDesc,
+        stays_on_chip_mall: bool,
+    ) -> RdnaCacheFlushType {
+        self.total_barriers_evaluated = self.total_barriers_evaluated.saturating_add(1);
+
+        if barrier.can_skip_cache_flush() {
+            // Discard skips L2 flush and L3 writeback completely
+            self.mall_writebacks_eliminated = self.mall_writebacks_eliminated.saturating_add(1);
+            self.l2_flushes_reduced = self.l2_flushes_reduced.saturating_add(1);
+            RdnaCacheFlushType::L0L1Invalidate
+        } else if stays_on_chip_mall {
+            // Intermediate pass staying in Infinity Cache suppresses VRAM writeback
+            self.mall_writebacks_eliminated = self.mall_writebacks_eliminated.saturating_add(1);
+            RdnaCacheFlushType::L2FlushAndInvalidate
+        } else {
+            // Full writeback to VRAM
+            RdnaCacheFlushType::L3MallWriteback
+        }
+    }
+}
 // Temporary stub for self-test during incremental commits.
 pub fn test_barrier_discard_subsystem() -> bool {
     true
