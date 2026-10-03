@@ -700,3 +700,194 @@ pub fn verify_audio_to_haptic_transcoder() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Integrated Handheld Haptic Governor with Thermal Brake Protection
+// ============================================================================
+
+/// Critical voice-coil temperature (°C) at which thermal brake disengages drive.
+pub const THERMAL_BRAKE_CUTOFF_TEMP_C: f32 = 75.0;
+/// Recovery temperature (°C) below which thermal brake resets after cooling.
+pub const THERMAL_BRAKE_RECOVERY_TEMP_C: f32 = 60.0;
+/// Ambient baseline chassis temperature (°C).
+pub const AMBIENT_CHASSIS_TEMP_C: f32 = 30.0;
+
+/// Integrated Handheld Haptic Manager and Thermal Brake Governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldHapticManager {
+    /// Dual-axis voice coil actuator drivers.
+    pub driver: DualAxisVcaDriver,
+    /// Procedural haptic waveform synthesizer.
+    pub synth: ProceduralHapticSynthesizer,
+    /// Low-frequency audio-to-haptic transcoder.
+    pub transcoder: AudioToHapticTranscoder,
+    /// Left VCA coil temperature estimate (°C).
+    pub coil_temp_left_c: f32,
+    /// Right VCA coil temperature estimate (°C).
+    pub coil_temp_right_c: f32,
+    /// Whether thermal brake cutoff is active on Left grip actuator.
+    pub thermal_brake_left: bool,
+    /// Whether thermal brake cutoff is active on Right grip actuator.
+    pub thermal_brake_right: bool,
+    /// Active spatial panning factor in [-1.0 .. 1.0].
+    pub spatial_pan: f32,
+    /// Master haptic gain multiplier [0.0 .. 1.0].
+    pub master_intensity: f32,
+}
+
+impl HandheldHapticManager {
+    /// Constructs an integrated handheld haptic manager with default thermal protections.
+    pub const fn new() -> Self {
+        Self {
+            driver: DualAxisVcaDriver::new(),
+            synth: ProceduralHapticSynthesizer::new(),
+            transcoder: AudioToHapticTranscoder::new(),
+            coil_temp_left_c: AMBIENT_CHASSIS_TEMP_C,
+            coil_temp_right_c: AMBIENT_CHASSIS_TEMP_C,
+            thermal_brake_left: false,
+            thermal_brake_right: false,
+            spatial_pan: 0.0,
+            master_intensity: 1.0,
+        }
+    }
+
+    /// Resets all internal state, stopping effects and resetting thermal flags.
+    pub fn reset(&mut self) {
+        self.driver.reset();
+        self.synth.stop();
+        self.transcoder.reset();
+        self.coil_temp_left_c = AMBIENT_CHASSIS_TEMP_C;
+        self.coil_temp_right_c = AMBIENT_CHASSIS_TEMP_C;
+        self.thermal_brake_left = false;
+        self.thermal_brake_right = false;
+        self.spatial_pan = 0.0;
+        self.master_intensity = 1.0;
+    }
+
+    /// Updates internal coil heating and cooling dissipation model.
+    pub fn update_thermal_model(&mut self, drive_l: f32, drive_r: f32, dt_s: f32) {
+        // Heating rate: ~15°C/s at max continuous 1.0 drive; cooling rate: ~3°C/s toward ambient
+        let heat_l = 15.0 * drive_l * drive_l;
+        let cool_l = 0.15 * (self.coil_temp_left_c - AMBIENT_CHASSIS_TEMP_C);
+        self.coil_temp_left_c += (heat_l - cool_l) * dt_s;
+        if self.coil_temp_left_c < AMBIENT_CHASSIS_TEMP_C {
+            self.coil_temp_left_c = AMBIENT_CHASSIS_TEMP_C;
+        }
+
+        let heat_r = 15.0 * drive_r * drive_r;
+        let cool_r = 0.15 * (self.coil_temp_right_c - AMBIENT_CHASSIS_TEMP_C);
+        self.coil_temp_right_c += (heat_r - cool_r) * dt_s;
+        if self.coil_temp_right_c < AMBIENT_CHASSIS_TEMP_C {
+            self.coil_temp_right_c = AMBIENT_CHASSIS_TEMP_C;
+        }
+
+        // Left thermal brake hysteresis
+        if !self.thermal_brake_left {
+            if self.coil_temp_left_c >= THERMAL_BRAKE_CUTOFF_TEMP_C {
+                self.thermal_brake_left = true;
+            }
+        } else {
+            if self.coil_temp_left_c <= THERMAL_BRAKE_RECOVERY_TEMP_C {
+                self.thermal_brake_left = false;
+            }
+        }
+
+        // Right thermal brake hysteresis
+        if !self.thermal_brake_right {
+            if self.coil_temp_right_c >= THERMAL_BRAKE_CUTOFF_TEMP_C {
+                self.thermal_brake_right = true;
+            }
+        } else {
+            if self.coil_temp_right_c <= THERMAL_BRAKE_RECOVERY_TEMP_C {
+                self.thermal_brake_right = false;
+            }
+        }
+    }
+
+    /// Primary 1000Hz haptic processing tick.
+    pub fn update_tick(
+        &mut self,
+        audio_left: f32,
+        audio_right: f32,
+        left_emf: f32,
+        left_phase_err: f32,
+        right_emf: f32,
+        right_phase_err: f32,
+        dt_s: f32,
+    ) -> (f32, f32) {
+        // 1. Closed-loop resonance frequency auto-tracking
+        self.driver.update_telemetry(left_emf, left_phase_err, right_emf, right_phase_err);
+
+        // 2. Synthesize procedural waveform sample and pan across grips
+        let proc_mono = self.synth.synthesize_sample(dt_s);
+        let (proc_l, proc_r) = HapticSpatializer::pan_sample(proc_mono, self.spatial_pan);
+
+        // 3. Extract and transcode sub-120Hz audio bass rumble
+        let (rumble_l, rumble_r) = self.transcoder.transcode_sample(audio_left, audio_right);
+
+        // 4. Mix procedural vibration and audio rumble
+        let mut target_amp_l = (proc_l.abs() + rumble_l).clamp(0.0, 1.0) * self.master_intensity;
+        let mut target_amp_r = (proc_r.abs() + rumble_r).clamp(0.0, 1.0) * self.master_intensity;
+
+        // 5. Update thermal dissipation model and apply thermal brake cutoff
+        self.update_thermal_model(target_amp_l, target_amp_r, dt_s);
+
+        if self.thermal_brake_left {
+            target_amp_l = 0.0;
+        }
+        if self.thermal_brake_right {
+            target_amp_r = 0.0;
+        }
+
+        self.driver.left.drive_amplitude = target_amp_l;
+        self.driver.right.drive_amplitude = target_amp_r;
+
+        // 6. Generate instantaneous force samples from resonance oscillators
+        self.driver.synthesize_stereo(dt_s)
+    }
+}
+
+/// Verification test for integrated handheld haptic manager and thermal brake protection.
+pub fn verify_haptic_governor_and_thermal_brake() -> bool {
+    let mut mgr = HandheldHapticManager::new();
+    let dt = 0.001; // 1 ms
+
+    // 1. Trigger Procedural Click Feedback with Center Panning
+    mgr.synth.trigger_effect(HapticEffectConfig::click());
+    mgr.spatial_pan = 0.0;
+
+    let (l1, r1) = mgr.update_tick(0.0, 0.0, 300.0, 0.0, 300.0, 0.0, dt);
+    // Both grips should engage
+    let _ = (l1, r1);
+    if !mgr.synth.is_active {
+        return false;
+    }
+
+    // 2. Test Thermal Brake Cutoff:
+    // Force Left coil temperature to 76.0°C (> 75.0°C cutoff threshold)
+    mgr.coil_temp_left_c = 76.0;
+    mgr.update_thermal_model(1.0, 0.0, dt);
+
+    if !mgr.thermal_brake_left {
+        return false;
+    }
+
+    // During thermal brake cutoff, Left drive amplitude must be clamped to 0.0
+    mgr.driver.left.drive_amplitude = 0.90;
+    let (l_braked, _) = mgr.update_tick(0.80, 0.0, 300.0, 0.0, 300.0, 0.0, dt);
+    if l_braked.abs() > 1e-5 || mgr.driver.left.drive_amplitude != 0.0 {
+        return false;
+    }
+
+    // 3. Test Thermal Recovery:
+    // Coil cools below 60.0°C recovery threshold
+    mgr.coil_temp_left_c = 58.0;
+    mgr.update_thermal_model(0.0, 0.0, dt);
+
+    if mgr.thermal_brake_left {
+        return false;
+    }
+
+    true
+}
