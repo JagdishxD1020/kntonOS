@@ -333,7 +333,117 @@ impl EnhancedBarrierDiscardOptimizer {
         }
     }
 }
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Enhanced Barriers & Discard Optimizer.
 pub fn test_barrier_discard_subsystem() -> bool {
+    // 1. Verify Enhanced Texture Barrier Discard Descriptors
+    let transient_barrier = EnhancedTextureBarrierDesc::new(
+        1,
+        TransientResourceType::TransientRenderTarget,
+        0x1,
+        0x2,
+        0x4,
+        0x8,
+        0,
+        1,
+        D3D12_TEXTURE_BARRIER_FLAGS::DISCARD,
+    );
+    if !transient_barrier.can_skip_cache_flush() {
+        return false;
+    }
+
+    let gbuffer_barrier = EnhancedTextureBarrierDesc::new(
+        2,
+        TransientResourceType::GbufferAlbedo,
+        0x1,
+        0x2,
+        0x4,
+        0x8,
+        0,
+        1,
+        D3D12_TEXTURE_BARRIER_FLAGS::NONE,
+    );
+    if gbuffer_barrier.can_skip_cache_flush() {
+        return false;
+    }
+
+    // 2. Verify Sub-Allocation Aliasing Barrier Engine
+    let mut alias_tracker = SubAllocationAliasTracker::new();
+    let mb: u64 = 1024 * 1024;
+
+    // Res 10: CascadeShadowMap (0..4MB in Heap 1)
+    let span10 = SubAllocatedHeapSpan::new(10, 1, 0, 4 * mb, TransientResourceType::CascadeShadowMap);
+    // Res 11: TransientRenderTarget (2..6MB in Heap 1) -> overlaps Res 10
+    let span11 = SubAllocatedHeapSpan::new(11, 1, 2 * mb, 4 * mb, TransientResourceType::TransientRenderTarget);
+    // Res 12: In Heap 2 (disjoint)
+    let span12 = SubAllocatedHeapSpan::new(12, 2, 0, 4 * mb, TransientResourceType::TransientRenderTarget);
+
+    if !span10.overlaps(&span11) || span10.overlaps(&span12) {
+        return false;
+    }
+
+    alias_tracker.register_span(span10);
+    alias_tracker.register_span(span11);
+
+    // Activate Res 10
+    if alias_tracker.activate_resource(10, false).is_err() {
+        return false;
+    }
+    let s10 = alias_tracker.spans.iter().find(|s| s.resource_id == 10).unwrap();
+    if !s10.is_active {
+        return false;
+    }
+
+    // Activate Res 11 with discard -> must alias Res 10 out and generate aliasing barrier
+    let alias_bar = match alias_tracker.activate_resource(11, true) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if alias_bar.resource_before_id != Some(10) || alias_bar.resource_after_id != Some(11) {
+        return false;
+    }
+    if !alias_bar.is_discard_enabled || alias_bar.sync_before != 0 {
+        return false;
+    }
+
+    let s10_after = alias_tracker.spans.iter().find(|s| s.resource_id == 10).unwrap();
+    let s11_after = alias_tracker.spans.iter().find(|s| s.resource_id == 11).unwrap();
+    if s10_after.is_active || !s11_after.is_active {
+        return false;
+    }
+
+    // 3. Verify RDNA 3 Infinity Cache L2/L3 Flush Minimizer
+    let mut minimizer = RdnaCacheFlushMinimizer::new();
+
+    // Discard barrier -> L0L1 invalidate, no L2 flush or L3 MALL writeback
+    let f1 = minimizer.evaluate_hardware_flush(&transient_barrier, false);
+    if f1 != RdnaCacheFlushType::L0L1Invalidate || minimizer.mall_writebacks_eliminated != 1 {
+        return false;
+    }
+
+    // On-chip intermediate pass barrier -> L2 flush, suppresses L3 MALL writeback
+    let f2 = minimizer.evaluate_hardware_flush(&gbuffer_barrier, true);
+    if f2 != RdnaCacheFlushType::L2FlushAndInvalidate || minimizer.mall_writebacks_eliminated != 2 {
+        return false;
+    }
+
+    // External memory writeback -> full L3 MALL writeback
+    let f3 = minimizer.evaluate_hardware_flush(&gbuffer_barrier, false);
+    if f3 != RdnaCacheFlushType::L3MallWriteback {
+        return false;
+    }
+
+    // 4. Verify Enhanced Barrier Discard Optimizer
+    let mut optimizer = EnhancedBarrierDiscardOptimizer::new();
+    let batch_barriers = [transient_barrier, gbuffer_barrier];
+    let opt_batch = optimizer.optimize_barrier_group(&batch_barriers, true);
+
+    if opt_batch.barriers_count != 2 || opt_batch.discards_count != 1 {
+        return false;
+    }
+    if opt_batch.hardware_flush != RdnaCacheFlushType::L2FlushAndInvalidate {
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-D3D12-BARRIER-DISCARD-PASS] Direct3D 12 enhanced barrier discard & alias optimizer verified\r\n");
     true
 }

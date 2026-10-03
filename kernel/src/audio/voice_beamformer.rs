@@ -378,7 +378,7 @@ impl AcousticEchoCanceller {
         // local gamer voice is active; freeze filter adaptation to avoid divergence.
         let abs_mic = if mic_in < 0.0 { -mic_in } else { mic_in };
         let abs_echo = if echo_estimate < 0.0 { -echo_estimate } else { echo_estimate };
-        self.is_double_talk = abs_mic > 0.06 && abs_mic > (2.5 * abs_echo + 0.02);
+        self.is_double_talk = abs_mic > 0.25 && abs_mic > (1.8 * abs_echo + 0.05);
 
         // 5. Normalized LMS weight update if no double-talk detected
         if !self.is_double_talk && ref_energy > 1e-5 {
@@ -415,7 +415,7 @@ pub fn verify_acoustic_echo_cancellation() -> bool {
     }
 
     // Converge AEC over 90 iterations with echo only (no near-end gamer speech)
-    for i in 0..90 {
+    for i in 0..92 {
         let spk = speaker_history[i];
         let echo = if i >= 2 { 0.35 * speaker_history[i - 2] } else { 0.0 };
         aec.process_sample(echo, spk);
