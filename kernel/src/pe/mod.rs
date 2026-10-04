@@ -31,6 +31,7 @@ pub mod srw_futex;
 pub mod enclave;
 pub mod dns_client;
 pub mod sxs_manifest;
+pub mod txf_filter;
 
 pub use header::*;
 pub use ntdll::*;
@@ -61,6 +62,7 @@ pub use srw_futex::*;
 pub use enclave::*;
 pub use dns_client::*;
 pub use sxs_manifest::*;
+pub use txf_filter::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
