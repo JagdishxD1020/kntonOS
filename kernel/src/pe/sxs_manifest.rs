@@ -362,3 +362,37 @@ fn get_current_thread_id() -> u32 {
     }
     1
 }
+
+/// Resolves a requested DLL name through the active Side-by-Side activation context redirection table.
+pub fn win32_sxs_redirect_dll_path(requested_dll: &str) -> String {
+    let mut hctx: HANDLE = 0;
+    unsafe {
+        GetCurrentActCtx(&mut hctx);
+    }
+
+    if hctx != 0 && hctx != INVALID_ACTCTX {
+        let contexts = ACTIVATION_CONTEXTS.lock();
+        if let Some(ctx) = contexts.get(&hctx) {
+            let lower_name = String::from(requested_dll).to_ascii_lowercase();
+            if let Some(target) = ctx.dll_redirections.get(&lower_name) {
+                return target.clone();
+            }
+        }
+    }
+
+    String::from(requested_dll)
+}
+
+/// Registers an explicit Side-by-Side DLL redirection for an activation context.
+pub fn win32_sxs_add_redirection(hActCtx: HANDLE, source_dll: &str, target_path: &str) -> bool {
+    let mut contexts = ACTIVATION_CONTEXTS.lock();
+    if let Some(ctx) = contexts.get_mut(&hActCtx) {
+        ctx.dll_redirections.insert(
+            String::from(source_dll).to_ascii_lowercase(),
+            String::from(target_path),
+        );
+        true
+    } else {
+        false
+    }
+}
