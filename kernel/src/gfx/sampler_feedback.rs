@@ -421,6 +421,207 @@ impl D3D12_FEEDBACK_TRANSCODE_ENGINE {
     }
 }
 
+
+// ============================================================================
+// Direct3D 12 Sampler Feedback Streaming Maps & Tile Residency Bitmask Decoder
+// ============================================================================
+
+// Packed bitmask tracking 64KB physical tile residency across a texture mip level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileResidencyBitmask {
+    // 64-bit words storing residency status (1 = resident, 0 = unmapped).
+    pub words: alloc::vec::Vec<u64>,
+    // Total number of discrete tiles represented in this bitmask.
+    pub total_tiles: u32,
+    // Total number of currently resident tiles.
+    pub resident_count: u32,
+}
+
+impl TileResidencyBitmask {
+    // Creates a new residency bitmask for the given tile count.
+    pub fn new(total_tiles: u32, all_resident: bool) -> Self {
+        let num_words = ((total_tiles as usize).saturating_add(63)) / 64;
+        let fill_word = if all_resident { !0u64 } else { 0u64 };
+        let mut words = alloc::vec![fill_word; num_words];
+
+        // Mask out extra bits in the last word
+        let remainder = (total_tiles as usize) % 64;
+        if all_resident && remainder != 0 && num_words > 0 {
+            words[num_words - 1] = (1u64 << remainder) - 1;
+        }
+
+        let resident_count = if all_resident { total_tiles } else { 0 };
+        Self {
+            words,
+            total_tiles,
+            resident_count,
+        }
+    }
+
+    // Queries whether a specific tile index is marked resident.
+    #[inline]
+    pub fn is_tile_resident(&self, tile_index: u32) -> bool {
+        if tile_index >= self.total_tiles {
+            return false;
+        }
+        let word_idx = (tile_index / 64) as usize;
+        let bit_idx = (tile_index % 64) as usize;
+        (self.words[word_idx] & (1u64 << bit_idx)) != 0
+    }
+
+    // Updates the residency status of a specific tile index.
+    pub fn set_tile_resident(&mut self, tile_index: u32, resident: bool) -> bool {
+        if tile_index >= self.total_tiles {
+            return false;
+        }
+        let word_idx = (tile_index / 64) as usize;
+        let bit_idx = (tile_index % 64) as usize;
+        let mask = 1u64 << bit_idx;
+        let was_resident = (self.words[word_idx] & mask) != 0;
+
+        if resident && !was_resident {
+            self.words[word_idx] |= mask;
+            self.resident_count = self.resident_count.saturating_add(1);
+        } else if !resident && was_resident {
+            self.words[word_idx] &= !mask;
+            self.resident_count = self.resident_count.saturating_sub(1);
+        }
+        was_resident
+    }
+
+    // Marks all tiles in this bitmask as resident or unmapped.
+    pub fn mark_all(&mut self, resident: bool) {
+        let fill_word = if resident { !0u64 } else { 0u64 };
+        self.words.fill(fill_word);
+        let remainder = (self.total_tiles as usize) % 64;
+        if resident && remainder != 0 && !self.words.is_empty() {
+            let last = self.words.len() - 1;
+            self.words[last] = (1u64 << remainder) - 1;
+        }
+        self.resident_count = if resident { self.total_tiles } else { 0 };
+    }
+}
+
+// Virtual texture streaming map pairing mip levels with discrete 64KB tiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingTextureVirtualMap {
+    // Virtual texture identifier.
+    pub texture_id: u32,
+    // Full resolution base texture width in texels.
+    pub width: u32,
+    // Full resolution base texture height in texels.
+    pub height: u32,
+    // Total number of mip levels in texture pyramid.
+    pub mip_levels: u8,
+    // Dimension in texels of a single 64KB tile at mip 0.
+    pub tile_dim_texels: u32,
+    // Per-mip residency bitmask tracking tile mapping status.
+    pub mip_residency: alloc::vec::Vec<TileResidencyBitmask>,
+}
+
+impl StreamingTextureVirtualMap {
+    // Constructs a virtual texture map and initializes residency bitmasks.
+    pub fn new(
+        texture_id: u32,
+        width: u32,
+        height: u32,
+        mip_levels: u8,
+        tile_dim_texels: u32,
+        base_mip_cutoff: u8,
+    ) -> Self {
+        let mut mip_residency = alloc::vec::Vec::with_capacity(mip_levels as usize);
+        for mip in 0..mip_levels {
+            let mip_w = core::cmp::max(1, width >> mip);
+            let mip_h = core::cmp::max(1, height >> mip);
+            let tiles_x = (mip_w.saturating_add(tile_dim_texels - 1)) / tile_dim_texels;
+            let tiles_y = (mip_h.saturating_add(tile_dim_texels - 1)) / tile_dim_texels;
+            let total_tiles = core::cmp::max(1, tiles_x * tiles_y);
+            // Coarse base mips at or above cutoff are permanently resident
+            let is_always_resident = mip >= base_mip_cutoff;
+            mip_residency.push(TileResidencyBitmask::new(total_tiles, is_always_resident));
+        }
+
+        Self {
+            texture_id,
+            width,
+            height,
+            mip_levels,
+            tile_dim_texels,
+            mip_residency,
+        }
+    }
+
+    // Calculates tile grid dimensions (tiles_x, tiles_y) for a specific mip level.
+    pub fn tiles_per_axis_for_mip(&self, mip: u8) -> (u32, u32) {
+        if mip >= self.mip_levels {
+            return (0, 0);
+        }
+        let mip_w = core::cmp::max(1, self.width >> mip);
+        let mip_h = core::cmp::max(1, self.height >> mip);
+        let tiles_x = (mip_w.saturating_add(self.tile_dim_texels - 1)) / self.tile_dim_texels;
+        let tiles_y = (mip_h.saturating_add(self.tile_dim_texels - 1)) / self.tile_dim_texels;
+        (core::cmp::max(1, tiles_x), core::cmp::max(1, tiles_y))
+    }
+
+    // Returns total tile count for a given mip level.
+    pub fn total_tiles_for_mip(&self, mip: u8) -> u32 {
+        let (tx, ty) = self.tiles_per_axis_for_mip(mip);
+        tx * ty
+    }
+}
+
+// Decodes raw GPU sampler feedback maps against virtual texture residency bitmasks.
+#[derive(Debug, Clone, Default)]
+pub struct TileResidencyBitmaskDecoder {
+    // Total decoded feedback tiles processed across frames.
+    pub total_tiles_decoded: u64,
+    // Total missing residency tile faults detected.
+    pub total_residency_faults: u64,
+}
+
+impl TileResidencyBitmaskDecoder {
+    // Creates a new tile residency bitmask decoder.
+    pub const fn new() -> Self {
+        Self {
+            total_tiles_decoded: 0,
+            total_residency_faults: 0,
+        }
+    }
+
+    // Decodes MinMip feedback map and identifies tiles requiring streaming load.
+    pub fn decode_min_mip_faults(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        virtual_map: &StreamingTextureVirtualMap,
+    ) -> alloc::vec::Vec<(u8, u32, u32)> {
+        let mut missing_tiles = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                self.total_tiles_decoded = self.total_tiles_decoded.saturating_add(1);
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP
+                        && sampled_mip < virtual_map.mip_levels
+                    {
+                        let (tiles_x, _) = virtual_map.tiles_per_axis_for_mip(sampled_mip);
+                        let tile_idx = ty * tiles_x + tx;
+                        let is_resident = virtual_map.mip_residency
+                            .get(sampled_mip as usize)
+                            .map_or(false, |mask| mask.is_tile_resident(tile_idx));
+
+                        if !is_resident {
+                            self.total_residency_faults = self.total_residency_faults.saturating_add(1);
+                            missing_tiles.push((sampled_mip, tx, ty));
+                        }
+                    }
+                }
+            }
+        }
+        missing_tiles
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
