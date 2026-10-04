@@ -492,6 +492,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 GPU multi-draw self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Enhanced Barrier Discard & Alias Optimizer (TASK-KNT-232)
+    if !gfx::test_barrier_discard_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 barrier discard self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 variable rate shading engine self-test failed!\r\n");

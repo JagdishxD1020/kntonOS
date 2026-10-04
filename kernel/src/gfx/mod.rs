@@ -49,6 +49,7 @@ pub mod root_signature_v1_2;
 pub mod work_graphs_allocator;
 pub mod wave_mma;
 pub mod gpu_multi_draw;
+pub mod barrier_discard;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -98,6 +99,7 @@ pub use root_signature_v1_2::*;
 pub use work_graphs_allocator::*;
 pub use wave_mma::*;
 pub use gpu_multi_draw::*;
+pub use barrier_discard::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
