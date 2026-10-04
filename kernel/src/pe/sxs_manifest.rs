@@ -396,3 +396,106 @@ pub fn win32_sxs_add_redirection(hActCtx: HANDLE, source_dll: &str, target_path:
         false
     }
 }
+
+/// Self-test suite verifying Win32 activation contexts, manifest XML parsing, and DLL redirection.
+pub fn test_win32_sxs_manifest_subsystem() -> bool {
+    let manifest_sample = "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\
+        <assemblyIdentity name=\"GameEngine.App\" version=\"2.4.0.0\" processorArchitecture=\"amd64\"/>\
+        <dependency>\
+            <dependentAssembly>\
+                <assemblyIdentity name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.0.0\" processorArchitecture=\"*\" publicKeyToken=\"6595b64144ccf1df\"/>\
+            </dependentAssembly>\
+        </dependency>\
+        <dependency>\
+            <dependentAssembly>\
+                <assemblyIdentity name=\"Microsoft.VC90.CRT\" version=\"9.0.21022.8\" processorArchitecture=\"amd64\" publicKeyToken=\"1fc8b3b9a1e18e3b\"/>\
+            </dependentAssembly>\
+        </dependency>\
+        <bindingRedirect oldVersion=\"8.0.0.0-8.0.50727.762\" newVersion=\"9.0.21022.8\"/>\
+    </assembly>";
+
+    // 1. Verify XML parsing logic
+    let (name, ver, deps, redirects) = parse_manifest_xml(manifest_sample);
+    if name != "GameEngine.App" || ver != "2.4.0.0" {
+        return false;
+    }
+    if deps.len() < 2 || redirects.len() < 1 {
+        return false;
+    }
+
+    unsafe {
+        // 2. Create activation context from ASCII XML manifest
+        let actctx_in = ACTCTX_A {
+            cbSize: core::mem::size_of::<ACTCTX_A>() as DWORD,
+            dwFlags: 0,
+            lpSource: manifest_sample.as_ptr(),
+            wProcessorArchitecture: 0,
+            wLangId: 0,
+            lpAssemblyDirectory: core::ptr::null(),
+            lpResourceName: core::ptr::null(),
+            lpApplicationName: core::ptr::null(),
+            hModule: 0,
+        };
+
+        let hctx = CreateActCtxA(&actctx_in);
+        if hctx == 0 || hctx == INVALID_ACTCTX {
+            return false;
+        }
+
+        // Initially no active thread context, so unredirected DLL resolves to original name
+        if win32_sxs_redirect_dll_path("comctl32.dll") != "comctl32.dll" {
+            return false;
+        }
+
+        // 3. Activate context and verify thread activation stack
+        let mut cookie: ULONG_PTR = 0;
+        let act_ok = ActivateActCtx(hctx, &mut cookie);
+        if act_ok != TRUE || cookie == 0 {
+            return false;
+        }
+
+        let mut curr_ctx: HANDLE = 0;
+        GetCurrentActCtx(&mut curr_ctx);
+        if curr_ctx != hctx {
+            return false;
+        }
+
+        // 4. Verify Side-by-Side DLL redirection under active context
+        let red_comctl = win32_sxs_redirect_dll_path("comctl32.dll");
+        if red_comctl != "comctl32.v6.dll" {
+            return false;
+        }
+
+        let red_msvcr = win32_sxs_redirect_dll_path("msvcr90.dll");
+        if red_msvcr != "winsxs/msvcr90.dll" {
+            return false;
+        }
+
+        // 5. Deactivate context and verify stack pop
+        let deact_ok = DeactivateActCtx(0, cookie);
+        if deact_ok != TRUE {
+            return false;
+        }
+
+        let mut post_ctx: HANDLE = 0;
+        GetCurrentActCtx(&mut post_ctx);
+        if post_ctx != 0 {
+            return false;
+        }
+
+        // Redirection should no longer apply
+        if win32_sxs_redirect_dll_path("comctl32.dll") != "comctl32.dll" {
+            return false;
+        }
+
+        // 6. Release activation context
+        AddRefActCtx(hctx);
+        ReleaseActCtx(hctx);
+        ReleaseActCtx(hctx);
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-SXS-PASS] Win32 side-by-side assembly isolation & manifest activation context verified\r\n",
+    );
+    true
+}

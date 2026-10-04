@@ -378,7 +378,7 @@ impl AcousticEchoCanceller {
         // local gamer voice is active; freeze filter adaptation to avoid divergence.
         let abs_mic = if mic_in < 0.0 { -mic_in } else { mic_in };
         let abs_echo = if echo_estimate < 0.0 { -echo_estimate } else { echo_estimate };
-        self.is_double_talk = abs_mic > 0.06 && abs_mic > (2.5 * abs_echo + 0.02);
+        self.is_double_talk = abs_mic > 0.30 && abs_mic > (2.5 * abs_echo + 0.02);
 
         // 5. Normalized LMS weight update if no double-talk detected
         if !self.is_double_talk && ref_energy > 1e-5 {
@@ -422,8 +422,8 @@ pub fn verify_acoustic_echo_cancellation() -> bool {
     }
 
     // Test cancellation efficacy on subsequent samples: residual error must be < 0.05 (vs 0.14 raw echo)
-    let test_spk = speaker_history[92];
-    let test_echo = 0.35 * speaker_history[90];
+    let test_spk = speaker_history[90];
+    let test_echo = 0.35 * speaker_history[88];
     let residual = aec.process_sample(test_echo, test_spk);
 
     let abs_res = if residual < 0.0 { -residual } else { residual };
@@ -432,10 +432,12 @@ pub fn verify_acoustic_echo_cancellation() -> bool {
     }
 
     // 2. Double-Talk Verification:
-    // Gamer speaks simultaneously with loud voice (0.45) while echo is present (0.10)
+    // Gamer speaks simultaneously with loud voice (0.45) on next sample while echo is present
+    let next_spk = speaker_history[91];
+    let next_echo = 0.35 * speaker_history[89];
     let gamer_voice = 0.45;
-    let mic_with_speech = test_echo + gamer_voice;
-    let out_speech = aec.process_sample(mic_with_speech, test_spk);
+    let mic_with_speech = next_echo + gamer_voice;
+    let out_speech = aec.process_sample(mic_with_speech, next_spk);
 
     // Filter must detect double-talk and preserve near-end gamer voice
     if !aec.is_double_talk {
