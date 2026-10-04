@@ -250,3 +250,291 @@ pub fn verify_dual_link_mlo_aggregation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Sub-2ms Jitter Buffer & Dynamic Link Re-balancing
+// ============================================================================
+
+/// Maximum playout jitter buffer deadline in microseconds (2.0 ms target).
+pub const JITTER_BUFFER_MAX_HOLD_US: u64 = 2000;
+/// Capacity of the jitter re-ordering buffer.
+pub const JITTER_BUFFER_CAPACITY: usize = 32;
+
+/// Packet descriptor transmitted and received across Wi-Fi 7 MLO links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MloPacket {
+    /// Packet monotonic sequence number.
+    pub seq_num: u32,
+    /// Hardware timestamp in microseconds when packet was enqueued / received.
+    pub timestamp_us: u64,
+    /// Radio band on which packet was sent/received.
+    pub band: MloBand,
+    /// Differentiated Services Code Point (e.g. 46 for Expedited Forwarding).
+    pub dscp: u8,
+    /// Payload length in bytes.
+    pub payload_len: u16,
+    /// Whether this frame is an MLO duplicate transmission.
+    pub is_duplicate: bool,
+}
+
+impl MloPacket {
+    /// Constructs a standard gaming netcode packet.
+    pub const fn new(seq_num: u32, timestamp_us: u64, band: MloBand, dscp: u8, payload_len: u16) -> Self {
+        Self {
+            seq_num,
+            timestamp_us,
+            band,
+            dscp,
+            payload_len,
+            is_duplicate: false,
+        }
+    }
+}
+
+/// Sub-2ms Packet De-Jitter Buffer reordering out-of-order multi-link arrivals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MloJitterBuffer {
+    /// Packet storage slots.
+    pub slots: [Option<MloPacket>; JITTER_BUFFER_CAPACITY],
+    /// Highest consecutive sequence number delivered to game engine.
+    pub last_delivered_seq: u32,
+    /// Playout target delay in microseconds (<= 2000 us).
+    pub playout_delay_us: u64,
+    /// Number of packets dropped due to late arrival past the sub-2ms deadline.
+    pub dropped_late_packets: u32,
+    /// Number of duplicate frames suppressed.
+    pub duplicate_suppressed: u32,
+}
+
+impl MloJitterBuffer {
+    /// Constructs a sub-2ms jitter buffer with zero initial state.
+    pub const fn new() -> Self {
+        Self {
+            slots: [None; JITTER_BUFFER_CAPACITY],
+            last_delivered_seq: 0,
+            playout_delay_us: JITTER_BUFFER_MAX_HOLD_US,
+            dropped_late_packets: 0,
+            duplicate_suppressed: 0,
+        }
+    }
+
+    /// Resets the jitter buffer.
+    pub fn reset(&mut self) {
+        self.slots = [None; JITTER_BUFFER_CAPACITY];
+        self.last_delivered_seq = 0;
+        self.dropped_late_packets = 0;
+        self.duplicate_suppressed = 0;
+    }
+
+    /// Ingests an incoming packet received from either 5GHz or 6GHz link.
+    pub fn push_packet(&mut self, pkt: MloPacket, _now_us: u64) -> bool {
+        // Discard duplicates or already-delivered sequence numbers
+        if self.last_delivered_seq > 0 && pkt.seq_num <= self.last_delivered_seq {
+            self.duplicate_suppressed += 1;
+            return false;
+        }
+
+        // Check for duplicate in current buffer
+        for slot in self.slots.iter_mut() {
+            if let Some(existing) = slot {
+                if existing.seq_num == pkt.seq_num {
+                    self.duplicate_suppressed += 1;
+                    return false;
+                }
+            }
+        }
+
+        // Find empty slot
+        for slot in self.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(pkt);
+                return true;
+            }
+        }
+
+        // Buffer overflow: drop oldest
+        self.dropped_late_packets += 1;
+        false
+    }
+
+    /// Pops the next playable in-order packet or expires overdue gaps.
+    pub fn pop_packet(&mut self, now_us: u64) -> Option<MloPacket> {
+        let expected_seq = self.last_delivered_seq + 1;
+
+        // 1. Direct in-order hit check
+        for slot in self.slots.iter_mut() {
+            if let Some(pkt) = slot {
+                if pkt.seq_num == expected_seq {
+                    let res = *pkt;
+                    *slot = None;
+                    self.last_delivered_seq = res.seq_num;
+                    return Some(res);
+                }
+            }
+        }
+
+        // 2. Deadline expiration check: find oldest buffered packet
+        let mut min_seq: Option<(usize, u32, u64)> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(pkt) = slot {
+                match min_seq {
+                    None => min_seq = Some((i, pkt.seq_num, pkt.timestamp_us)),
+                    Some((_, best_seq, _)) => {
+                        if pkt.seq_num < best_seq {
+                            min_seq = Some((i, pkt.seq_num, pkt.timestamp_us));
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((idx, seq, ts)) = min_seq {
+            // If the oldest buffered packet has waited longer than the sub-2ms playout deadline
+            if now_us.saturating_sub(ts) >= self.playout_delay_us {
+                let res = self.slots[idx].take();
+                self.last_delivered_seq = seq;
+                return res;
+            }
+        }
+
+        None
+    }
+}
+
+/// Real-time Jitter Monitor and Link Re-balancer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MloLinkRebalancer {
+    /// Estimated moving average jitter on 5 GHz link (microseconds).
+    pub jitter_5ghz_us: u32,
+    /// Estimated moving average jitter on 6 GHz link (microseconds).
+    pub jitter_6ghz_us: u32,
+    /// Previous packet transit latency on 5 GHz link.
+    pub prev_transit_5ghz_us: u32,
+    /// Previous packet transit latency on 6 GHz link.
+    pub prev_transit_6ghz_us: u32,
+    /// Whether 6 GHz link jitter exceeded sub-2ms bound, forcing traffic shift.
+    pub force_shift_to_5ghz: bool,
+}
+
+impl MloLinkRebalancer {
+    pub const fn new() -> Self {
+        Self {
+            jitter_5ghz_us: 1000,
+            jitter_6ghz_us: 300,
+            prev_transit_5ghz_us: 4500,
+            prev_transit_6ghz_us: 1200,
+            force_shift_to_5ghz: false,
+        }
+    }
+
+    /// Records transit latency for an arrived packet and updates RFC 3550 style jitter.
+    pub fn update_transit_sample(&mut self, band: MloBand, transit_time_us: u32) {
+        match band {
+            MloBand::Band5GHz => {
+                let diff = if transit_time_us >= self.prev_transit_5ghz_us {
+                    transit_time_us - self.prev_transit_5ghz_us
+                } else {
+                    self.prev_transit_5ghz_us - transit_time_us
+                };
+                self.prev_transit_5ghz_us = transit_time_us;
+                self.jitter_5ghz_us = self.jitter_5ghz_us + ((diff as i32 - self.jitter_5ghz_us as i32) / 16) as u32;
+            }
+            MloBand::Band6GHz => {
+                let diff = if transit_time_us >= self.prev_transit_6ghz_us {
+                    transit_time_us - self.prev_transit_6ghz_us
+                } else {
+                    self.prev_transit_6ghz_us - transit_time_us
+                };
+                self.prev_transit_6ghz_us = transit_time_us;
+                self.jitter_6ghz_us = self.jitter_6ghz_us + ((diff as i32 - self.jitter_6ghz_us as i32) / 16) as u32;
+
+                // Re-balance trigger: if 6 GHz jitter exceeds sub-2ms bound (2000 us), shift traffic
+                if self.jitter_6ghz_us >= JITTER_BUFFER_MAX_HOLD_US as u32 {
+                    self.force_shift_to_5ghz = true;
+                } else if self.jitter_6ghz_us <= 1200 {
+                    self.force_shift_to_5ghz = false;
+                }
+            }
+        }
+    }
+}
+
+/// Verification test for sub-2ms jitter buffer and dynamic link rebalancing.
+pub fn verify_mlo_jitter_buffer_and_rebalance() -> bool {
+    let mut jbuf = MloJitterBuffer::new();
+
+    // 1. Ingest out-of-order packets: [Seq 1, Seq 3, Seq 2, Seq 4]
+    let t0 = 10_000_000u64;
+    let p1 = MloPacket::new(1, t0, MloBand::Band5GHz, 46, 64);
+    let p3 = MloPacket::new(3, t0 + 200, MloBand::Band6GHz, 46, 64);
+    let p2 = MloPacket::new(2, t0 + 400, MloBand::Band5GHz, 46, 64);
+    let p4 = MloPacket::new(4, t0 + 600, MloBand::Band6GHz, 46, 64);
+
+    jbuf.push_packet(p1, t0);
+    jbuf.push_packet(p3, t0 + 200);
+    jbuf.push_packet(p2, t0 + 400);
+    jbuf.push_packet(p4, t0 + 600);
+
+    // Verify packets are popped in strictly monotonic sequence [1, 2, 3, 4]
+    let out1 = jbuf.pop_packet(t0 + 500);
+    if out1.map(|p| p.seq_num) != Some(1) {
+        return false;
+    }
+    let out2 = jbuf.pop_packet(t0 + 500);
+    if out2.map(|p| p.seq_num) != Some(2) {
+        return false;
+    }
+    let out3 = jbuf.pop_packet(t0 + 500);
+    if out3.map(|p| p.seq_num) != Some(3) {
+        return false;
+    }
+    let out4 = jbuf.pop_packet(t0 + 700);
+    if out4.map(|p| p.seq_num) != Some(4) {
+        return false;
+    }
+
+    // 2. Test Duplicate Suppression
+    let dup_p4 = MloPacket::new(4, t0 + 800, MloBand::Band5GHz, 46, 64);
+    if jbuf.push_packet(dup_p4, t0 + 800) {
+        return false;
+    }
+    if jbuf.duplicate_suppressed == 0 {
+        return false;
+    }
+
+    // 3. Test Playout Timeout on Lost Packet
+    // Packet 5 lost. Packet 6 arrives at t = 10_001_000
+    let p6 = MloPacket::new(6, 10_001_000, MloBand::Band6GHz, 46, 64);
+    jbuf.push_packet(p6, 10_001_000);
+
+    // At t + 1000us (< 2000us), packet 6 should NOT pop yet (waiting for packet 5)
+    if jbuf.pop_packet(10_002_000).is_some() {
+        return false;
+    }
+
+    // At t + 2500us (>= 2000us deadline), deadline expires and packet 6 must pop
+    let out6 = jbuf.pop_packet(10_003_500);
+    if out6.map(|p| p.seq_num) != Some(6) {
+        return false;
+    }
+
+    // 4. Test Jitter Monitor and Link Rebalancing
+    let mut rebalancer = MloLinkRebalancer::new();
+    if rebalancer.force_shift_to_5ghz {
+        return false;
+    }
+
+    // Inject high transit latency fluctuations on 6 GHz link
+    for i in 0..40 {
+        let transit = if i % 2 == 0 { 10_000 } else { 1_000 };
+        rebalancer.update_transit_sample(MloBand::Band6GHz, transit);
+    }
+
+    // Jitter on 6GHz should exceed 2000 us and trigger shift
+    if !rebalancer.force_shift_to_5ghz || rebalancer.jitter_6ghz_us < 2000 {
+        return false;
+    }
+
+    true
+}
