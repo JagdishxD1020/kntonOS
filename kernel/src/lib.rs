@@ -1119,6 +1119,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Side-by-Side (SxS) Manifest Activation Engine (TASK-KNT-233)
+    if !pe::test_win32_sxs_manifest_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 SxS manifest activation self-test failed!\r\n");
+    }
+
     // Verify Win32 Asynchronous DNS Resolution Service (TASK-KNT-230)
     if !pe::test_win32_dns_client_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 DNS client self-test failed!\r\n");
