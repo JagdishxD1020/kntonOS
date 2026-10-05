@@ -827,6 +827,149 @@ impl GpuTextureLodFeedbackAnalyzer {
     }
 }
 
+
+// ============================================================================
+// Asynchronous DirectStorage Streaming Request Generator
+// ============================================================================
+
+// Compression algorithms supported by DirectStorage NVMe-to-GPU streaming.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectStorageCompression {
+    None = 0,
+    GDeflate = 1,
+    Zlib = 2,
+}
+
+// Represents an asynchronous DirectStorage queue submission request for a 64KB texture tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectStorageStreamingRequest {
+    // Unique monotonic request tracking index.
+    pub request_id: u64,
+    // Source texture identifier.
+    pub texture_id: u32,
+    // Subresource mip level index.
+    pub subresource_mip: u8,
+    // Horizontal tile coordinate in the texture mip level.
+    pub tile_x: u16,
+    // Vertical tile coordinate in the texture mip level.
+    pub tile_y: u16,
+    // Byte offset in the virtual package file on NVMe storage.
+    pub source_file_offset: u64,
+    // Compressed payload size in bytes.
+    pub compressed_size_bytes: u32,
+    // Decompressed payload size in bytes (typically 65536 for 64KB tile).
+    pub uncompressed_size_bytes: u32,
+    // Target physical VRAM destination address or tile pool slot.
+    pub destination_vram_addr: u64,
+    // Compression format used for decompression in GPU shader or HW engine.
+    pub compression: DirectStorageCompression,
+    // DirectStorage completion fence value to signal upon DMA transfer finish.
+    pub fence_signal_value: u64,
+}
+
+// Translates prioritized mip load requests into asynchronous DirectStorage streaming commands.
+#[derive(Debug, Clone)]
+pub struct DirectStorageStreamGenerator {
+    // Current monotonic request ID generator.
+    pub next_request_id: u64,
+    // DirectStorage timeline fence value.
+    pub current_fence_value: u64,
+    // Base physical VRAM pool address for streaming tiles.
+    pub vram_tile_pool_base: u64,
+    // Standard tile byte size (64KB).
+    pub standard_tile_size: u32,
+    // Active compression mode for streaming package assets.
+    pub compression_mode: DirectStorageCompression,
+    // Average compression ratio percentage (e.g. 40 = 40% of uncompressed size).
+    pub compression_ratio_percent: u32,
+    // Total DirectStorage requests generated.
+    pub total_requests_generated: u64,
+    // Total uncompressed streaming bytes requested.
+    pub total_uncompressed_bytes: u64,
+    // Total compressed bytes transferred over NVMe.
+    pub total_compressed_bytes: u64,
+}
+
+impl DirectStorageStreamGenerator {
+    // Constructs an asynchronous DirectStorage streaming request generator.
+    pub fn new(vram_tile_pool_base: u64, compression_mode: DirectStorageCompression) -> Self {
+        let compression_ratio_percent = match compression_mode {
+            DirectStorageCompression::None => 100,
+            DirectStorageCompression::GDeflate => 45, // ~45% footprint for BC textures
+            DirectStorageCompression::Zlib => 55,
+        };
+
+        Self {
+            next_request_id: 1,
+            current_fence_value: 0,
+            vram_tile_pool_base,
+            standard_tile_size: 65536, // 64 KiB
+            compression_mode,
+            compression_ratio_percent,
+            total_requests_generated: 0,
+            total_uncompressed_bytes: 0,
+            total_compressed_bytes: 0,
+        }
+    }
+
+    // Translates a slice of dynamic mip requests into DirectStorage queue streaming packets.
+    pub fn generate_streaming_requests(
+        &mut self,
+        mip_requests: &[DynamicMipLevelRequest],
+    ) -> alloc::vec::Vec<DirectStorageStreamingRequest> {
+        let mut ds_requests = alloc::vec::Vec::with_capacity(mip_requests.len());
+
+        for req in mip_requests {
+            self.current_fence_value = self.current_fence_value.saturating_add(1);
+            let req_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.saturating_add(1);
+
+            let uncompressed_size = self.standard_tile_size;
+            let compressed_size = if self.compression_mode == DirectStorageCompression::None {
+                uncompressed_size
+            } else {
+                (uncompressed_size * self.compression_ratio_percent) / 100
+            };
+
+            // Calculate deterministic NVMe file offset from texture layout
+            let tile_index = (req.tile_y as u64) * 256 + (req.tile_x as u64);
+            let mip_base_offset = (req.texture_id as u64) * 0x10000000 + (req.mip_level as u64) * 0x1000000;
+            let source_file_offset = mip_base_offset + tile_index * (compressed_size as u64);
+
+            // Compute destination VRAM physical tile address in sparse pool
+            let destination_vram_addr = self.vram_tile_pool_base + ((req_id - 1) % 1024) * 65536;
+
+            let ds_req = DirectStorageStreamingRequest {
+                request_id: req_id,
+                texture_id: req.texture_id,
+                subresource_mip: req.mip_level,
+                tile_x: req.tile_x,
+                tile_y: req.tile_y,
+                source_file_offset,
+                compressed_size_bytes: compressed_size,
+                uncompressed_size_bytes: uncompressed_size,
+                destination_vram_addr,
+                compression: self.compression_mode,
+                fence_signal_value: self.current_fence_value,
+            };
+
+            self.total_requests_generated = self.total_requests_generated.saturating_add(1);
+            self.total_uncompressed_bytes = self.total_uncompressed_bytes.saturating_add(uncompressed_size as u64);
+            self.total_compressed_bytes = self.total_compressed_bytes.saturating_add(compressed_size as u64);
+
+            ds_requests.push(ds_req);
+        }
+
+        ds_requests
+    }
+
+    // Returns total NVMe transfer bandwidth saved due to DirectStorage compression.
+    pub fn bandwidth_saved_bytes(&self) -> u64 {
+        self.total_uncompressed_bytes.saturating_sub(self.total_compressed_bytes)
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
