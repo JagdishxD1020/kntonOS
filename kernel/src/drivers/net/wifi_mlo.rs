@@ -538,3 +538,200 @@ pub fn verify_mlo_jitter_buffer_and_rebalance() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: DSCP 46 Expedited Forwarding (EF) QoS Priority Queue
+// ============================================================================
+
+/// DSCP 46 (Expedited Forwarding, 0x2E): Critical Multiplayer Game Netcode.
+pub const DSCP_EXPEDITED_FORWARDING: u8 = 46;
+/// DSCP 34 (Assured Forwarding AF41, 0x22): Real-Time Voice Chat.
+pub const DSCP_VOICE_CHAT: u8 = 34;
+/// DSCP 26 (Assured Forwarding AF31, 0x1A): Video Streaming Slices.
+pub const DSCP_VIDEO_STREAMING: u8 = 26;
+/// DSCP 0 (Best Effort, 0x00): Default Background Downloads.
+pub const DSCP_BEST_EFFORT: u8 = 0;
+
+/// Internal Quality of Service priority tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QosPriorityTier {
+    /// Strict highest priority: game ticks, inputs, hit registration.
+    ExpeditedForwarding = 0,
+    /// Second priority: voice communications.
+    Voice = 1,
+    /// Third priority: display video frames.
+    Video = 2,
+    /// Lowest priority: background bulk downloads.
+    BestEffort = 3,
+}
+
+impl QosPriorityTier {
+    /// Maps a 6-bit DSCP code point into the corresponding QoS priority tier.
+    pub fn from_dscp(dscp: u8) -> Self {
+        match dscp {
+            DSCP_EXPEDITED_FORWARDING => Self::ExpeditedForwarding,
+            DSCP_VOICE_CHAT => Self::Voice,
+            DSCP_VIDEO_STREAMING => Self::Video,
+            _ => Self::BestEffort,
+        }
+    }
+}
+
+/// Fixed-capacity ring buffer for an individual QoS tier.
+pub const QOS_QUEUE_TIER_CAPACITY: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QosFifoRing {
+    pub buffer: [Option<MloPacket>; QOS_QUEUE_TIER_CAPACITY],
+    pub head: usize,
+    pub tail: usize,
+    pub count: usize,
+}
+
+impl QosFifoRing {
+    pub const fn new() -> Self {
+        Self {
+            buffer: [None; QOS_QUEUE_TIER_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+        }
+    }
+
+    pub fn push(&mut self, pkt: MloPacket) -> bool {
+        if self.count >= QOS_QUEUE_TIER_CAPACITY {
+            return false; // Queue full
+        }
+        self.buffer[self.tail] = Some(pkt);
+        self.tail = (self.tail + 1) % QOS_QUEUE_TIER_CAPACITY;
+        self.count += 1;
+        true
+    }
+
+    pub fn pop(&mut self) -> Option<MloPacket> {
+        if self.count == 0 {
+            return None;
+        }
+        let item = self.buffer[self.head].take();
+        self.head = (self.head + 1) % QOS_QUEUE_TIER_CAPACITY;
+        self.count -= 1;
+        item
+    }
+}
+
+/// 4-Tier Strict-Priority QoS Scheduler with DSCP 46 Expedited Forwarding preemption.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DscpPriorityQueue {
+    /// Tier 0: DSCP 46 EF game netcode queue.
+    pub ef_queue: QosFifoRing,
+    /// Tier 1: DSCP 34 voice chat queue.
+    pub voice_queue: QosFifoRing,
+    /// Tier 2: DSCP 26 video streaming queue.
+    pub video_queue: QosFifoRing,
+    /// Tier 3: DSCP 0 best effort queue.
+    pub be_queue: QosFifoRing,
+    /// Total packets processed across all queues.
+    pub total_enqueued: u64,
+    /// Total packets dropped due to tier capacity saturation.
+    pub total_dropped: u32,
+}
+
+impl DscpPriorityQueue {
+    /// Constructs a strict-priority QoS queue.
+    pub const fn new() -> Self {
+        Self {
+            ef_queue: QosFifoRing::new(),
+            voice_queue: QosFifoRing::new(),
+            video_queue: QosFifoRing::new(),
+            be_queue: QosFifoRing::new(),
+            total_enqueued: 0,
+            total_dropped: 0,
+        }
+    }
+
+    /// Enqueues an outgoing packet according to its DSCP code point.
+    pub fn enqueue(&mut self, pkt: MloPacket) -> bool {
+        let tier = QosPriorityTier::from_dscp(pkt.dscp);
+        let success = match tier {
+            QosPriorityTier::ExpeditedForwarding => self.ef_queue.push(pkt),
+            QosPriorityTier::Voice => self.voice_queue.push(pkt),
+            QosPriorityTier::Video => self.video_queue.push(pkt),
+            QosPriorityTier::BestEffort => self.be_queue.push(pkt),
+        };
+
+        if success {
+            self.total_enqueued += 1;
+            true
+        } else {
+            self.total_dropped += 1;
+            false
+        }
+    }
+
+    /// Dequeues the highest-priority available packet with strict EF preemption.
+    pub fn dequeue_highest_priority(&mut self) -> Option<MloPacket> {
+        // Strict priority order: EF (46) > Voice (34) > Video (26) > BE (0)
+        if let Some(pkt) = self.ef_queue.pop() {
+            return Some(pkt);
+        }
+        if let Some(pkt) = self.voice_queue.pop() {
+            return Some(pkt);
+        }
+        if let Some(pkt) = self.video_queue.pop() {
+            return Some(pkt);
+        }
+        self.be_queue.pop()
+    }
+}
+
+/// Verification test for DSCP 46 Expedited Forwarding QoS priority queue.
+pub fn verify_dscp46_qos_priority_queue() -> bool {
+    let mut qos = DscpPriorityQueue::new();
+    let now = 20_000_000u64;
+
+    // 1. Enqueue 5 bulk best effort packets (DSCP 0)
+    for i in 1..=5 {
+        let be_pkt = MloPacket::new(i, now, MloBand::Band5GHz, DSCP_BEST_EFFORT, 1400);
+        if !qos.enqueue(be_pkt) {
+            return false;
+        }
+    }
+
+    // 2. Enqueue a video packet (DSCP 26) and a voice packet (DSCP 34)
+    let vid_pkt = MloPacket::new(6, now, MloBand::Band6GHz, DSCP_VIDEO_STREAMING, 1200);
+    let voice_pkt = MloPacket::new(7, now, MloBand::Band6GHz, DSCP_VOICE_CHAT, 120);
+    qos.enqueue(vid_pkt);
+    qos.enqueue(voice_pkt);
+
+    // 3. Enqueue a critical multiplayer game netcode tick (DSCP 46 Expedited Forwarding)
+    let ef_pkt = MloPacket::new(99, now, MloBand::Band6GHz, DSCP_EXPEDITED_FORWARDING, 64);
+    qos.enqueue(ef_pkt);
+
+    // 4. Strict priority dequeue verification:
+    // First dequeued MUST be the DSCP 46 EF packet (Seq 99), preempting all prior bulk packets
+    let first = qos.dequeue_highest_priority();
+    if first.map(|p| p.seq_num) != Some(99) || first.map(|p| p.dscp) != Some(DSCP_EXPEDITED_FORWARDING) {
+        return false;
+    }
+
+    // Second dequeued MUST be Voice (Seq 7, DSCP 34)
+    let second = qos.dequeue_highest_priority();
+    if second.map(|p| p.seq_num) != Some(7) || second.map(|p| p.dscp) != Some(DSCP_VOICE_CHAT) {
+        return false;
+    }
+
+    // Third dequeued MUST be Video (Seq 6, DSCP 26)
+    let third = qos.dequeue_highest_priority();
+    if third.map(|p| p.seq_num) != Some(6) || third.map(|p| p.dscp) != Some(DSCP_VIDEO_STREAMING) {
+        return false;
+    }
+
+    // Fourth dequeued MUST be the first Best Effort packet (Seq 1, DSCP 0)
+    let fourth = qos.dequeue_highest_priority();
+    if fourth.map(|p| p.seq_num) != Some(1) || fourth.map(|p| p.dscp) != Some(DSCP_BEST_EFFORT) {
+        return false;
+    }
+
+    true
+}
