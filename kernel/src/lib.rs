@@ -1124,6 +1124,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Transactional NTFS & Mini-Filter Layer (TASK-KNT-235)
+    if !pe::test_win32_txf_filter_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 TxF filter self-test failed!\r\n");
+    }
+
     // Verify Win32 Side-by-Side (SxS) Manifest Activation Engine (TASK-KNT-233)
     if !pe::test_win32_sxs_manifest_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 SxS manifest activation self-test failed!\r\n");

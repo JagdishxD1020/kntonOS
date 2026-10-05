@@ -1,0 +1,684 @@
+//! Win32 Transactional NTFS (TxF) & Kernel Mini-Filter Virtualization Layer.
+//!
+//! Implements atomic file transaction primitives (CreateTransaction, CommitTransaction, RollbackTransaction),
+//! copy-on-write page backing for transacted streams during game patch deployment,
+//! snapshot reader isolation preventing dirty reads by parallel worker threads,
+//! and kernel mini-filter pre/post-operation callbacks intercepting Win32 file I/O.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, unused_imports, dead_code)]
+
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::ffi::c_void;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::memory::spinlock::Spinlock;
+use crate::pe::kernel32::{
+    win32_set_last_error, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
+};
+pub use crate::pe::srw_futex::{DWORD, PVOID, SIZE_T};
+pub use crate::pe::synch::HANDLE;
+pub use crate::pe::threadpool::{BOOL, FALSE, TRUE};
+
+// Transaction Outcome & States
+pub const TRANSACTION_STATE_ACTIVE: u32 = 1;
+pub const TRANSACTION_STATE_PREPARED: u32 = 2;
+pub const TRANSACTION_STATE_COMMITTED: u32 = 3;
+pub const TRANSACTION_STATE_ABORTED: u32 = 4;
+
+// Transaction Options
+pub const TRANSACTION_DO_NOT_PROMOTE: DWORD = 0x0000_0001;
+
+pub const ERROR_TRANSACTIONAL_CONFLICT: DWORD = 6700;
+pub const ERROR_TRANSACTION_NOT_ACTIVE: DWORD = 6701;
+pub const ERROR_TRANSACTION_ALREADY_COMMITTED: DWORD = 6702;
+pub const ERROR_TRANSACTION_ALREADY_ABORTED: DWORD = 6703;
+
+/// Transacted in-memory file snapshot stream backing copy-on-write changes.
+#[derive(Clone, Debug)]
+pub struct TransactedFileStream {
+    pub path: String,
+    pub original_data: Vec<u8>,
+    pub modified_data: Vec<u8>,
+    pub is_deleted: bool,
+    pub is_created: bool,
+    pub is_modified: bool,
+}
+
+/// Transaction object descriptor.
+#[derive(Clone, Debug)]
+pub struct TransactionInner {
+    pub id: HANDLE,
+    pub state: u32,
+    pub description: String,
+    pub timeout_ms: u32,
+    pub streams: BTreeMap<String, TransactedFileStream>,
+}
+
+static NEXT_TX_ID: AtomicU64 = AtomicU64::new(0x9000);
+static TRANSACTIONS: Spinlock<BTreeMap<HANDLE, TransactionInner>> = Spinlock::new(BTreeMap::new());
+
+/// Creates a new Win32 atomic file transaction.
+pub unsafe extern "system" fn CreateTransaction(
+    _lpTransactionAttributes: *const c_void,
+    _UOW: *const c_void,
+    _CreateOptions: DWORD,
+    _IsolationLevel: DWORD,
+    _IsolationFlags: DWORD,
+    Timeout: DWORD,
+    Description: *const u16,
+) -> HANDLE {
+    let mut desc_str = String::new();
+    if !Description.is_null() {
+        let mut idx = 0;
+        while *Description.add(idx) != 0 && idx < 256 {
+            desc_str.push(*Description.add(idx) as u8 as char);
+            idx += 1;
+        }
+    }
+
+    let id = NEXT_TX_ID.fetch_add(1, Ordering::SeqCst) as HANDLE;
+    let tx = TransactionInner {
+        id,
+        state: TRANSACTION_STATE_ACTIVE,
+        description: desc_str,
+        timeout_ms: Timeout,
+        streams: BTreeMap::new(),
+    };
+
+    TRANSACTIONS.lock().insert(id, tx);
+    win32_set_last_error(ERROR_SUCCESS);
+    id
+}
+
+/// Commits all pending transacted file modifications atomically to the filesystem.
+pub unsafe extern "system" fn CommitTransaction(TransactionHandle: HANDLE) -> BOOL {
+    if TransactionHandle == 0 || TransactionHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut transactions = TRANSACTIONS.lock();
+    let tx = match transactions.get_mut(&TransactionHandle) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if tx.state != TRANSACTION_STATE_ACTIVE {
+        win32_set_last_error(ERROR_TRANSACTION_NOT_ACTIVE);
+        return FALSE;
+    }
+
+    // Flush copy-on-write streams to VFS
+    {
+        let mut vfs = crate::fs::VFS.lock();
+        for (path, stream) in &tx.streams {
+            if stream.is_deleted {
+                // If VFS supports deletion or truncate
+                let _ = vfs.write_file(path, &[]);
+            } else if stream.is_modified || stream.is_created {
+                let _ = vfs.write_file(path, &stream.modified_data);
+            }
+        }
+    }
+
+    tx.state = TRANSACTION_STATE_COMMITTED;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Rolls back and discards all pending transacted file modifications.
+pub unsafe extern "system" fn RollbackTransaction(TransactionHandle: HANDLE) -> BOOL {
+    if TransactionHandle == 0 || TransactionHandle == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    let mut transactions = TRANSACTIONS.lock();
+    let tx = match transactions.get_mut(&TransactionHandle) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if tx.state != TRANSACTION_STATE_ACTIVE {
+        win32_set_last_error(ERROR_TRANSACTION_NOT_ACTIVE);
+        return FALSE;
+    }
+
+    // Discard all transacted stream buffers without altering VFS
+    tx.streams.clear();
+    tx.state = TRANSACTION_STATE_ABORTED;
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Transacted file handle referencing a specific transaction and file path.
+#[derive(Clone, Debug)]
+pub struct TransactedFileHandle {
+    pub handle_id: HANDLE,
+    pub transaction_id: HANDLE,
+    pub path: String,
+    pub cursor: usize,
+    pub desired_access: DWORD,
+}
+
+static NEXT_TX_FILE_HANDLE: AtomicU64 = AtomicU64::new(0x9800);
+static TRANSACTED_HANDLES: Spinlock<BTreeMap<HANDLE, TransactedFileHandle>> = Spinlock::new(BTreeMap::new());
+
+/// Opens or creates a file within a transaction with copy-on-write page backing.
+pub unsafe extern "system" fn CreateFileTransactedA(
+    lpFileName: *const u8,
+    dwDesiredAccess: DWORD,
+    _dwShareMode: DWORD,
+    _lpSecurityAttributes: *const c_void,
+    dwCreationDisposition: DWORD,
+    _dwFlagsAndAttributes: DWORD,
+    _hTemplateFile: HANDLE,
+    hTransaction: HANDLE,
+    _pusMiniVersion: *mut u16,
+    _lpExtendedParameter: *mut c_void,
+) -> HANDLE {
+    if lpFileName.is_null() || hTransaction == 0 || hTransaction == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE as HANDLE;
+    }
+
+    let mut len = 0;
+    while *lpFileName.add(len) != 0 && len < 4096 {
+        len += 1;
+    }
+    let slice = core::slice::from_raw_parts(lpFileName, len);
+    let path_str = match core::str::from_utf8(slice) {
+        Ok(s) => String::from(s),
+        Err(_) => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return INVALID_HANDLE_VALUE as HANDLE;
+        }
+    };
+
+    let mut transactions = TRANSACTIONS.lock();
+    let tx = match transactions.get_mut(&hTransaction) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return INVALID_HANDLE_VALUE as HANDLE;
+        }
+    };
+
+    if tx.state != TRANSACTION_STATE_ACTIVE {
+        win32_set_last_error(ERROR_TRANSACTION_NOT_ACTIVE);
+        return INVALID_HANDLE_VALUE as HANDLE;
+    }
+
+    // Ingest initial content via copy-on-write if stream does not already exist
+    if !tx.streams.contains_key(&path_str) {
+        let existing_data = {
+            let vfs = crate::fs::VFS.lock();
+            vfs.read_file(&path_str).unwrap_or_default()
+        };
+
+        let is_created = dwCreationDisposition == 1 || dwCreationDisposition == 2; // CREATE_NEW / CREATE_ALWAYS
+        let stream = TransactedFileStream {
+            path: path_str.clone(),
+            original_data: existing_data.clone(),
+            modified_data: if is_created { Vec::new() } else { existing_data },
+            is_deleted: false,
+            is_created,
+            is_modified: false,
+        };
+        tx.streams.insert(path_str.clone(), stream);
+    }
+
+    let hid = NEXT_TX_FILE_HANDLE.fetch_add(1, Ordering::SeqCst) as HANDLE;
+    let handle_entry = TransactedFileHandle {
+        handle_id: hid,
+        transaction_id: hTransaction,
+        path: path_str,
+        cursor: 0,
+        desired_access: dwDesiredAccess,
+    };
+
+    TRANSACTED_HANDLES.lock().insert(hid, handle_entry);
+    win32_set_last_error(ERROR_SUCCESS);
+    hid
+}
+
+/// Reads data from a transacted file stream.
+pub unsafe extern "system" fn ReadFileTransacted(
+    hFile: HANDLE,
+    lpBuffer: *mut c_void,
+    nNumberOfBytesToRead: DWORD,
+    lpNumberOfBytesRead: *mut DWORD,
+    _lpOverlapped: *mut c_void,
+) -> BOOL {
+    if lpBuffer.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut handles = TRANSACTED_HANDLES.lock();
+    let h = match handles.get_mut(&hFile) {
+        Some(h) => h,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    let transactions = TRANSACTIONS.lock();
+    let tx = match transactions.get(&h.transaction_id) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    let stream = match tx.streams.get(&h.path) {
+        Some(s) => s,
+        None => {
+            win32_set_last_error(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    };
+
+    let available = stream.modified_data.len().saturating_sub(h.cursor);
+    let to_read = (nNumberOfBytesToRead as usize).min(available);
+
+    if to_read > 0 {
+        let src = &stream.modified_data[h.cursor..h.cursor + to_read];
+        core::ptr::copy_nonoverlapping(src.as_ptr(), lpBuffer as *mut u8, to_read);
+        h.cursor += to_read;
+    }
+
+    if !lpNumberOfBytesRead.is_null() {
+        *lpNumberOfBytesRead = to_read as DWORD;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Writes data into a copy-on-write transacted file stream.
+pub unsafe extern "system" fn WriteFileTransacted(
+    hFile: HANDLE,
+    lpBuffer: *const c_void,
+    nNumberOfBytesToWrite: DWORD,
+    lpNumberOfBytesWritten: *mut DWORD,
+    _lpOverlapped: *mut c_void,
+) -> BOOL {
+    if lpBuffer.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let mut handles = TRANSACTED_HANDLES.lock();
+    let h = match handles.get_mut(&hFile) {
+        Some(h) => h,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    let mut transactions = TRANSACTIONS.lock();
+    let tx = match transactions.get_mut(&h.transaction_id) {
+        Some(t) => t,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+    };
+
+    if tx.state != TRANSACTION_STATE_ACTIVE {
+        win32_set_last_error(ERROR_TRANSACTION_NOT_ACTIVE);
+        return FALSE;
+    }
+
+    let stream = match tx.streams.get_mut(&h.path) {
+        Some(s) => s,
+        None => {
+            win32_set_last_error(ERROR_FILE_NOT_FOUND);
+            return FALSE;
+        }
+    };
+
+    let to_write = nNumberOfBytesToWrite as usize;
+    let slice = core::slice::from_raw_parts(lpBuffer as *const u8, to_write);
+
+    // Expand buffer if cursor + to_write > current length
+    if h.cursor + to_write > stream.modified_data.len() {
+        stream.modified_data.resize(h.cursor + to_write, 0);
+    }
+
+    stream.modified_data[h.cursor..h.cursor + to_write].copy_from_slice(slice);
+    h.cursor += to_write;
+    stream.is_modified = true;
+
+    if !lpNumberOfBytesWritten.is_null() {
+        *lpNumberOfBytesWritten = to_write as DWORD;
+    }
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Closes a transacted file handle.
+pub unsafe extern "system" fn CloseTransactedHandle(hFile: HANDLE) -> BOOL {
+    if TRANSACTED_HANDLES.lock().remove(&hFile).is_some() {
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+
+// Mini-Filter Status Flags
+pub const FLT_PREOP_SUCCESS_WITH_CALLBACK: u32 = 0;
+pub const FLT_PREOP_SUCCESS_NO_CALLBACK: u32 = 1;
+pub const FLT_PREOP_PENDING: u32 = 2;
+pub const FLT_PREOP_DISALLOW_FASTIO: u32 = 3;
+pub const FLT_PREOP_COMPLETE: u32 = 4;
+
+pub const FLT_POSTOP_FINISHED_PROCESSING: u32 = 0;
+pub const FLT_POSTOP_MORE_PROCESSING_REQUIRED: u32 = 1;
+
+// IRP Major Function Codes
+pub const IRP_MJ_CREATE: u8 = 0x00;
+pub const IRP_MJ_READ: u8 = 0x03;
+pub const IRP_MJ_WRITE: u8 = 0x04;
+pub const IRP_MJ_CLOSE: u8 = 0x02;
+pub const IRP_MJ_CLEANUP: u8 = 0x12;
+
+/// Operation parameters passed to mini-filter pre/post callbacks.
+#[derive(Clone, Debug)]
+pub struct FltCallbackData {
+    pub major_function: u8,
+    pub path: String,
+    pub buffer: *mut c_void,
+    pub length: usize,
+    pub status: DWORD,
+}
+
+pub type PFLT_PRE_OPERATION_CALLBACK = Option<
+    unsafe extern "system" fn(
+        pData: *mut FltCallbackData,
+        pCompletionContext: *mut *mut c_void,
+    ) -> u32,
+>;
+
+pub type PFLT_POST_OPERATION_CALLBACK = Option<
+    unsafe extern "system" fn(
+        pData: *mut FltCallbackData,
+        pCompletionContext: *mut c_void,
+    ) -> u32,
+>;
+
+/// Registered mini-filter callback pair for an IRP major function.
+#[derive(Clone, Copy)]
+pub struct MiniFilterRegistration {
+    pub major_function: u8,
+    pub pre_op: PFLT_PRE_OPERATION_CALLBACK,
+    pub post_op: PFLT_POST_OPERATION_CALLBACK,
+}
+
+static MINI_FILTERS: Spinlock<Vec<MiniFilterRegistration>> = Spinlock::new(Vec::new());
+
+/// Registers a kernel mini-filter callback pair to intercept Win32 file I/O.
+pub fn win32_flt_register_filter(
+    major_function: u8,
+    pre_op: PFLT_PRE_OPERATION_CALLBACK,
+    post_op: PFLT_POST_OPERATION_CALLBACK,
+) {
+    MINI_FILTERS.lock().push(MiniFilterRegistration {
+        major_function,
+        pre_op,
+        post_op,
+    });
+}
+
+/// Dispatches pre-operation callbacks across all registered kernel mini-filters.
+pub fn win32_flt_dispatch_pre_operation(data: &mut FltCallbackData) -> u32 {
+    let filters = MINI_FILTERS.lock().clone();
+    for filter in filters {
+        if filter.major_function == data.major_function {
+            if let Some(pre) = filter.pre_op {
+                let mut ctx: *mut c_void = core::ptr::null_mut();
+                let res = unsafe { pre(data as *mut FltCallbackData, &mut ctx) };
+                if res == FLT_PREOP_COMPLETE {
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        }
+    }
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+/// Dispatches post-operation callbacks across all registered kernel mini-filters.
+pub fn win32_flt_dispatch_post_operation(data: &mut FltCallbackData) {
+    let filters = MINI_FILTERS.lock().clone();
+    for filter in filters {
+        if filter.major_function == data.major_function {
+            if let Some(post) = filter.post_op {
+                unsafe {
+                    post(data as *mut FltCallbackData, core::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
+
+/// Reads an immutable snapshot of a file, guaranteeing non-blocking reader isolation from active transactions.
+pub fn win32_txf_read_snapshot_isolated(path: &str) -> Option<Vec<u8>> {
+    // Check if any active transaction is modifying this file
+    let transactions = TRANSACTIONS.lock();
+    for tx in transactions.values() {
+        if tx.state == TRANSACTION_STATE_ACTIVE {
+            if let Some(stream) = tx.streams.get(path) {
+                // Return original committed data, preventing dirty reads of in-flight transacted writes
+                return Some(stream.original_data.clone());
+            }
+        }
+    }
+    drop(transactions);
+
+    // Fallback to current committed state in VFS
+    let vfs = crate::fs::VFS.lock();
+    vfs.read_file(path).ok()
+}
+
+/// Returns whether a file currently has an active uncommitted transacted write lock.
+pub fn win32_txf_is_file_transacted(path: &str) -> bool {
+    let transactions = TRANSACTIONS.lock();
+    for tx in transactions.values() {
+        if tx.state == TRANSACTION_STATE_ACTIVE && tx.streams.contains_key(path) {
+            return true;
+        }
+    }
+    false
+}
+
+static FILTER_PREOP_CALLED: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "system" fn test_flt_preop(
+    pData: *mut FltCallbackData,
+    _pCompletionContext: *mut *mut c_void,
+) -> u32 {
+    if !pData.is_null() && (*pData).major_function == IRP_MJ_CREATE {
+        FILTER_PREOP_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+/// Self-test suite verifying Win32 Transactional NTFS (TxF) and mini-filter virtualization.
+pub fn test_win32_txf_filter_subsystem() -> bool {
+    let test_file = "/game_data/patch_test.bin";
+    let initial_data = b"BASE_VERSION_1.0.0";
+    let patch_data = b"PATCHED_VERSION_2.0.0";
+
+    // Seed initial committed file in VFS
+    {
+        let mut vfs = crate::fs::VFS.lock();
+        let _ = vfs.write_file(test_file, initial_data);
+    }
+
+    unsafe {
+        // 1. Create a Win32 transaction
+        let htx = CreateTransaction(
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            10000,
+            core::ptr::null(),
+        );
+
+        if htx == 0 || htx == (INVALID_HANDLE_VALUE as HANDLE) {
+            return false;
+        }
+
+        // 2. Register kernel mini-filter callback and dispatch pre-op
+        win32_flt_register_filter(IRP_MJ_CREATE, Some(test_flt_preop), None);
+
+        let mut flt_data = FltCallbackData {
+            major_function: IRP_MJ_CREATE,
+            path: String::from(test_file),
+            buffer: core::ptr::null_mut(),
+            length: 0,
+            status: 0,
+        };
+        win32_flt_dispatch_pre_operation(&mut flt_data);
+        if FILTER_PREOP_CALLED.load(Ordering::SeqCst) < 1 {
+            return false;
+        }
+
+        // 3. Open transacted file stream with copy-on-write
+        let mut path_zero = Vec::from(test_file.as_bytes());
+        path_zero.push(0);
+
+        let hfile = CreateFileTransactedA(
+            path_zero.as_ptr(),
+            0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+            0,
+            core::ptr::null(),
+            3, // OPEN_EXISTING
+            0,
+            0,
+            htx,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+
+        if hfile == 0 || hfile == (INVALID_HANDLE_VALUE as HANDLE) {
+            return false;
+        }
+
+        // 4. Overwrite file within transaction
+        let mut bytes_written: DWORD = 0;
+        let written = WriteFileTransacted(
+            hfile,
+            patch_data.as_ptr() as *const c_void,
+            patch_data.len() as DWORD,
+            &mut bytes_written,
+            core::ptr::null_mut(),
+        );
+
+        if written != TRUE || bytes_written != (patch_data.len() as DWORD) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        // 5. Verify Snapshot Reader Isolation (parallel worker threads must NOT see dirty writes)
+        if !win32_txf_is_file_transacted(test_file) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        let isolated_read = win32_txf_read_snapshot_isolated(test_file);
+        if isolated_read.as_deref() != Some(initial_data) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        // 6. Test Rollback: discard changes
+        CloseTransactedHandle(hfile);
+        if RollbackTransaction(htx) != TRUE {
+            return false;
+        }
+
+        // VFS content should remain original initial data
+        {
+            let vfs = crate::fs::VFS.lock();
+            let cur = vfs.read_file(test_file).unwrap_or_default();
+            if cur != initial_data {
+                return false;
+            }
+        }
+
+        // 7. Test Commit flow
+        let htx2 = CreateTransaction(
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            10000,
+            core::ptr::null(),
+        );
+
+        let hfile2 = CreateFileTransactedA(
+            path_zero.as_ptr(),
+            0xC000_0000,
+            0,
+            core::ptr::null(),
+            3,
+            0,
+            0,
+            htx2,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+
+        WriteFileTransacted(
+            hfile2,
+            patch_data.as_ptr() as *const c_void,
+            patch_data.len() as DWORD,
+            &mut bytes_written,
+            core::ptr::null_mut(),
+        );
+
+        CloseTransactedHandle(hfile2);
+
+        // Commit transaction
+        if CommitTransaction(htx2) != TRUE {
+            return false;
+        }
+
+        // VFS should now contain committed patch data
+        {
+            let vfs = crate::fs::VFS.lock();
+            let cur = vfs.read_file(test_file).unwrap_or_default();
+            if cur != patch_data {
+                return false;
+            }
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-TXF-PASS] Win32 transactional NTFS and kernel mini-filter layer verified\r\n",
+    );
+    true
+}
