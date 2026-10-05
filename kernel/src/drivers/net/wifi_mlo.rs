@@ -961,3 +961,40 @@ pub fn verify_fast_link_failover() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Wi-Fi 7 MLO & Deterministic Game Packet Pacer.
+pub fn test_wifi_mlo_subsystem() -> bool {
+    crate::serial_write_str("[KNT-NET] Testing Handheld Wi-Fi 7 Multi-Link Operation (MLO) & Deterministic Game Packet Pacer...\r\n");
+
+    // 1. Verify dual-link 5GHz + 6GHz aggregation and bandwidth allocator
+    if !verify_dual_link_mlo_aggregation() {
+        crate::serial_write_str("[KNT-PANIC] Wi-Fi 7 dual-link aggregation verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify sub-2ms jitter buffer and dynamic link rebalancing
+    if !verify_mlo_jitter_buffer_and_rebalance() {
+        crate::serial_write_str("[KNT-PANIC] Wi-Fi 7 jitter buffer and link rebalancing verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify DSCP 46 Expedited Forwarding QoS priority queue
+    if !verify_dscp46_qos_priority_queue() {
+        crate::serial_write_str("[KNT-PANIC] Wi-Fi 7 DSCP 46 QoS priority queue verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify fast link failover (<5ms) and seamless packet duplication
+    if !verify_fast_link_failover() {
+        crate::serial_write_str("[KNT-PANIC] Wi-Fi 7 fast link failover verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-NET-WIFI-MLO-PASS] Handheld Wi-Fi 7 MLO aggregation, sub-2ms jitter buffer, and DSCP 46 QoS verified\r\n");
+    true
+}
