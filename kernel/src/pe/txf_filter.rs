@@ -381,3 +381,98 @@ pub unsafe extern "system" fn CloseTransactedHandle(hFile: HANDLE) -> BOOL {
         FALSE
     }
 }
+
+// Mini-Filter Status Flags
+pub const FLT_PREOP_SUCCESS_WITH_CALLBACK: u32 = 0;
+pub const FLT_PREOP_SUCCESS_NO_CALLBACK: u32 = 1;
+pub const FLT_PREOP_PENDING: u32 = 2;
+pub const FLT_PREOP_DISALLOW_FASTIO: u32 = 3;
+pub const FLT_PREOP_COMPLETE: u32 = 4;
+
+pub const FLT_POSTOP_FINISHED_PROCESSING: u32 = 0;
+pub const FLT_POSTOP_MORE_PROCESSING_REQUIRED: u32 = 1;
+
+// IRP Major Function Codes
+pub const IRP_MJ_CREATE: u8 = 0x00;
+pub const IRP_MJ_READ: u8 = 0x03;
+pub const IRP_MJ_WRITE: u8 = 0x04;
+pub const IRP_MJ_CLOSE: u8 = 0x02;
+pub const IRP_MJ_CLEANUP: u8 = 0x12;
+
+/// Operation parameters passed to mini-filter pre/post callbacks.
+#[derive(Clone, Debug)]
+pub struct FltCallbackData {
+    pub major_function: u8,
+    pub path: String,
+    pub buffer: *mut c_void,
+    pub length: usize,
+    pub status: DWORD,
+}
+
+pub type PFLT_PRE_OPERATION_CALLBACK = Option<
+    unsafe extern "system" fn(
+        pData: *mut FltCallbackData,
+        pCompletionContext: *mut *mut c_void,
+    ) -> u32,
+>;
+
+pub type PFLT_POST_OPERATION_CALLBACK = Option<
+    unsafe extern "system" fn(
+        pData: *mut FltCallbackData,
+        pCompletionContext: *mut c_void,
+    ) -> u32,
+>;
+
+/// Registered mini-filter callback pair for an IRP major function.
+#[derive(Clone, Copy)]
+pub struct MiniFilterRegistration {
+    pub major_function: u8,
+    pub pre_op: PFLT_PRE_OPERATION_CALLBACK,
+    pub post_op: PFLT_POST_OPERATION_CALLBACK,
+}
+
+static MINI_FILTERS: Spinlock<Vec<MiniFilterRegistration>> = Spinlock::new(Vec::new());
+
+/// Registers a kernel mini-filter callback pair to intercept Win32 file I/O.
+pub fn win32_flt_register_filter(
+    major_function: u8,
+    pre_op: PFLT_PRE_OPERATION_CALLBACK,
+    post_op: PFLT_POST_OPERATION_CALLBACK,
+) {
+    MINI_FILTERS.lock().push(MiniFilterRegistration {
+        major_function,
+        pre_op,
+        post_op,
+    });
+}
+
+/// Dispatches pre-operation callbacks across all registered kernel mini-filters.
+pub fn win32_flt_dispatch_pre_operation(data: &mut FltCallbackData) -> u32 {
+    let filters = MINI_FILTERS.lock().clone();
+    for filter in filters {
+        if filter.major_function == data.major_function {
+            if let Some(pre) = filter.pre_op {
+                let mut ctx: *mut c_void = core::ptr::null_mut();
+                let res = unsafe { pre(data as *mut FltCallbackData, &mut ctx) };
+                if res == FLT_PREOP_COMPLETE {
+                    return FLT_PREOP_COMPLETE;
+                }
+            }
+        }
+    }
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+/// Dispatches post-operation callbacks across all registered kernel mini-filters.
+pub fn win32_flt_dispatch_post_operation(data: &mut FltCallbackData) {
+    let filters = MINI_FILTERS.lock().clone();
+    for filter in filters {
+        if filter.major_function == data.major_function {
+            if let Some(post) = filter.post_op {
+                unsafe {
+                    post(data as *mut FltCallbackData, core::ptr::null_mut());
+                }
+            }
+        }
+    }
+}
