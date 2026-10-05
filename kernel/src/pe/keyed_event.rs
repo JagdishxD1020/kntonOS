@@ -175,3 +175,212 @@ fn get_current_thread_id() -> u32 {
     }
     1
 }
+
+/// Windows NT RTL_CRITICAL_SECTION structure.
+#[repr(C)]
+#[derive(Debug)]
+pub struct RTL_CRITICAL_SECTION {
+    pub DebugInfo: *mut c_void,
+    pub LockCount: i32,
+    pub RecursionCount: i32,
+    pub OwningThread: HANDLE,
+    pub LockSemaphore: HANDLE,
+    pub SpinCount: usize,
+}
+
+pub type PRTL_CRITICAL_SECTION = *mut RTL_CRITICAL_SECTION;
+
+pub const RTL_CRITICAL_SECTION_FLAG_NO_DEBUG_INFO: DWORD = 0x0100_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_DYNAMIC_SPIN: DWORD = 0x0200_0000;
+pub const RTL_CRITICAL_SECTION_FLAG_STATIC_INIT: DWORD = 0x0400_0000;
+
+/// Initializes a critical section with a configurable spin count.
+pub unsafe extern "system" fn InitializeCriticalSectionAndSpinCount(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+    dwSpinCount: DWORD,
+) -> BOOL {
+    if lpCriticalSection.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    (*lpCriticalSection).DebugInfo = core::ptr::null_mut();
+    (*lpCriticalSection).LockCount = -1;
+    (*lpCriticalSection).RecursionCount = 0;
+    (*lpCriticalSection).OwningThread = 0;
+    (*lpCriticalSection).LockSemaphore = 0;
+    (*lpCriticalSection).SpinCount = (dwSpinCount & 0x00FF_FFFF) as usize;
+
+    win32_set_last_error(ERROR_SUCCESS);
+    TRUE
+}
+
+/// Sets the spin count for a critical section.
+pub unsafe extern "system" fn SetCriticalSectionSpinCount(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+    dwSpinCount: DWORD,
+) -> DWORD {
+    if lpCriticalSection.is_null() {
+        return 0;
+    }
+    let old_spin = (*lpCriticalSection).SpinCount as DWORD;
+    (*lpCriticalSection).SpinCount = (dwSpinCount & 0x00FF_FFFF) as usize;
+    old_spin
+}
+
+/// Enters a critical section, employing adaptive spin iterations before yielding CPU.
+pub unsafe extern "system" fn RtlEnterCriticalSection(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+) -> u32 {
+    if lpCriticalSection.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let tid = get_current_thread_id() as HANDLE;
+
+    // Check if the calling thread already owns this critical section (recursive enter)
+    if (*lpCriticalSection).OwningThread == tid {
+        (*lpCriticalSection).LockCount += 1;
+        (*lpCriticalSection).RecursionCount += 1;
+        return STATUS_SUCCESS;
+    }
+
+    // Adaptive spinloop phase
+    let spin_max = (*lpCriticalSection).SpinCount;
+    let mut spins = 0;
+    let lock_count_ptr = &mut (*lpCriticalSection).LockCount as *mut i32 as *mut AtomicI32;
+
+    while spins < spin_max {
+        if (*lock_count_ptr)
+            .compare_exchange_weak(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            (*lpCriticalSection).OwningThread = tid;
+            (*lpCriticalSection).RecursionCount = 1;
+            record_contention_acquisition(lpCriticalSection as usize, spins as u32);
+            return STATUS_SUCCESS;
+        }
+        core::hint::spin_loop();
+        spins += 1;
+    }
+
+    // Contended wait phase: increment lock count and wait via keyed event or yield
+    loop {
+        if (*lock_count_ptr)
+            .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            (*lpCriticalSection).OwningThread = tid;
+            (*lpCriticalSection).RecursionCount = 1;
+            record_contention_acquisition(lpCriticalSection as usize, spins as u32);
+            return STATUS_SUCCESS;
+        }
+        crate::process::yield_now();
+        spins += 1;
+    }
+}
+
+/// Attempts to enter a critical section without blocking or spinning.
+pub unsafe extern "system" fn RtlTryEnterCriticalSection(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+) -> BOOL {
+    if lpCriticalSection.is_null() {
+        return FALSE;
+    }
+
+    let tid = get_current_thread_id() as HANDLE;
+    if (*lpCriticalSection).OwningThread == tid {
+        (*lpCriticalSection).LockCount += 1;
+        (*lpCriticalSection).RecursionCount += 1;
+        return TRUE;
+    }
+
+    let lock_count_ptr = &mut (*lpCriticalSection).LockCount as *mut i32 as *mut AtomicI32;
+    if (*lock_count_ptr)
+        .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+        .is_ok()
+    {
+        (*lpCriticalSection).OwningThread = tid;
+        (*lpCriticalSection).RecursionCount = 1;
+        TRUE
+    } else {
+        FALSE
+    }
+}
+
+/// Leaves a critical section, decrementing recursion and releasing ownership.
+pub unsafe extern "system" fn RtlLeaveCriticalSection(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+) -> u32 {
+    if lpCriticalSection.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let tid = get_current_thread_id() as HANDLE;
+    if (*lpCriticalSection).OwningThread != tid {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    (*lpCriticalSection).RecursionCount -= 1;
+    if (*lpCriticalSection).RecursionCount > 0 {
+        (*lpCriticalSection).LockCount -= 1;
+        return STATUS_SUCCESS;
+    }
+
+    (*lpCriticalSection).OwningThread = 0;
+    let lock_count_ptr = &mut (*lpCriticalSection).LockCount as *mut i32 as *mut AtomicI32;
+    (*lock_count_ptr).store(-1, Ordering::Release);
+    record_contention_release(lpCriticalSection as usize);
+
+    STATUS_SUCCESS
+}
+
+/// Deletes a critical section object.
+pub unsafe extern "system" fn RtlDeleteCriticalSection(
+    lpCriticalSection: PRTL_CRITICAL_SECTION,
+) -> u32 {
+    if lpCriticalSection.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    (*lpCriticalSection).LockCount = -1;
+    (*lpCriticalSection).OwningThread = 0;
+    STATUS_SUCCESS
+}
+
+/// Telemetry record for critical section contention and hold times.
+#[derive(Clone, Debug, Default)]
+pub struct LockContentionStats {
+    pub total_acquisitions: u64,
+    pub contended_acquisitions: u64,
+    pub total_spins: u64,
+    pub active_holders: u32,
+    pub last_acquired_tick: u64,
+    pub total_hold_time_ms: u64,
+}
+
+static CONTENTION_PROFILER: Spinlock<BTreeMap<usize, LockContentionStats>> = Spinlock::new(BTreeMap::new());
+
+fn record_contention_acquisition(lock_addr: usize, spins: u32) {
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let mut profiler = CONTENTION_PROFILER.lock();
+    let stats = profiler.entry(lock_addr).or_insert_with(LockContentionStats::default);
+    stats.total_acquisitions += 1;
+    if spins > 0 {
+        stats.contended_acquisitions += 1;
+        stats.total_spins += spins as u64;
+    }
+    stats.active_holders = 1;
+    stats.last_acquired_tick = now;
+}
+
+fn record_contention_release(lock_addr: usize) {
+    let now = crate::pe::perf_counter::win32_get_tick_count64();
+    let mut profiler = CONTENTION_PROFILER.lock();
+    if let Some(stats) = profiler.get_mut(&lock_addr) {
+        if stats.active_holders > 0 {
+            let hold_time = now.saturating_sub(stats.last_acquired_tick);
+            stats.total_hold_time_ms += hold_time;
+            stats.active_holders = 0;
+        }
+    }
+}
