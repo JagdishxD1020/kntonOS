@@ -506,3 +506,179 @@ pub fn win32_txf_is_file_transacted(path: &str) -> bool {
     }
     false
 }
+
+static FILTER_PREOP_CALLED: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "system" fn test_flt_preop(
+    pData: *mut FltCallbackData,
+    _pCompletionContext: *mut *mut c_void,
+) -> u32 {
+    if !pData.is_null() && (*pData).major_function == IRP_MJ_CREATE {
+        FILTER_PREOP_CALLED.fetch_add(1, Ordering::SeqCst);
+    }
+    FLT_PREOP_SUCCESS_NO_CALLBACK
+}
+
+/// Self-test suite verifying Win32 Transactional NTFS (TxF) and mini-filter virtualization.
+pub fn test_win32_txf_filter_subsystem() -> bool {
+    let test_file = "/game_data/patch_test.bin";
+    let initial_data = b"BASE_VERSION_1.0.0";
+    let patch_data = b"PATCHED_VERSION_2.0.0";
+
+    // Seed initial committed file in VFS
+    {
+        let mut vfs = crate::fs::VFS.lock();
+        let _ = vfs.write_file(test_file, initial_data);
+    }
+
+    unsafe {
+        // 1. Create a Win32 transaction
+        let htx = CreateTransaction(
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            10000,
+            core::ptr::null(),
+        );
+
+        if htx == 0 || htx == (INVALID_HANDLE_VALUE as HANDLE) {
+            return false;
+        }
+
+        // 2. Register kernel mini-filter callback and dispatch pre-op
+        win32_flt_register_filter(IRP_MJ_CREATE, Some(test_flt_preop), None);
+
+        let mut flt_data = FltCallbackData {
+            major_function: IRP_MJ_CREATE,
+            path: String::from(test_file),
+            buffer: core::ptr::null_mut(),
+            length: 0,
+            status: 0,
+        };
+        win32_flt_dispatch_pre_operation(&mut flt_data);
+        if FILTER_PREOP_CALLED.load(Ordering::SeqCst) < 1 {
+            return false;
+        }
+
+        // 3. Open transacted file stream with copy-on-write
+        let mut path_zero = Vec::from(test_file.as_bytes());
+        path_zero.push(0);
+
+        let hfile = CreateFileTransactedA(
+            path_zero.as_ptr(),
+            0xC000_0000, // GENERIC_READ | GENERIC_WRITE
+            0,
+            core::ptr::null(),
+            3, // OPEN_EXISTING
+            0,
+            0,
+            htx,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+
+        if hfile == 0 || hfile == (INVALID_HANDLE_VALUE as HANDLE) {
+            return false;
+        }
+
+        // 4. Overwrite file within transaction
+        let mut bytes_written: DWORD = 0;
+        let written = WriteFileTransacted(
+            hfile,
+            patch_data.as_ptr() as *const c_void,
+            patch_data.len() as DWORD,
+            &mut bytes_written,
+            core::ptr::null_mut(),
+        );
+
+        if written != TRUE || bytes_written != (patch_data.len() as DWORD) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        // 5. Verify Snapshot Reader Isolation (parallel worker threads must NOT see dirty writes)
+        if !win32_txf_is_file_transacted(test_file) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        let isolated_read = win32_txf_read_snapshot_isolated(test_file);
+        if isolated_read.as_deref() != Some(initial_data) {
+            CloseTransactedHandle(hfile);
+            RollbackTransaction(htx);
+            return false;
+        }
+
+        // 6. Test Rollback: discard changes
+        CloseTransactedHandle(hfile);
+        if RollbackTransaction(htx) != TRUE {
+            return false;
+        }
+
+        // VFS content should remain original initial data
+        {
+            let vfs = crate::fs::VFS.lock();
+            let cur = vfs.read_file(test_file).unwrap_or_default();
+            if cur != initial_data {
+                return false;
+            }
+        }
+
+        // 7. Test Commit flow
+        let htx2 = CreateTransaction(
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            10000,
+            core::ptr::null(),
+        );
+
+        let hfile2 = CreateFileTransactedA(
+            path_zero.as_ptr(),
+            0xC000_0000,
+            0,
+            core::ptr::null(),
+            3,
+            0,
+            0,
+            htx2,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+
+        WriteFileTransacted(
+            hfile2,
+            patch_data.as_ptr() as *const c_void,
+            patch_data.len() as DWORD,
+            &mut bytes_written,
+            core::ptr::null_mut(),
+        );
+
+        CloseTransactedHandle(hfile2);
+
+        // Commit transaction
+        if CommitTransaction(htx2) != TRUE {
+            return false;
+        }
+
+        // VFS should now contain committed patch data
+        {
+            let vfs = crate::fs::VFS.lock();
+            let cur = vfs.read_file(test_file).unwrap_or_default();
+            if cur != patch_data {
+                return false;
+            }
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-TXF-PASS] Win32 transactional NTFS and kernel mini-filter layer verified\r\n",
+    );
+    true
+}
