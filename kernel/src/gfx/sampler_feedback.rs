@@ -1287,8 +1287,125 @@ pub fn test_sampler_feedback_subsystem() -> bool {
     }
     crate::serial_write_str("  * Transcode engine 64KB physical streaming tile generation verified\r\n");
 
-    // 5. Emit deterministic boot sentinel
+    // 5. Verify StreamingTextureVirtualMap and TileResidencyBitmaskDecoder
+    let vmap = StreamingTextureVirtualMap::new(100, 2048, 2048, 12, 128, 4);
+    if vmap.total_tiles_for_mip(0) != 256 || vmap.total_tiles_for_mip(4) != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Virtual map tile geometry mismatch\r\n");
+        return false;
+    }
+    // Mip 4 is coarse base mip (>= 4) -> must be resident by default
+    if !vmap.mip_residency[4].is_tile_resident(0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Pinned base mip must be resident\r\n");
+        return false;
+    }
+    // Mip 0 is fine mip (< 4) -> unmapped by default
+    if vmap.mip_residency[0].is_tile_resident(0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Fine mip must not be resident initially\r\n");
+        return false;
+    }
+
+    let mut decoder = TileResidencyBitmaskDecoder::new();
+    let faults = decoder.decode_min_mip_faults(&min_mip_map, &vmap);
+    if faults.is_empty() || faults[0] != (2, 1, 1) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Feedback residency decoder fault mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Streaming virtual map and residency bitmask decoder verified\r\n");
+
+    // 6. Verify GPU Texture LOD Feedback Analyzer and Dynamic Mip Request Queue
+    let mut analyzer = GpuTextureLodFeedbackAnalyzer::new();
+    let mut req_queue = DynamicMipRequestQueue::new(64);
+    analyzer.analyze_feedback(&min_mip_map, &vmap, 1, &mut req_queue);
+
+    if req_queue.requests.len() != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Analyzer request queue count mismatch\r\n");
+        return false;
+    }
+    let req0 = req_queue.requests[0];
+    if req0.texture_id != 100 || req0.mip_level != 2 || req0.tile_x != 1 || req0.tile_y != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Generated request metadata mismatch\r\n");
+        return false;
+    }
+
+    // Deduplication test: identical request must be dropped
+    if req_queue.enqueue(req0) || req_queue.total_duplicates_dropped != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Request deduplication failed\r\n");
+        return false;
+    }
+
+    // Add finer Mip 0 request with high-res priority boost
+    let fine_req = DynamicMipLevelRequest::new(100, 0, 0, 0, 1700, 1);
+    req_queue.enqueue(fine_req);
+    let top_req = match req_queue.pop_highest_priority() {
+        Some(r) => r,
+        None => return false,
+    };
+    if top_req.mip_level != 0 || top_req.priority != 1700 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Priority queue ordering mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * GPU LOD feedback analyzer and dynamic mip request queue verified\r\n");
+
+    // 7. Verify Asynchronous DirectStorage Streaming Request Generator
+    let mut ds_gen = DirectStorageStreamGenerator::new(0xE000_0000, DirectStorageCompression::GDeflate);
+    let sample_reqs = [top_req, req0];
+    let ds_batch = ds_gen.generate_streaming_requests(&sample_reqs);
+
+    if ds_batch.len() != 2 || ds_batch[0].compression != DirectStorageCompression::GDeflate {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage batch generation failed\r\n");
+        return false;
+    }
+    if ds_batch[0].uncompressed_size_bytes != 65536 || ds_batch[0].compressed_size_bytes != 29491 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage GDeflate tile compression size mismatch\r\n");
+        return false;
+    }
+    if ds_gen.bandwidth_saved_bytes() == 0 || ds_batch[1].fence_signal_value != 2 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage bandwidth savings or fence tracking mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DirectStorage asynchronous GDeflate streaming request generator verified\r\n");
+
+    // 8. Verify Handheld VRAM Saving Memory Governor & Mip Eviction
+    let mut governor = HandheldVramLodGovernor::new(20 * 1024 * 1024); // 20 MiB budget
+    // Register pinned base mip (Mip 4, 1 tile = 64KB)
+    governor.register_resident_mip(100, 4, 1, true);
+    // Register unpinned mips: Mip 1 (64 tiles = 4MB), Mip 0 (192 tiles = 12MB)
+    governor.register_resident_mip(100, 1, 64, false);
+    governor.register_resident_mip(100, 0, 192, false);
+
+    // Initial usage: 16MB + 64KB (> 15MB elevated threshold)
+    if governor.current_pressure() != VramPressureLevel::Elevated {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Initial memory pressure should be Elevated\r\n");
+        return false;
+    }
+
+    // Advance frame to 5 and touch Mip 0 (leaving Mip 1 unreferenced at frame 0)
+    for _ in 0..5 {
+        governor.advance_frame();
+    }
+    governor.touch_mip(100, 0);
+
+    // Reclaim under pressure: Mip 1 is unreferenced (frame 0) and unpinned, so it must be evicted first
+    let mut vmaps = [vmap];
+    let reclaimed = governor.reclaim_under_pressure(&mut vmaps);
+    if reclaimed != 64 * 65536 || governor.total_mips_evicted != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Governor eviction reclamation mismatch\r\n");
+        return false;
+    }
+    if governor.current_pressure() != VramPressureLevel::Nominal {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Memory pressure did not drop to Nominal\r\n");
+        return false;
+    }
+    // Verify pinned base mip (Mip 4) is still resident in governor
+    if !governor.resident_mips.iter().any(|m| m.texture_id == 100 && m.mip_level == 4 && m.is_pinned_base) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Pinned base mip was erroneously evicted\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Handheld VRAM LOD governor and unreferenced mip eviction verified\r\n");
+
+    // 9. Emit deterministic boot sentinels
     crate::serial_write_str("[KNT-GPU-FEEDBACK-PASS] Direct3D 12 sampler feedback and texture streaming engine verified\r\n");
+    crate::serial_write_str("[KNT-D3D12-SAMPLER-FEEDBACK-PASS] Direct3D 12 sampler feedback & dynamic LOD governor verified\r\n");
     true
 }
 
