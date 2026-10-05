@@ -622,6 +622,211 @@ impl TileResidencyBitmaskDecoder {
     }
 }
 
+
+// ============================================================================
+// GPU Texture LOD Feedback Analysis & Dynamic Mip-Level Request Queue
+// ============================================================================
+
+// Represents a single dynamic mip tile load request demanded by GPU LOD feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicMipLevelRequest {
+    // Virtual texture identifier.
+    pub texture_id: u32,
+    // Target mip level to stream (0 = finest resolution).
+    pub mip_level: u8,
+    // Horizontal tile coordinate within the mip level.
+    pub tile_x: u16,
+    // Vertical tile coordinate within the mip level.
+    pub tile_y: u16,
+    // Priority score: higher score indicates higher visual urgency.
+    pub priority: u32,
+    // Monotonic frame counter when request was queued.
+    pub frame_timestamp: u64,
+}
+
+impl DynamicMipLevelRequest {
+    // Constructs a new dynamic mip level request with computed priority.
+    pub fn new(
+        texture_id: u32,
+        mip_level: u8,
+        tile_x: u16,
+        tile_y: u16,
+        priority: u32,
+        frame_timestamp: u64,
+    ) -> Self {
+        Self {
+            texture_id,
+            mip_level,
+            tile_x,
+            tile_y,
+            priority,
+            frame_timestamp,
+        }
+    }
+}
+
+// Bounded priority queue of pending mip level streaming requests with deduplication.
+#[derive(Debug, Clone)]
+pub struct DynamicMipRequestQueue {
+    // Max requests retained in the queue.
+    pub capacity: usize,
+    // Pending requests sorted by priority (highest priority first).
+    pub requests: alloc::vec::Vec<DynamicMipLevelRequest>,
+    // Total requests enqueued lifetime.
+    pub total_enqueued: u64,
+    // Total duplicate requests dropped.
+    pub total_duplicates_dropped: u64,
+}
+
+impl DynamicMipRequestQueue {
+    // Constructs a new request queue with the specified maximum capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            requests: alloc::vec::Vec::with_capacity(core::cmp::min(capacity, 1024)),
+            total_enqueued: 0,
+            total_duplicates_dropped: 0,
+        }
+    }
+
+    // Queries whether an identical request already exists in the queue.
+    pub fn contains(&self, texture_id: u32, mip_level: u8, tile_x: u16, tile_y: u16) -> bool {
+        self.requests.iter().any(|r| {
+            r.texture_id == texture_id
+                && r.mip_level == mip_level
+                && r.tile_x == tile_x
+                && r.tile_y == tile_y
+        })
+    }
+
+    // Enqueues a mip level request with deduplication and priority insertion.
+    pub fn enqueue(&mut self, req: DynamicMipLevelRequest) -> bool {
+        if self.contains(req.texture_id, req.mip_level, req.tile_x, req.tile_y) {
+            self.total_duplicates_dropped = self.total_duplicates_dropped.saturating_add(1);
+            return false;
+        }
+
+        if self.requests.len() >= self.capacity {
+            // Drop lowest priority if incoming request is more urgent
+            if let Some(lowest) = self.requests.last() {
+                if req.priority > lowest.priority {
+                    self.requests.pop();
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Binary search insertion index to maintain descending priority order
+        let insert_idx = match self.requests.binary_search_by(|probe| probe.priority.cmp(&req.priority).reverse()) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        self.requests.insert(insert_idx, req);
+        self.total_enqueued = self.total_enqueued.saturating_add(1);
+        true
+    }
+
+    // Dequeues highest priority streaming request.
+    pub fn pop_highest_priority(&mut self) -> Option<DynamicMipLevelRequest> {
+        if self.requests.is_empty() {
+            None
+        } else {
+            Some(self.requests.remove(0))
+        }
+    }
+
+    // Dequeues a batch of requests up to `max_batch` count.
+    pub fn pop_batch(&mut self, max_batch: usize) -> alloc::vec::Vec<DynamicMipLevelRequest> {
+        let count = core::cmp::min(max_batch, self.requests.len());
+        let mut batch = alloc::vec::Vec::with_capacity(count);
+        for _ in 0..count {
+            if !self.requests.is_empty() {
+                batch.push(self.requests.remove(0));
+            }
+        }
+        batch
+    }
+
+    // Clears all pending requests.
+    pub fn clear(&mut self) {
+        self.requests.clear();
+    }
+}
+
+// Analyzes GPU sampler feedback to determine required texture LODs and enqueues streaming requests.
+#[derive(Debug, Clone)]
+pub struct GpuTextureLodFeedbackAnalyzer {
+    // Priority bonus for fine resolution mips (Mip 0, Mip 1) to eliminate texture blur.
+    pub high_res_priority_boost: u32,
+    // Total feedback analysis passes executed.
+    pub feedback_passes_analyzed: u64,
+    // Total tile load requests generated.
+    pub requests_generated: u64,
+}
+
+impl GpuTextureLodFeedbackAnalyzer {
+    // Constructs a GPU texture LOD feedback analyzer.
+    pub const fn new() -> Self {
+        Self {
+            high_res_priority_boost: 500,
+            feedback_passes_analyzed: 0,
+            requests_generated: 0,
+        }
+    }
+
+    // Analyzes feedback map against virtual texture layout and populates the request queue.
+    pub fn analyze_feedback(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        virtual_map: &StreamingTextureVirtualMap,
+        current_frame: u64,
+        queue: &mut DynamicMipRequestQueue,
+    ) {
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP
+                        && sampled_mip < virtual_map.mip_levels
+                    {
+                        let (tiles_x, _) = virtual_map.tiles_per_axis_for_mip(sampled_mip);
+                        let tile_idx = ty * tiles_x + tx;
+                        let is_resident = virtual_map.mip_residency
+                            .get(sampled_mip as usize)
+                            .map_or(false, |mask| mask.is_tile_resident(tile_idx));
+
+                        if !is_resident {
+                            // Compute priority: higher for finer mips
+                            let mut priority = (virtual_map.mip_levels.saturating_sub(sampled_mip) as u32) * 100;
+                            if sampled_mip <= 1 {
+                                priority = priority.saturating_add(self.high_res_priority_boost);
+                            }
+
+                            let req = DynamicMipLevelRequest::new(
+                                virtual_map.texture_id,
+                                sampled_mip,
+                                tx as u16,
+                                ty as u16,
+                                priority,
+                                current_frame,
+                            );
+
+                            if queue.enqueue(req) {
+                                self.requests_generated = self.requests_generated.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.feedback_passes_analyzed = self.feedback_passes_analyzed.saturating_add(1);
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
