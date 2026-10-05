@@ -476,3 +476,33 @@ pub fn win32_flt_dispatch_post_operation(data: &mut FltCallbackData) {
         }
     }
 }
+
+/// Reads an immutable snapshot of a file, guaranteeing non-blocking reader isolation from active transactions.
+pub fn win32_txf_read_snapshot_isolated(path: &str) -> Option<Vec<u8>> {
+    // Check if any active transaction is modifying this file
+    let transactions = TRANSACTIONS.lock();
+    for tx in transactions.values() {
+        if tx.state == TRANSACTION_STATE_ACTIVE {
+            if let Some(stream) = tx.streams.get(path) {
+                // Return original committed data, preventing dirty reads of in-flight transacted writes
+                return Some(stream.original_data.clone());
+            }
+        }
+    }
+    drop(transactions);
+
+    // Fallback to current committed state in VFS
+    let vfs = crate::fs::VFS.lock();
+    vfs.read_file(path).ok()
+}
+
+/// Returns whether a file currently has an active uncommitted transacted write lock.
+pub fn win32_txf_is_file_transacted(path: &str) -> bool {
+    let transactions = TRANSACTIONS.lock();
+    for tx in transactions.values() {
+        if tx.state == TRANSACTION_STATE_ACTIVE && tx.streams.contains_key(path) {
+            return true;
+        }
+    }
+    false
+}
