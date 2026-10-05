@@ -421,6 +421,733 @@ impl D3D12_FEEDBACK_TRANSCODE_ENGINE {
     }
 }
 
+
+// ============================================================================
+// Direct3D 12 Sampler Feedback Streaming Maps & Tile Residency Bitmask Decoder
+// ============================================================================
+
+// Packed bitmask tracking 64KB physical tile residency across a texture mip level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileResidencyBitmask {
+    // 64-bit words storing residency status (1 = resident, 0 = unmapped).
+    pub words: alloc::vec::Vec<u64>,
+    // Total number of discrete tiles represented in this bitmask.
+    pub total_tiles: u32,
+    // Total number of currently resident tiles.
+    pub resident_count: u32,
+}
+
+impl TileResidencyBitmask {
+    // Creates a new residency bitmask for the given tile count.
+    pub fn new(total_tiles: u32, all_resident: bool) -> Self {
+        let num_words = ((total_tiles as usize).saturating_add(63)) / 64;
+        let fill_word = if all_resident { !0u64 } else { 0u64 };
+        let mut words = alloc::vec![fill_word; num_words];
+
+        // Mask out extra bits in the last word
+        let remainder = (total_tiles as usize) % 64;
+        if all_resident && remainder != 0 && num_words > 0 {
+            words[num_words - 1] = (1u64 << remainder) - 1;
+        }
+
+        let resident_count = if all_resident { total_tiles } else { 0 };
+        Self {
+            words,
+            total_tiles,
+            resident_count,
+        }
+    }
+
+    // Queries whether a specific tile index is marked resident.
+    #[inline]
+    pub fn is_tile_resident(&self, tile_index: u32) -> bool {
+        if tile_index >= self.total_tiles {
+            return false;
+        }
+        let word_idx = (tile_index / 64) as usize;
+        let bit_idx = (tile_index % 64) as usize;
+        (self.words[word_idx] & (1u64 << bit_idx)) != 0
+    }
+
+    // Updates the residency status of a specific tile index.
+    pub fn set_tile_resident(&mut self, tile_index: u32, resident: bool) -> bool {
+        if tile_index >= self.total_tiles {
+            return false;
+        }
+        let word_idx = (tile_index / 64) as usize;
+        let bit_idx = (tile_index % 64) as usize;
+        let mask = 1u64 << bit_idx;
+        let was_resident = (self.words[word_idx] & mask) != 0;
+
+        if resident && !was_resident {
+            self.words[word_idx] |= mask;
+            self.resident_count = self.resident_count.saturating_add(1);
+        } else if !resident && was_resident {
+            self.words[word_idx] &= !mask;
+            self.resident_count = self.resident_count.saturating_sub(1);
+        }
+        was_resident
+    }
+
+    // Marks all tiles in this bitmask as resident or unmapped.
+    pub fn mark_all(&mut self, resident: bool) {
+        let fill_word = if resident { !0u64 } else { 0u64 };
+        self.words.fill(fill_word);
+        let remainder = (self.total_tiles as usize) % 64;
+        if resident && remainder != 0 && !self.words.is_empty() {
+            let last = self.words.len() - 1;
+            self.words[last] = (1u64 << remainder) - 1;
+        }
+        self.resident_count = if resident { self.total_tiles } else { 0 };
+    }
+}
+
+// Virtual texture streaming map pairing mip levels with discrete 64KB tiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingTextureVirtualMap {
+    // Virtual texture identifier.
+    pub texture_id: u32,
+    // Full resolution base texture width in texels.
+    pub width: u32,
+    // Full resolution base texture height in texels.
+    pub height: u32,
+    // Total number of mip levels in texture pyramid.
+    pub mip_levels: u8,
+    // Dimension in texels of a single 64KB tile at mip 0.
+    pub tile_dim_texels: u32,
+    // Per-mip residency bitmask tracking tile mapping status.
+    pub mip_residency: alloc::vec::Vec<TileResidencyBitmask>,
+}
+
+impl StreamingTextureVirtualMap {
+    // Constructs a virtual texture map and initializes residency bitmasks.
+    pub fn new(
+        texture_id: u32,
+        width: u32,
+        height: u32,
+        mip_levels: u8,
+        tile_dim_texels: u32,
+        base_mip_cutoff: u8,
+    ) -> Self {
+        let mut mip_residency = alloc::vec::Vec::with_capacity(mip_levels as usize);
+        for mip in 0..mip_levels {
+            let mip_w = core::cmp::max(1, width >> mip);
+            let mip_h = core::cmp::max(1, height >> mip);
+            let tiles_x = (mip_w.saturating_add(tile_dim_texels - 1)) / tile_dim_texels;
+            let tiles_y = (mip_h.saturating_add(tile_dim_texels - 1)) / tile_dim_texels;
+            let total_tiles = core::cmp::max(1, tiles_x * tiles_y);
+            // Coarse base mips at or above cutoff are permanently resident
+            let is_always_resident = mip >= base_mip_cutoff;
+            mip_residency.push(TileResidencyBitmask::new(total_tiles, is_always_resident));
+        }
+
+        Self {
+            texture_id,
+            width,
+            height,
+            mip_levels,
+            tile_dim_texels,
+            mip_residency,
+        }
+    }
+
+    // Calculates tile grid dimensions (tiles_x, tiles_y) for a specific mip level.
+    pub fn tiles_per_axis_for_mip(&self, mip: u8) -> (u32, u32) {
+        if mip >= self.mip_levels {
+            return (0, 0);
+        }
+        let mip_w = core::cmp::max(1, self.width >> mip);
+        let mip_h = core::cmp::max(1, self.height >> mip);
+        let tiles_x = (mip_w.saturating_add(self.tile_dim_texels - 1)) / self.tile_dim_texels;
+        let tiles_y = (mip_h.saturating_add(self.tile_dim_texels - 1)) / self.tile_dim_texels;
+        (core::cmp::max(1, tiles_x), core::cmp::max(1, tiles_y))
+    }
+
+    // Returns total tile count for a given mip level.
+    pub fn total_tiles_for_mip(&self, mip: u8) -> u32 {
+        let (tx, ty) = self.tiles_per_axis_for_mip(mip);
+        tx * ty
+    }
+}
+
+// Decodes raw GPU sampler feedback maps against virtual texture residency bitmasks.
+#[derive(Debug, Clone, Default)]
+pub struct TileResidencyBitmaskDecoder {
+    // Total decoded feedback tiles processed across frames.
+    pub total_tiles_decoded: u64,
+    // Total missing residency tile faults detected.
+    pub total_residency_faults: u64,
+}
+
+impl TileResidencyBitmaskDecoder {
+    // Creates a new tile residency bitmask decoder.
+    pub const fn new() -> Self {
+        Self {
+            total_tiles_decoded: 0,
+            total_residency_faults: 0,
+        }
+    }
+
+    // Decodes MinMip feedback map and identifies tiles requiring streaming load.
+    pub fn decode_min_mip_faults(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        virtual_map: &StreamingTextureVirtualMap,
+    ) -> alloc::vec::Vec<(u8, u32, u32)> {
+        let mut missing_tiles = alloc::vec::Vec::new();
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                self.total_tiles_decoded = self.total_tiles_decoded.saturating_add(1);
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP
+                        && sampled_mip < virtual_map.mip_levels
+                    {
+                        let (tiles_x, _) = virtual_map.tiles_per_axis_for_mip(sampled_mip);
+                        let tile_idx = ty * tiles_x + tx;
+                        let is_resident = virtual_map.mip_residency
+                            .get(sampled_mip as usize)
+                            .map_or(false, |mask| mask.is_tile_resident(tile_idx));
+
+                        if !is_resident {
+                            self.total_residency_faults = self.total_residency_faults.saturating_add(1);
+                            missing_tiles.push((sampled_mip, tx, ty));
+                        }
+                    }
+                }
+            }
+        }
+        missing_tiles
+    }
+}
+
+
+// ============================================================================
+// GPU Texture LOD Feedback Analysis & Dynamic Mip-Level Request Queue
+// ============================================================================
+
+// Represents a single dynamic mip tile load request demanded by GPU LOD feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicMipLevelRequest {
+    // Virtual texture identifier.
+    pub texture_id: u32,
+    // Target mip level to stream (0 = finest resolution).
+    pub mip_level: u8,
+    // Horizontal tile coordinate within the mip level.
+    pub tile_x: u16,
+    // Vertical tile coordinate within the mip level.
+    pub tile_y: u16,
+    // Priority score: higher score indicates higher visual urgency.
+    pub priority: u32,
+    // Monotonic frame counter when request was queued.
+    pub frame_timestamp: u64,
+}
+
+impl DynamicMipLevelRequest {
+    // Constructs a new dynamic mip level request with computed priority.
+    pub fn new(
+        texture_id: u32,
+        mip_level: u8,
+        tile_x: u16,
+        tile_y: u16,
+        priority: u32,
+        frame_timestamp: u64,
+    ) -> Self {
+        Self {
+            texture_id,
+            mip_level,
+            tile_x,
+            tile_y,
+            priority,
+            frame_timestamp,
+        }
+    }
+}
+
+// Bounded priority queue of pending mip level streaming requests with deduplication.
+#[derive(Debug, Clone)]
+pub struct DynamicMipRequestQueue {
+    // Max requests retained in the queue.
+    pub capacity: usize,
+    // Pending requests sorted by priority (highest priority first).
+    pub requests: alloc::vec::Vec<DynamicMipLevelRequest>,
+    // Total requests enqueued lifetime.
+    pub total_enqueued: u64,
+    // Total duplicate requests dropped.
+    pub total_duplicates_dropped: u64,
+}
+
+impl DynamicMipRequestQueue {
+    // Constructs a new request queue with the specified maximum capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            requests: alloc::vec::Vec::with_capacity(core::cmp::min(capacity, 1024)),
+            total_enqueued: 0,
+            total_duplicates_dropped: 0,
+        }
+    }
+
+    // Queries whether an identical request already exists in the queue.
+    pub fn contains(&self, texture_id: u32, mip_level: u8, tile_x: u16, tile_y: u16) -> bool {
+        self.requests.iter().any(|r| {
+            r.texture_id == texture_id
+                && r.mip_level == mip_level
+                && r.tile_x == tile_x
+                && r.tile_y == tile_y
+        })
+    }
+
+    // Enqueues a mip level request with deduplication and priority insertion.
+    pub fn enqueue(&mut self, req: DynamicMipLevelRequest) -> bool {
+        if self.contains(req.texture_id, req.mip_level, req.tile_x, req.tile_y) {
+            self.total_duplicates_dropped = self.total_duplicates_dropped.saturating_add(1);
+            return false;
+        }
+
+        if self.requests.len() >= self.capacity {
+            // Drop lowest priority if incoming request is more urgent
+            if let Some(lowest) = self.requests.last() {
+                if req.priority > lowest.priority {
+                    self.requests.pop();
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        // Binary search insertion index to maintain descending priority order
+        let insert_idx = match self.requests.binary_search_by(|probe| probe.priority.cmp(&req.priority).reverse()) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        self.requests.insert(insert_idx, req);
+        self.total_enqueued = self.total_enqueued.saturating_add(1);
+        true
+    }
+
+    // Dequeues highest priority streaming request.
+    pub fn pop_highest_priority(&mut self) -> Option<DynamicMipLevelRequest> {
+        if self.requests.is_empty() {
+            None
+        } else {
+            Some(self.requests.remove(0))
+        }
+    }
+
+    // Dequeues a batch of requests up to `max_batch` count.
+    pub fn pop_batch(&mut self, max_batch: usize) -> alloc::vec::Vec<DynamicMipLevelRequest> {
+        let count = core::cmp::min(max_batch, self.requests.len());
+        let mut batch = alloc::vec::Vec::with_capacity(count);
+        for _ in 0..count {
+            if !self.requests.is_empty() {
+                batch.push(self.requests.remove(0));
+            }
+        }
+        batch
+    }
+
+    // Clears all pending requests.
+    pub fn clear(&mut self) {
+        self.requests.clear();
+    }
+}
+
+// Analyzes GPU sampler feedback to determine required texture LODs and enqueues streaming requests.
+#[derive(Debug, Clone)]
+pub struct GpuTextureLodFeedbackAnalyzer {
+    // Priority bonus for fine resolution mips (Mip 0, Mip 1) to eliminate texture blur.
+    pub high_res_priority_boost: u32,
+    // Total feedback analysis passes executed.
+    pub feedback_passes_analyzed: u64,
+    // Total tile load requests generated.
+    pub requests_generated: u64,
+}
+
+impl GpuTextureLodFeedbackAnalyzer {
+    // Constructs a GPU texture LOD feedback analyzer.
+    pub const fn new() -> Self {
+        Self {
+            high_res_priority_boost: 500,
+            feedback_passes_analyzed: 0,
+            requests_generated: 0,
+        }
+    }
+
+    // Analyzes feedback map against virtual texture layout and populates the request queue.
+    pub fn analyze_feedback(
+        &mut self,
+        feedback_map: &D3D12_SAMPLER_FEEDBACK_MAP,
+        virtual_map: &StreamingTextureVirtualMap,
+        current_frame: u64,
+        queue: &mut DynamicMipRequestQueue,
+    ) {
+        let desc = &feedback_map.desc;
+
+        for ty in 0..desc.map_height_tiles {
+            for tx in 0..desc.map_width_tiles {
+                if let Some(sampled_mip) = feedback_map.get_min_mip(tx, ty) {
+                    if sampled_mip != D3D12_SAMPLER_FEEDBACK_UNACCESSED_MIP
+                        && sampled_mip < virtual_map.mip_levels
+                    {
+                        let (tiles_x, _) = virtual_map.tiles_per_axis_for_mip(sampled_mip);
+                        let tile_idx = ty * tiles_x + tx;
+                        let is_resident = virtual_map.mip_residency
+                            .get(sampled_mip as usize)
+                            .map_or(false, |mask| mask.is_tile_resident(tile_idx));
+
+                        if !is_resident {
+                            // Compute priority: higher for finer mips
+                            let mut priority = (virtual_map.mip_levels.saturating_sub(sampled_mip) as u32) * 100;
+                            if sampled_mip <= 1 {
+                                priority = priority.saturating_add(self.high_res_priority_boost);
+                            }
+
+                            let req = DynamicMipLevelRequest::new(
+                                virtual_map.texture_id,
+                                sampled_mip,
+                                tx as u16,
+                                ty as u16,
+                                priority,
+                                current_frame,
+                            );
+
+                            if queue.enqueue(req) {
+                                self.requests_generated = self.requests_generated.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.feedback_passes_analyzed = self.feedback_passes_analyzed.saturating_add(1);
+    }
+}
+
+
+// ============================================================================
+// Asynchronous DirectStorage Streaming Request Generator
+// ============================================================================
+
+// Compression algorithms supported by DirectStorage NVMe-to-GPU streaming.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectStorageCompression {
+    None = 0,
+    GDeflate = 1,
+    Zlib = 2,
+}
+
+// Represents an asynchronous DirectStorage queue submission request for a 64KB texture tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectStorageStreamingRequest {
+    // Unique monotonic request tracking index.
+    pub request_id: u64,
+    // Source texture identifier.
+    pub texture_id: u32,
+    // Subresource mip level index.
+    pub subresource_mip: u8,
+    // Horizontal tile coordinate in the texture mip level.
+    pub tile_x: u16,
+    // Vertical tile coordinate in the texture mip level.
+    pub tile_y: u16,
+    // Byte offset in the virtual package file on NVMe storage.
+    pub source_file_offset: u64,
+    // Compressed payload size in bytes.
+    pub compressed_size_bytes: u32,
+    // Decompressed payload size in bytes (typically 65536 for 64KB tile).
+    pub uncompressed_size_bytes: u32,
+    // Target physical VRAM destination address or tile pool slot.
+    pub destination_vram_addr: u64,
+    // Compression format used for decompression in GPU shader or HW engine.
+    pub compression: DirectStorageCompression,
+    // DirectStorage completion fence value to signal upon DMA transfer finish.
+    pub fence_signal_value: u64,
+}
+
+// Translates prioritized mip load requests into asynchronous DirectStorage streaming commands.
+#[derive(Debug, Clone)]
+pub struct DirectStorageStreamGenerator {
+    // Current monotonic request ID generator.
+    pub next_request_id: u64,
+    // DirectStorage timeline fence value.
+    pub current_fence_value: u64,
+    // Base physical VRAM pool address for streaming tiles.
+    pub vram_tile_pool_base: u64,
+    // Standard tile byte size (64KB).
+    pub standard_tile_size: u32,
+    // Active compression mode for streaming package assets.
+    pub compression_mode: DirectStorageCompression,
+    // Average compression ratio percentage (e.g. 40 = 40% of uncompressed size).
+    pub compression_ratio_percent: u32,
+    // Total DirectStorage requests generated.
+    pub total_requests_generated: u64,
+    // Total uncompressed streaming bytes requested.
+    pub total_uncompressed_bytes: u64,
+    // Total compressed bytes transferred over NVMe.
+    pub total_compressed_bytes: u64,
+}
+
+impl DirectStorageStreamGenerator {
+    // Constructs an asynchronous DirectStorage streaming request generator.
+    pub fn new(vram_tile_pool_base: u64, compression_mode: DirectStorageCompression) -> Self {
+        let compression_ratio_percent = match compression_mode {
+            DirectStorageCompression::None => 100,
+            DirectStorageCompression::GDeflate => 45, // ~45% footprint for BC textures
+            DirectStorageCompression::Zlib => 55,
+        };
+
+        Self {
+            next_request_id: 1,
+            current_fence_value: 0,
+            vram_tile_pool_base,
+            standard_tile_size: 65536, // 64 KiB
+            compression_mode,
+            compression_ratio_percent,
+            total_requests_generated: 0,
+            total_uncompressed_bytes: 0,
+            total_compressed_bytes: 0,
+        }
+    }
+
+    // Translates a slice of dynamic mip requests into DirectStorage queue streaming packets.
+    pub fn generate_streaming_requests(
+        &mut self,
+        mip_requests: &[DynamicMipLevelRequest],
+    ) -> alloc::vec::Vec<DirectStorageStreamingRequest> {
+        let mut ds_requests = alloc::vec::Vec::with_capacity(mip_requests.len());
+
+        for req in mip_requests {
+            self.current_fence_value = self.current_fence_value.saturating_add(1);
+            let req_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.saturating_add(1);
+
+            let uncompressed_size = self.standard_tile_size;
+            let compressed_size = if self.compression_mode == DirectStorageCompression::None {
+                uncompressed_size
+            } else {
+                (uncompressed_size * self.compression_ratio_percent) / 100
+            };
+
+            // Calculate deterministic NVMe file offset from texture layout
+            let tile_index = (req.tile_y as u64) * 256 + (req.tile_x as u64);
+            let mip_base_offset = (req.texture_id as u64) * 0x10000000 + (req.mip_level as u64) * 0x1000000;
+            let source_file_offset = mip_base_offset + tile_index * (compressed_size as u64);
+
+            // Compute destination VRAM physical tile address in sparse pool
+            let destination_vram_addr = self.vram_tile_pool_base + ((req_id - 1) % 1024) * 65536;
+
+            let ds_req = DirectStorageStreamingRequest {
+                request_id: req_id,
+                texture_id: req.texture_id,
+                subresource_mip: req.mip_level,
+                tile_x: req.tile_x,
+                tile_y: req.tile_y,
+                source_file_offset,
+                compressed_size_bytes: compressed_size,
+                uncompressed_size_bytes: uncompressed_size,
+                destination_vram_addr,
+                compression: self.compression_mode,
+                fence_signal_value: self.current_fence_value,
+            };
+
+            self.total_requests_generated = self.total_requests_generated.saturating_add(1);
+            self.total_uncompressed_bytes = self.total_uncompressed_bytes.saturating_add(uncompressed_size as u64);
+            self.total_compressed_bytes = self.total_compressed_bytes.saturating_add(compressed_size as u64);
+
+            ds_requests.push(ds_req);
+        }
+
+        ds_requests
+    }
+
+    // Returns total NVMe transfer bandwidth saved due to DirectStorage compression.
+    pub fn bandwidth_saved_bytes(&self) -> u64 {
+        self.total_uncompressed_bytes.saturating_sub(self.total_compressed_bytes)
+    }
+}
+
+
+// ============================================================================
+// Handheld VRAM Saving Memory Governor & Unreferenced Mip Eviction
+// ============================================================================
+
+// Memory pressure tiers for handheld APU unified memory architecture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VramPressureLevel {
+    // Nominal usage (< 75% budget); streaming is unrestricted.
+    Nominal,
+    // Elevated usage (75% - 90% budget); proactive eviction of cold fine mips.
+    Elevated,
+    // Critical usage (>= 90% budget); aggressive eviction down to pinned base mips.
+    Critical,
+}
+
+// Tracks residency, memory footprint, and reference recency for a texture mip level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentMipEntry {
+    // Texture identifier.
+    pub texture_id: u32,
+    // Mip level index (0 = finest resolution).
+    pub mip_level: u8,
+    // Total resident 64KB tiles in this mip level.
+    pub resident_tile_count: u32,
+    // Total memory footprint in bytes (tiles * 65536).
+    pub size_bytes: u64,
+    // Frame timestamp when this mip level was last referenced in GPU sampler feedback.
+    pub last_referenced_frame: u64,
+    // Flag indicating whether this is a coarse base mip pinned permanently to prevent fallback pop-in.
+    pub is_pinned_base: bool,
+}
+
+impl ResidentMipEntry {
+    // Constructs a new resident mip entry.
+    pub fn new(
+        texture_id: u32,
+        mip_level: u8,
+        resident_tile_count: u32,
+        current_frame: u64,
+        is_pinned_base: bool,
+    ) -> Self {
+        let size_bytes = (resident_tile_count as u64) * 65536;
+        Self {
+            texture_id,
+            mip_level,
+            resident_tile_count,
+            size_bytes,
+            last_referenced_frame: current_frame,
+            is_pinned_base,
+        }
+    }
+}
+
+// Memory governor managing texture LOD residency and reclaiming VRAM under pressure.
+#[derive(Debug, Clone)]
+pub struct HandheldVramLodGovernor {
+    // Total VRAM budget allocated for streaming textures (in bytes).
+    pub vram_budget_bytes: u64,
+    // Current total VRAM consumed by resident streaming tiles (in bytes).
+    pub current_vram_usage_bytes: u64,
+    // Elevated pressure threshold in bytes (75% of budget).
+    pub elevated_threshold_bytes: u64,
+    // Critical pressure threshold in bytes (90% of budget).
+    pub critical_threshold_bytes: u64,
+    // Monotonic frame counter.
+    pub current_frame: u64,
+    // Active resident mip entries.
+    pub resident_mips: alloc::vec::Vec<ResidentMipEntry>,
+    // Total mips evicted lifetime.
+    pub total_mips_evicted: u64,
+    // Total VRAM reclaimed lifetime in bytes.
+    pub total_bytes_reclaimed: u64,
+}
+
+impl HandheldVramLodGovernor {
+    // Constructs a handheld VRAM LOD governor with budget-based pressure thresholds.
+    pub fn new(vram_budget_bytes: u64) -> Self {
+        let elevated_threshold_bytes = (vram_budget_bytes * 75) / 100;
+        let critical_threshold_bytes = (vram_budget_bytes * 90) / 100;
+
+        Self {
+            vram_budget_bytes,
+            current_vram_usage_bytes: 0,
+            elevated_threshold_bytes,
+            critical_threshold_bytes,
+            current_frame: 0,
+            resident_mips: alloc::vec::Vec::new(),
+            total_mips_evicted: 0,
+            total_bytes_reclaimed: 0,
+        }
+    }
+
+    // Evaluates current memory pressure tier based on resident texture memory.
+    pub fn current_pressure(&self) -> VramPressureLevel {
+        if self.current_vram_usage_bytes >= self.critical_threshold_bytes {
+            VramPressureLevel::Critical
+        } else if self.current_vram_usage_bytes >= self.elevated_threshold_bytes {
+            VramPressureLevel::Elevated
+        } else {
+            VramPressureLevel::Nominal
+        }
+    }
+
+    // Registers a resident mip level with the governor.
+    pub fn register_resident_mip(
+        &mut self,
+        texture_id: u32,
+        mip_level: u8,
+        resident_tile_count: u32,
+        is_pinned_base: bool,
+    ) {
+        let entry = ResidentMipEntry::new(
+            texture_id,
+            mip_level,
+            resident_tile_count,
+            self.current_frame,
+            is_pinned_base,
+        );
+        self.current_vram_usage_bytes = self.current_vram_usage_bytes.saturating_add(entry.size_bytes);
+        self.resident_mips.push(entry);
+    }
+
+    // Marks a resident mip level as referenced during the current frame.
+    pub fn touch_mip(&mut self, texture_id: u32, mip_level: u8) {
+        if let Some(entry) = self.resident_mips.iter_mut().find(|e| e.texture_id == texture_id && e.mip_level == mip_level) {
+            entry.last_referenced_frame = self.current_frame;
+        }
+    }
+
+    // Advances the frame counter.
+    pub fn advance_frame(&mut self) {
+        self.current_frame = self.current_frame.saturating_add(1);
+    }
+
+    // Reclaims unreferenced mips when memory pressure is Elevated or Critical.
+    pub fn reclaim_under_pressure(&mut self, virtual_maps: &mut [StreamingTextureVirtualMap]) -> u64 {
+        let target_usage = match self.current_pressure() {
+            VramPressureLevel::Nominal => return 0,
+            VramPressureLevel::Elevated => self.elevated_threshold_bytes,
+            VramPressureLevel::Critical => self.elevated_threshold_bytes.saturating_sub(self.vram_budget_bytes / 10),
+        };
+
+        let mut reclaimed_bytes: u64 = 0;
+
+        // Sort candidates: unpinned first, oldest last_referenced_frame, then finer mips (mip 0 before mip 1)
+        while self.current_vram_usage_bytes > target_usage {
+            // Find best candidate for eviction
+            let candidate_idx = self.resident_mips
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.is_pinned_base && e.resident_tile_count > 0)
+                .min_by_key(|(_, e)| (e.last_referenced_frame, e.mip_level))
+                .map(|(idx, _)| idx);
+
+            match candidate_idx {
+                Some(idx) => {
+                    let entry = self.resident_mips.remove(idx);
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(entry.size_bytes);
+                    self.current_vram_usage_bytes = self.current_vram_usage_bytes.saturating_sub(entry.size_bytes);
+                    self.total_mips_evicted = self.total_mips_evicted.saturating_add(1);
+                    self.total_bytes_reclaimed = self.total_bytes_reclaimed.saturating_add(entry.size_bytes);
+
+                    // Unmap tiles from virtual texture map
+                    if let Some(vmap) = virtual_maps.iter_mut().find(|v| v.texture_id == entry.texture_id) {
+                        if let Some(mask) = vmap.mip_residency.get_mut(entry.mip_level as usize) {
+                            mask.mark_all(false);
+                        }
+                    }
+                }
+                None => break, // No more unpinned mips eligible for eviction
+            }
+        }
+
+        reclaimed_bytes
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
@@ -560,8 +1287,125 @@ pub fn test_sampler_feedback_subsystem() -> bool {
     }
     crate::serial_write_str("  * Transcode engine 64KB physical streaming tile generation verified\r\n");
 
-    // 5. Emit deterministic boot sentinel
+    // 5. Verify StreamingTextureVirtualMap and TileResidencyBitmaskDecoder
+    let vmap = StreamingTextureVirtualMap::new(100, 2048, 2048, 12, 128, 4);
+    if vmap.total_tiles_for_mip(0) != 256 || vmap.total_tiles_for_mip(4) != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Virtual map tile geometry mismatch\r\n");
+        return false;
+    }
+    // Mip 4 is coarse base mip (>= 4) -> must be resident by default
+    if !vmap.mip_residency[4].is_tile_resident(0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Pinned base mip must be resident\r\n");
+        return false;
+    }
+    // Mip 0 is fine mip (< 4) -> unmapped by default
+    if vmap.mip_residency[0].is_tile_resident(0) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Fine mip must not be resident initially\r\n");
+        return false;
+    }
+
+    let mut decoder = TileResidencyBitmaskDecoder::new();
+    let faults = decoder.decode_min_mip_faults(&min_mip_map, &vmap);
+    if faults.is_empty() || faults[0] != (2, 1, 1) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Feedback residency decoder fault mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Streaming virtual map and residency bitmask decoder verified\r\n");
+
+    // 6. Verify GPU Texture LOD Feedback Analyzer and Dynamic Mip Request Queue
+    let mut analyzer = GpuTextureLodFeedbackAnalyzer::new();
+    let mut req_queue = DynamicMipRequestQueue::new(64);
+    analyzer.analyze_feedback(&min_mip_map, &vmap, 1, &mut req_queue);
+
+    if req_queue.requests.len() != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Analyzer request queue count mismatch\r\n");
+        return false;
+    }
+    let req0 = req_queue.requests[0];
+    if req0.texture_id != 100 || req0.mip_level != 2 || req0.tile_x != 1 || req0.tile_y != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Generated request metadata mismatch\r\n");
+        return false;
+    }
+
+    // Deduplication test: identical request must be dropped
+    if req_queue.enqueue(req0) || req_queue.total_duplicates_dropped != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Request deduplication failed\r\n");
+        return false;
+    }
+
+    // Add finer Mip 0 request with high-res priority boost
+    let fine_req = DynamicMipLevelRequest::new(100, 0, 0, 0, 1700, 1);
+    req_queue.enqueue(fine_req);
+    let top_req = match req_queue.pop_highest_priority() {
+        Some(r) => r,
+        None => return false,
+    };
+    if top_req.mip_level != 0 || top_req.priority != 1700 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Priority queue ordering mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * GPU LOD feedback analyzer and dynamic mip request queue verified\r\n");
+
+    // 7. Verify Asynchronous DirectStorage Streaming Request Generator
+    let mut ds_gen = DirectStorageStreamGenerator::new(0xE000_0000, DirectStorageCompression::GDeflate);
+    let sample_reqs = [top_req, req0];
+    let ds_batch = ds_gen.generate_streaming_requests(&sample_reqs);
+
+    if ds_batch.len() != 2 || ds_batch[0].compression != DirectStorageCompression::GDeflate {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage batch generation failed\r\n");
+        return false;
+    }
+    if ds_batch[0].uncompressed_size_bytes != 65536 || ds_batch[0].compressed_size_bytes != 29491 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage GDeflate tile compression size mismatch\r\n");
+        return false;
+    }
+    if ds_gen.bandwidth_saved_bytes() == 0 || ds_batch[1].fence_signal_value != 2 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] DirectStorage bandwidth savings or fence tracking mismatch\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * DirectStorage asynchronous GDeflate streaming request generator verified\r\n");
+
+    // 8. Verify Handheld VRAM Saving Memory Governor & Mip Eviction
+    let mut governor = HandheldVramLodGovernor::new(20 * 1024 * 1024); // 20 MiB budget
+    // Register pinned base mip (Mip 4, 1 tile = 64KB)
+    governor.register_resident_mip(100, 4, 1, true);
+    // Register unpinned mips: Mip 1 (64 tiles = 4MB), Mip 0 (192 tiles = 12MB)
+    governor.register_resident_mip(100, 1, 64, false);
+    governor.register_resident_mip(100, 0, 192, false);
+
+    // Initial usage: 16MB + 64KB (> 15MB elevated threshold)
+    if governor.current_pressure() != VramPressureLevel::Elevated {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Initial memory pressure should be Elevated\r\n");
+        return false;
+    }
+
+    // Advance frame to 5 and touch Mip 0 (leaving Mip 1 unreferenced at frame 0)
+    for _ in 0..5 {
+        governor.advance_frame();
+    }
+    governor.touch_mip(100, 0);
+
+    // Reclaim under pressure: Mip 1 is unreferenced (frame 0) and unpinned, so it must be evicted first
+    let mut vmaps = [vmap];
+    let reclaimed = governor.reclaim_under_pressure(&mut vmaps);
+    if reclaimed != 64 * 65536 || governor.total_mips_evicted != 1 {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Governor eviction reclamation mismatch\r\n");
+        return false;
+    }
+    if governor.current_pressure() != VramPressureLevel::Nominal {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Memory pressure did not drop to Nominal\r\n");
+        return false;
+    }
+    // Verify pinned base mip (Mip 4) is still resident in governor
+    if !governor.resident_mips.iter().any(|m| m.texture_id == 100 && m.mip_level == 4 && m.is_pinned_base) {
+        crate::serial_write_str("[KNT-FEEDBACK-FAIL] Pinned base mip was erroneously evicted\r\n");
+        return false;
+    }
+    crate::serial_write_str("  * Handheld VRAM LOD governor and unreferenced mip eviction verified\r\n");
+
+    // 9. Emit deterministic boot sentinels
     crate::serial_write_str("[KNT-GPU-FEEDBACK-PASS] Direct3D 12 sampler feedback and texture streaming engine verified\r\n");
+    crate::serial_write_str("[KNT-D3D12-SAMPLER-FEEDBACK-PASS] Direct3D 12 sampler feedback & dynamic LOD governor verified\r\n");
     true
 }
 
