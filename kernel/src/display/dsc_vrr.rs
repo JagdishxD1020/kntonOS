@@ -200,3 +200,188 @@ pub fn verify_dsc_slice_multiplexer_and_rc() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Variable Refresh Rate (VRR) Fast-Sync Pacer with LFC (30Hz-165Hz)
+// ============================================================================
+
+/// Minimum native VRR panel refresh frequency in Hz.
+pub const VRR_MIN_FREQ_HZ: u32 = 30;
+/// Maximum native VRR panel refresh frequency in Hz.
+pub const VRR_MAX_FREQ_HZ: u32 = 165;
+/// Low Framerate Compensation (LFC) activation threshold in Hz.
+pub const VRR_LFC_THRESHOLD_HZ: u32 = 48;
+
+/// Presentation timing directive computed by the VRR pacer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrrFramePresentation {
+    /// Modulated frame duration in microseconds passed to display timing controller.
+    pub presentation_interval_us: u32,
+    /// Effective panel scanout refresh rate in Hz.
+    pub effective_refresh_hz: u32,
+    /// LFC repeat count for this frame (1 = native presentation, >=2 = repeated scanouts).
+    pub lfc_multiplier: u8,
+    /// Whether Low Framerate Compensation is active for this frame.
+    pub is_lfc_active: bool,
+}
+
+/// Variable Refresh Rate (VRR) Fast-Sync Engine with LFC across 30Hz - 165Hz.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VrrFastSyncPacer {
+    /// Minimum supported panel refresh rate in Hz.
+    pub min_hz: u32,
+    /// Maximum supported panel refresh rate in Hz.
+    pub max_hz: u32,
+    /// Threshold below which LFC automatically multiplies frame scans.
+    pub lfc_threshold_hz: u32,
+    /// Latest measured game render interval in microseconds.
+    pub last_render_interval_us: u32,
+    /// Active presentation parameters.
+    pub current_presentation: VrrFramePresentation,
+    /// Total rendered frames processed.
+    pub total_frames_processed: u64,
+    /// Total LFC repeated frame presentations executed.
+    pub total_lfc_repeats: u64,
+}
+
+impl VrrFastSyncPacer {
+    /// Constructs a VRR Fast-Sync pacer for a 30Hz - 165Hz gaming panel.
+    pub const fn new() -> Self {
+        Self {
+            min_hz: VRR_MIN_FREQ_HZ,
+            max_hz: VRR_MAX_FREQ_HZ,
+            lfc_threshold_hz: VRR_LFC_THRESHOLD_HZ,
+            last_render_interval_us: 16_666, // 60 Hz initial
+            current_presentation: VrrFramePresentation {
+                presentation_interval_us: 16_666,
+                effective_refresh_hz: 60,
+                lfc_multiplier: 1,
+                is_lfc_active: false,
+            },
+            total_frames_processed: 0,
+            total_lfc_repeats: 0,
+        }
+    }
+
+    /// Computes presentation timing and LFC replication for a newly rendered frame.
+    pub fn pace_frame(&mut self, render_interval_us: u32) -> VrrFramePresentation {
+        self.last_render_interval_us = render_interval_us;
+        self.total_frames_processed += 1;
+
+        let render_hz = if render_interval_us == 0 {
+            self.max_hz
+        } else {
+            1_000_000 / render_interval_us
+        };
+
+        // Zone 1: High framerate (> max_hz): clamp to max panel capability
+        if render_hz >= self.max_hz {
+            let interval = 1_000_000 / self.max_hz;
+            self.current_presentation = VrrFramePresentation {
+                presentation_interval_us: interval,
+                effective_refresh_hz: self.max_hz,
+                lfc_multiplier: 1,
+                is_lfc_active: false,
+            };
+            return self.current_presentation;
+        }
+
+        // Zone 2: Native VRR range (lfc_threshold_hz <= render_hz < max_hz)
+        if render_hz >= self.lfc_threshold_hz {
+            self.current_presentation = VrrFramePresentation {
+                presentation_interval_us: render_interval_us,
+                effective_refresh_hz: render_hz,
+                lfc_multiplier: 1,
+                is_lfc_active: false,
+            };
+            return self.current_presentation;
+        }
+
+        // Zone 3: Low framerate (< lfc_threshold_hz): Activate Low Framerate Compensation (LFC)
+        // Calculate integer repeat multiplier M such that (render_hz * M) falls within native VRR range
+        let mut multiplier: u8 = 2;
+        while ((render_hz * multiplier as u32) < self.lfc_threshold_hz) && (multiplier < 8) {
+            multiplier += 1;
+        }
+
+        let lfc_interval_us = render_interval_us / (multiplier as u32);
+        let effective_hz = (render_hz * multiplier as u32).clamp(self.min_hz, self.max_hz);
+
+        self.total_lfc_repeats += (multiplier - 1) as u64;
+
+        self.current_presentation = VrrFramePresentation {
+            presentation_interval_us: lfc_interval_us,
+            effective_refresh_hz: effective_hz,
+            lfc_multiplier: multiplier,
+            is_lfc_active: true,
+        };
+
+        self.current_presentation
+    }
+
+    /// Computes modulated vertical blanking front porch scanlines to match frame interval.
+    pub fn calculate_vfront_porch_lines(
+        &self,
+        presentation_interval_us: u32,
+        active_lines: u32,
+        line_time_ns: u32,
+    ) -> u32 {
+        if line_time_ns == 0 {
+            return 40;
+        }
+        let total_frame_ns = (presentation_interval_us as u64) * 1000;
+        let total_lines = (total_frame_ns / line_time_ns as u64) as u32;
+
+        if total_lines > active_lines {
+            total_lines - active_lines
+        } else {
+            20 // Minimum vertical porch
+        }
+    }
+}
+
+/// Verification test for VRR Fast-Sync pacer with Low Framerate Compensation (LFC).
+pub fn verify_vrr_fast_sync_and_lfc() -> bool {
+    let mut pacer = VrrFastSyncPacer::new();
+
+    // 1. High-framerate gaming at 120 fps (~8333 us) -> Native VRR, no LFC
+    let p_120 = pacer.pace_frame(8_333);
+    if p_120.effective_refresh_hz != 120 || p_120.is_lfc_active || p_120.lfc_multiplier != 1 {
+        return false;
+    }
+
+    // 2. Standard 60 fps gaming (16666 us) -> Native VRR, no LFC
+    let p_60 = pacer.pace_frame(16_666);
+    if p_60.effective_refresh_hz != 60 || p_60.is_lfc_active || p_60.lfc_multiplier != 1 {
+        return false;
+    }
+
+    // 3. Marginal framerate at 50 fps (20000 us) -> Still above 48Hz threshold, no LFC
+    let p_50 = pacer.pace_frame(20_000);
+    if p_50.effective_refresh_hz != 50 || p_50.is_lfc_active {
+        return false;
+    }
+
+    // 4. Low framerate stutter at 24 fps (~41666 us) -> Below 48Hz threshold, LFC MUST activate
+    // Multiplier M = 2: 24 fps * 2 = 48 Hz scanout, interval = 41666 / 2 ≈ 20833 us
+    let p_24 = pacer.pace_frame(41_666);
+    if !p_24.is_lfc_active || p_24.lfc_multiplier != 2 {
+        return false;
+    }
+    if p_24.effective_refresh_hz < 48 || p_24.presentation_interval_us > 21_000 {
+        return false;
+    }
+
+    // 5. Severe framerate drop at 15 fps (~66666 us)
+    // Multiplier M = 4: 15 fps * 4 = 60 Hz scanout, interval = 66666 / 4 ≈ 16666 us
+    let p_15 = pacer.pace_frame(66_666);
+    if !p_15.is_lfc_active || p_15.lfc_multiplier < 3 {
+        return false;
+    }
+    if p_15.effective_refresh_hz < 48 {
+        return false;
+    }
+
+    true
+}
