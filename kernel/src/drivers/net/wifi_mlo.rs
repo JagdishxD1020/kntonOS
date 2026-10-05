@@ -735,3 +735,229 @@ pub fn verify_dscp46_qos_priority_queue() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Fast Link Failover (<5ms) & Seamless Packet Duplication
+// ============================================================================
+
+/// Maximum allowable failover redirect duration in microseconds (< 5 ms).
+pub const MAX_FAILOVER_DEADLINE_US: u64 = 5000;
+/// Consecutive dropped ACK threshold triggering link failover.
+pub const FAILOVER_DROP_THRESHOLD: u32 = 3;
+
+/// Fast Link Failover Governor monitoring link health and executing sub-5ms redirects.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MloFailoverGovernor {
+    /// Consecutive lost packet counter on 5 GHz.
+    pub consecutive_drops_5g: u32,
+    /// Consecutive lost packet counter on 6 GHz.
+    pub consecutive_drops_6g: u32,
+    /// Timestamp when link degradation was first detected.
+    pub failover_trigger_timestamp_us: u64,
+    /// Measured elapsed time in microseconds to complete traffic redirection.
+    pub failover_elapsed_us: u64,
+    /// Whether 6 GHz link is currently marked as failed / degraded.
+    pub is_6ghz_failed: bool,
+    /// Whether seamless packet duplication is active across both links.
+    pub is_duplication_active: bool,
+    /// Total failover events executed.
+    pub total_failovers: u32,
+}
+
+impl MloFailoverGovernor {
+    pub const fn new() -> Self {
+        Self {
+            consecutive_drops_5g: 0,
+            consecutive_drops_6g: 0,
+            failover_trigger_timestamp_us: 0,
+            failover_elapsed_us: 0,
+            is_6ghz_failed: false,
+            is_duplication_active: false,
+            total_failovers: 0,
+        }
+    }
+
+    /// Reports transmission outcome (ACK or timeout) for a packet on a specific band.
+    pub fn report_ack_status(&mut self, band: MloBand, acked: bool, now_us: u64) {
+        match band {
+            MloBand::Band6GHz => {
+                if acked {
+                    self.consecutive_drops_6g = 0;
+                    if self.is_6ghz_failed {
+                        self.is_6ghz_failed = false;
+                        self.is_duplication_active = false;
+                    }
+                } else {
+                    if self.consecutive_drops_6g == 0 {
+                        self.failover_trigger_timestamp_us = now_us;
+                    }
+                    self.consecutive_drops_6g += 1;
+
+                    // Trigger fast link failover upon reaching drop threshold
+                    if self.consecutive_drops_6g >= FAILOVER_DROP_THRESHOLD && !self.is_6ghz_failed {
+                        self.is_6ghz_failed = true;
+                        self.is_duplication_active = true;
+                        self.failover_elapsed_us = now_us.saturating_sub(self.failover_trigger_timestamp_us);
+                        self.total_failovers += 1;
+                    }
+                }
+            }
+            MloBand::Band5GHz => {
+                if acked {
+                    self.consecutive_drops_5g = 0;
+                } else {
+                    self.consecutive_drops_5g += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Integrated Handheld Wi-Fi 7 Multi-Link Operation (MLO) Manager.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldWifiMloManager {
+    /// Dual-link aggregator for 5GHz and 6GHz radios.
+    pub aggregator: DualLinkMloAggregator,
+    /// Sub-2ms playout jitter buffer.
+    pub jitter_buffer: MloJitterBuffer,
+    /// Real-time link rebalancer.
+    pub rebalancer: MloLinkRebalancer,
+    /// DSCP 46 Expedited Forwarding QoS priority scheduler.
+    pub qos_queue: DscpPriorityQueue,
+    /// Fast failover governor.
+    pub failover_gov: MloFailoverGovernor,
+    /// Next outbound monotonic sequence number.
+    pub next_tx_seq: u32,
+    /// Total bytes transmitted across MLO links.
+    pub total_bytes_tx: u64,
+    /// Total bytes received across MLO links.
+    pub total_bytes_rx: u64,
+}
+
+impl HandheldWifiMloManager {
+    /// Constructs a fully integrated handheld Wi-Fi 7 MLO manager.
+    pub const fn new() -> Self {
+        Self {
+            aggregator: DualLinkMloAggregator::new(),
+            jitter_buffer: MloJitterBuffer::new(),
+            rebalancer: MloLinkRebalancer::new(),
+            qos_queue: DscpPriorityQueue::new(),
+            failover_gov: MloFailoverGovernor::new(),
+            next_tx_seq: 1,
+            total_bytes_tx: 0,
+            total_bytes_rx: 0,
+        }
+    }
+
+    /// Enqueues an outgoing packet into the DSCP priority queue and prepares MLO transmission.
+    pub fn send_game_packet(
+        &mut self,
+        dscp: u8,
+        payload_len: u16,
+        now_us: u64,
+    ) -> Option<(MloPacket, Option<MloPacket>)> {
+        let seq = self.next_tx_seq;
+        self.next_tx_seq = self.next_tx_seq.wrapping_add(1);
+
+        // Determine destination band based on link health and failover governor
+        let is_critical = dscp == DSCP_EXPEDITED_FORWARDING;
+        let target_band = if self.failover_gov.is_6ghz_failed {
+            MloBand::Band5GHz
+        } else if self.rebalancer.force_shift_to_5ghz {
+            MloBand::Band5GHz
+        } else {
+            self.aggregator.select_tx_link(is_critical).unwrap_or(MloBand::Band5GHz)
+        };
+
+        let primary_pkt = MloPacket::new(seq, now_us, target_band, dscp, payload_len);
+        if !self.qos_queue.enqueue(primary_pkt) {
+            return None;
+        }
+
+        let scheduled_pkt = self.qos_queue.dequeue_highest_priority()?;
+        self.total_bytes_tx += scheduled_pkt.payload_len as u64;
+
+        // If seamless packet duplication is active, synthesize clone on alternate band
+        let duplicate_pkt = if self.failover_gov.is_duplication_active && is_critical {
+            let alt_band = match scheduled_pkt.band {
+                MloBand::Band6GHz => MloBand::Band5GHz,
+                MloBand::Band5GHz => MloBand::Band6GHz,
+            };
+            let mut clone = scheduled_pkt;
+            clone.band = alt_band;
+            clone.is_duplicate = true;
+            self.total_bytes_tx += clone.payload_len as u64;
+            Some(clone)
+        } else {
+            None
+        };
+
+        Some((scheduled_pkt, duplicate_pkt))
+    }
+
+    /// Ingests a received packet from hardware into the sub-2ms jitter buffer.
+    pub fn receive_packet(&mut self, pkt: MloPacket, now_us: u64) -> Option<MloPacket> {
+        let transit_us = now_us.saturating_sub(pkt.timestamp_us) as u32;
+        self.rebalancer.update_transit_sample(pkt.band, transit_us);
+
+        if self.jitter_buffer.push_packet(pkt, now_us) {
+            self.total_bytes_rx += pkt.payload_len as u64;
+        }
+
+        self.jitter_buffer.pop_packet(now_us)
+    }
+}
+
+/// Verification test for fast link failover (<5ms) and seamless packet duplication.
+pub fn verify_fast_link_failover() -> bool {
+    let mut manager = HandheldWifiMloManager::new();
+    let t0 = 30_000_000u64;
+
+    // 1. Initial healthy state: critical game netcode routes to 6 GHz
+    let (tx1, dup1) = match manager.send_game_packet(DSCP_EXPEDITED_FORWARDING, 64, t0) {
+        Some(res) => res,
+        None => return false,
+    };
+    if tx1.band != MloBand::Band6GHz || dup1.is_some() {
+        return false;
+    }
+
+    // 2. Simulate rapid packet loss on 6GHz (3 consecutive unacked packets within 1.5ms = 1500us)
+    manager.failover_gov.report_ack_status(MloBand::Band6GHz, false, t0 + 500);
+    manager.failover_gov.report_ack_status(MloBand::Band6GHz, false, t0 + 1000);
+    manager.failover_gov.report_ack_status(MloBand::Band6GHz, false, t0 + 1500);
+
+    // Failover must have triggered in < 5ms (< 5000 us)
+    if !manager.failover_gov.is_6ghz_failed {
+        return false;
+    }
+    if manager.failover_gov.failover_elapsed_us >= MAX_FAILOVER_DEADLINE_US {
+        return false;
+    }
+    if !manager.failover_gov.is_duplication_active {
+        return false;
+    }
+
+    // 3. Next critical netcode packet sent during failover must immediately route to 5GHz with duplication
+    let t_fail = t0 + 2000;
+    let (tx_fail, dup_fail) = match manager.send_game_packet(DSCP_EXPEDITED_FORWARDING, 64, t_fail) {
+        Some(res) => res,
+        None => return false,
+    };
+
+    if tx_fail.band != MloBand::Band5GHz {
+        return false;
+    }
+    if dup_fail.is_none() || dup_fail.map(|p| p.band) != Some(MloBand::Band6GHz) {
+        return false;
+    }
+
+    // 4. Test recovery: ACK received on 6GHz restores primary operation
+    manager.failover_gov.report_ack_status(MloBand::Band6GHz, true, t_fail + 1000);
+    if manager.failover_gov.is_6ghz_failed || manager.failover_gov.is_duplication_active {
+        return false;
+    }
+
+    true
+}
