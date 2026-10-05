@@ -17,3 +17,6 @@ pub use vrr_pacer::*;
 pub use dock_manager::*;
 pub mod panel_overdrive;
 pub use panel_overdrive::*;
+
+pub mod dsc_vrr;
+pub use dsc_vrr::*;
