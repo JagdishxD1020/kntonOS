@@ -970,6 +970,184 @@ impl DirectStorageStreamGenerator {
     }
 }
 
+
+// ============================================================================
+// Handheld VRAM Saving Memory Governor & Unreferenced Mip Eviction
+// ============================================================================
+
+// Memory pressure tiers for handheld APU unified memory architecture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VramPressureLevel {
+    // Nominal usage (< 75% budget); streaming is unrestricted.
+    Nominal,
+    // Elevated usage (75% - 90% budget); proactive eviction of cold fine mips.
+    Elevated,
+    // Critical usage (>= 90% budget); aggressive eviction down to pinned base mips.
+    Critical,
+}
+
+// Tracks residency, memory footprint, and reference recency for a texture mip level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentMipEntry {
+    // Texture identifier.
+    pub texture_id: u32,
+    // Mip level index (0 = finest resolution).
+    pub mip_level: u8,
+    // Total resident 64KB tiles in this mip level.
+    pub resident_tile_count: u32,
+    // Total memory footprint in bytes (tiles * 65536).
+    pub size_bytes: u64,
+    // Frame timestamp when this mip level was last referenced in GPU sampler feedback.
+    pub last_referenced_frame: u64,
+    // Flag indicating whether this is a coarse base mip pinned permanently to prevent fallback pop-in.
+    pub is_pinned_base: bool,
+}
+
+impl ResidentMipEntry {
+    // Constructs a new resident mip entry.
+    pub fn new(
+        texture_id: u32,
+        mip_level: u8,
+        resident_tile_count: u32,
+        current_frame: u64,
+        is_pinned_base: bool,
+    ) -> Self {
+        let size_bytes = (resident_tile_count as u64) * 65536;
+        Self {
+            texture_id,
+            mip_level,
+            resident_tile_count,
+            size_bytes,
+            last_referenced_frame: current_frame,
+            is_pinned_base,
+        }
+    }
+}
+
+// Memory governor managing texture LOD residency and reclaiming VRAM under pressure.
+#[derive(Debug, Clone)]
+pub struct HandheldVramLodGovernor {
+    // Total VRAM budget allocated for streaming textures (in bytes).
+    pub vram_budget_bytes: u64,
+    // Current total VRAM consumed by resident streaming tiles (in bytes).
+    pub current_vram_usage_bytes: u64,
+    // Elevated pressure threshold in bytes (75% of budget).
+    pub elevated_threshold_bytes: u64,
+    // Critical pressure threshold in bytes (90% of budget).
+    pub critical_threshold_bytes: u64,
+    // Monotonic frame counter.
+    pub current_frame: u64,
+    // Active resident mip entries.
+    pub resident_mips: alloc::vec::Vec<ResidentMipEntry>,
+    // Total mips evicted lifetime.
+    pub total_mips_evicted: u64,
+    // Total VRAM reclaimed lifetime in bytes.
+    pub total_bytes_reclaimed: u64,
+}
+
+impl HandheldVramLodGovernor {
+    // Constructs a handheld VRAM LOD governor with budget-based pressure thresholds.
+    pub fn new(vram_budget_bytes: u64) -> Self {
+        let elevated_threshold_bytes = (vram_budget_bytes * 75) / 100;
+        let critical_threshold_bytes = (vram_budget_bytes * 90) / 100;
+
+        Self {
+            vram_budget_bytes,
+            current_vram_usage_bytes: 0,
+            elevated_threshold_bytes,
+            critical_threshold_bytes,
+            current_frame: 0,
+            resident_mips: alloc::vec::Vec::new(),
+            total_mips_evicted: 0,
+            total_bytes_reclaimed: 0,
+        }
+    }
+
+    // Evaluates current memory pressure tier based on resident texture memory.
+    pub fn current_pressure(&self) -> VramPressureLevel {
+        if self.current_vram_usage_bytes >= self.critical_threshold_bytes {
+            VramPressureLevel::Critical
+        } else if self.current_vram_usage_bytes >= self.elevated_threshold_bytes {
+            VramPressureLevel::Elevated
+        } else {
+            VramPressureLevel::Nominal
+        }
+    }
+
+    // Registers a resident mip level with the governor.
+    pub fn register_resident_mip(
+        &mut self,
+        texture_id: u32,
+        mip_level: u8,
+        resident_tile_count: u32,
+        is_pinned_base: bool,
+    ) {
+        let entry = ResidentMipEntry::new(
+            texture_id,
+            mip_level,
+            resident_tile_count,
+            self.current_frame,
+            is_pinned_base,
+        );
+        self.current_vram_usage_bytes = self.current_vram_usage_bytes.saturating_add(entry.size_bytes);
+        self.resident_mips.push(entry);
+    }
+
+    // Marks a resident mip level as referenced during the current frame.
+    pub fn touch_mip(&mut self, texture_id: u32, mip_level: u8) {
+        if let Some(entry) = self.resident_mips.iter_mut().find(|e| e.texture_id == texture_id && e.mip_level == mip_level) {
+            entry.last_referenced_frame = self.current_frame;
+        }
+    }
+
+    // Advances the frame counter.
+    pub fn advance_frame(&mut self) {
+        self.current_frame = self.current_frame.saturating_add(1);
+    }
+
+    // Reclaims unreferenced mips when memory pressure is Elevated or Critical.
+    pub fn reclaim_under_pressure(&mut self, virtual_maps: &mut [StreamingTextureVirtualMap]) -> u64 {
+        let target_usage = match self.current_pressure() {
+            VramPressureLevel::Nominal => return 0,
+            VramPressureLevel::Elevated => self.elevated_threshold_bytes,
+            VramPressureLevel::Critical => self.elevated_threshold_bytes.saturating_sub(self.vram_budget_bytes / 10),
+        };
+
+        let mut reclaimed_bytes: u64 = 0;
+
+        // Sort candidates: unpinned first, oldest last_referenced_frame, then finer mips (mip 0 before mip 1)
+        while self.current_vram_usage_bytes > target_usage {
+            // Find best candidate for eviction
+            let candidate_idx = self.resident_mips
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.is_pinned_base && e.resident_tile_count > 0)
+                .min_by_key(|(_, e)| (e.last_referenced_frame, e.mip_level))
+                .map(|(idx, _)| idx);
+
+            match candidate_idx {
+                Some(idx) => {
+                    let entry = self.resident_mips.remove(idx);
+                    reclaimed_bytes = reclaimed_bytes.saturating_add(entry.size_bytes);
+                    self.current_vram_usage_bytes = self.current_vram_usage_bytes.saturating_sub(entry.size_bytes);
+                    self.total_mips_evicted = self.total_mips_evicted.saturating_add(1);
+                    self.total_bytes_reclaimed = self.total_bytes_reclaimed.saturating_add(entry.size_bytes);
+
+                    // Unmap tiles from virtual texture map
+                    if let Some(vmap) = virtual_maps.iter_mut().find(|v| v.texture_id == entry.texture_id) {
+                        if let Some(mask) = vmap.mip_residency.get_mut(entry.mip_level as usize) {
+                            mask.mark_all(false);
+                        }
+                    }
+                }
+                None => break, // No more unpinned mips eligible for eviction
+            }
+        }
+
+        reclaimed_bytes
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Sampler Feedback & Texture Streaming
 pub fn test_sampler_feedback_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-FEEDBACK] Initializing Direct3D 12 Sampler Feedback self-test...\r\n");
