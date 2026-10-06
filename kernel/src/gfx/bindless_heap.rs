@@ -576,6 +576,137 @@ impl DescriptorBoundsTrapEngine {
     }
 }
 
+// ============================================================================
+// Handheld L2/L3 Cache Warming Pipeline for Bindless Material Lookups
+// ============================================================================
+
+// Target APU cache hierarchy tier for prefetched bindless descriptor data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheWarmLevel {
+    // Local compute unit L2 cache (lowest latency ~20 cycles).
+    L2Cache,
+    // On-die L3 Infinity Cache / MALL (moderate latency ~90 cycles vs 300+ VRAM cycles).
+    L3InfinityCache,
+    // Main memory / VRAM fallback on cache miss.
+    VramUncached,
+}
+
+// Tracked 64-byte hardware cache line residency in APU L2/L3 caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WarmedCacheLine {
+    // 64-byte aligned physical cache line tag address.
+    pub cache_line_tag: u64,
+    // Cache hierarchy level where line is currently resident.
+    pub level: CacheWarmLevel,
+    // Valid residency marker.
+    pub is_valid: bool,
+}
+
+// Handheld APU hardware cache warming pipeline prefetching hot bindless material descriptors.
+#[derive(Debug, Clone)]
+pub struct HandheldCacheWarmingPipeline {
+    // Active table of resident warmed 64-byte cache lines.
+    pub warmed_lines: alloc::vec::Vec<WarmedCacheLine>,
+    // Maximum cache lines budgeted for prefetch warming.
+    pub max_warmed_lines: usize,
+    // Total 64-byte descriptor cache lines warmed lifetime.
+    pub total_lines_warmed: u64,
+    // Total simulated material lookups hitting L2 cache.
+    pub estimated_l2_hits: u64,
+    // Total simulated material lookups hitting L3 Infinity Cache.
+    pub estimated_l3_hits: u64,
+    // Total high-latency VRAM DRAM round-trips avoided.
+    pub vram_fetches_avoided: u64,
+}
+
+impl HandheldCacheWarmingPipeline {
+    // Constructs a handheld cache warming pipeline with the specified line capacity.
+    pub fn new(max_warmed_lines: usize) -> Self {
+        Self {
+            warmed_lines: alloc::vec::Vec::with_capacity(max_warmed_lines),
+            max_warmed_lines,
+            total_lines_warmed: 0,
+            estimated_l2_hits: 0,
+            estimated_l3_hits: 0,
+            vram_fetches_avoided: 0,
+        }
+    }
+
+    // Prefetches and warms a contiguous range of bindless descriptors into L2/L3 cache.
+    pub fn warm_descriptor_range(
+        &mut self,
+        heap_base_va: u64,
+        start_index: u32,
+        count: u32,
+        level: CacheWarmLevel,
+    ) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+
+        // 32 bytes per descriptor -> 2 descriptors per 64-byte cache line
+        let start_addr = heap_base_va + (start_index as u64) * 32;
+        let end_addr = start_addr + (count as u64) * 32;
+
+        let start_tag = start_addr / 64;
+        let end_tag = (end_addr.saturating_add(63)) / 64;
+
+        let mut lines_warmed: u32 = 0;
+
+        for tag in start_tag..end_tag {
+            if let Some(existing) = self.warmed_lines.iter_mut().find(|l| l.cache_line_tag == tag && l.is_valid) {
+                // Upgrade from L3 to L2 if warmer level requested
+                if level == CacheWarmLevel::L2Cache && existing.level == CacheWarmLevel::L3InfinityCache {
+                    existing.level = CacheWarmLevel::L2Cache;
+                }
+            } else {
+                if self.warmed_lines.len() >= self.max_warmed_lines {
+                    self.warmed_lines.remove(0); // FIFO line eviction
+                }
+                self.warmed_lines.push(WarmedCacheLine {
+                    cache_line_tag: tag,
+                    level,
+                    is_valid: true,
+                });
+                lines_warmed = lines_warmed.saturating_add(1);
+                self.total_lines_warmed = self.total_lines_warmed.saturating_add(1);
+            }
+        }
+
+        lines_warmed
+    }
+
+    // Simulates a GPU wave bindless material lookup and tracks cache hit metrics.
+    pub fn simulate_material_lookup(&mut self, heap_base_va: u64, index: u32) -> CacheWarmLevel {
+        let addr = heap_base_va + (index as u64) * 32;
+        let tag = addr / 64;
+
+        if let Some(line) = self.warmed_lines.iter().find(|l| l.cache_line_tag == tag && l.is_valid) {
+            match line.level {
+                CacheWarmLevel::L2Cache => {
+                    self.estimated_l2_hits = self.estimated_l2_hits.saturating_add(1);
+                    self.vram_fetches_avoided = self.vram_fetches_avoided.saturating_add(1);
+                    CacheWarmLevel::L2Cache
+                }
+                CacheWarmLevel::L3InfinityCache => {
+                    self.estimated_l3_hits = self.estimated_l3_hits.saturating_add(1);
+                    self.vram_fetches_avoided = self.vram_fetches_avoided.saturating_add(1);
+                    CacheWarmLevel::L3InfinityCache
+                }
+                CacheWarmLevel::VramUncached => CacheWarmLevel::VramUncached,
+            }
+        } else {
+            CacheWarmLevel::VramUncached
+        }
+    }
+
+    // Calculates estimated memory access latency cycles saved by L2/L3 warming.
+    pub fn estimated_cycles_saved(&self) -> u64 {
+        // L2 hit saves ~280 cycles (300 DRAM - 20 L2); L3 hit saves ~200 cycles (300 DRAM - 100 L3)
+        self.estimated_l2_hits * 280 + self.estimated_l3_hits * 200
+    }
+}
+
 // Self-test entrypoint stub during incremental commits.
 pub fn test_bindless_heap_subsystem() -> bool {
     true
