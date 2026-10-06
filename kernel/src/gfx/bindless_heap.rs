@@ -707,7 +707,191 @@ impl HandheldCacheWarmingPipeline {
     }
 }
 
-// Self-test entrypoint stub during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 SM 6.8 Bindless Heap & Extended Descriptors.
 pub fn test_bindless_heap_subsystem() -> bool {
+    // 1. Verify SM 6.8 ResourceDescriptorHeap & SamplerDescriptorHeap
+    let mut res_heap = ResourceDescriptorHeap::new(512);
+    let mut smp_heap = SamplerDescriptorHeap::new(64);
+
+    let tex_desc = ExtendedResourceDescriptor::new_typed_texture(0x1000_0000, 1024 * 1024, 0x3231564E, 10);
+    let buf_desc = ExtendedResourceDescriptor::new_raw_buffer(0x2000_0000, 65536, false);
+    let uav_desc = ExtendedResourceDescriptor::new_raw_buffer(0x3000_0000, 65536, true);
+    let sampler_desc = ExtendedSamplerDescriptor::new_anisotropic(16);
+
+    if res_heap.set_descriptor(10, tex_desc).is_err()
+        || res_heap.set_descriptor(11, buf_desc).is_err()
+        || res_heap.set_descriptor(12, uav_desc).is_err()
+    {
+        return false;
+    }
+    if smp_heap.set_sampler(3, sampler_desc).is_err() {
+        return false;
+    }
+    if res_heap.active_count != 3 || smp_heap.active_count != 1 {
+        return false;
+    }
+
+    let q_tex = match res_heap.get_descriptor(10) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if q_tex.gpu_virtual_address != 0x1000_0000 || q_tex.mip_levels != 10 {
+        return false;
+    }
+
+    let q_smp = match smp_heap.get_sampler(3) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if q_smp.max_anisotropy != 16 {
+        return false;
+    }
+
+    // Unallocated slot query returns SlotNotAllocated
+    if res_heap.get_descriptor(50) != Err(BindlessHeapError::SlotNotAllocated) {
+        return false;
+    }
+
+    // 2. Verify Generational Descriptor Recycling Pool & ABA Hazard Prevention
+    let mut pool = GenerationalDescriptorPool::new(128);
+    let h1 = match pool.allocate(ExtendedDescriptorType::ShaderResourceTypedTexture) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if h1.index() != 0 || h1.generation() != 1 {
+        return false;
+    }
+
+    // Valid handle resolves successfully
+    if pool.validate_handle(h1) != Ok(0) {
+        return false;
+    }
+
+    // Free handle h1 -> slot 0 generation increments from 1 to 2
+    if pool.free(h1).is_err() {
+        return false;
+    }
+    if pool.allocated_count != 0 {
+        return false;
+    }
+
+    // Stale handle h1 access must fail with SlotNotAllocated
+    if pool.validate_handle(h1) != Err(BindlessHeapError::SlotNotAllocated) {
+        return false;
+    }
+
+    // Re-allocate slot 0 -> returns h2 with generation 2
+    let h2 = match pool.allocate(ExtendedDescriptorType::UnorderedAccessView) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if h2.index() != 0 || h2.generation() != 2 {
+        return false;
+    }
+
+    // Stale handle h1 (generation 1) on active slot 0 with generation 2 -> ABA prevented!
+    if pool.validate_handle(h1) != Err(BindlessHeapError::GenerationalMismatch) {
+        return false;
+    }
+    if pool.aba_mismatches_prevented != 1 {
+        return false;
+    }
+
+    // Double-free with stale handle h1 must fail with GenerationalMismatch
+    if pool.free(h1) != Err(BindlessHeapError::GenerationalMismatch) {
+        return false;
+    }
+    if pool.aba_mismatches_prevented != 2 {
+        return false;
+    }
+
+    // Free with correct handle h2 succeeds
+    if pool.free(h2).is_err() {
+        return false;
+    }
+
+    // 3. Verify GPU Descriptor Bounds Checking & Safety Trap Engine
+    let mut trap_engine = DescriptorBoundsTrapEngine::new(
+        100, // resource heap upper bound
+        16,  // sampler heap upper bound
+        DescriptorTrapPolicy::ReturnNullDescriptor,
+    );
+
+    // In-bounds allocated access
+    let checked_res = match trap_engine.check_resource_access(&res_heap, 10, 0x400010, 1, 100) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if checked_res.gpu_virtual_address != 0x1000_0000 {
+        return false;
+    }
+
+    // Out-of-bounds access (index 150 >= bound 100) -> returns null descriptor safely
+    let oob_res = match trap_engine.check_resource_access(&res_heap, 150, 0x400020, 2, 101) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if oob_res.is_valid || oob_res.gpu_virtual_address != 0 {
+        return false;
+    }
+    if trap_engine.total_bounds_traps_triggered != 1 {
+        return false;
+    }
+    let fault = match trap_engine.last_fault {
+        Some(f) => f,
+        None => return false,
+    };
+    if fault.fault_index != 150 || fault.heap_bound != 100 || fault.shader_pc != 0x400020 {
+        return false;
+    }
+
+    // TrapAndHalt policy
+    trap_engine.trap_policy = DescriptorTrapPolicy::TrapAndHalt;
+    if trap_engine.check_resource_access(&res_heap, 200, 0x400030, 3, 102)
+        != Err(BindlessHeapError::IndexOutOfBounds)
+    {
+        return false;
+    }
+
+    // 4. Verify Handheld L2/L3 Cache Warming Pipeline
+    let mut cache_pipeline = HandheldCacheWarmingPipeline::new(128);
+    let heap_base = 0x0000_7FFF_E000_0000;
+
+    // Warm descriptors 0..16 into L2 cache (8 cache lines = 512 bytes)
+    let warmed_count = cache_pipeline.warm_descriptor_range(heap_base, 0, 16, CacheWarmLevel::L2Cache);
+    if warmed_count != 8 || cache_pipeline.total_lines_warmed != 8 {
+        return false;
+    }
+
+    // Warm descriptors 16..32 into L3 Infinity Cache
+    let l3_warmed = cache_pipeline.warm_descriptor_range(heap_base, 16, 16, CacheWarmLevel::L3InfinityCache);
+    if l3_warmed != 8 || cache_pipeline.total_lines_warmed != 16 {
+        return false;
+    }
+
+    // Simulate lookups
+    if cache_pipeline.simulate_material_lookup(heap_base, 5) != CacheWarmLevel::L2Cache {
+        return false;
+    }
+    if cache_pipeline.simulate_material_lookup(heap_base, 20) != CacheWarmLevel::L3InfinityCache {
+        return false;
+    }
+    // Lookup unwarmed descriptor (index 80) -> VramUncached
+    if cache_pipeline.simulate_material_lookup(heap_base, 80) != CacheWarmLevel::VramUncached {
+        return false;
+    }
+
+    if cache_pipeline.estimated_l2_hits != 1
+        || cache_pipeline.estimated_l3_hits != 1
+        || cache_pipeline.vram_fetches_avoided != 2
+    {
+        return false;
+    }
+    if cache_pipeline.estimated_cycles_saved() != 480 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-D3D12-BINDLESS-HEAP-PASS] Direct3D 12 SM 6.8 bindless heap & descriptor safety verified\r\n");
     true
 }
