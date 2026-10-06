@@ -423,6 +423,159 @@ impl GenerationalDescriptorPool {
     }
 }
 
+// ============================================================================
+// GPU Descriptor Table Bounds Checking & Safety Trap Engine
+// ============================================================================
+
+// Policy enacted when a shader wave executes an out-of-bounds descriptor access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorTrapPolicy {
+    // Returns a safe zero-filled null descriptor, dropping writes and reading zeros.
+    ReturnNullDescriptor,
+    // Emits a hardware trap interrupt and halts the offending wave.
+    TrapAndHalt,
+}
+
+// Diagnostic telemetry recorded during a descriptor table bounds violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorFaultDiagnostic {
+    // Attempted descriptor heap index that triggered the fault.
+    pub fault_index: u32,
+    // Active upper bound of the descriptor table at the time of access.
+    pub heap_bound: u32,
+    // Virtual program counter (PC) of the offending shader instruction.
+    pub shader_pc: u64,
+    // Hardware execution wave / SIMD lane cluster identifier.
+    pub wave_id: u32,
+    // Whether the fault occurred in SamplerDescriptorHeap[] (true) or ResourceDescriptorHeap[] (false).
+    pub is_sampler_heap: bool,
+    // Monotonic hardware cycle or event timestamp.
+    pub timestamp: u64,
+}
+
+// GPU-side descriptor table bounds checker and safety trap dispatcher.
+#[derive(Debug, Clone)]
+pub struct DescriptorBoundsTrapEngine {
+    // Dynamic upper bound for ResourceDescriptorHeap[].
+    pub resource_heap_bound: u32,
+    // Dynamic upper bound for SamplerDescriptorHeap[].
+    pub sampler_heap_bound: u32,
+    // Active safety policy for out-of-bounds containment.
+    pub trap_policy: DescriptorTrapPolicy,
+    // Total descriptor lookups validated.
+    pub total_accesses_checked: u64,
+    // Total out-of-bounds or invalid descriptor accesses trapped.
+    pub total_bounds_traps_triggered: u64,
+    // Diagnostic details of the most recent trapped access fault.
+    pub last_fault: Option<DescriptorFaultDiagnostic>,
+    // Fallback static null resource descriptor.
+    pub null_resource_descriptor: ExtendedResourceDescriptor,
+    // Fallback static null sampler descriptor.
+    pub null_sampler_descriptor: ExtendedSamplerDescriptor,
+}
+
+impl DescriptorBoundsTrapEngine {
+    // Constructs a descriptor bounds checking and safety trap engine.
+    pub fn new(
+        resource_heap_bound: u32,
+        sampler_heap_bound: u32,
+        trap_policy: DescriptorTrapPolicy,
+    ) -> Self {
+        Self {
+            resource_heap_bound,
+            sampler_heap_bound,
+            trap_policy,
+            total_accesses_checked: 0,
+            total_bounds_traps_triggered: 0,
+            last_fault: None,
+            null_resource_descriptor: ExtendedResourceDescriptor::null(),
+            null_sampler_descriptor: ExtendedSamplerDescriptor::null(),
+        }
+    }
+
+    // Validates a shader dynamic indexing lookup into ResourceDescriptorHeap[].
+    pub fn check_resource_access<'a>(
+        &'a mut self,
+        heap: &'a ResourceDescriptorHeap,
+        index: u32,
+        shader_pc: u64,
+        wave_id: u32,
+        timestamp: u64,
+    ) -> Result<&'a ExtendedResourceDescriptor, BindlessHeapError> {
+        self.total_accesses_checked = self.total_accesses_checked.saturating_add(1);
+
+        if index >= self.resource_heap_bound || index >= heap.capacity {
+            self.total_bounds_traps_triggered = self.total_bounds_traps_triggered.saturating_add(1);
+            self.last_fault = Some(DescriptorFaultDiagnostic {
+                fault_index: index,
+                heap_bound: self.resource_heap_bound,
+                shader_pc,
+                wave_id,
+                is_sampler_heap: false,
+                timestamp,
+            });
+
+            return match self.trap_policy {
+                DescriptorTrapPolicy::ReturnNullDescriptor => Ok(&self.null_resource_descriptor),
+                DescriptorTrapPolicy::TrapAndHalt => Err(BindlessHeapError::IndexOutOfBounds),
+            };
+        }
+
+        match heap.get_descriptor(index) {
+            Ok(desc) => Ok(desc),
+            Err(BindlessHeapError::SlotNotAllocated) => {
+                self.total_bounds_traps_triggered = self.total_bounds_traps_triggered.saturating_add(1);
+                match self.trap_policy {
+                    DescriptorTrapPolicy::ReturnNullDescriptor => Ok(&self.null_resource_descriptor),
+                    DescriptorTrapPolicy::TrapAndHalt => Err(BindlessHeapError::SlotNotAllocated),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // Validates a shader dynamic indexing lookup into SamplerDescriptorHeap[].
+    pub fn check_sampler_access<'a>(
+        &'a mut self,
+        heap: &'a SamplerDescriptorHeap,
+        index: u32,
+        shader_pc: u64,
+        wave_id: u32,
+        timestamp: u64,
+    ) -> Result<&'a ExtendedSamplerDescriptor, BindlessHeapError> {
+        self.total_accesses_checked = self.total_accesses_checked.saturating_add(1);
+
+        if index >= self.sampler_heap_bound || index >= heap.capacity {
+            self.total_bounds_traps_triggered = self.total_bounds_traps_triggered.saturating_add(1);
+            self.last_fault = Some(DescriptorFaultDiagnostic {
+                fault_index: index,
+                heap_bound: self.sampler_heap_bound,
+                shader_pc,
+                wave_id,
+                is_sampler_heap: true,
+                timestamp,
+            });
+
+            return match self.trap_policy {
+                DescriptorTrapPolicy::ReturnNullDescriptor => Ok(&self.null_sampler_descriptor),
+                DescriptorTrapPolicy::TrapAndHalt => Err(BindlessHeapError::IndexOutOfBounds),
+            };
+        }
+
+        match heap.get_sampler(index) {
+            Ok(sampler) => Ok(sampler),
+            Err(BindlessHeapError::SlotNotAllocated) => {
+                self.total_bounds_traps_triggered = self.total_bounds_traps_triggered.saturating_add(1);
+                match self.trap_policy {
+                    DescriptorTrapPolicy::ReturnNullDescriptor => Ok(&self.null_sampler_descriptor),
+                    DescriptorTrapPolicy::TrapAndHalt => Err(BindlessHeapError::SlotNotAllocated),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 // Self-test entrypoint stub during incremental commits.
 pub fn test_bindless_heap_subsystem() -> bool {
     true
