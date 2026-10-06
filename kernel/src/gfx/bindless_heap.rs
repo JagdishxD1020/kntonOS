@@ -250,6 +250,179 @@ impl SamplerDescriptorHeap {
     }
 }
 
+// ============================================================================
+// Generational Descriptor Handle Recycling Pool with ABA Prevention
+// ============================================================================
+
+// 64-bit generational descriptor handle pairing a slot index with an ABA guard generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BindlessDescriptorHandle {
+    // Packed handle bits: high 32 bits = generation, low 32 bits = slot index.
+    pub raw_handle: u64,
+}
+
+impl BindlessDescriptorHandle {
+    // Constructs a new generational descriptor handle.
+    pub const fn new(index: u32, generation: u32) -> Self {
+        let raw = ((generation as u64) << 32) | (index as u64);
+        Self { raw_handle: raw }
+    }
+
+    // Returns a null/invalid handle representation.
+    pub const fn null() -> Self {
+        Self { raw_handle: 0 }
+    }
+
+    // Extracts the 32-bit slot index from this handle.
+    #[inline]
+    pub const fn index(&self) -> u32 {
+        self.raw_handle as u32
+    }
+
+    // Extracts the 32-bit ABA guard generation from this handle.
+    #[inline]
+    pub const fn generation(&self) -> u32 {
+        (self.raw_handle >> 32) as u32
+    }
+
+    // Returns whether this handle is non-null and possesses a valid generation (> 0).
+    #[inline]
+    pub const fn is_valid(&self) -> bool {
+        self.generation() > 0
+    }
+}
+
+// Internal slot metadata tracking allocation status and generational increment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorSlotMeta {
+    // Current generational tag incremented on each recycle to prevent ABA hazards.
+    pub generation: u32,
+    // Allocation state flag.
+    pub is_allocated: bool,
+    // Descriptor category currently occupying this slot.
+    pub desc_type: ExtendedDescriptorType,
+}
+
+impl DescriptorSlotMeta {
+    // Creates a new unallocated descriptor slot metadata entry with initial generation 1.
+    pub const fn new() -> Self {
+        Self {
+            generation: 1,
+            is_allocated: false,
+            desc_type: ExtendedDescriptorType::ConstantBufferView,
+        }
+    }
+}
+
+// Generational recycling pool for dynamic descriptor handles preventing stale wave access.
+#[derive(Debug, Clone)]
+pub struct GenerationalDescriptorPool {
+    // Per-slot metadata containing active generations.
+    pub slots: alloc::vec::Vec<DescriptorSlotMeta>,
+    // LIFO freelist storing available slot indices for O(1) recycling.
+    pub freelist: alloc::vec::Vec<u32>,
+    // Total capacity of this descriptor pool.
+    pub capacity: u32,
+    // Current number of actively allocated descriptor slots.
+    pub allocated_count: u32,
+    // Total lifetime allocations fulfilled.
+    pub total_allocations: u64,
+    // Total lifetime descriptor releases.
+    pub total_frees: u64,
+    // Total stale/stray descriptor accesses blocked due to generation mismatch.
+    pub aba_mismatches_prevented: u64,
+}
+
+impl GenerationalDescriptorPool {
+    // Constructs a new generational descriptor pool with the specified capacity.
+    pub fn new(capacity: u32) -> Self {
+        let cap = core::cmp::min(capacity as usize, SM68_MAX_RESOURCE_DESCRIPTORS);
+        let mut freelist = alloc::vec::Vec::with_capacity(cap);
+        for i in (0..cap).rev() {
+            freelist.push(i as u32);
+        }
+        Self {
+            slots: alloc::vec![DescriptorSlotMeta::new(); cap],
+            freelist,
+            capacity: cap as u32,
+            allocated_count: 0,
+            total_allocations: 0,
+            total_frees: 0,
+            aba_mismatches_prevented: 0,
+        }
+    }
+
+    // Allocates a descriptor slot and returns a generational handle.
+    pub fn allocate(
+        &mut self,
+        desc_type: ExtendedDescriptorType,
+    ) -> Result<BindlessDescriptorHandle, BindlessHeapError> {
+        let index = match self.freelist.pop() {
+            Some(idx) => idx,
+            None => return Err(BindlessHeapError::HeapFull),
+        };
+
+        let slot = &mut self.slots[index as usize];
+        slot.is_allocated = true;
+        slot.desc_type = desc_type;
+
+        self.allocated_count = self.allocated_count.saturating_add(1);
+        self.total_allocations = self.total_allocations.saturating_add(1);
+
+        Ok(BindlessDescriptorHandle::new(index, slot.generation))
+    }
+
+    // Releases an allocated descriptor slot, advancing its generation to invalidate outstanding handles.
+    pub fn free(&mut self, handle: BindlessDescriptorHandle) -> Result<(), BindlessHeapError> {
+        let index = handle.index();
+        if index >= self.capacity {
+            return Err(BindlessHeapError::IndexOutOfBounds);
+        }
+
+        let slot = &mut self.slots[index as usize];
+        if !slot.is_allocated {
+            return Err(BindlessHeapError::SlotNotAllocated);
+        }
+
+        if slot.generation != handle.generation() {
+            self.aba_mismatches_prevented = self.aba_mismatches_prevented.saturating_add(1);
+            return Err(BindlessHeapError::GenerationalMismatch);
+        }
+
+        slot.is_allocated = false;
+        // Increment generation and ensure it wraps around cleanly without reaching 0
+        slot.generation = slot.generation.wrapping_add(1);
+        if slot.generation == 0 {
+            slot.generation = 1;
+        }
+
+        self.freelist.push(index);
+        self.allocated_count = self.allocated_count.saturating_sub(1);
+        self.total_frees = self.total_frees.saturating_add(1);
+        Ok(())
+    }
+
+    // Validates that an incoming handle matches the active slot and current generation.
+    pub fn validate_handle(&mut self, handle: BindlessDescriptorHandle) -> Result<u32, BindlessHeapError> {
+        let index = handle.index();
+        if index >= self.capacity {
+            return Err(BindlessHeapError::IndexOutOfBounds);
+        }
+
+        let slot = &self.slots[index as usize];
+        if !slot.is_allocated {
+            return Err(BindlessHeapError::SlotNotAllocated);
+        }
+
+        if slot.generation != handle.generation() {
+            self.aba_mismatches_prevented = self.aba_mismatches_prevented.saturating_add(1);
+            return Err(BindlessHeapError::GenerationalMismatch);
+        }
+
+        Ok(index)
+    }
+}
+
 // Self-test entrypoint stub during incremental commits.
 pub fn test_bindless_heap_subsystem() -> bool {
     true
