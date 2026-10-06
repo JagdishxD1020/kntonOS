@@ -449,3 +449,15 @@ impl PriorityInheritingWaiterQueue {
         self.owner_boosted_priority
     }
 }
+
+/// Retrieves contention telemetry profiling statistics for a critical section or lock address.
+pub fn win32_get_lock_contention_stats(lock_addr: usize) -> Option<LockContentionStats> {
+    let profiler = CONTENTION_PROFILER.lock();
+    profiler.get(&lock_addr).cloned()
+}
+
+/// Resets contention telemetry metrics for a lock address.
+pub fn win32_reset_lock_contention_stats(lock_addr: usize) {
+    let mut profiler = CONTENTION_PROFILER.lock();
+    profiler.remove(&lock_addr);
+}
