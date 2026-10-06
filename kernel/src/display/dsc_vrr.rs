@@ -503,3 +503,201 @@ pub fn verify_oled_flicker_compensation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Handheld Static Image Idle Step-Down (to 10Hz) & Display Governor
+// ============================================================================
+
+/// Deep idle power-saving refresh rate in Hz for static screen content.
+pub const DISPLAY_IDLE_MIN_REFRESH_HZ: u32 = 10;
+/// Deep idle frame interval in microseconds (10 Hz = 100,000 us).
+pub const DISPLAY_IDLE_MIN_INTERVAL_US: u32 = 100_000;
+/// Inactivity threshold in microseconds before stepping down to 30 Hz (500 ms).
+pub const INACTIVITY_STAGE1_THRESHOLD_US: u64 = 500_000;
+/// Inactivity threshold in microseconds before stepping down to deep 10 Hz (2000 ms).
+pub const INACTIVITY_STAGE2_THRESHOLD_US: u64 = 2_000_000;
+
+/// Static image inactivity detector and power-saving refresh rate step-down controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayIdleStepDown {
+    /// Accumulated duration of static screen content in microseconds.
+    pub static_inactivity_duration_us: u64,
+    /// Active target refresh rate in Hz (10 .. 165 Hz).
+    pub current_target_hz: u32,
+    /// Whether deep 10Hz idle mode is engaged.
+    pub is_deep_idle_active: bool,
+    /// Total transitions into 10Hz deep idle.
+    pub total_idle_entries: u32,
+}
+
+impl DisplayIdleStepDown {
+    /// Constructs a static image step-down controller in active 60Hz mode.
+    pub const fn new() -> Self {
+        Self {
+            static_inactivity_duration_us: 0,
+            current_target_hz: 60,
+            is_deep_idle_active: false,
+            total_idle_entries: 0,
+        }
+    }
+
+    /// Resets inactivity on new frame damage or user input event.
+    pub fn report_active_content(&mut self, active_gaming_hz: u32) {
+        self.static_inactivity_duration_us = 0;
+        self.current_target_hz = active_gaming_hz.clamp(VRR_MIN_FREQ_HZ, VRR_MAX_FREQ_HZ);
+        self.is_deep_idle_active = false;
+    }
+
+    /// Steps forward elapsed time and applies progressive refresh rate reduction for static images.
+    pub fn update_inactivity(&mut self, elapsed_us: u32, max_gaming_hz: u32) -> u32 {
+        self.static_inactivity_duration_us += elapsed_us as u64;
+
+        if self.static_inactivity_duration_us >= INACTIVITY_STAGE2_THRESHOLD_US {
+            // Stage 2: Deep 10Hz static image idle (Panel Self Refresh state)
+            if !self.is_deep_idle_active {
+                self.is_deep_idle_active = true;
+                self.total_idle_entries += 1;
+            }
+            self.current_target_hz = DISPLAY_IDLE_MIN_REFRESH_HZ;
+        } else if self.static_inactivity_duration_us >= INACTIVITY_STAGE1_THRESHOLD_US {
+            // Stage 1: Minor idle step-down to 30Hz
+            self.current_target_hz = 30;
+            self.is_deep_idle_active = false;
+        } else {
+            // Active gaming rate
+            self.current_target_hz = max_gaming_hz.clamp(VRR_MIN_FREQ_HZ, VRR_MAX_FREQ_HZ);
+            self.is_deep_idle_active = false;
+        }
+
+        self.current_target_hz
+    }
+}
+
+/// Composite output structure containing all timing and physical scanout parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldDisplayOutput {
+    /// Active frame presentation interval in microseconds.
+    pub presentation_interval_us: u32,
+    /// Target scanout refresh frequency in Hz (10 .. 165 Hz).
+    pub refresh_hz: u32,
+    /// LFC repetition multiplier.
+    pub lfc_multiplier: u8,
+    /// Compensated OLED panel brightness [0.0 .. 1.0].
+    pub compensated_brightness: f32,
+    /// Effective VESA DSC 1.2a compression ratio achieved.
+    pub dsc_compression_ratio: f32,
+    /// Whether display is operating in 10Hz power-saving deep idle.
+    pub is_deep_idle: bool,
+}
+
+/// Integrated Handheld Display DSC & Adaptive VRR Fast-Sync Engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldDisplayGovernor {
+    /// VESA DSC 1.2a slice multiplexer.
+    pub dsc_mux: DscSliceMultiplexer,
+    /// VRR fast-sync pacer with LFC.
+    pub vrr_pacer: VrrFastSyncPacer,
+    /// OLED luminance flicker compensator.
+    pub flicker_comp: OledVrrFlickerCompensator,
+    /// Static image 10Hz idle step-down controller.
+    pub idle_controller: DisplayIdleStepDown,
+}
+
+impl HandheldDisplayGovernor {
+    /// Constructs an integrated display governor for a 2560x1600 165Hz handheld display.
+    pub const fn new() -> Self {
+        Self {
+            dsc_mux: DscSliceMultiplexer::new(2560, 1600, 2),
+            vrr_pacer: VrrFastSyncPacer::new(),
+            flicker_comp: OledVrrFlickerCompensator::new(),
+            idle_controller: DisplayIdleStepDown::new(),
+        }
+    }
+
+    /// Primary display frame execution method.
+    pub fn process_frame(
+        &mut self,
+        is_static_content: bool,
+        render_interval_us: u32,
+        apl_pct: f32,
+        base_brightness: f32,
+        elapsed_us: u32,
+    ) -> HandheldDisplayOutput {
+        // 1. Inactivity & Static Image Idle Step-Down
+        let _target_hz = if is_static_content {
+            self.idle_controller.update_inactivity(elapsed_us, 120)
+        } else {
+            self.idle_controller.report_active_content(120);
+            120
+        };
+
+        // 2. VRR Pacing & LFC Calculation
+        let presentation = if self.idle_controller.is_deep_idle_active {
+            VrrFramePresentation {
+                presentation_interval_us: DISPLAY_IDLE_MIN_INTERVAL_US,
+                effective_refresh_hz: DISPLAY_IDLE_MIN_REFRESH_HZ,
+                lfc_multiplier: 1,
+                is_lfc_active: false,
+            }
+        } else {
+            self.vrr_pacer.pace_frame(render_interval_us)
+        };
+
+        // 3. OLED Luminance Flicker Compensation
+        let comp_brightness = self.flicker_comp.compute_compensated_luminance(
+            presentation.presentation_interval_us,
+            apl_pct,
+            base_brightness,
+        );
+
+        // 4. DSC 1.2a Slice Multiplexing
+        self.dsc_mux.process_scanline_chunks(64, 128);
+
+        HandheldDisplayOutput {
+            presentation_interval_us: presentation.presentation_interval_us,
+            refresh_hz: presentation.effective_refresh_hz,
+            lfc_multiplier: presentation.lfc_multiplier,
+            compensated_brightness: comp_brightness,
+            dsc_compression_ratio: self.dsc_mux.effective_compression_ratio(),
+            is_deep_idle: self.idle_controller.is_deep_idle_active,
+        }
+    }
+}
+
+/// Verification test for static image idle step-down and integrated display governor.
+pub fn verify_static_image_idle_stepdown_and_governor() -> bool {
+    let mut gov = HandheldDisplayGovernor::new();
+
+    // 1. Active gameplay at 120Hz: verify non-idle active state
+    let out_active = gov.process_frame(false, 8_333, 50.0, 0.70, 8_333);
+    if out_active.is_deep_idle || out_active.refresh_hz != 120 {
+        return false;
+    }
+    if out_active.dsc_compression_ratio < 2.50 {
+        return false;
+    }
+
+    // 2. Static image inactivity for 600ms -> should step down to Stage 1 (30Hz)
+    let out_stage1 = gov.process_frame(true, 16_666, 50.0, 0.70, 600_000);
+    if out_stage1.is_deep_idle || gov.idle_controller.current_target_hz != 30 {
+        return false;
+    }
+
+    // 3. Static image inactivity past 2000ms -> should step down to Stage 2 Deep Idle (10Hz)
+    let out_deep = gov.process_frame(true, 33_333, 50.0, 0.70, 1_600_000);
+    if !out_deep.is_deep_idle || out_deep.refresh_hz != DISPLAY_IDLE_MIN_REFRESH_HZ {
+        return false;
+    }
+    if out_deep.presentation_interval_us != DISPLAY_IDLE_MIN_INTERVAL_US {
+        return false;
+    }
+
+    // 4. Instantaneous Wake-up: New user touch / input event arrives -> immediately restores active 120Hz
+    let out_wakeup = gov.process_frame(false, 8_333, 50.0, 0.70, 8_333);
+    if out_wakeup.is_deep_idle || out_wakeup.refresh_hz != 120 {
+        return false;
+    }
+
+    true
+}
