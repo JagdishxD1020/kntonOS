@@ -33,6 +33,7 @@ pub mod dns_client;
 pub mod sxs_manifest;
 pub mod txf_filter;
 pub mod keyed_event;
+pub mod shared_section;
 
 pub use header::*;
 pub use ntdll::*;
@@ -65,6 +66,7 @@ pub use dns_client::*;
 pub use sxs_manifest::*;
 pub use txf_filter::*;
 pub use keyed_event::*;
+pub use shared_section::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
