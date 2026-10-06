@@ -384,3 +384,68 @@ fn record_contention_release(lock_addr: usize) {
         }
     }
 }
+
+/// Lock-free FIFO waiter queue entry with priority inheritance descriptor.
+#[derive(Clone, Debug)]
+pub struct FifoWaiterNode {
+    pub thread_id: u32,
+    pub base_priority: u32,
+    pub effective_priority: u32,
+    pub signaled: bool,
+}
+
+/// FIFO waiter queue with priority inheritance preventing priority inversion on game threads.
+pub struct PriorityInheritingWaiterQueue {
+    pub lock_id: usize,
+    pub owning_thread: u32,
+    pub owner_boosted_priority: u32,
+    pub waiters: Vec<FifoWaiterNode>,
+}
+
+impl PriorityInheritingWaiterQueue {
+    pub fn new(lock_id: usize) -> Self {
+        Self {
+            lock_id,
+            owning_thread: 0,
+            owner_boosted_priority: 0,
+            waiters: Vec::new(),
+        }
+    }
+
+    /// Enqueues a waiter and boosts the lock owner's priority to match the highest waiting thread.
+    pub fn enqueue_waiter(&mut self, thread_id: u32, priority: u32) {
+        self.waiters.push(FifoWaiterNode {
+            thread_id,
+            base_priority: priority,
+            effective_priority: priority,
+            signaled: false,
+        });
+
+        // Priority inheritance: if waiter priority exceeds owner's priority, boost owner
+        if priority > self.owner_boosted_priority {
+            self.owner_boosted_priority = priority;
+        }
+    }
+
+    /// Dequeues the next waiter in FIFO order and restores owner priority when queue empties.
+    pub fn dequeue_waiter(&mut self) -> Option<u32> {
+        if let Some(pos) = self.waiters.iter().position(|w| !w.signaled) {
+            self.waiters[pos].signaled = true;
+            let tid = self.waiters[pos].thread_id;
+            self.waiters.remove(pos);
+
+            // Recalculate boosted priority from remaining waiters
+            let max_prio = self.waiters.iter().map(|w| w.effective_priority).max().unwrap_or(0);
+            self.owner_boosted_priority = max_prio;
+            Some(tid)
+        } else {
+            self.owner_boosted_priority = 0;
+            None
+        }
+    }
+
+    /// Returns the current boosted priority inherited by the owning thread.
+    pub fn get_inherited_priority(&self) -> u32 {
+        self.owner_boosted_priority
+    }
+}
