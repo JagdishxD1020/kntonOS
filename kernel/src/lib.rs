@@ -825,6 +825,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld direct display DC dimming and variable overdrive self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Display DSC & Adaptive Refresh Rate (VRR) Fast-Sync Engine (TASK-KNT-238)
+    if !display::test_dsc_vrr_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld display DSC compression and VRR fast-sync self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)

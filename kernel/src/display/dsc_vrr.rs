@@ -40,8 +40,8 @@ impl DscSlice {
             slice_width,
             slice_height,
             target_bpp_x16: 128, // 8.0 bpp (3:1 compression from 24bpp)
-            rc_buffer_bits: DSC_RC_BUFFER_SIZE_BITS / 4, // Initial buffer fullness (25%)
-            qp: 4,
+            rc_buffer_bits: DSC_RC_BUFFER_SIZE_BITS / 2, // Initial buffer fullness (50%)
+            qp: 8,
             total_bits_produced: 0,
         }
     }
@@ -65,10 +65,14 @@ impl DscSlice {
         self.qp = if fullness_ratio > 0.85 {
             14
         } else if fullness_ratio > 0.70 {
-            10
-        } else if fullness_ratio > 0.50 {
-            7
+            11
+        } else if fullness_ratio > 0.55 {
+            9
+        } else if fullness_ratio > 0.45 {
+            8
         } else if fullness_ratio > 0.30 {
+            6
+        } else if fullness_ratio > 0.15 {
             4
         } else {
             2
@@ -130,8 +134,8 @@ impl DscSliceMultiplexer {
         for i in 0..self.active_slice_count {
             // Simulate entropy encoding: higher complexity and lower QP generate more bits
             let base_bits = (chunk_pixels_per_slice * 8) as i32; // 3:1 nominal target
-            let qp_effect = (8 - self.slices[i].qp as i32) * (chunk_pixels_per_slice as i32 / 4);
-            let comp_effect = (complexity_factor as i32 - 128) * (chunk_pixels_per_slice as i32 / 8);
+            let qp_effect = (8 - self.slices[i].qp as i32) * (chunk_pixels_per_slice as i32 / 8);
+            let comp_effect = (complexity_factor as i32 - 128) * (chunk_pixels_per_slice as i32 / 16);
 
             let produced_bits = (base_bits + qp_effect + comp_effect).max(base_bits / 2) as u32;
             let compressed_bytes = ((produced_bits + 7) / 8) as usize;
@@ -699,5 +703,42 @@ pub fn verify_static_image_idle_stepdown_and_governor() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Display DSC & Adaptive VRR Fast-Sync Engine.
+pub fn test_dsc_vrr_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DISPLAY] Testing Handheld Display DSC 1.2a & Adaptive VRR Fast-Sync Engine...\r\n");
+
+    // 1. Verify VESA DSC 1.2a slice multiplexer and rate control buffer governor
+    if !verify_dsc_slice_multiplexer_and_rc() {
+        crate::serial_write_str("[KNT-PANIC] VESA DSC 1.2a slice multiplexer verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify VRR Fast-Sync pacer with Low Framerate Compensation (LFC)
+    if !verify_vrr_fast_sync_and_lfc() {
+        crate::serial_write_str("[KNT-PANIC] VRR Fast-Sync pacer and LFC verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify OLED/Mini-LED panel luminance flicker compensation
+    if !verify_oled_flicker_compensation() {
+        crate::serial_write_str("[KNT-PANIC] OLED luminance flicker compensation verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify static image idle step-down (to 10Hz) and integrated display governor
+    if !verify_static_image_idle_stepdown_and_governor() {
+        crate::serial_write_str("[KNT-PANIC] Static image idle step-down verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-DISPLAY-DSC-VRR-PASS] Handheld display DSC 1.2a compression and VRR fast-sync engine verified\r\n");
     true
 }
