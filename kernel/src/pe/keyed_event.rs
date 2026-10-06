@@ -242,6 +242,7 @@ pub unsafe extern "system" fn RtlEnterCriticalSection(
     if (*lpCriticalSection).OwningThread == tid {
         (*lpCriticalSection).LockCount += 1;
         (*lpCriticalSection).RecursionCount += 1;
+        record_contention_acquisition(lpCriticalSection as usize, 0);
         return STATUS_SUCCESS;
     }
 
@@ -292,6 +293,7 @@ pub unsafe extern "system" fn RtlTryEnterCriticalSection(
     if (*lpCriticalSection).OwningThread == tid {
         (*lpCriticalSection).LockCount += 1;
         (*lpCriticalSection).RecursionCount += 1;
+        record_contention_acquisition(lpCriticalSection as usize, 0);
         return TRUE;
     }
 
@@ -302,6 +304,7 @@ pub unsafe extern "system" fn RtlTryEnterCriticalSection(
     {
         (*lpCriticalSection).OwningThread = tid;
         (*lpCriticalSection).RecursionCount = 1;
+        record_contention_acquisition(lpCriticalSection as usize, 0);
         TRUE
     } else {
         FALSE
@@ -460,4 +463,135 @@ pub fn win32_get_lock_contention_stats(lock_addr: usize) -> Option<LockContentio
 pub fn win32_reset_lock_contention_stats(lock_addr: usize) {
     let mut profiler = CONTENTION_PROFILER.lock();
     profiler.remove(&lock_addr);
+}
+
+/// Self-test suite verifying Win32 critical sections, keyed events, and priority inheritance.
+pub fn test_win32_keyed_event_subsystem() -> bool {
+    unsafe {
+        // 1. Verify NT Keyed Events lifecycle and release/wait matching
+        let mut h_keyed: HANDLE = 0;
+        let create_status = NtCreateKeyedEvent(&mut h_keyed, KEYEDEVENT_ALL_ACCESS, core::ptr::null(), 0);
+        if create_status != STATUS_SUCCESS || h_keyed == 0 {
+            return false;
+        }
+
+        let test_key = 0xDEAD_BEEF_CAFE_0001usize as *const c_void;
+
+        // Release first (storing pre-signaled token)
+        let rel_status = NtReleaseKeyedEvent(h_keyed, test_key, FALSE, core::ptr::null());
+        if rel_status != STATUS_SUCCESS {
+            return false;
+        }
+
+        // Wait should consume pre-signaled release immediately without blocking
+        let wait_status = NtWaitForKeyedEvent(h_keyed, test_key, FALSE, core::ptr::null());
+        if wait_status != STATUS_SUCCESS {
+            return false;
+        }
+
+        // 2. Verify RTL_CRITICAL_SECTION with configurable spin count
+        let mut cs = RTL_CRITICAL_SECTION {
+            DebugInfo: core::ptr::null_mut(),
+            LockCount: -1,
+            RecursionCount: 0,
+            OwningThread: 0,
+            LockSemaphore: 0,
+            SpinCount: 0,
+        };
+
+        if InitializeCriticalSectionAndSpinCount(&mut cs, 4000) != TRUE {
+            return false;
+        }
+
+        if cs.SpinCount != 4000 {
+            return false;
+        }
+
+        let old_spin = SetCriticalSectionSpinCount(&mut cs, 2000);
+        if old_spin != 4000 || cs.SpinCount != 2000 {
+            return false;
+        }
+
+        // 3. Verify TryEnter and Enter / Leave semantics
+        if RtlTryEnterCriticalSection(&mut cs) != TRUE {
+            return false;
+        }
+
+        if cs.RecursionCount != 1 || cs.OwningThread == 0 {
+            return false;
+        }
+
+        // Recursive acquisition
+        if RtlEnterCriticalSection(&mut cs) != STATUS_SUCCESS {
+            return false;
+        }
+        if cs.RecursionCount != 2 {
+            return false;
+        }
+
+        // Recursive release
+        if RtlLeaveCriticalSection(&mut cs) != STATUS_SUCCESS {
+            return false;
+        }
+        if cs.RecursionCount != 1 {
+            return false;
+        }
+
+        // Final release
+        if RtlLeaveCriticalSection(&mut cs) != STATUS_SUCCESS {
+            return false;
+        }
+        if cs.RecursionCount != 0 || cs.OwningThread != 0 {
+            return false;
+        }
+
+        // 4. Verify Contention Telemetry Profiler
+        let stats = win32_get_lock_contention_stats(&cs as *const _ as usize);
+        if stats.is_none() || stats.unwrap().total_acquisitions < 2 {
+            return false;
+        }
+
+        // 5. Verify Priority Inheritance FIFO Queue
+        let mut queue = PriorityInheritingWaiterQueue::new(&cs as *const _ as usize);
+        queue.enqueue_waiter(101, 15);
+        queue.enqueue_waiter(102, 31); // Real-time priority thread
+        queue.enqueue_waiter(103, 20);
+
+        // Inherited priority should boost to highest waiter (31)
+        if queue.get_inherited_priority() != 31 {
+            return false;
+        }
+
+        // FIFO dequeue order: first waiter is 101
+        let first = queue.dequeue_waiter();
+        if first != Some(101) {
+            return false;
+        }
+
+        // Inherited priority remains 31 (due to waiter 102)
+        if queue.get_inherited_priority() != 31 {
+            return false;
+        }
+
+        // Next waiter is 102
+        let second = queue.dequeue_waiter();
+        if second != Some(102) {
+            return false;
+        }
+
+        // Inherited priority now drops to remaining waiter 103's priority (20)
+        if queue.get_inherited_priority() != 20 {
+            return false;
+        }
+
+        // Clean up critical section
+        if RtlDeleteCriticalSection(&mut cs) != STATUS_SUCCESS {
+            return false;
+        }
+    }
+
+    crate::serial_write_str(
+        "[KNT-WIN32-KEYED-EVENT-PASS] Win32 critical sections, keyed events and adaptive spinlocks verified\r\n",
+    );
+    true
 }

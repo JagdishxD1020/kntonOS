@@ -1124,6 +1124,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Critical Sections & Keyed Events (TASK-KNT-237)
+    if !pe::test_win32_keyed_event_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Keyed Event self-test failed!\r\n");
+    }
+
     // Verify Win32 Transactional NTFS & Mini-Filter Layer (TASK-KNT-235)
     if !pe::test_win32_txf_filter_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 TxF filter self-test failed!\r\n");
