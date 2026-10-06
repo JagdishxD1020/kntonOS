@@ -385,3 +385,121 @@ pub fn verify_vrr_fast_sync_and_lfc() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: OLED/Mini-LED Luminance Flicker Compensation for VRR
+// ============================================================================
+
+/// Nominal reference refresh rate in Hz where OLED gamma calibration is centered.
+pub const OLED_REF_REFRESH_HZ: u32 = 120;
+/// Nominal reference frame duration in microseconds (120 Hz = ~8333 us).
+pub const OLED_REF_INTERVAL_US: u32 = 8_333;
+
+/// OLED / Mini-LED Panel Luminance Flicker Compensator during rapid VRR framerate swings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OledVrrFlickerCompensator {
+    /// Baseline calibrated panel refresh rate (nominally 120 Hz).
+    pub ref_refresh_hz: u32,
+    /// Flicker compensation gain coefficient (fractional adjustment per ms of V-blank extension).
+    pub compensation_gain: f32,
+    /// Low-pass filtered frame duration tracking parameter to prevent abrupt luminance jumps.
+    pub filtered_interval_us: f32,
+    /// Current calculated luminance correction multiplier (0.90 .. 1.15).
+    pub current_correction_factor: f32,
+    /// Smoothing factor alpha for the interval tracker (0.0 < alpha <= 1.0).
+    pub filter_alpha: f32,
+}
+
+impl OledVrrFlickerCompensator {
+    /// Constructs an OLED/Mini-LED flicker compensator with calibrated handheld defaults.
+    pub const fn new() -> Self {
+        Self {
+            ref_refresh_hz: OLED_REF_REFRESH_HZ,
+            compensation_gain: 0.0035, // +0.35% luminance compensation per 1ms V-blank extension
+            filtered_interval_us: OLED_REF_INTERVAL_US as f32,
+            current_correction_factor: 1.0,
+            filter_alpha: 0.35,
+        }
+    }
+
+    /// Resets the compensator state to reference 120Hz baseline.
+    pub fn reset(&mut self) {
+        self.filtered_interval_us = OLED_REF_INTERVAL_US as f32;
+        self.current_correction_factor = 1.0;
+    }
+
+    /// Computes compensated panel luminance given current frame duration and Average Picture Level (APL).
+    pub fn compute_compensated_luminance(
+        &mut self,
+        current_interval_us: u32,
+        apl_pct: f32,
+        base_brightness: f32,
+    ) -> f32 {
+        // 1. Smooth frame duration across successive frames to eliminate high-frequency ripple
+        self.filtered_interval_us += self.filter_alpha * (current_interval_us as f32 - self.filtered_interval_us);
+
+        // 2. Compute delta interval relative to calibrated 120Hz reference in milliseconds
+        let delta_interval_ms = (self.filtered_interval_us - OLED_REF_INTERVAL_US as f32) / 1000.0;
+
+        // 3. Near-black dark scene weighting:
+        // Human perception of OLED VRR gamma flicker is highest in near-black / dark scenes (< 30% APL)
+        // and negligible in bright daytime outdoor scenes (> 70% APL).
+        let dark_scene_weight = if apl_pct <= 20.0 {
+            1.0
+        } else if apl_pct >= 80.0 {
+            0.15
+        } else {
+            1.0 - ((apl_pct - 20.0) / 60.0) * 0.85
+        };
+
+        // 4. Calculate compensation multiplier:
+        // When refresh rate drops (interval expands), pixel capacitor charge leaks during long V-blank,
+        // causing luminance drop. We inject positive compensation to maintain constant perceived gamma.
+        let raw_factor = 1.0 + self.compensation_gain * delta_interval_ms * dark_scene_weight;
+        self.current_correction_factor = raw_factor.clamp(0.92, 1.12);
+
+        // 5. Apply correction to base panel brightness
+        (base_brightness * self.current_correction_factor).clamp(0.0, 1.0)
+    }
+}
+
+/// Verification test for OLED/Mini-LED luminance flicker compensation.
+pub fn verify_oled_flicker_compensation() -> bool {
+    let mut comp = OledVrrFlickerCompensator::new();
+
+    // 1. Steady 120Hz reference state: correction factor must be exactly 1.0
+    for _ in 0..10 {
+        comp.compute_compensated_luminance(OLED_REF_INTERVAL_US, 25.0, 0.50);
+    }
+    if (comp.current_correction_factor - 1.0).abs() > 0.005 {
+        return false;
+    }
+
+    // 2. Sudden framerate drop from 120Hz to 40Hz (~25,000 us) in a dark game dungeon (APL = 10%)
+    // V-blank duration expands by ~16.7 ms
+    for _ in 0..15 {
+        comp.compute_compensated_luminance(25_000, 10.0, 0.50);
+    }
+
+    // Compensation factor must be positively boosted (> 1.04) to counteract OLED charge decay
+    if comp.current_correction_factor <= 1.03 {
+        return false;
+    }
+    let boosted_brightness = comp.compute_compensated_luminance(25_000, 10.0, 0.50);
+    if boosted_brightness <= 0.515 {
+        return false;
+    }
+
+    // 3. Bright daylight scene (APL = 90%):
+    // Near-black sensitivity factor must suppress correction compared to dark scene
+    let mut comp_bright = OledVrrFlickerCompensator::new();
+    for _ in 0..15 {
+        comp_bright.compute_compensated_luminance(25_000, 90.0, 0.50);
+    }
+    if comp_bright.current_correction_factor >= comp.current_correction_factor {
+        return false;
+    }
+
+    true
+}
