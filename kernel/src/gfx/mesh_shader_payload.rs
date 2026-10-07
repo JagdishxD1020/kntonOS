@@ -424,6 +424,121 @@ impl MeshletVisibilityFilter {
     }
 }
 
+// ============================================================================
+// Handheld GPU Power-Saving Geometry LOD Decimation Governor
+// ============================================================================
+
+// Handheld APU power and thermal operation profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldPowerMode {
+    // High performance mode (full geometry fidelity, e.g. 28W TDP AC connected).
+    Performance,
+    // Balanced handheld mode (moderate LOD decimation, e.g. 15W TDP).
+    Balanced,
+    // Battery saver mode (aggressive LOD decimation, e.g. 10W TDP).
+    BatterySaver,
+    // Extreme power saver mode (minimum LOD and threadgroup clamping, e.g. 7W TDP).
+    ExtremePowerSaver,
+}
+
+// Adaptive governor modulating mesh shader amplification to conserve battery and GPU power.
+#[derive(Debug, Clone)]
+pub struct GeometryLodDecimationGovernor {
+    // Current operating power profile.
+    pub power_mode: HandheldPowerMode,
+    // Maximum allowed Mesh Shader threadgroups per dispatch.
+    pub max_threadgroup_clamp: u32,
+    // Geometry density decimation ratio percentage (100 = full density, 25 = 1/4 density).
+    pub decimation_ratio_percent: u32,
+    // Additional LOD level bias added to Amplification Shader payload.
+    pub lod_bias: u8,
+    // Total candidate primitives evaluated.
+    pub total_primitives_evaluated: u64,
+    // Total primitives eliminated through power decimation.
+    pub total_primitives_decimated: u64,
+}
+
+impl GeometryLodDecimationGovernor {
+    // Constructs a geometry LOD decimation governor with the specified power profile.
+    pub fn new(initial_mode: HandheldPowerMode) -> Self {
+        let mut gov = Self {
+            power_mode: initial_mode,
+            max_threadgroup_clamp: 1024,
+            decimation_ratio_percent: 100,
+            lod_bias: 0,
+            total_primitives_evaluated: 0,
+            total_primitives_decimated: 0,
+        };
+        gov.apply_mode_parameters(initial_mode);
+        gov
+    }
+
+    // Configures governor parameters matching the active power mode.
+    fn apply_mode_parameters(&mut self, mode: HandheldPowerMode) {
+        self.power_mode = mode;
+        match mode {
+            HandheldPowerMode::Performance => {
+                self.max_threadgroup_clamp = 1024;
+                self.decimation_ratio_percent = 100;
+                self.lod_bias = 0;
+            }
+            HandheldPowerMode::Balanced => {
+                self.max_threadgroup_clamp = 512;
+                self.decimation_ratio_percent = 75;
+                self.lod_bias = 1;
+            }
+            HandheldPowerMode::BatterySaver => {
+                self.max_threadgroup_clamp = 256;
+                self.decimation_ratio_percent = 50;
+                self.lod_bias = 2;
+            }
+            HandheldPowerMode::ExtremePowerSaver => {
+                self.max_threadgroup_clamp = 128;
+                self.decimation_ratio_percent = 25;
+                self.lod_bias = 3;
+            }
+        }
+    }
+
+    // Switches the power mode and updates governor thresholds dynamically.
+    pub fn set_power_mode(&mut self, mode: HandheldPowerMode) {
+        self.apply_mode_parameters(mode);
+    }
+
+    // Adapts an incoming DispatchMesh request, clamping threadgroups and returning the LOD bias.
+    pub fn govern_dispatch(
+        &mut self,
+        requested: DispatchMeshArguments,
+        primitives_per_group: u32,
+    ) -> (DispatchMeshArguments, u8) {
+        let total_requested_groups = requested.total_threadgroups() as u32;
+        let clamped_x = core::cmp::min(requested.thread_group_count_x, self.max_threadgroup_clamp);
+        let clamped_y = requested.thread_group_count_y;
+        let clamped_z = requested.thread_group_count_z;
+
+        let total_effective_groups = (clamped_x as u64) * (clamped_y as u64) * (clamped_z as u64);
+        let requested_prims = (total_requested_groups as u64) * (primitives_per_group as u64);
+        let effective_prims = ((total_effective_groups * (primitives_per_group as u64))
+            * (self.decimation_ratio_percent as u64)) / 100;
+
+        let decimated_prims = requested_prims.saturating_sub(effective_prims);
+
+        self.total_primitives_evaluated = self.total_primitives_evaluated.saturating_add(requested_prims);
+        self.total_primitives_decimated = self.total_primitives_decimated.saturating_add(decimated_prims);
+
+        (DispatchMeshArguments::new(clamped_x, clamped_y, clamped_z), self.lod_bias)
+    }
+
+    // Calculates overall primitive decimation percentage achieved.
+    pub fn decimation_percent(&self) -> u32 {
+        if self.total_primitives_evaluated == 0 {
+            0
+        } else {
+            ((self.total_primitives_decimated * 100) / self.total_primitives_evaluated) as u32
+        }
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_mesh_shader_payload_subsystem() -> bool {
     true
