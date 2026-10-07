@@ -572,3 +572,248 @@ pub fn verify_thermal_runaway_emergency_ramp() -> bool {
 }
 
 
+
+
+// ============================================================================
+// Feature 4: Anti-Stall Low-RPM Kickstarter & Integrated Cooling Governor
+// ============================================================================
+
+/// Pulse duty cycle applied during the anti-stall kickstart phase (85%).
+pub const KICKSTART_PULSE_DUTY: f32 = 0.85;
+/// Duration of the high-energy kickstart pulse in milliseconds (60 ms).
+pub const KICKSTART_PULSE_DURATION_MS: u32 = 60;
+/// Settling period after kickstart pulse before expecting steady-state RPM (100 ms).
+pub const KICKSTART_SETTLING_DURATION_MS: u32 = 100;
+/// Minimum tachometer RPM threshold indicating the rotor has broken free from cogging.
+pub const KICKSTART_SPIN_CONFIRM_RPM: u32 = 600;
+/// Maximum consecutive kickstart retries before declaring motor stall fault.
+pub const KICKSTART_MAX_RETRIES: u8 = 3;
+
+/// Anti-stall kickstarter state machine phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickstarterState {
+    /// Fan is stopped at 0 RPM.
+    IdleStopped,
+    /// Injected high-energy kickstart pulse to break rotor cogging and static friction.
+    Kicking,
+    /// Settling down to commanded target low-RPM duty cycle.
+    Settling,
+    /// Rotor spinning steadily above stall threshold.
+    Running,
+    /// Motor locked-rotor stall fault detected after max retries.
+    Stalled,
+}
+
+/// Anti-stall low-RPM kickstarter algorithm for whisper-quiet handheld gaming.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AntiStallKickstarter {
+    /// Current state machine phase.
+    pub state: KickstarterState,
+    /// Commanded steady-state target duty cycle from the fan governor (0.0 to 1.0).
+    pub target_duty: f32,
+    /// Output duty cycle modulated by the kickstart state machine (0.0 to 1.0).
+    pub output_duty: f32,
+    /// Timer tracking active phase duration in milliseconds.
+    pub phase_timer_ms: u32,
+    /// Number of kickstart retries attempted for the current start cycle.
+    pub retry_count: u8,
+    /// Total successful kickstarts executed over system uptime.
+    pub total_successful_kicks: u32,
+}
+
+impl AntiStallKickstarter {
+    /// Constructs an anti-stall kickstarter in idle stopped state.
+    pub const fn new() -> Self {
+        Self {
+            state: KickstarterState::IdleStopped,
+            target_duty: 0.0,
+            output_duty: 0.0,
+            phase_timer_ms: 0,
+            retry_count: 0,
+            total_successful_kicks: 0,
+        }
+    }
+
+    /// Advances kickstarter state machine by `dt_ms` given desired `commanded_duty` and measured `tach_rpm`.
+    pub fn update(&mut self, commanded_duty: f32, tach_rpm: u32, dt_ms: u32) -> f32 {
+        self.target_duty = commanded_duty.clamp(0.0, 1.0);
+
+        if self.target_duty <= 0.05 {
+            // Fan stop commanded
+            self.state = KickstarterState::IdleStopped;
+            self.output_duty = 0.0;
+            self.phase_timer_ms = 0;
+            self.retry_count = 0;
+            return 0.0;
+        }
+
+        match self.state {
+            KickstarterState::IdleStopped => {
+                // Transitioning from 0 RPM stop to spin: Initiate kickstart pulse!
+                self.state = KickstarterState::Kicking;
+                self.output_duty = KICKSTART_PULSE_DUTY;
+                self.phase_timer_ms = 0;
+                self.retry_count = 0;
+            }
+            KickstarterState::Kicking => {
+                self.output_duty = KICKSTART_PULSE_DUTY;
+                self.phase_timer_ms += dt_ms;
+
+                if self.phase_timer_ms >= KICKSTART_PULSE_DURATION_MS {
+                    // Kick phase complete, transition to settling
+                    self.state = KickstarterState::Settling;
+                    self.output_duty = self.target_duty;
+                    self.phase_timer_ms = 0;
+                }
+            }
+            KickstarterState::Settling => {
+                self.output_duty = self.target_duty;
+                self.phase_timer_ms += dt_ms;
+
+                if tach_rpm >= KICKSTART_SPIN_CONFIRM_RPM {
+                    // Confirmed running!
+                    self.state = KickstarterState::Running;
+                    self.total_successful_kicks += 1;
+                    self.retry_count = 0;
+                } else if self.phase_timer_ms >= KICKSTART_SETTLING_DURATION_MS {
+                    // Rotor failed to spin up in time
+                    if self.retry_count < KICKSTART_MAX_RETRIES {
+                        self.retry_count += 1;
+                        self.state = KickstarterState::Kicking;
+                        self.output_duty = KICKSTART_PULSE_DUTY;
+                        self.phase_timer_ms = 0;
+                    } else {
+                        // Max retries exceeded, flag stall
+                        self.state = KickstarterState::Stalled;
+                        self.output_duty = 0.0; // Cut power to prevent overheating stalled coil
+                    }
+                }
+            }
+            KickstarterState::Running => {
+                self.output_duty = self.target_duty;
+
+                // Monitor for unexpected in-flight stall
+                if tach_rpm < 200 && self.target_duty >= 0.15 {
+                    // Unexpected rotor stall during operation: re-kick
+                    self.state = KickstarterState::Kicking;
+                    self.output_duty = KICKSTART_PULSE_DUTY;
+                    self.phase_timer_ms = 0;
+                    self.retry_count = 0;
+                }
+            }
+            KickstarterState::Stalled => {
+                self.output_duty = 0.0;
+                // Remains stalled until fan is stopped and re-commanded
+            }
+        }
+
+        self.output_duty
+    }
+}
+
+/// Integrated Handheld Active Fan & Liquid-Metal Cooling Pump Governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldCoolingGovernor {
+    /// PWM fan curve governor with acoustic whine avoidance.
+    pub fan_gov: PwmFanGovernor,
+    /// Coolant micro-pump with Hall flow telemetry.
+    pub pump: CoolantMicroPump,
+    /// Thermal runaway emergency supervisor (<100ms response).
+    pub emergency_ramp: ThermalRunawayEmergencyRamp,
+    /// Anti-stall low-RPM kickstarter.
+    pub kickstarter: AntiStallKickstarter,
+}
+
+impl HandheldCoolingGovernor {
+    /// Constructs the integrated cooling governor.
+    pub const fn new() -> Self {
+        Self {
+            fan_gov: PwmFanGovernor::new(),
+            pump: CoolantMicroPump::new(),
+            emergency_ramp: ThermalRunawayEmergencyRamp::new(),
+            kickstarter: AntiStallKickstarter::new(),
+        }
+    }
+
+    /// Evaluates holistic cooling state given APU temperature, TDP, and hardware sensors.
+    pub fn process_cycle(
+        &mut self,
+        apu_temp_c: f32,
+        tdp_watts: f32,
+        fan_tach_rpm: u32,
+        pump_pulses: u32,
+        dt_ms: u32,
+    ) -> (f32, f32, bool) {
+        // 1. Ingest pump flow telemetry
+        self.pump.update_telemetry(pump_pulses, dt_ms, apu_temp_c - 15.0, apu_temp_c - 20.0);
+
+        // 2. Check thermal runaway emergency ramp
+        let rate_of_rise = (apu_temp_c - self.fan_gov.prev_temp_c) * (1000.0 / dt_ms as f32);
+        let emergency_dir = self.emergency_ramp.evaluate(apu_temp_c, rate_of_rise, dt_ms);
+
+        if emergency_dir.force_max_cooling {
+            // Override everything: 100% cooling dispatch
+            let final_fan_duty = 1.0;
+            let final_pump_duty = 1.0;
+            return (final_fan_duty, final_pump_duty, emergency_dir.assert_prochot);
+        }
+
+        // 3. Normal closed-loop thermal & acoustic fan governor
+        let raw_fan_duty = self.fan_gov.update(apu_temp_c);
+
+        // 4. Pass through anti-stall kickstarter for low-RPM start reliability
+        let final_fan_duty = self.kickstarter.update(raw_fan_duty, fan_tach_rpm, dt_ms);
+
+        // 5. Modulate liquid coolant micro-pump flow
+        let final_pump_duty = self.pump.throttle_flow_by_heat_flux(apu_temp_c, tdp_watts);
+
+        (final_fan_duty, final_pump_duty, false)
+    }
+}
+
+/// Verification test for anti-stall low-RPM kickstarter and integrated cooling governor.
+pub fn verify_anti_stall_kickstarter_and_governor() -> bool {
+    let mut kickstarter = AntiStallKickstarter::new();
+
+    // 1. Transition from stopped to whisper gaming low duty (20%)
+    // Must immediately deliver KICKSTART_PULSE_DUTY (85%)
+    let duty_kick = kickstarter.update(0.20, 0, 20);
+    if kickstarter.state != KickstarterState::Kicking || duty_kick != KICKSTART_PULSE_DUTY {
+        return false;
+    }
+
+    // 2. After 60ms pulse duration, transitions to Settling
+    kickstarter.update(0.20, 400, 50); // total 70ms in kick phase
+    if kickstarter.state != KickstarterState::Settling || kickstarter.output_duty != 0.20 {
+        return false;
+    }
+
+    // 3. Rotor reaches 800 RPM (> KICKSTART_SPIN_CONFIRM_RPM 600) -> confirms Running
+    let duty_running = kickstarter.update(0.20, 800, 20);
+    if kickstarter.state != KickstarterState::Running || duty_running != 0.20 {
+        return false;
+    }
+    if kickstarter.total_successful_kicks != 1 {
+        return false;
+    }
+
+    // 4. Test integrated governor
+    let mut gov = HandheldCoolingGovernor::new();
+    // Test nominal whisper cycle (42°C, 6W TDP, 0 RPM initially -> should trigger kickstart)
+    let (fan_d, pump_d, prochot) = gov.process_cycle(42.0, 6.0, 0, 4, 50);
+    if prochot {
+        return false;
+    }
+    // Below 45°C fan is passive 0.0
+    if fan_d != 0.0 || pump_d < 0.20 {
+        return false;
+    }
+
+    // Test high temperature 96°C -> must engage emergency 100% cooling ramp
+    let (em_fan, em_pump, _) = gov.process_cycle(96.0, 30.0, 2000, 20, 50);
+    if em_fan != 1.0 || em_pump != 1.0 {
+        return false;
+    }
+
+    true
+}
