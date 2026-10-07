@@ -334,3 +334,157 @@ pub fn win32_section_is_page_dirty(hSection: HANDLE, page_index: usize) -> bool 
     }
     false
 }
+
+/// Magic identifier for KntonOS zero-copy gaming IPC ring buffer.
+pub const GAMING_RING_MAGIC: u32 = 0x47414D45; // 'GAME'
+
+/// Header structure for zero-copy inter-process gaming video and audio ring buffer.
+#[repr(C, align(64))]
+pub struct GamingRingHeader {
+    pub magic: u32,
+    pub capacity: u32,
+    pub head: AtomicU32,
+    pub tail: AtomicU32,
+    pub frame_seq: AtomicU32,
+    pub dropped_frames: AtomicU32,
+    pub _reserved: [u8; 40],
+}
+
+/// Creates a named zero-copy gaming video and audio shared memory ring buffer.
+pub fn win32_create_shared_gaming_ring(name: &str, capacity_bytes: usize) -> Option<HANDLE> {
+    let header_size = core::mem::size_of::<GamingRingHeader>();
+    let total_size = header_size + capacity_bytes;
+
+    let h_sec = unsafe {
+        CreateSharedSectionA(
+            0,
+            core::ptr::null_mut(),
+            PAGE_READWRITE,
+            0,
+            total_size as DWORD,
+            name.as_ptr(),
+        )
+    };
+
+    if h_sec == 0 || h_sec == (INVALID_HANDLE_VALUE as HANDLE) {
+        return None;
+    }
+
+    let sections = SECTIONS.lock();
+    if let Some(sec) = sections.get(&h_sec) {
+        unsafe {
+            let header = &mut *(sec.storage.ptr as *mut GamingRingHeader);
+            if header.magic != GAMING_RING_MAGIC {
+                header.magic = GAMING_RING_MAGIC;
+                header.capacity = capacity_bytes as u32;
+                header.head.store(0, Ordering::SeqCst);
+                header.tail.store(0, Ordering::SeqCst);
+                header.frame_seq.store(0, Ordering::SeqCst);
+                header.dropped_frames.store(0, Ordering::SeqCst);
+            }
+        }
+    }
+
+    Some(h_sec)
+}
+
+/// Writes a frame or audio packet into the zero-copy shared gaming ring buffer.
+pub fn win32_shared_gaming_ring_write(h_section: HANDLE, data: &[u8]) -> bool {
+    let sections = SECTIONS.lock();
+    let sec = match sections.get(&h_section) {
+        Some(s) => s,
+        None => return false,
+    };
+
+    unsafe {
+        let header = &*(sec.storage.ptr as *const GamingRingHeader);
+        if header.magic != GAMING_RING_MAGIC {
+            return false;
+        }
+
+        let cap = header.capacity as usize;
+        let head = header.head.load(Ordering::Acquire) as usize;
+        let tail = header.tail.load(Ordering::Acquire) as usize;
+
+        let available = if head >= tail {
+            cap - (head - tail) - 1
+        } else {
+            tail - head - 1
+        };
+
+        let total_needed = 4 + data.len();
+        if total_needed > available {
+            header.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let data_ptr = sec.storage.ptr.add(core::mem::size_of::<GamingRingHeader>());
+        let mut cur = head;
+
+        // Write 4-byte length prefix
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        for &b in &len_bytes {
+            *data_ptr.add(cur) = b;
+            cur = (cur + 1) % cap;
+        }
+
+        // Write payload
+        for &b in data {
+            *data_ptr.add(cur) = b;
+            cur = (cur + 1) % cap;
+        }
+
+        header.head.store(cur as u32, Ordering::Release);
+        header.frame_seq.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// Reads a frame or audio packet from the zero-copy shared gaming ring buffer.
+pub fn win32_shared_gaming_ring_read(h_section: HANDLE, out_buf: &mut [u8]) -> usize {
+    let sections = SECTIONS.lock();
+    let sec = match sections.get(&h_section) {
+        Some(s) => s,
+        None => return 0,
+    };
+
+    unsafe {
+        let header = &*(sec.storage.ptr as *const GamingRingHeader);
+        if header.magic != GAMING_RING_MAGIC {
+            return 0;
+        }
+
+        let cap = header.capacity as usize;
+        let head = header.head.load(Ordering::Acquire) as usize;
+        let tail = header.tail.load(Ordering::Acquire) as usize;
+
+        if head == tail {
+            return 0; // Buffer empty
+        }
+
+        let data_ptr = sec.storage.ptr.add(core::mem::size_of::<GamingRingHeader>());
+        let mut cur = tail;
+
+        // Read 4-byte length prefix
+        let mut len_bytes = [0u8; 4];
+        for b in &mut len_bytes {
+            *b = *data_ptr.add(cur);
+            cur = (cur + 1) % cap;
+        }
+        let packet_len = u32::from_le_bytes(len_bytes) as usize;
+
+        let read_len = packet_len.min(out_buf.len());
+        for i in 0..read_len {
+            out_buf[i] = *data_ptr.add(cur);
+            cur = (cur + 1) % cap;
+        }
+
+        // If output buffer was smaller than packet, skip remaining bytes
+        if packet_len > read_len {
+            cur = (cur + (packet_len - read_len)) % cap;
+        }
+
+        header.tail.store(cur as u32, Ordering::Release);
+        read_len
+    }
+}
