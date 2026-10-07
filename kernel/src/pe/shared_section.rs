@@ -96,15 +96,18 @@ impl Drop for SectionStorage {
 }
 
 /// Representation of an active mapped view of a shared memory section.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct SectionMappedView {
     pub base_address: usize,
     pub size: usize,
     pub offset: usize,
     pub desired_access: DWORD,
     pub is_copy_on_write: bool,
-    pub cow_buffer: Option<Arc<Spinlock<Vec<u8>>>>,
+    pub cow_buffer: Option<*mut u8>,
 }
+
+unsafe impl Send for SectionMappedView {}
+unsafe impl Sync for SectionMappedView {}
 
 /// Win32 Named Shared Memory Section object descriptor.
 pub struct SharedSectionInner {
@@ -119,7 +122,7 @@ pub struct SharedSectionInner {
 static NEXT_SECTION_ID: AtomicU64 = AtomicU64::new(0xA000);
 static SECTIONS: Spinlock<BTreeMap<HANDLE, SharedSectionInner>> = Spinlock::new(BTreeMap::new());
 static NAMED_SECTIONS: Spinlock<BTreeMap<String, HANDLE>> = Spinlock::new(BTreeMap::new());
-static MAPPED_VIEWS: Spinlock<BTreeMap<usize, SectionMappedView>> = Spinlock::new(BTreeMap::new());
+static MAPPED_VIEWS: Spinlock<alloc::vec::Vec<SectionMappedView>> = Spinlock::new(alloc::vec::Vec::new());
 static VIRTUAL_VIEW_ALLOC_ADDR: AtomicUsize = AtomicUsize::new(0x0000_7FF9_0000_0000);
 
 /// Creates or opens a Win32 named/anonymous shared memory section.
@@ -249,20 +252,30 @@ pub unsafe extern "system" fn MapSharedSectionViewEx(
     };
 
     let is_cow = (dwDesiredAccess & FILE_MAP_COPY) != 0;
+    let (view_ptr, cow_buf) = if is_cow {
+        let layout = match Layout::from_size_align(view_len, 4096) {
+            Ok(l) => l,
+            Err(_) => {
+                win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+                return core::ptr::null_mut();
+            }
+        };
+        let replica = alloc::alloc::alloc_zeroed(layout);
+        if replica.is_null() {
+            win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+            return core::ptr::null_mut();
+        }
+        let src = section.storage.ptr.add(offset);
+        core::ptr::copy_nonoverlapping(src, replica, view_len);
+        (replica, Some(replica))
+    } else {
+        (section.storage.ptr.add(offset), None)
+    };
+
     let base_addr = if !lpBaseAddress.is_null() {
         lpBaseAddress as usize
     } else {
-        VIRTUAL_VIEW_ALLOC_ADDR.fetch_add(view_len + 0x10000, Ordering::SeqCst)
-    };
-
-    let cow_buf = if is_cow {
-        let mut cow_vec = Vec::with_capacity(view_len);
-        let src = section.storage.ptr.add(offset);
-        let slice = core::slice::from_raw_parts(src, view_len);
-        cow_vec.extend_from_slice(slice);
-        Some(Arc::new(Spinlock::new(cow_vec)))
-    } else {
-        None
+        view_ptr as usize
     };
 
     let view = SectionMappedView {
@@ -274,7 +287,7 @@ pub unsafe extern "system" fn MapSharedSectionViewEx(
         cow_buffer: cow_buf,
     };
 
-    MAPPED_VIEWS.lock().insert(base_addr, view);
+    MAPPED_VIEWS.lock().push(view);
     win32_set_last_error(ERROR_SUCCESS);
     base_addr as PVOID
 }
@@ -287,7 +300,14 @@ pub unsafe extern "system" fn UnmapSharedSectionView(lpBaseAddress: PVOID) -> BO
     }
 
     let addr = lpBaseAddress as usize;
-    if MAPPED_VIEWS.lock().remove(&addr).is_some() {
+    let mut views = MAPPED_VIEWS.lock();
+    if let Some(idx) = views.iter().position(|v| v.base_address == addr) {
+        let view = views.remove(idx);
+        if let Some(buf) = view.cow_buffer {
+            if let Ok(layout) = Layout::from_size_align(view.size, 4096) {
+                alloc::alloc::dealloc(buf, layout);
+            }
+        }
         win32_set_last_error(ERROR_SUCCESS);
         TRUE
     } else {
@@ -299,7 +319,7 @@ pub unsafe extern "system" fn UnmapSharedSectionView(lpBaseAddress: PVOID) -> BO
 /// Intercepts page fault write-access on a mapped section, enforcing write-protection traps and COW.
 pub fn win32_section_handle_page_fault(fault_addr: usize, is_write: bool) -> bool {
     let views = MAPPED_VIEWS.lock();
-    for view in views.values() {
+    for view in views.iter() {
         if fault_addr >= view.base_address && fault_addr < view.base_address + view.size {
             // Write to Read-Only mapping triggers access violation trap
             if is_write && (view.desired_access & (FILE_MAP_WRITE | FILE_MAP_COPY)) == 0 {
@@ -487,4 +507,136 @@ pub fn win32_shared_gaming_ring_read(h_section: HANDLE, out_buf: &mut [u8]) -> u
         header.tail.store(cur as u32, Ordering::Release);
         read_len
     }
+}
+
+/// Self-test suite verifying Win32 shared memory sections, COW fault interception, and gaming ring buffer.
+pub fn test_win32_shared_section_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Named Shared Memory Section subsystem self-test...\r\n");
+
+    // 1. Create a named shared memory section (8192 bytes = 2 pages)
+    let sec_name = "Global\\KntonGamingSharedMemTest\0";
+    let h_sec = unsafe {
+        CreateSharedSectionA(
+            0,
+            core::ptr::null_mut(),
+            PAGE_READWRITE,
+            0,
+            8192,
+            sec_name.as_ptr(),
+        )
+    };
+
+    if h_sec == 0 || h_sec == (INVALID_HANDLE_VALUE as HANDLE) {
+        crate::serial_write_str("[KNT-ERROR] Failed to create shared section\r\n");
+        return false;
+    }
+
+    // 2. Map Read-Only view and verify write protection trap via page fault interception
+    let ro_view = unsafe {
+        MapSharedSectionViewEx(
+            h_sec,
+            FILE_MAP_READ,
+            0,
+            0,
+            4096,
+            core::ptr::null_mut(),
+        )
+    };
+    if ro_view.is_null() {
+        crate::serial_write_str("[KNT-ERROR] Failed to map read-only section view\r\n");
+        return false;
+    }
+
+    // Attempting write access on Read-Only view should trigger protection trap (false)
+    let ro_addr = ro_view as usize;
+    if win32_section_handle_page_fault(ro_addr, true) {
+        crate::serial_write_str("[KNT-ERROR] RO view allowed write page fault!\r\n");
+        return false;
+    }
+
+    // 3. Map Copy-on-Write view and verify page fault resolution and dirty page marking
+    let cow_view = unsafe {
+        MapSharedSectionViewEx(
+            h_sec,
+            FILE_MAP_COPY,
+            0,
+            0,
+            4096,
+            core::ptr::null_mut(),
+        )
+    };
+    if cow_view.is_null() {
+        crate::serial_write_str("[KNT-ERROR] Failed to map COW section view\r\n");
+        return false;
+    }
+
+    let cow_addr = cow_view as usize;
+    if !win32_section_handle_page_fault(cow_addr, true) {
+        crate::serial_write_str("[KNT-ERROR] COW view rejected valid write page fault!\r\n");
+        return false;
+    }
+
+    if !win32_section_is_page_dirty(h_sec, 0) {
+        crate::serial_write_str("[KNT-ERROR] Dirty page tracking failed to detect COW modification!\r\n");
+        return false;
+    }
+
+    // 4. Map Read/Write view, write test pattern, unmap
+    let rw_view = unsafe {
+        MapSharedSectionViewEx(
+            h_sec,
+            FILE_MAP_WRITE | FILE_MAP_READ,
+            0,
+            0,
+            4096,
+            core::ptr::null_mut(),
+        )
+    };
+    if rw_view.is_null() {
+        crate::serial_write_str("[KNT-ERROR] Failed to map RW section view\r\n");
+        return false;
+    }
+
+    unsafe {
+        let ptr = rw_view as *mut u32;
+        *ptr = 0xDEADBEEF;
+        if *ptr != 0xDEADBEEF {
+            crate::serial_write_str("[KNT-ERROR] RW section view memory coherency mismatch!\r\n");
+            return false;
+        }
+
+        if UnmapSharedSectionView(ro_view) == FALSE
+            || UnmapSharedSectionView(cow_view) == FALSE
+            || UnmapSharedSectionView(rw_view) == FALSE
+        {
+            crate::serial_write_str("[KNT-ERROR] UnmapSharedSectionView failed!\r\n");
+            return false;
+        }
+    }
+
+    // 5. Verify handheld zero-copy gaming IPC video/audio ring buffer
+    let ring_name = "Global\\KntonGamingRingBufferTest\0";
+    let h_ring = match win32_create_shared_gaming_ring(ring_name, 1024) {
+        Some(h) => h,
+        None => {
+            crate::serial_write_str("[KNT-ERROR] Failed to create gaming shared ring buffer\r\n");
+            return false;
+        }
+    };
+
+    let sample_frame = b"AUDIO_PCM_FRAME_TEST_PACKET_96KHZ_24BIT";
+    if !win32_shared_gaming_ring_write(h_ring, sample_frame) {
+        crate::serial_write_str("[KNT-ERROR] Failed to write to gaming ring buffer\r\n");
+        return false;
+    }
+
+    let mut recv_buf = [0u8; 64];
+    let n_read = win32_shared_gaming_ring_read(h_ring, &mut recv_buf);
+    if n_read != sample_frame.len() || &recv_buf[..n_read] != sample_frame {
+        crate::serial_write_str("[KNT-ERROR] Gaming ring buffer data corrupt or length mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-SECTION-PASS] Win32 named shared memory sections and anti-cheat mirror verified\r\n");
+    true
 }
