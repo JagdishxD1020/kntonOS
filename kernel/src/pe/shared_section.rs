@@ -203,3 +203,95 @@ pub unsafe extern "system" fn CreateSharedSectionA(
     win32_set_last_error(ERROR_SUCCESS);
     id
 }
+
+/// Maps a view of a shared memory section into the address space of the calling process.
+pub unsafe extern "system" fn MapSharedSectionViewEx(
+    hSection: HANDLE,
+    dwDesiredAccess: DWORD,
+    dwFileOffsetHigh: DWORD,
+    dwFileOffsetLow: DWORD,
+    dwNumberOfBytesToMap: SIZE_T,
+    lpBaseAddress: PVOID,
+) -> PVOID {
+    if hSection == 0 || hSection == (INVALID_HANDLE_VALUE as HANDLE) {
+        win32_set_last_error(ERROR_INVALID_HANDLE);
+        return core::ptr::null_mut();
+    }
+
+    let sections = SECTIONS.lock();
+    let section = match sections.get(&hSection) {
+        Some(s) => s,
+        None => {
+            win32_set_last_error(ERROR_INVALID_HANDLE);
+            return core::ptr::null_mut();
+        }
+    };
+
+    // Access mask security checks: verify section supports the requested view mode
+    if (dwDesiredAccess & FILE_MAP_WRITE) != 0 && (section.access_mask & SECTION_MAP_WRITE) == 0 {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        return core::ptr::null_mut();
+    }
+    if (dwDesiredAccess & FILE_MAP_READ) != 0 && (section.access_mask & SECTION_MAP_READ) == 0 {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        return core::ptr::null_mut();
+    }
+    if (dwDesiredAccess & FILE_MAP_EXECUTE) != 0 && (section.access_mask & SECTION_MAP_EXECUTE) == 0 {
+        win32_set_last_error(ERROR_ACCESS_DENIED);
+        return core::ptr::null_mut();
+    }
+
+    let offset = ((dwFileOffsetHigh as usize) << 32) | (dwFileOffsetLow as usize);
+    let view_len = if dwNumberOfBytesToMap == 0 {
+        section.max_size.saturating_sub(offset)
+    } else {
+        dwNumberOfBytesToMap
+    };
+
+    let is_cow = (dwDesiredAccess & FILE_MAP_COPY) != 0;
+    let base_addr = if !lpBaseAddress.is_null() {
+        lpBaseAddress as usize
+    } else {
+        VIRTUAL_VIEW_ALLOC_ADDR.fetch_add(view_len + 0x10000, Ordering::SeqCst)
+    };
+
+    let cow_buf = if is_cow {
+        let mut cow_vec = Vec::with_capacity(view_len);
+        let src = section.storage.ptr.add(offset);
+        let slice = core::slice::from_raw_parts(src, view_len);
+        cow_vec.extend_from_slice(slice);
+        Some(Arc::new(Spinlock::new(cow_vec)))
+    } else {
+        None
+    };
+
+    let view = SectionMappedView {
+        base_address: base_addr,
+        size: view_len,
+        offset,
+        desired_access: dwDesiredAccess,
+        is_copy_on_write: is_cow,
+        cow_buffer: cow_buf,
+    };
+
+    MAPPED_VIEWS.lock().insert(base_addr, view);
+    win32_set_last_error(ERROR_SUCCESS);
+    base_addr as PVOID
+}
+
+/// Unmaps a previously mapped view of a shared memory section.
+pub unsafe extern "system" fn UnmapSharedSectionView(lpBaseAddress: PVOID) -> BOOL {
+    if lpBaseAddress.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    let addr = lpBaseAddress as usize;
+    if MAPPED_VIEWS.lock().remove(&addr).is_some() {
+        win32_set_last_error(ERROR_SUCCESS);
+        TRUE
+    } else {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        FALSE
+    }
+}
