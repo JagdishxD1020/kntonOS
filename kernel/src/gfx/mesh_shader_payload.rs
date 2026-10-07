@@ -280,6 +280,150 @@ impl DynamicCullDistributor {
     }
 }
 
+// ============================================================================
+// Per-Primitive Cull Bounding Sphere Test & View-Frustum Visibility Filter
+// ============================================================================
+
+// Bounding sphere enclosing a meshlet or primitive cluster for coarse spatial rejection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrimitiveBoundingSphere {
+    // 3D center point in world or view space [X, Y, Z].
+    pub center: [f32; 3],
+    // Radius of the bounding sphere.
+    pub radius: f32,
+}
+
+impl PrimitiveBoundingSphere {
+    // Constructs a new bounding sphere.
+    pub const fn new(center: [f32; 3], radius: f32) -> Self {
+        Self { center, radius }
+    }
+
+    // Evaluates whether this sphere lies entirely behind a half-space plane (nx * x + ny * y + nz * z + d < -r).
+    #[inline]
+    pub fn is_outside_plane(&self, plane: [f32; 4]) -> bool {
+        let dist = plane[0] * self.center[0]
+            + plane[1] * self.center[1]
+            + plane[2] * self.center[2]
+            + plane[3];
+        dist < -self.radius
+    }
+}
+
+// 6-plane view frustum represented by plane equations in Hessian normal form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewFrustumPlanes {
+    // 6 clipping planes: Left, Right, Bottom, Top, Near, Far. Each is [nx, ny, nz, d].
+    pub planes: [[f32; 4]; 6],
+}
+
+impl ViewFrustumPlanes {
+    // Constructs a frustum from 6 plane equations.
+    pub const fn from_planes(planes: [[f32; 4]; 6]) -> Self {
+        Self { planes }
+    }
+
+    // Evaluates whether a bounding sphere is inside or intersecting the view frustum.
+    pub fn is_sphere_visible(&self, sphere: &PrimitiveBoundingSphere) -> bool {
+        for plane in &self.planes {
+            if sphere.is_outside_plane(*plane) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Normal cone for cluster-level backface and orientation culling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrimitiveNormalCone {
+    // Apex position of the normal cone in world or view space.
+    pub apex: [f32; 3],
+    // Primary normalized axis direction vector [X, Y, Z].
+    pub axis: [f32; 3],
+    // Cosine of the cone cutoff angle (dot product threshold for backfacing rejection).
+    pub cutoff: f32,
+}
+
+impl PrimitiveNormalCone {
+    // Constructs a primitive normal cone.
+    pub const fn new(apex: [f32; 3], axis: [f32; 3], cutoff: f32) -> Self {
+        Self { apex, axis, cutoff }
+    }
+
+    // Evaluates whether all primitives in this cluster are facing away from the camera.
+    pub fn is_backfacing(&self, camera_pos: [f32; 3]) -> bool {
+        let dir = [
+            camera_pos[0] - self.apex[0],
+            camera_pos[1] - self.apex[1],
+            camera_pos[2] - self.apex[2],
+        ];
+        let len_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        if len_sq < 1e-6 {
+            return false;
+        }
+
+        // Fast inverse square root approximation
+        let inv_len = 1.0 / super::mesh_shader::sqrt_approx(len_sq);
+        let view_dir = [dir[0] * inv_len, dir[1] * inv_len, dir[2] * inv_len];
+
+        let dot = view_dir[0] * self.axis[0] + view_dir[1] * self.axis[1] + view_dir[2] * self.axis[2];
+        dot <= self.cutoff
+    }
+}
+
+// Complete visibility filtering stage evaluating frustum and backface culling per meshlet.
+#[derive(Debug, Clone)]
+pub struct MeshletVisibilityFilter {
+    // Camera view frustum clipping planes.
+    pub frustum: ViewFrustumPlanes,
+    // Eye/camera position in world space.
+    pub camera_position: [f32; 3],
+    // Total meshlets culled due to frustum exclusion.
+    pub frustum_culls: u64,
+    // Total meshlets culled due to backface normal cone rejection.
+    pub backface_culls: u64,
+    // Total meshlets accepted as visible.
+    pub visible_survivors: u64,
+}
+
+impl MeshletVisibilityFilter {
+    // Constructs a meshlet visibility filter.
+    pub fn new(frustum: ViewFrustumPlanes, camera_position: [f32; 3]) -> Self {
+        Self {
+            frustum,
+            camera_position,
+            frustum_culls: 0,
+            backface_culls: 0,
+            visible_survivors: 0,
+        }
+    }
+
+    // Evaluates a candidate meshlet bounding sphere and optional normal cone.
+    pub fn evaluate_meshlet(
+        &mut self,
+        sphere: &PrimitiveBoundingSphere,
+        cone: Option<&PrimitiveNormalCone>,
+    ) -> bool {
+        // 1. Frustum visibility test
+        if !self.frustum.is_sphere_visible(sphere) {
+            self.frustum_culls = self.frustum_culls.saturating_add(1);
+            return false;
+        }
+
+        // 2. Normal cone backface test
+        if let Some(c) = cone {
+            if c.is_backfacing(self.camera_position) {
+                self.backface_culls = self.backface_culls.saturating_add(1);
+                return false;
+            }
+        }
+
+        self.visible_survivors = self.visible_survivors.saturating_add(1);
+        true
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_mesh_shader_payload_subsystem() -> bool {
     true
