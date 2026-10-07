@@ -10,6 +10,7 @@ pub mod quick_suspend;
 pub mod rgb_aura;
 pub mod bypass_charging;
 pub mod coulomb_counter;
+pub mod cooling_pump;
 
 pub use battery_balance::*;
 pub use coulomb_counter::*;
@@ -18,6 +19,7 @@ pub use battery_gauge::*;
 pub use whisper_mode::*;
 pub use quick_suspend::*;
 pub use rgb_aura::*;
+pub use cooling_pump::*;
 
 /// Verification self-test suite for Handheld PC Dual-Battery Balance Manager & USB-PD 3.1 Extended Power Profile Engine.
 pub fn test_dual_battery_balance_subsystem() -> bool {
