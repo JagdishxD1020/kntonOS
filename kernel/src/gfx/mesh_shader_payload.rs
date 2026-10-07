@@ -539,7 +539,133 @@ impl GeometryLodDecimationGovernor {
     }
 }
 
-// Temporary stub for self-test during incremental commits.
+// Comprehensive self-test suite for Direct3D 12 Agility Mesh Shader & Amplification Pipeline.
 pub fn test_mesh_shader_payload_subsystem() -> bool {
+    // 1. Verify Task Graph Dispatch Pipeline configuration
+    let task_desc = MeshShaderTaskDesc {
+        pipeline_id: 1,
+        root_signature_gpu_va: 0x0000_7FFF_1000_0000,
+        as_threadgroup_size: [32, 1, 1],
+        ms_threadgroup_size: [128, 1, 1],
+        payload_size_bytes: 512,
+        max_amplified_groups: 256,
+    };
+    if task_desc.validate().is_err() {
+        return false;
+    }
+
+    let mut pipeline = match MeshShaderTaskPipeline::new(task_desc) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    // 2. Verify AS Group Payload Buffer Suballocator & Dynamic Cull Distributor
+    let mut suballoc = PayloadBufferSuballocator::new(65536, 128); // 64 KiB buffer, 128-byte aligned
+    let off1 = match suballoc.suballocate(256) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off1 != 0 {
+        return false;
+    }
+
+    let off2 = match suballoc.suballocate(300) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off2 != 256 {
+        return false;
+    }
+
+    let off3 = match suballoc.suballocate(128) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off3 != 640 {
+        return false;
+    }
+
+    let mut distributor = DynamicCullDistributor::new(1); // 1 meshlet per MS group
+    let mut payload = AsGroupPayload::new(0, 0);
+    payload.push_survivor(0);
+    payload.push_survivor(2);
+    payload.push_survivor(5);
+    payload.push_survivor(8);
+
+    let disp = distributor.compute_amplified_dispatch(10, &payload);
+    if disp.thread_group_count_x != 4 || disp.total_threadgroups() != 4 {
+        return false;
+    }
+    if distributor.culling_efficiency_percent() != 60 {
+        return false;
+    }
+
+    pipeline.record_dispatch(1, disp.total_threadgroups());
+    if pipeline.total_as_invocations != 1 || pipeline.total_ms_invocations != 4 {
+        return false;
+    }
+
+    // 3. Verify Bounding Sphere View-Frustum Visibility & Normal Cone Culling
+    let frustum = ViewFrustumPlanes::from_planes([
+        [1.0, 0.0, 0.0, 10.0],   // Left: x + 10 >= 0
+        [-1.0, 0.0, 0.0, 10.0],  // Right: -x + 10 >= 0
+        [0.0, 1.0, 0.0, 10.0],   // Bottom: y + 10 >= 0
+        [0.0, -1.0, 0.0, 10.0],  // Top: -y + 10 >= 0
+        [0.0, 0.0, -1.0, -1.0],  // Near: -z - 1 >= 0 (z <= -1)
+        [0.0, 0.0, 1.0, 100.0],  // Far: z + 100 >= 0 (z >= -100)
+    ]);
+
+    let mut vis_filter = MeshletVisibilityFilter::new(frustum, [0.0, 0.0, 0.0]);
+
+    // Meshlet A: inside frustum, facing camera
+    let sphere_in = PrimitiveBoundingSphere::new([0.0, 0.0, -10.0], 2.0);
+    let cone_front = PrimitiveNormalCone::new([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], 0.0);
+    if !vis_filter.evaluate_meshlet(&sphere_in, Some(&cone_front)) {
+        return false;
+    }
+
+    // Meshlet B: outside frustum (far to the right x = 30)
+    let sphere_out = PrimitiveBoundingSphere::new([30.0, 0.0, -10.0], 2.0);
+    if vis_filter.evaluate_meshlet(&sphere_out, Some(&cone_front)) {
+        return false;
+    }
+    if vis_filter.frustum_culls != 1 {
+        return false;
+    }
+
+    // Meshlet C: inside frustum, but backfacing (normal points away from camera -Z)
+    let cone_back = PrimitiveNormalCone::new([0.0, 0.0, -10.0], [0.0, 0.0, -1.0], 0.0);
+    if vis_filter.evaluate_meshlet(&sphere_in, Some(&cone_back)) {
+        return false;
+    }
+    if vis_filter.backface_culls != 1 {
+        return false;
+    }
+    if vis_filter.visible_survivors != 1 {
+        return false;
+    }
+
+    // 4. Verify Handheld GPU Power-Saving Geometry Decimation Governor
+    let mut governor = GeometryLodDecimationGovernor::new(HandheldPowerMode::Performance);
+    let requested_dispatch = DispatchMeshArguments::new(800, 1, 1);
+
+    // Performance mode: full throughput
+    let (gov_disp, lod) = governor.govern_dispatch(requested_dispatch, 64);
+    if gov_disp.thread_group_count_x != 800 || lod != 0 {
+        return false;
+    }
+
+    // BatterySaver mode: clamps threadgroups to 256 and applies 50% decimation
+    governor.set_power_mode(HandheldPowerMode::BatterySaver);
+    let (bs_disp, bs_lod) = governor.govern_dispatch(requested_dispatch, 64);
+    if bs_disp.thread_group_count_x != 256 || bs_lod != 2 {
+        return false;
+    }
+    if governor.total_primitives_decimated == 0 || governor.decimation_percent() == 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-D3D12-MESH-SHADER-PASS] Direct3D 12 mesh shader amplification & payload distributor verified\r\n");
     true
 }

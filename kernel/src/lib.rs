@@ -502,6 +502,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 bindless heap engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Direct3D 12 Mesh Shader Primitive Amplification & Payload Distributor (TASK-KNT-241)
+    if !gfx::test_mesh_shader_payload_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 mesh shader amplification payload self-test failed!\r\n");
+    }
+
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 variable rate shading engine self-test failed!\r\n");
