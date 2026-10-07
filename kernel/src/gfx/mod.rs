@@ -51,6 +51,7 @@ pub mod wave_mma;
 pub mod gpu_multi_draw;
 pub mod barrier_discard;
 pub mod bindless_heap;
+pub mod mesh_shader_payload;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -102,6 +103,7 @@ pub use wave_mma::*;
 pub use gpu_multi_draw::*;
 pub use barrier_discard::*;
 pub use bindless_heap::*;
+pub use mesh_shader_payload::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.

@@ -1,0 +1,671 @@
+//! Direct3D 12 Agility Mesh Shader Primitive Amplification & Payload Distributor.
+//! Implements Amplification Shader (AS) to Mesh Shader (MS) task graph pipeline.
+
+#![allow(dead_code, non_camel_case_types, non_snake_case)]
+
+// Maximum amplification shader threadgroup size in any dimension.
+pub const D3D12_AS_MAX_THREADGROUP_DIMENSION: u32 = 1024;
+// Maximum mesh shader threadgroup size in any dimension.
+pub const D3D12_MS_MAX_THREADGROUP_DIMENSION: u32 = 128;
+// Maximum payload size in bytes passed from AS to MS (16 KiB per D3D12 Agility spec).
+pub const D3D12_AS_MAX_PAYLOAD_SIZE_BYTES: u32 = 16384;
+
+// Arguments for D3D12 DispatchMesh API call specifying threadgroup counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchMeshArguments {
+    // Number of threadgroups dispatched along X dimension.
+    pub thread_group_count_x: u32,
+    // Number of threadgroups dispatched along Y dimension.
+    pub thread_group_count_y: u32,
+    // Number of threadgroups dispatched along Z dimension.
+    pub thread_group_count_z: u32,
+}
+
+impl DispatchMeshArguments {
+    // Constructs new 3D dispatch arguments.
+    pub const fn new(x: u32, y: u32, z: u32) -> Self {
+        Self {
+            thread_group_count_x: x,
+            thread_group_count_y: y,
+            thread_group_count_z: z,
+        }
+    }
+
+    // Computes total flat threadgroups dispatched.
+    pub const fn total_threadgroups(&self) -> u64 {
+        (self.thread_group_count_x as u64)
+            * (self.thread_group_count_y as u64)
+            * (self.thread_group_count_z as u64)
+    }
+}
+
+// Configuration descriptor for an Amplification and Mesh Shader task graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshShaderTaskDesc {
+    // Unique identifier for this mesh task pipeline.
+    pub pipeline_id: u32,
+    // Base GPU virtual address of root signature.
+    pub root_signature_gpu_va: u64,
+    // Amplification Shader threadgroup sizing [X, Y, Z].
+    pub as_threadgroup_size: [u32; 3],
+    // Mesh Shader threadgroup sizing [X, Y, Z].
+    pub ms_threadgroup_size: [u32; 3],
+    // Payload byte size transferred per amplified threadgroup.
+    pub payload_size_bytes: u32,
+    // Maximum allowable amplified mesh shader groups per AS invocation.
+    pub max_amplified_groups: u32,
+}
+
+impl MeshShaderTaskDesc {
+    // Validates pipeline configuration against hardware limits.
+    pub fn validate(&self) -> Result<(), MeshShaderPayloadError> {
+        if self.as_threadgroup_size[0] == 0
+            || self.as_threadgroup_size[1] == 0
+            || self.as_threadgroup_size[2] == 0
+            || self.as_threadgroup_size[0] > D3D12_AS_MAX_THREADGROUP_DIMENSION
+        {
+            return Err(MeshShaderPayloadError::InvalidThreadgroupSize);
+        }
+        if self.ms_threadgroup_size[0] == 0
+            || self.ms_threadgroup_size[1] == 0
+            || self.ms_threadgroup_size[2] == 0
+            || self.ms_threadgroup_size[0] > D3D12_MS_MAX_THREADGROUP_DIMENSION
+        {
+            return Err(MeshShaderPayloadError::InvalidThreadgroupSize);
+        }
+        if self.payload_size_bytes > D3D12_AS_MAX_PAYLOAD_SIZE_BYTES {
+            return Err(MeshShaderPayloadError::PayloadSizeOverflow(self.payload_size_bytes));
+        }
+        Ok(())
+    }
+}
+
+// Error conditions returned by the mesh shader amplification subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshShaderPayloadError {
+    InvalidThreadgroupSize,
+    PayloadSizeOverflow(u32),
+    SuballocatorOutOfMemory,
+    InvalidPayloadAlignment,
+    AmplificationLimitExceeded(u32),
+}
+
+// Task graph pipeline coordinator executing Amplification-to-Mesh shader dispatches.
+#[derive(Debug, Clone)]
+pub struct MeshShaderTaskPipeline {
+    // Pipeline configuration descriptor.
+    pub desc: MeshShaderTaskDesc,
+    // Total AS threadgroups invoked.
+    pub total_as_invocations: u64,
+    // Total amplified MS threadgroups spawned.
+    pub total_ms_invocations: u64,
+    // Total primitive amplification ratio (MS groups / AS groups * 100).
+    pub running_amplification_ratio: u32,
+}
+
+impl MeshShaderTaskPipeline {
+    // Constructs a new mesh shader task pipeline.
+    pub fn new(desc: MeshShaderTaskDesc) -> Result<Self, MeshShaderPayloadError> {
+        desc.validate()?;
+        Ok(Self {
+            desc,
+            total_as_invocations: 0,
+            total_ms_invocations: 0,
+            running_amplification_ratio: 0,
+        })
+    }
+
+    // Records an amplification dispatch and updates invocation metrics.
+    pub fn record_dispatch(&mut self, as_groups: u64, spawned_ms_groups: u64) {
+        self.total_as_invocations = self.total_as_invocations.saturating_add(as_groups);
+        self.total_ms_invocations = self.total_ms_invocations.saturating_add(spawned_ms_groups);
+        if self.total_as_invocations > 0 {
+            self.running_amplification_ratio = ((self.total_ms_invocations * 100) / self.total_as_invocations) as u32;
+        }
+    }
+}
+
+// ============================================================================
+// AS Group Payload Buffer Suballocator & Dynamic Cull Distributor
+// ============================================================================
+
+// Packed payload structure output by an Amplification Shader workgroup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsGroupPayload {
+    // Base meshlet offset in geometry cluster.
+    pub base_meshlet_index: u32,
+    // Surviving meshlet indices within this AS cluster (after culling).
+    pub surviving_meshlet_indices: alloc::vec::Vec<u8>,
+    // LOD level index selected by AS.
+    pub lod_level: u8,
+    // Custom user payload data words (e.g. instance matrix index, material ID).
+    pub user_payload: [u32; 8],
+}
+
+impl AsGroupPayload {
+    // Constructs a new amplification payload.
+    pub fn new(base_meshlet_index: u32, lod_level: u8) -> Self {
+        Self {
+            base_meshlet_index,
+            surviving_meshlet_indices: alloc::vec::Vec::new(),
+            lod_level,
+            user_payload: [0; 8],
+        }
+    }
+
+    // Appends a surviving meshlet index to this payload.
+    pub fn push_survivor(&mut self, meshlet_offset: u8) {
+        self.surviving_meshlet_indices.push(meshlet_offset);
+    }
+
+    // Number of surviving meshlets ready for mesh shader processing.
+    pub fn survivor_count(&self) -> usize {
+        self.surviving_meshlet_indices.len()
+    }
+}
+
+// Suballocator managing scratch payload memory shared between AS and MS workgroups.
+#[derive(Debug, Clone)]
+pub struct PayloadBufferSuballocator {
+    // Total backing scratch pool capacity in bytes.
+    pub buffer_capacity_bytes: usize,
+    // Memory alignment requirement in bytes (e.g. 128 bytes).
+    pub alignment_bytes: usize,
+    // Current allocation bump offset.
+    pub current_offset: usize,
+    // High-water mark of memory consumed.
+    pub peak_allocated_bytes: usize,
+    // Total allocation operations served.
+    pub total_allocations: u64,
+}
+
+impl PayloadBufferSuballocator {
+    // Constructs a new payload buffer suballocator.
+    pub fn new(buffer_capacity_bytes: usize, alignment_bytes: usize) -> Self {
+        let align = if alignment_bytes.is_power_of_two() && alignment_bytes > 0 {
+            alignment_bytes
+        } else {
+            128
+        };
+        Self {
+            buffer_capacity_bytes,
+            alignment_bytes: align,
+            current_offset: 0,
+            peak_allocated_bytes: 0,
+            total_allocations: 0,
+        }
+    }
+
+    // Suballocates an aligned slice of payload scratch memory.
+    pub fn suballocate(&mut self, size_bytes: usize) -> Result<usize, MeshShaderPayloadError> {
+        let aligned_offset = (self.current_offset.saturating_add(self.alignment_bytes - 1))
+            & !(self.alignment_bytes - 1);
+        let end_offset = aligned_offset.saturating_add(size_bytes);
+
+        if end_offset > self.buffer_capacity_bytes {
+            return Err(MeshShaderPayloadError::SuballocatorOutOfMemory);
+        }
+
+        self.current_offset = end_offset;
+        self.peak_allocated_bytes = core::cmp::max(self.peak_allocated_bytes, end_offset);
+        self.total_allocations = self.total_allocations.saturating_add(1);
+
+        Ok(aligned_offset)
+    }
+
+    // Resets suballocator offset for next dispatch frame.
+    pub fn reset(&mut self) {
+        self.current_offset = 0;
+    }
+}
+
+// Distributes surviving meshlets into amplified downstream Mesh Shader threadgroups.
+#[derive(Debug, Clone)]
+pub struct DynamicCullDistributor {
+    // Number of meshlets processed per spawned Mesh Shader threadgroup (typically 1 or 2).
+    pub meshlets_per_ms_group: u32,
+    // Total candidate meshlets evaluated across all AS invocations.
+    pub input_meshlets_count: u64,
+    // Total meshlets culled (frustum, occlusion, or LOD).
+    pub culled_meshlets_count: u64,
+    // Total meshlets forwarded to downstream Mesh Shaders.
+    pub emitted_meshlets_count: u64,
+    // Total amplified MS threadgroups spawned.
+    pub amplified_groups_spawned: u64,
+}
+
+impl DynamicCullDistributor {
+    // Constructs a dynamic cull distributor.
+    pub fn new(meshlets_per_ms_group: u32) -> Self {
+        let per_group = core::cmp::max(1, meshlets_per_ms_group);
+        Self {
+            meshlets_per_ms_group: per_group,
+            input_meshlets_count: 0,
+            culled_meshlets_count: 0,
+            emitted_meshlets_count: 0,
+            amplified_groups_spawned: 0,
+        }
+    }
+
+    // Calculates downstream DispatchMesh arguments from an AS payload.
+    pub fn compute_amplified_dispatch(
+        &mut self,
+        total_cluster_meshlets: u32,
+        payload: &AsGroupPayload,
+    ) -> DispatchMeshArguments {
+        let survivors = payload.survivor_count() as u32;
+        let culled = total_cluster_meshlets.saturating_sub(survivors);
+
+        self.input_meshlets_count = self.input_meshlets_count.saturating_add(total_cluster_meshlets as u64);
+        self.culled_meshlets_count = self.culled_meshlets_count.saturating_add(culled as u64);
+        self.emitted_meshlets_count = self.emitted_meshlets_count.saturating_add(survivors as u64);
+
+        if survivors == 0 {
+            return DispatchMeshArguments::new(0, 0, 0);
+        }
+
+        let groups_x = (survivors.saturating_add(self.meshlets_per_ms_group - 1)) / self.meshlets_per_ms_group;
+        self.amplified_groups_spawned = self.amplified_groups_spawned.saturating_add(groups_x as u64);
+
+        DispatchMeshArguments::new(groups_x, 1, 1)
+    }
+
+    // Computes overall culling efficiency percentage (0 to 100%).
+    pub fn culling_efficiency_percent(&self) -> u32 {
+        if self.input_meshlets_count == 0 {
+            0
+        } else {
+            ((self.culled_meshlets_count * 100) / self.input_meshlets_count) as u32
+        }
+    }
+}
+
+// ============================================================================
+// Per-Primitive Cull Bounding Sphere Test & View-Frustum Visibility Filter
+// ============================================================================
+
+// Bounding sphere enclosing a meshlet or primitive cluster for coarse spatial rejection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrimitiveBoundingSphere {
+    // 3D center point in world or view space [X, Y, Z].
+    pub center: [f32; 3],
+    // Radius of the bounding sphere.
+    pub radius: f32,
+}
+
+impl PrimitiveBoundingSphere {
+    // Constructs a new bounding sphere.
+    pub const fn new(center: [f32; 3], radius: f32) -> Self {
+        Self { center, radius }
+    }
+
+    // Evaluates whether this sphere lies entirely behind a half-space plane (nx * x + ny * y + nz * z + d < -r).
+    #[inline]
+    pub fn is_outside_plane(&self, plane: [f32; 4]) -> bool {
+        let dist = plane[0] * self.center[0]
+            + plane[1] * self.center[1]
+            + plane[2] * self.center[2]
+            + plane[3];
+        dist < -self.radius
+    }
+}
+
+// 6-plane view frustum represented by plane equations in Hessian normal form.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewFrustumPlanes {
+    // 6 clipping planes: Left, Right, Bottom, Top, Near, Far. Each is [nx, ny, nz, d].
+    pub planes: [[f32; 4]; 6],
+}
+
+impl ViewFrustumPlanes {
+    // Constructs a frustum from 6 plane equations.
+    pub const fn from_planes(planes: [[f32; 4]; 6]) -> Self {
+        Self { planes }
+    }
+
+    // Evaluates whether a bounding sphere is inside or intersecting the view frustum.
+    pub fn is_sphere_visible(&self, sphere: &PrimitiveBoundingSphere) -> bool {
+        for plane in &self.planes {
+            if sphere.is_outside_plane(*plane) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Normal cone for cluster-level backface and orientation culling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrimitiveNormalCone {
+    // Apex position of the normal cone in world or view space.
+    pub apex: [f32; 3],
+    // Primary normalized axis direction vector [X, Y, Z].
+    pub axis: [f32; 3],
+    // Cosine of the cone cutoff angle (dot product threshold for backfacing rejection).
+    pub cutoff: f32,
+}
+
+impl PrimitiveNormalCone {
+    // Constructs a primitive normal cone.
+    pub const fn new(apex: [f32; 3], axis: [f32; 3], cutoff: f32) -> Self {
+        Self { apex, axis, cutoff }
+    }
+
+    // Evaluates whether all primitives in this cluster are facing away from the camera.
+    pub fn is_backfacing(&self, camera_pos: [f32; 3]) -> bool {
+        let dir = [
+            camera_pos[0] - self.apex[0],
+            camera_pos[1] - self.apex[1],
+            camera_pos[2] - self.apex[2],
+        ];
+        let len_sq = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        if len_sq < 1e-6 {
+            return false;
+        }
+
+        // Fast inverse square root approximation
+        let inv_len = 1.0 / super::mesh_shader::sqrt_approx(len_sq);
+        let view_dir = [dir[0] * inv_len, dir[1] * inv_len, dir[2] * inv_len];
+
+        let dot = view_dir[0] * self.axis[0] + view_dir[1] * self.axis[1] + view_dir[2] * self.axis[2];
+        dot <= self.cutoff
+    }
+}
+
+// Complete visibility filtering stage evaluating frustum and backface culling per meshlet.
+#[derive(Debug, Clone)]
+pub struct MeshletVisibilityFilter {
+    // Camera view frustum clipping planes.
+    pub frustum: ViewFrustumPlanes,
+    // Eye/camera position in world space.
+    pub camera_position: [f32; 3],
+    // Total meshlets culled due to frustum exclusion.
+    pub frustum_culls: u64,
+    // Total meshlets culled due to backface normal cone rejection.
+    pub backface_culls: u64,
+    // Total meshlets accepted as visible.
+    pub visible_survivors: u64,
+}
+
+impl MeshletVisibilityFilter {
+    // Constructs a meshlet visibility filter.
+    pub fn new(frustum: ViewFrustumPlanes, camera_position: [f32; 3]) -> Self {
+        Self {
+            frustum,
+            camera_position,
+            frustum_culls: 0,
+            backface_culls: 0,
+            visible_survivors: 0,
+        }
+    }
+
+    // Evaluates a candidate meshlet bounding sphere and optional normal cone.
+    pub fn evaluate_meshlet(
+        &mut self,
+        sphere: &PrimitiveBoundingSphere,
+        cone: Option<&PrimitiveNormalCone>,
+    ) -> bool {
+        // 1. Frustum visibility test
+        if !self.frustum.is_sphere_visible(sphere) {
+            self.frustum_culls = self.frustum_culls.saturating_add(1);
+            return false;
+        }
+
+        // 2. Normal cone backface test
+        if let Some(c) = cone {
+            if c.is_backfacing(self.camera_position) {
+                self.backface_culls = self.backface_culls.saturating_add(1);
+                return false;
+            }
+        }
+
+        self.visible_survivors = self.visible_survivors.saturating_add(1);
+        true
+    }
+}
+
+// ============================================================================
+// Handheld GPU Power-Saving Geometry LOD Decimation Governor
+// ============================================================================
+
+// Handheld APU power and thermal operation profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldPowerMode {
+    // High performance mode (full geometry fidelity, e.g. 28W TDP AC connected).
+    Performance,
+    // Balanced handheld mode (moderate LOD decimation, e.g. 15W TDP).
+    Balanced,
+    // Battery saver mode (aggressive LOD decimation, e.g. 10W TDP).
+    BatterySaver,
+    // Extreme power saver mode (minimum LOD and threadgroup clamping, e.g. 7W TDP).
+    ExtremePowerSaver,
+}
+
+// Adaptive governor modulating mesh shader amplification to conserve battery and GPU power.
+#[derive(Debug, Clone)]
+pub struct GeometryLodDecimationGovernor {
+    // Current operating power profile.
+    pub power_mode: HandheldPowerMode,
+    // Maximum allowed Mesh Shader threadgroups per dispatch.
+    pub max_threadgroup_clamp: u32,
+    // Geometry density decimation ratio percentage (100 = full density, 25 = 1/4 density).
+    pub decimation_ratio_percent: u32,
+    // Additional LOD level bias added to Amplification Shader payload.
+    pub lod_bias: u8,
+    // Total candidate primitives evaluated.
+    pub total_primitives_evaluated: u64,
+    // Total primitives eliminated through power decimation.
+    pub total_primitives_decimated: u64,
+}
+
+impl GeometryLodDecimationGovernor {
+    // Constructs a geometry LOD decimation governor with the specified power profile.
+    pub fn new(initial_mode: HandheldPowerMode) -> Self {
+        let mut gov = Self {
+            power_mode: initial_mode,
+            max_threadgroup_clamp: 1024,
+            decimation_ratio_percent: 100,
+            lod_bias: 0,
+            total_primitives_evaluated: 0,
+            total_primitives_decimated: 0,
+        };
+        gov.apply_mode_parameters(initial_mode);
+        gov
+    }
+
+    // Configures governor parameters matching the active power mode.
+    fn apply_mode_parameters(&mut self, mode: HandheldPowerMode) {
+        self.power_mode = mode;
+        match mode {
+            HandheldPowerMode::Performance => {
+                self.max_threadgroup_clamp = 1024;
+                self.decimation_ratio_percent = 100;
+                self.lod_bias = 0;
+            }
+            HandheldPowerMode::Balanced => {
+                self.max_threadgroup_clamp = 512;
+                self.decimation_ratio_percent = 75;
+                self.lod_bias = 1;
+            }
+            HandheldPowerMode::BatterySaver => {
+                self.max_threadgroup_clamp = 256;
+                self.decimation_ratio_percent = 50;
+                self.lod_bias = 2;
+            }
+            HandheldPowerMode::ExtremePowerSaver => {
+                self.max_threadgroup_clamp = 128;
+                self.decimation_ratio_percent = 25;
+                self.lod_bias = 3;
+            }
+        }
+    }
+
+    // Switches the power mode and updates governor thresholds dynamically.
+    pub fn set_power_mode(&mut self, mode: HandheldPowerMode) {
+        self.apply_mode_parameters(mode);
+    }
+
+    // Adapts an incoming DispatchMesh request, clamping threadgroups and returning the LOD bias.
+    pub fn govern_dispatch(
+        &mut self,
+        requested: DispatchMeshArguments,
+        primitives_per_group: u32,
+    ) -> (DispatchMeshArguments, u8) {
+        let total_requested_groups = requested.total_threadgroups() as u32;
+        let clamped_x = core::cmp::min(requested.thread_group_count_x, self.max_threadgroup_clamp);
+        let clamped_y = requested.thread_group_count_y;
+        let clamped_z = requested.thread_group_count_z;
+
+        let total_effective_groups = (clamped_x as u64) * (clamped_y as u64) * (clamped_z as u64);
+        let requested_prims = (total_requested_groups as u64) * (primitives_per_group as u64);
+        let effective_prims = ((total_effective_groups * (primitives_per_group as u64))
+            * (self.decimation_ratio_percent as u64)) / 100;
+
+        let decimated_prims = requested_prims.saturating_sub(effective_prims);
+
+        self.total_primitives_evaluated = self.total_primitives_evaluated.saturating_add(requested_prims);
+        self.total_primitives_decimated = self.total_primitives_decimated.saturating_add(decimated_prims);
+
+        (DispatchMeshArguments::new(clamped_x, clamped_y, clamped_z), self.lod_bias)
+    }
+
+    // Calculates overall primitive decimation percentage achieved.
+    pub fn decimation_percent(&self) -> u32 {
+        if self.total_primitives_evaluated == 0 {
+            0
+        } else {
+            ((self.total_primitives_decimated * 100) / self.total_primitives_evaluated) as u32
+        }
+    }
+}
+
+// Comprehensive self-test suite for Direct3D 12 Agility Mesh Shader & Amplification Pipeline.
+pub fn test_mesh_shader_payload_subsystem() -> bool {
+    // 1. Verify Task Graph Dispatch Pipeline configuration
+    let task_desc = MeshShaderTaskDesc {
+        pipeline_id: 1,
+        root_signature_gpu_va: 0x0000_7FFF_1000_0000,
+        as_threadgroup_size: [32, 1, 1],
+        ms_threadgroup_size: [128, 1, 1],
+        payload_size_bytes: 512,
+        max_amplified_groups: 256,
+    };
+    if task_desc.validate().is_err() {
+        return false;
+    }
+
+    let mut pipeline = match MeshShaderTaskPipeline::new(task_desc) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    // 2. Verify AS Group Payload Buffer Suballocator & Dynamic Cull Distributor
+    let mut suballoc = PayloadBufferSuballocator::new(65536, 128); // 64 KiB buffer, 128-byte aligned
+    let off1 = match suballoc.suballocate(256) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off1 != 0 {
+        return false;
+    }
+
+    let off2 = match suballoc.suballocate(300) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off2 != 256 {
+        return false;
+    }
+
+    let off3 = match suballoc.suballocate(128) {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if off3 != 640 {
+        return false;
+    }
+
+    let mut distributor = DynamicCullDistributor::new(1); // 1 meshlet per MS group
+    let mut payload = AsGroupPayload::new(0, 0);
+    payload.push_survivor(0);
+    payload.push_survivor(2);
+    payload.push_survivor(5);
+    payload.push_survivor(8);
+
+    let disp = distributor.compute_amplified_dispatch(10, &payload);
+    if disp.thread_group_count_x != 4 || disp.total_threadgroups() != 4 {
+        return false;
+    }
+    if distributor.culling_efficiency_percent() != 60 {
+        return false;
+    }
+
+    pipeline.record_dispatch(1, disp.total_threadgroups());
+    if pipeline.total_as_invocations != 1 || pipeline.total_ms_invocations != 4 {
+        return false;
+    }
+
+    // 3. Verify Bounding Sphere View-Frustum Visibility & Normal Cone Culling
+    let frustum = ViewFrustumPlanes::from_planes([
+        [1.0, 0.0, 0.0, 10.0],   // Left: x + 10 >= 0
+        [-1.0, 0.0, 0.0, 10.0],  // Right: -x + 10 >= 0
+        [0.0, 1.0, 0.0, 10.0],   // Bottom: y + 10 >= 0
+        [0.0, -1.0, 0.0, 10.0],  // Top: -y + 10 >= 0
+        [0.0, 0.0, -1.0, -1.0],  // Near: -z - 1 >= 0 (z <= -1)
+        [0.0, 0.0, 1.0, 100.0],  // Far: z + 100 >= 0 (z >= -100)
+    ]);
+
+    let mut vis_filter = MeshletVisibilityFilter::new(frustum, [0.0, 0.0, 0.0]);
+
+    // Meshlet A: inside frustum, facing camera
+    let sphere_in = PrimitiveBoundingSphere::new([0.0, 0.0, -10.0], 2.0);
+    let cone_front = PrimitiveNormalCone::new([0.0, 0.0, -10.0], [0.0, 0.0, 1.0], 0.0);
+    if !vis_filter.evaluate_meshlet(&sphere_in, Some(&cone_front)) {
+        return false;
+    }
+
+    // Meshlet B: outside frustum (far to the right x = 30)
+    let sphere_out = PrimitiveBoundingSphere::new([30.0, 0.0, -10.0], 2.0);
+    if vis_filter.evaluate_meshlet(&sphere_out, Some(&cone_front)) {
+        return false;
+    }
+    if vis_filter.frustum_culls != 1 {
+        return false;
+    }
+
+    // Meshlet C: inside frustum, but backfacing (normal points away from camera -Z)
+    let cone_back = PrimitiveNormalCone::new([0.0, 0.0, -10.0], [0.0, 0.0, -1.0], 0.0);
+    if vis_filter.evaluate_meshlet(&sphere_in, Some(&cone_back)) {
+        return false;
+    }
+    if vis_filter.backface_culls != 1 {
+        return false;
+    }
+    if vis_filter.visible_survivors != 1 {
+        return false;
+    }
+
+    // 4. Verify Handheld GPU Power-Saving Geometry Decimation Governor
+    let mut governor = GeometryLodDecimationGovernor::new(HandheldPowerMode::Performance);
+    let requested_dispatch = DispatchMeshArguments::new(800, 1, 1);
+
+    // Performance mode: full throughput
+    let (gov_disp, lod) = governor.govern_dispatch(requested_dispatch, 64);
+    if gov_disp.thread_group_count_x != 800 || lod != 0 {
+        return false;
+    }
+
+    // BatterySaver mode: clamps threadgroups to 256 and applies 50% decimation
+    governor.set_power_mode(HandheldPowerMode::BatterySaver);
+    let (bs_disp, bs_lod) = governor.govern_dispatch(requested_dispatch, 64);
+    if bs_disp.thread_group_count_x != 256 || bs_lod != 2 {
+        return false;
+    }
+    if governor.total_primitives_decimated == 0 || governor.decimation_percent() == 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel
+    crate::serial_write_str("[KNT-D3D12-MESH-SHADER-PASS] Direct3D 12 mesh shader amplification & payload distributor verified\r\n");
+    true
+}
