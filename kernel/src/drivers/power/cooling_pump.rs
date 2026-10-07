@@ -204,3 +204,191 @@ pub fn verify_fan_curve_and_acoustic_avoidance() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Coolant Micro-Pump Flow Sensor Monitoring & PWM Flow Throttling
+// ============================================================================
+
+/// Minimum PWM duty cycle for the liquid cooling micro-pump when active (prevents bearing stall).
+pub const PUMP_MIN_PWM_DUTY: f32 = 0.20;
+/// Maximum rated coolant volumetric flow rate in mL/min.
+pub const PUMP_MAX_FLOW_ML_MIN: u16 = 450;
+/// Minimum safe coolant volumetric flow rate in mL/min before cavitation/stall flag.
+pub const PUMP_MIN_SAFE_FLOW_ML_MIN: u16 = 45;
+/// Flow sensor calibration pulses per milliliter of coolant.
+pub const PUMP_PULSES_PER_ML: u32 = 12;
+/// Maximum allowable dry-run duration in milliseconds before emergency shutdown.
+pub const PUMP_DRY_RUN_TRIP_MS: u32 = 400;
+
+/// Liquid-Metal Closed-Loop Coolant Micro-Pump Controller and Flow Monitor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoolantMicroPump {
+    /// Active PWM duty cycle commanded to the micro-pump motor (0.0 to 1.0).
+    pub pwm_duty: f32,
+    /// Desired coolant flow rate in mL/min.
+    pub target_flow_ml_min: u16,
+    /// Measured coolant flow rate from Hall-effect sensor in mL/min.
+    pub measured_flow_ml_min: u16,
+    /// Estimated pump impeller rotational speed in RPM.
+    pub pump_rpm: u16,
+    /// Cavitation / air-bubble warning indicator.
+    pub is_cavitation_warning: bool,
+    /// Dry-run trip flag (pump operating without fluid flow).
+    pub is_dry_run_fault: bool,
+    /// Accumulated duration of zero flow while pump is commanded active.
+    pub dry_run_timer_ms: u32,
+    /// Cumulative flow sensor pulses received.
+    pub total_flow_pulses: u64,
+    /// Coolant temperature entering cold plate (°C).
+    pub coolant_temp_in_c: f32,
+    /// Coolant temperature exiting radiator (°C).
+    pub coolant_temp_out_c: f32,
+}
+
+impl CoolantMicroPump {
+    /// Constructs a liquid coolant micro-pump controller.
+    pub const fn new() -> Self {
+        Self {
+            pwm_duty: 0.0,
+            target_flow_ml_min: 0,
+            measured_flow_ml_min: 0,
+            pump_rpm: 0,
+            is_cavitation_warning: false,
+            is_dry_run_fault: false,
+            dry_run_timer_ms: 0,
+            total_flow_pulses: 0,
+            coolant_temp_in_c: 25.0,
+            coolant_temp_out_c: 25.0,
+        }
+    }
+
+    /// Ingests flow sensor Hall-effect pulses over time window `dt_ms` and updates flow telemetry.
+    pub fn update_telemetry(
+        &mut self,
+        pulses: u32,
+        dt_ms: u32,
+        temp_in_c: f32,
+        temp_out_c: f32,
+    ) {
+        self.total_flow_pulses += pulses as u64;
+        self.coolant_temp_in_c = temp_in_c;
+        self.coolant_temp_out_c = temp_out_c;
+
+        if dt_ms == 0 {
+            return;
+        }
+
+        // Calculate flow rate: (pulses / PUMP_PULSES_PER_ML) * (60,000 / dt_ms)
+        let ml_flow = pulses as f32 / PUMP_PULSES_PER_ML as f32;
+        let flow_rate_ml_min = (ml_flow * (60_000.0 / dt_ms as f32)) as u16;
+        self.measured_flow_ml_min = flow_rate_ml_min.min(PUMP_MAX_FLOW_ML_MIN * 2);
+
+        // Approximate pump RPM (12 pulses/mL * ~8 mL/sec at 4000 RPM)
+        self.pump_rpm = if self.measured_flow_ml_min > 0 {
+            1200 + ((self.measured_flow_ml_min as f32 / PUMP_MAX_FLOW_ML_MIN as f32) * 3600.0) as u16
+        } else {
+            0
+        };
+
+        // Dry-run and cavitation diagnosis:
+        if self.pwm_duty >= PUMP_MIN_PWM_DUTY {
+            if self.measured_flow_ml_min < 10 {
+                self.dry_run_timer_ms += dt_ms;
+                if self.dry_run_timer_ms >= PUMP_DRY_RUN_TRIP_MS {
+                    self.is_dry_run_fault = true;
+                }
+            } else {
+                self.dry_run_timer_ms = 0;
+                self.is_dry_run_fault = false;
+            }
+
+            // Cavitation check: High commanded duty but abnormally low flow rate
+            if self.pwm_duty >= 0.50 && self.measured_flow_ml_min < PUMP_MIN_SAFE_FLOW_ML_MIN {
+                self.is_cavitation_warning = true;
+            } else {
+                self.is_cavitation_warning = false;
+            }
+        } else {
+            self.dry_run_timer_ms = 0;
+            self.is_dry_run_fault = false;
+            self.is_cavitation_warning = false;
+        }
+    }
+
+    /// Throttles coolant flow based on thermal heat flux (APU die temp and thermal power dissipation).
+    pub fn throttle_flow_by_heat_flux(&mut self, apu_temp_c: f32, tdp_watts: f32) -> f32 {
+        if self.is_dry_run_fault {
+            // Cut power to pump to protect ceramic bearings from dry-run burn
+            self.pwm_duty = 0.0;
+            self.target_flow_ml_min = 0;
+            return 0.0;
+        }
+
+        // Modulate pump speed based on thermal energy dissipation:
+        // Handheld whisper power: APU <= 45°C & TDP <= 8W -> Low whisper flow (25% duty, ~110 mL/min)
+        // Sustained gaming: 55°C - 75°C & TDP 15W-25W -> Balanced flow (40% - 70% duty)
+        // High load: > 80°C or TDP > 28W -> Full circulation (85% - 100% duty)
+        let duty = if apu_temp_c <= 45.0 && tdp_watts <= 8.0 {
+            PUMP_MIN_PWM_DUTY + 0.05 // 25% whisper circulation
+        } else if apu_temp_c <= 65.0 {
+            0.30 + ((apu_temp_c - 45.0) / 20.0) * 0.25 // 30% to 55%
+        } else if apu_temp_c <= 85.0 {
+            0.55 + ((apu_temp_c - 65.0) / 20.0) * 0.30 // 55% to 85%
+        } else {
+            0.85 + ((apu_temp_c - 85.0) / 15.0) * 0.15 // 85% to 100%
+        };
+
+        self.pwm_duty = duty.clamp(PUMP_MIN_PWM_DUTY, 1.0);
+        self.target_flow_ml_min = (self.pwm_duty * PUMP_MAX_FLOW_ML_MIN as f32) as u16;
+        self.pwm_duty
+    }
+}
+
+/// Verification test for coolant micro-pump flow monitoring and pulse-width flow throttling.
+pub fn verify_coolant_pump_flow_monitoring() -> bool {
+    let mut pump = CoolantMicroPump::new();
+
+    // 1. Initial idle state
+    if pump.pwm_duty != 0.0 || pump.measured_flow_ml_min != 0 || pump.is_dry_run_fault {
+        return false;
+    }
+
+    // 2. Whisper idle flow throttling at 42°C and 6W TDP
+    let duty_whisper = pump.throttle_flow_by_heat_flux(42.0, 6.0);
+    if duty_whisper < 0.20 || duty_whisper > 0.30 {
+        return false;
+    }
+    if pump.target_flow_ml_min < 90 || pump.target_flow_ml_min > 130 {
+        return false;
+    }
+
+    // 3. Flow telemetry update: 100ms window with 24 pulses (2 mL -> 1200 mL/min / 100ms * 60s)
+    // 2 mL in 100ms = 20 mL/sec = 1200 mL/min... wait, 24 pulses / 12 = 2 mL; 2 * (60,000 / 100) = 1200 mL/min
+    // For nominal ~200 mL/min at 100ms window: pulses = (200 / 60000) * 100 * 12 = 4 pulses
+    pump.update_telemetry(4, 100, 35.0, 30.0);
+    if pump.measured_flow_ml_min == 0 || pump.pump_rpm == 0 {
+        return false;
+    }
+
+    // 4. Heavy gaming heat flux throttling at 78°C and 25W TDP
+    let duty_heavy = pump.throttle_flow_by_heat_flux(78.0, 25.0);
+    if duty_heavy <= duty_whisper || duty_heavy < 0.70 {
+        return false;
+    }
+
+    // 5. Dry-run safety protection: Commanded 70% duty, but 0 flow pulses for 500ms
+    pump.update_telemetry(0, 500, 78.0, 75.0);
+    if !pump.is_dry_run_fault {
+        return false;
+    }
+
+    // Dry-run fault must immediately shut off pump duty on next evaluation
+    let duty_fault = pump.throttle_flow_by_heat_flux(80.0, 25.0);
+    if duty_fault != 0.0 || pump.pwm_duty != 0.0 {
+        return false;
+    }
+
+    true
+}
+
