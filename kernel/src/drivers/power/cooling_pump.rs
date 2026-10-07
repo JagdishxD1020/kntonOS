@@ -137,12 +137,17 @@ impl PwmFanGovernor {
 
         self.target_duty = filtered_duty.clamp(0.0, 1.0);
 
-        // Apply slew rate limiter to prevent abrupt fan speed oscillations
-        let delta = self.target_duty - self.effective_duty;
-        if delta.abs() > self.max_slew_per_step {
-            self.effective_duty += delta.signum() * self.max_slew_per_step;
-        } else {
+        // Apply slew rate limiter to prevent abrupt fan speed oscillations,
+        // but snap across the resonant whine band immediately so the fan never lingers in the whine zone
+        if self.avoidance_state != AcousticAvoidanceState::Normal {
             self.effective_duty = self.target_duty;
+        } else {
+            let delta = self.target_duty - self.effective_duty;
+            if delta.abs() > self.max_slew_per_step {
+                self.effective_duty += delta.signum() * self.max_slew_per_step;
+            } else {
+                self.effective_duty = self.target_duty;
+            }
         }
 
         self.current_rpm = self.duty_to_rpm(self.effective_duty);
@@ -652,7 +657,7 @@ impl AntiStallKickstarter {
                 // Transitioning from 0 RPM stop to spin: Initiate kickstart pulse!
                 self.state = KickstarterState::Kicking;
                 self.output_duty = KICKSTART_PULSE_DUTY;
-                self.phase_timer_ms = 0;
+                self.phase_timer_ms = dt_ms;
                 self.retry_count = 0;
             }
             KickstarterState::Kicking => {
@@ -815,5 +820,42 @@ pub fn verify_anti_stall_kickstarter_and_governor() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Active Fan & Liquid-Metal Cooling Pump Governor.
+pub fn test_cooling_pump_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER] Testing Handheld Active Fan & Liquid-Metal Cooling Pump Governor...\r\n");
+
+    // 1. Verify PWM Fan Curve Governor & Acoustic Whine Resonance Avoidance
+    if !verify_fan_curve_and_acoustic_avoidance() {
+        crate::serial_write_str("[KNT-PANIC] PWM fan curve and acoustic whine avoidance verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Coolant Micro-Pump Flow Monitoring & PWM Flow Throttling
+    if !verify_coolant_pump_flow_monitoring() {
+        crate::serial_write_str("[KNT-PANIC] Coolant micro-pump flow monitoring verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify Thermal Runaway Emergency Ramp (<100ms response to APU > 95°C)
+    if !verify_thermal_runaway_emergency_ramp() {
+        crate::serial_write_str("[KNT-PANIC] Thermal runaway emergency ramp verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify Anti-Stall Low-RPM Kickstarter & Integrated Cooling Governor
+    if !verify_anti_stall_kickstarter_and_governor() {
+        crate::serial_write_str("[KNT-PANIC] Anti-stall low-RPM kickstarter verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-COOLING-PASS] Handheld active fan and liquid-metal cooling pump governor verified\r\n");
     true
 }

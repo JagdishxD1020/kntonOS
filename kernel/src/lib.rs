@@ -872,6 +872,11 @@ pub extern "C" fn kmain() -> ! {
 
 
 
+    // Initialize and verify Handheld Active Fan & Liquid-Metal Cooling Pump Governor (TASK-KNT-242)
+    if !drivers::power::test_cooling_pump_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld cooling pump governor self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
     if !drivers::power::test_thermal_governor_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld thermal governor and dynamic fan curve engine self-test failed!\r\n");
