@@ -295,3 +295,42 @@ pub unsafe extern "system" fn UnmapSharedSectionView(lpBaseAddress: PVOID) -> BO
         FALSE
     }
 }
+
+/// Intercepts page fault write-access on a mapped section, enforcing write-protection traps and COW.
+pub fn win32_section_handle_page_fault(fault_addr: usize, is_write: bool) -> bool {
+    let views = MAPPED_VIEWS.lock();
+    for view in views.values() {
+        if fault_addr >= view.base_address && fault_addr < view.base_address + view.size {
+            // Write to Read-Only mapping triggers access violation trap
+            if is_write && (view.desired_access & (FILE_MAP_WRITE | FILE_MAP_COPY)) == 0 {
+                return false; // Trap: access violation for anti-cheat verification
+            }
+
+            // Copy-On-Write handler: mark dirty and isolate page
+            if is_write && view.is_copy_on_write {
+                let page_idx = (fault_addr - view.base_address) / 4096;
+                let sections = SECTIONS.lock();
+                for sec in sections.values() {
+                    if page_idx < sec.storage.page_count {
+                        sec.storage.dirty_pages[page_idx].store(true, Ordering::SeqCst);
+                    }
+                }
+                return true; // Successfully resolved COW page fault
+            }
+
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns whether a specific page within a shared section has been modified (dirty page tracking).
+pub fn win32_section_is_page_dirty(hSection: HANDLE, page_index: usize) -> bool {
+    let sections = SECTIONS.lock();
+    if let Some(sec) = sections.get(&hSection) {
+        if page_index < sec.storage.page_count {
+            return sec.storage.dirty_pages[page_index].load(Ordering::SeqCst);
+        }
+    }
+    false
+}
