@@ -35,6 +35,7 @@ pub mod txf_filter;
 pub mod keyed_event;
 pub mod shared_section;
 pub mod pmc_perf;
+pub mod av_clock;
 
 pub use header::*;
 pub use ntdll::*;
@@ -69,6 +70,7 @@ pub use txf_filter::*;
 pub use keyed_event::*;
 pub use shared_section::*;
 pub use pmc_perf::*;
+pub use av_clock::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
