@@ -529,6 +529,7 @@ pub fn sys_query_system_information(
         1 => 16, // SystemProcessorInformation
         2 => 48, // SystemPerformanceInformation
         3 => 32, // SystemTimeOfDayInformation
+        42 => 40, // SystemHardwarePmcInformation (TASK-KNT-244)
         _ => 16,
     };
 
@@ -549,6 +550,13 @@ pub fn sys_query_system_information(
         if info_class == 0 && buf.len() >= 32 {
             buf[0..4].copy_from_slice(&4096u32.to_le_bytes());
             buf[4..8].copy_from_slice(&4u32.to_le_bytes());
+        } else if info_class == 42 && buf.len() >= 40 {
+            let snap = crate::pe::pmc_perf::win32_pmc_sample_counters();
+            buf[0..8].copy_from_slice(&snap.instructions_retired.to_le_bytes());
+            buf[8..16].copy_from_slice(&snap.core_cycles.to_le_bytes());
+            buf[16..24].copy_from_slice(&snap.l3_cache_misses.to_le_bytes());
+            buf[24..32].copy_from_slice(&snap.branch_mispredictions.to_le_bytes());
+            buf[32..40].copy_from_slice(&snap.timestamp_tsc.to_le_bytes());
         }
     }
 
