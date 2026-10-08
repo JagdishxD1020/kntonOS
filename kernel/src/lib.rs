@@ -506,6 +506,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_mesh_shader_payload_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 mesh shader amplification payload self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Command Signature Suballocation & Indirect Pool (TASK-KNT-243)
+    if !gfx::test_command_signature_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility command signature self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
