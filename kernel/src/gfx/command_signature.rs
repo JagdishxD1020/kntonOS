@@ -526,7 +526,194 @@ impl HandheldIndirectMemoryGovernor {
     }
 }
 
-// Temporary stub for self-test during incremental commits.
+// Comprehensive verification self-test suite for D3D12 command signatures and indirect buffer pool.
 pub fn test_command_signature_subsystem() -> bool {
+    // 1. Verify indirect command packet structures and root constant sizing.
+    let draw_args = D3D12_DRAW_ARGUMENTS {
+        vertex_count_per_instance: 3,
+        instance_count: 1,
+        start_vertex_location: 0,
+        start_instance_location: 0,
+    };
+    let draw_pkt = IndirectCommandPacket::from_draw(draw_args);
+    if draw_pkt.kind != IndirectCommandKind::Draw || draw_pkt.draw_args != Some(draw_args) {
+        return false;
+    }
+
+    let constants = IndirectRootConstantsArgument::new(1, 0, &[101, 102, 103, 104]);
+    if constants.byte_size() != 16 {
+        return false;
+    }
+
+    let draw_idx_args = D3D12_DRAW_INDEXED_ARGUMENTS {
+        index_count_per_instance: 6,
+        instance_count: 1,
+        start_index_location: 0,
+        base_vertex_location: 0,
+        start_instance_location: 0,
+    };
+    let indexed_pkt = IndirectCommandPacket::from_draw_indexed(
+        draw_idx_args,
+        alloc::vec![constants.clone()],
+    );
+    if indexed_pkt.kind != IndirectCommandKind::DrawIndexed
+        || indexed_pkt.root_constants.len() != 1
+    {
+        return false;
+    }
+
+    let dispatch_args = D3D12_DISPATCH_ARGUMENTS {
+        thread_group_count_x: 4,
+        thread_group_count_y: 2,
+        thread_group_count_z: 1,
+    };
+    let disp_pkt = IndirectCommandPacket::from_dispatch(dispatch_args);
+    if disp_pkt.kind != IndirectCommandKind::Dispatch
+        || disp_pkt.dispatch_args != Some(dispatch_args)
+    {
+        return false;
+    }
+
+    // 2. Verify stride validation and argument buffer bounds checking.
+    let mut checker = ArgumentBufferBoundsChecker::new();
+    let desc = D3D12_COMMAND_SIGNATURE_DESC::new(
+        32,
+        alloc::vec![
+            D3D12_INDIRECT_ARGUMENT_DESC::make_draw(),
+            D3D12_INDIRECT_ARGUMENT_DESC::make_constant(1, 0, 4),
+        ],
+        0,
+    );
+
+    // Stride must be multiple of 4.
+    if checker.validate_stride(30, &desc).is_ok() {
+        return false;
+    }
+    // Stride must meet minimum stride requirement (32 bytes).
+    if checker.validate_stride(28, &desc).is_ok() {
+        return false;
+    }
+    // Stride exceeding 2048 bytes rejected.
+    if checker.validate_stride(2052, &desc).is_ok() {
+        return false;
+    }
+    // Valid stride accepted.
+    if checker.validate_stride(32, &desc).is_err() {
+        return false;
+    }
+
+    // Buffer bounds checking: valid bounds.
+    let req = checker.validate_buffer_bounds(1024, 0, 10, 32);
+    if req != Ok(320) {
+        return false;
+    }
+    // Misaligned offset rejected.
+    if checker.validate_buffer_bounds(1024, 3, 10, 32).is_ok() {
+        return false;
+    }
+    // Buffer overflow rejected.
+    if checker.validate_buffer_bounds(1024, 900, 10, 32).is_ok() {
+        return false;
+    }
+    if checker.bounds_checks_passed < 1
+        || checker.overflow_violations_blocked < 1
+        || checker.misaligned_strides_blocked < 4
+    {
+        return false;
+    }
+
+    // 3. Verify indirect argument ring buffer suballocator and multi-frame fence progression.
+    let mut ring = IndirectArgumentRingAllocator::new(0x2000_0000, 1024);
+    let c1 = match ring.suballocate(400, 4) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if c1.offset != 0 || c1.gpu_virtual_address != 0x2000_0000 {
+        return false;
+    }
+
+    let _fence2 = ring.advance_fence();
+    let c2 = match ring.suballocate(400, 4) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if c2.offset != 400 {
+        return false;
+    }
+
+    // Ring full: next 400 bytes cannot fit without wrapping and tail is 0.
+    if ring.suballocate(400, 4).is_ok() {
+        return false;
+    }
+
+    // Retire fence 1 -> tail advances to 400.
+    let retired1 = ring.retire_frame(1);
+    if retired1 != 400 || ring.tail != 400 {
+        return false;
+    }
+
+    // Wrap-around allocation to offset 0 now succeeds.
+    let _fence3 = ring.advance_fence();
+    let c3 = match ring.suballocate(400, 4) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if c3.offset != 0 {
+        return false;
+    }
+
+    // Retire fence 2 -> tail wraps to 0.
+    let retired2 = ring.retire_frame(2);
+    if retired2 != 400 || ring.tail != 0 {
+        return false;
+    }
+
+    // Retire fence 3 -> buffer completely empty, head and tail reset.
+    let retired3 = ring.retire_frame(3);
+    if retired3 != 400 || ring.head != 0 || ring.tail != 0 {
+        return false;
+    }
+
+    // 4. Verify handheld GPU indirect memory governor and chunk recycling pool.
+    let mut gov = HandheldIndirectMemoryGovernor::new(1024);
+    let mut fresh_ring = IndirectArgumentRingAllocator::new(0x3000_0000, 2048);
+
+    let chunk_a = match gov.acquire_or_allocate(256, 4, &mut fresh_ring) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if gov.total_reused_chunks != 0 || gov.current_vram_usage_bytes != 256 {
+        return false;
+    }
+
+    // Recycle chunk into pool.
+    gov.recycle_chunk(chunk_a);
+    if gov.pool_chunk_count() != 1 {
+        return false;
+    }
+
+    // Reacquire smaller or equal chunk: must be serviced from recycling pool without ring allocation.
+    let chunk_b = match gov.acquire_or_allocate(128, 4, &mut fresh_ring) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if chunk_b.gpu_virtual_address != chunk_a.gpu_virtual_address
+        || gov.total_reused_chunks != 1
+        || gov.pool_chunk_count() != 0
+    {
+        return false;
+    }
+
+    // Verify pressure reclamation under thermal budget limit.
+    gov.current_vram_usage_bytes = 1500;
+    gov.recycle_chunk(chunk_b);
+    if gov.pressure_evictions == 0 || gov.pool_chunk_count() != 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str(
+        "[KNT-D3D12-CMD-SIG-PASS] Direct3D 12 agility command signature & indirect pool verified\r\n",
+    );
     true
 }
