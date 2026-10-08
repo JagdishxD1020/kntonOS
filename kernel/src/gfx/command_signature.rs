@@ -431,6 +431,101 @@ impl ArgumentBufferBoundsChecker {
     }
 }
 
+// Handheld GPU indirect memory footprint governor recycling reusable command chunks.
+#[derive(Debug)]
+pub struct HandheldIndirectMemoryGovernor {
+    // Target maximum memory budget for transient indirect arguments.
+    pub target_vram_limit_bytes: usize,
+    // Current tracked indirect argument VRAM footprint.
+    pub current_vram_usage_bytes: usize,
+    // Recycled chunk pool available for immediate re-binding.
+    pub recycled_chunks: alloc::vec::Vec<IndirectArgumentChunk>,
+    // Cumulative recycled chunks pushed to pool.
+    pub total_recycled_chunks: u64,
+    // Cumulative recycled chunks successfully reused.
+    pub total_reused_chunks: u64,
+    // Count of chunk evictions triggered under thermal or memory pressure.
+    pub pressure_evictions: u64,
+}
+
+impl HandheldIndirectMemoryGovernor {
+    // Creates a new handheld indirect memory governor with specified budget.
+    pub fn new(target_vram_limit_bytes: usize) -> Self {
+        Self {
+            target_vram_limit_bytes,
+            current_vram_usage_bytes: 0,
+            recycled_chunks: alloc::vec::Vec::new(),
+            total_recycled_chunks: 0,
+            total_reused_chunks: 0,
+            pressure_evictions: 0,
+        }
+    }
+
+    // Returns whether current memory usage exceeds target handheld threshold.
+    pub fn is_under_pressure(&self) -> bool {
+        self.current_vram_usage_bytes > self.target_vram_limit_bytes
+    }
+
+    // Pushes a completed chunk into the recycling pool.
+    pub fn recycle_chunk(&mut self, chunk: IndirectArgumentChunk) {
+        self.total_recycled_chunks += 1;
+        self.recycled_chunks.push(chunk);
+        if self.is_under_pressure() {
+            self.reclaim_under_pressure();
+        }
+    }
+
+    // Attempts to acquire a recycled chunk or suballocates a new chunk from ring allocator.
+    pub fn acquire_or_allocate(
+        &mut self,
+        size: usize,
+        alignment: usize,
+        ring: &mut IndirectArgumentRingAllocator,
+    ) -> Result<IndirectArgumentChunk, CommandSignatureError> {
+        let align = if alignment < D3D12_INDIRECT_ARGUMENT_BUFFER_ALIGNMENT {
+            D3D12_INDIRECT_ARGUMENT_BUFFER_ALIGNMENT
+        } else {
+            alignment
+        };
+        let aligned_size = align_up_usize(size, align);
+
+        // Check if any recycled chunk meets the aligned size requirement.
+        if let Some(pos) =
+            self.recycled_chunks.iter().position(|c| c.aligned_size_bytes >= aligned_size)
+        {
+            let mut chunk = self.recycled_chunks.remove(pos);
+            chunk.size_bytes = size;
+            chunk.fence_value = ring.current_fence;
+            ring.in_flight_chunks.push(chunk);
+            self.total_reused_chunks += 1;
+            return Ok(chunk);
+        }
+
+        // Suballocate fresh chunk from ring allocator.
+        let chunk = ring.suballocate(size, alignment)?;
+        self.current_vram_usage_bytes += chunk.aligned_size_bytes;
+        Ok(chunk)
+    }
+
+    // Evicts cached recycled chunks to alleviate memory pressure on handheld GPU.
+    pub fn reclaim_under_pressure(&mut self) -> usize {
+        let mut bytes_evicted = 0usize;
+        while !self.recycled_chunks.is_empty() && self.is_under_pressure() {
+            let chunk = self.recycled_chunks.remove(0);
+            bytes_evicted += chunk.aligned_size_bytes;
+            self.current_vram_usage_bytes =
+                self.current_vram_usage_bytes.saturating_sub(chunk.aligned_size_bytes);
+            self.pressure_evictions += 1;
+        }
+        bytes_evicted
+    }
+
+    // Total count of cached chunks in pool.
+    pub fn pool_chunk_count(&self) -> usize {
+        self.recycled_chunks.len()
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_command_signature_subsystem() -> bool {
     true
