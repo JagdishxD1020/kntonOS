@@ -184,3 +184,152 @@ pub fn verify_one_euro_filter_adaptive_smoothing() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: 6-Axis IMU Predictive Motion Compensation for Chassis Tremors
+// ============================================================================
+
+/// High-pass cutoff frequency in Hz to isolate hand/chassis micro-tremors (3.5 Hz).
+pub const TREMOR_HIGHPASS_CUTOFF_HZ: f32 = 3.5;
+/// Gyroscope angular rate coupling coefficient (touchpad coordinate displacement per deg/s).
+pub const TREMOR_GYRO_COUPLING_GAIN: f32 = 0.075;
+/// Accelerometer linear vibration coupling coefficient (touchpad coordinate displacement per G).
+pub const TREMOR_ACCEL_COUPLING_GAIN: f32 = 4.20;
+
+/// 6-Axis IMU Predictive Handheld Chassis Tremor Compensator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImuTremorCompensator {
+    /// High-pass filtered gyro Z (yaw) rate in deg/s.
+    pub hp_gyro_z: f32,
+    /// High-pass filtered gyro X (pitch) rate in deg/s.
+    pub hp_gyro_x: f32,
+    /// High-pass filtered linear acceleration X in G.
+    pub hp_accel_x: f32,
+    /// High-pass filtered linear acceleration Y in G.
+    pub hp_accel_y: f32,
+    /// Previous raw sensor readings for discrete differentiator.
+    pub prev_raw_gyro_z: f32,
+    pub prev_raw_gyro_x: f32,
+    pub prev_raw_accel_x: f32,
+    pub prev_raw_accel_y: f32,
+    /// Cumulative tremor cancellation displacement on X axis.
+    pub total_tremor_rejected_x: f32,
+    /// Cumulative tremor cancellation displacement on Y axis.
+    pub total_tremor_rejected_y: f32,
+}
+
+impl ImuTremorCompensator {
+    /// Constructs an IMU tremor compensator with handheld gaming defaults.
+    pub const fn new() -> Self {
+        Self {
+            hp_gyro_z: 0.0,
+            hp_gyro_x: 0.0,
+            hp_accel_x: 0.0,
+            hp_accel_y: 0.0,
+            prev_raw_gyro_z: 0.0,
+            prev_raw_gyro_x: 0.0,
+            prev_raw_accel_x: 0.0,
+            prev_raw_accel_y: 0.0,
+            total_tremor_rejected_x: 0.0,
+            total_tremor_rejected_y: 0.0,
+        }
+    }
+
+    /// Resets tremor tracking filter state.
+    pub fn reset(&mut self) {
+        self.hp_gyro_z = 0.0;
+        self.hp_gyro_x = 0.0;
+        self.hp_accel_x = 0.0;
+        self.hp_accel_y = 0.0;
+        self.prev_raw_gyro_z = 0.0;
+        self.prev_raw_gyro_x = 0.0;
+        self.prev_raw_accel_x = 0.0;
+        self.prev_raw_accel_y = 0.0;
+    }
+
+    /// Compensates touchpad displacement vector `(delta_x, delta_y)` by subtracting IMU-predicted tremors.
+    pub fn compensate_motion(
+        &mut self,
+        delta_x: f32,
+        delta_y: f32,
+        gyro_dps: (f32, f32, f32),   // (roll, pitch, yaw) in deg/s
+        accel_g: (f32, f32, f32),    // (x, y, z) in G
+        dt_s: f32,
+    ) -> (f32, f32) {
+        if dt_s <= 0.00001 {
+            return (delta_x, delta_y);
+        }
+
+        // High-pass filter alpha: RC = 1 / (2 * PI * fc)
+        // alpha_hp = RC / (RC + dt)
+        let rc = 1.0 / (TOUCHPAD_TWO_PI * TREMOR_HIGHPASS_CUTOFF_HZ);
+        let alpha_hp = rc / (rc + dt_s);
+
+        // 1. Isolate high-frequency tremor components:
+        // hp[n] = alpha_hp * (hp[n-1] + input[n] - input[n-1])
+        self.hp_gyro_z = alpha_hp * (self.hp_gyro_z + gyro_dps.2 - self.prev_raw_gyro_z);
+        self.hp_gyro_x = alpha_hp * (self.hp_gyro_x + gyro_dps.1 - self.prev_raw_gyro_x);
+        self.hp_accel_x = alpha_hp * (self.hp_accel_x + accel_g.0 - self.prev_raw_accel_x);
+        self.hp_accel_y = alpha_hp * (self.hp_accel_y + accel_g.1 - self.prev_raw_accel_y);
+
+        self.prev_raw_gyro_z = gyro_dps.2;
+        self.prev_raw_gyro_x = gyro_dps.1;
+        self.prev_raw_accel_x = accel_g.0;
+        self.prev_raw_accel_y = accel_g.1;
+
+        // 2. Predict tremor induced on touchpad surface:
+        let tremor_x = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_z * dt_s * 100.0
+            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_x * dt_s * 100.0;
+        let tremor_y = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_x * dt_s * 100.0
+            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_y * dt_s * 100.0;
+
+        self.total_tremor_rejected_x += tremor_x.abs();
+        self.total_tremor_rejected_y += tremor_y.abs();
+
+        // 3. Subtract tremor from raw touchpad delta to yield clean intentional movement
+        (delta_x - tremor_x, delta_y - tremor_y)
+    }
+}
+
+/// Verification test for 6-axis IMU predictive motion compensation.
+pub fn verify_imu_predictive_chassis_tremor_compensation() -> bool {
+    let mut comp = ImuTremorCompensator::new();
+    let dt = 0.004; // 250 Hz IMU/Touchpad poll
+
+    // 1. Test Static Device State (Zero Gyro, 1G Gravity on Z axis):
+    // Pure intentional thumb movement (10.0, 10.0) must pass through unperturbed
+    for _ in 0..10 {
+        let (cx, cy) = comp.compensate_motion(10.0, 10.0, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
+        if (cx - 10.0).abs() > 0.05 || (cy - 10.0).abs() > 0.05 {
+            return false;
+        }
+    }
+
+    // 2. Test Chassis Tremor Rejection:
+    // User thumb is resting stationary on touchpad (raw delta = 0.0), but handheld chassis
+    // experiences rapid 8 Hz tremor oscillation (gyro yaw swings +-20 deg/s, accel +-0.15G)
+    let mut total_output_drift_x = 0.0f32;
+    for i in 0..50 {
+        let gyro_yaw = if i % 2 == 0 { 20.0 } else { -20.0 };
+        let accel_x = if i % 2 == 0 { 0.15 } else { -0.15 };
+        // The tremor induces an apparent motion on the touchpad of ~0.12 units
+        let raw_touchpad_delta = if i % 2 == 0 { 0.12 } else { -0.12 };
+
+        let (cx, _) = comp.compensate_motion(
+            raw_touchpad_delta,
+            0.0,
+            (0.0, 0.0, gyro_yaw),
+            (accel_x, 0.0, 1.0),
+            dt,
+        );
+        total_output_drift_x += cx.abs();
+    }
+
+    // Tremor compensation should have largely canceled the tremor motion
+    if total_output_drift_x > 3.0 || comp.total_tremor_rejected_x <= 0.05 {
+        return false;
+    }
+
+    true
+}
