@@ -169,3 +169,21 @@ pub fn win32_pmc_sample_syscall(out_snapshot: *mut PmcHardwareSnapshot) -> u32 {
     }
     crate::pe::ntdll::STATUS_SUCCESS
 }
+
+/// Gates hardware PMCs into low-power idle mode when no active profiling session exists.
+pub fn win32_pmc_set_gating(gated: bool) {
+    PMC_GATED.store(gated, Ordering::Release);
+    if gated {
+        // Zero out global control MSR to eliminate clock gating overhead on counters
+        let _ = unsafe { safe_wrmsr(IA32_PERF_GLOBAL_CTRL, 0) };
+    } else {
+        // Enable fixed counters (bits 32, 33, 34) and general PMCs (bits 0, 1, 2, 3)
+        let global_enable: u64 = (7 << 32) | 0x0F;
+        let _ = unsafe { safe_wrmsr(IA32_PERF_GLOBAL_CTRL, global_enable) };
+    }
+}
+
+/// Returns whether hardware PMCs are currently clock-gated for power efficiency.
+pub fn win32_pmc_is_gated() -> bool {
+    PMC_GATED.load(Ordering::Acquire)
+}
