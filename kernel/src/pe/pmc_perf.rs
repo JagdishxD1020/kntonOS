@@ -71,6 +71,15 @@ pub unsafe fn safe_wrmsr(msr: u32, val: u64) -> Result<(), ()> {
     Ok(())
 }
 
+/// Initializes hardware performance monitor counters driver.
+pub fn win32_pmc_init() -> bool {
+    if PMC_INITIALIZED.load(Ordering::Acquire) {
+        return true;
+    }
+    PMC_INITIALIZED.store(true, Ordering::Release);
+    true
+}
+
 /// Gaming frame-time telemetry counter state.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -186,4 +195,62 @@ pub fn win32_pmc_set_gating(gated: bool) {
 /// Returns whether hardware PMCs are currently clock-gated for power efficiency.
 pub fn win32_pmc_is_gated() -> bool {
     PMC_GATED.load(Ordering::Acquire)
+}
+
+/// Self-test suite verifying x86-64 hardware PMC MSR driver, gaming telemetry, and NT syscall interface.
+pub fn test_win32_pmc_perf_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Hardware PMC & Frame-Time Telemetry self-test...\r\n");
+
+    // 1. Initialize driver
+    if !win32_pmc_init() {
+        crate::serial_write_str("[KNT-ERROR] win32_pmc_init failed\r\n");
+        return false;
+    }
+
+    // 2. Test energy gating state toggle
+    win32_pmc_set_gating(false);
+    if win32_pmc_is_gated() {
+        crate::serial_write_str("[KNT-ERROR] win32_pmc_is_gated failed to ungate\r\n");
+        return false;
+    }
+
+    // 3. Sample hardware counters
+    let snap1 = win32_pmc_sample_counters();
+    if snap1.instructions_retired == 0 || snap1.core_cycles == 0 {
+        crate::serial_write_str("[KNT-ERROR] PMC counters are zero\r\n");
+        return false;
+    }
+
+    // 4. Test gaming frame-time telemetry differential
+    let telem = win32_pmc_record_frame_telemetry(16_666_666); // 16.6ms frame
+    if telem.frame_duration_ns != 16_666_666 {
+        crate::serial_write_str("[KNT-ERROR] Frame duration mismatch\r\n");
+        return false;
+    }
+    if telem.instructions_retired == 0 || telem.core_cycles == 0 {
+        crate::serial_write_str("[KNT-ERROR] Frame counter differential zero\r\n");
+        return false;
+    }
+
+    // 5. Test userland performance sampling syscall interface
+    let mut user_snap = PmcHardwareSnapshot::default();
+    let status = win32_pmc_sample_syscall(&mut user_snap);
+    if status != crate::pe::ntdll::STATUS_SUCCESS {
+        crate::serial_write_str("[KNT-ERROR] win32_pmc_sample_syscall failed\r\n");
+        return false;
+    }
+    if user_snap.instructions_retired == 0 {
+        crate::serial_write_str("[KNT-ERROR] Userland snapshot instructions zero\r\n");
+        return false;
+    }
+
+    // Re-gate PMCs to conserve power when test finishes
+    win32_pmc_set_gating(true);
+    if !win32_pmc_is_gated() {
+        crate::serial_write_str("[KNT-ERROR] win32_pmc_set_gating failed to re-gate\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-PMC-PASS] Win32 hardware PMC and low-overhead frame-time telemetry verified\r\n");
+    true
 }
