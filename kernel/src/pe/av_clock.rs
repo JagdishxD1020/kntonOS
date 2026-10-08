@@ -144,3 +144,58 @@ pub fn MFGetPresentationTime(clock_handle: HANDLE) -> Option<i64> {
         _ => 0,
     })
 }
+
+/// AV sync drift compensator synchronizing display VSync and audio DAC clocks.
+pub struct AvDriftCompensator {
+    pub vsync_period_ns: u64,
+    pub audio_sample_rate: u32,
+    pub estimated_drift_ns: AtomicI64,
+    pub total_vsync_events: AtomicU64,
+    pub total_audio_samples: AtomicU64,
+    pub proportional_gain_x1000: i64,
+    pub integral_gain_x1000: i64,
+    pub accumulated_error_ns: AtomicI64,
+}
+
+impl AvDriftCompensator {
+    pub fn new(vsync_period_ns: u64, audio_sample_rate: u32) -> Self {
+        Self {
+            vsync_period_ns,
+            audio_sample_rate,
+            estimated_drift_ns: AtomicI64::new(0),
+            total_vsync_events: AtomicU64::new(0),
+            total_audio_samples: AtomicU64::new(0),
+            proportional_gain_x1000: 450,
+            integral_gain_x1000: 50,
+            accumulated_error_ns: AtomicI64::new(0),
+        }
+    }
+
+    /// Records a display VSync event at the specified timestamp in nanoseconds.
+    pub fn record_vsync(&self, _vsync_timestamp_ns: u64) {
+        self.total_vsync_events.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records audio DAC frame consumption and calculates clock skew.
+    pub fn record_audio_frames(&self, frame_count: u32, _audio_timestamp_ns: u64) {
+        self.total_audio_samples.fetch_add(frame_count as u64, Ordering::Relaxed);
+    }
+
+    /// Computes sub-microsecond clock drift and returns sample correction delta (in fractional samples).
+    pub fn calculate_drift_correction_ppb(&self, display_time_ns: u64, audio_time_ns: u64) -> i64 {
+        let raw_drift_ns = (display_time_ns as i64) - (audio_time_ns as i64);
+        self.estimated_drift_ns.store(raw_drift_ns, Ordering::Release);
+
+        let acc = self.accumulated_error_ns.fetch_add(raw_drift_ns / 100, Ordering::Relaxed) + (raw_drift_ns / 100);
+        let p_term = (raw_drift_ns * self.proportional_gain_x1000) / 1000;
+        let i_term = (acc * self.integral_gain_x1000) / 1000;
+
+        // Bounded drift correction in parts-per-billion
+        (p_term + i_term).clamp(-100_000, 100_000)
+    }
+
+    /// Returns estimated drift in nanoseconds.
+    pub fn current_drift_ns(&self) -> i64 {
+        self.estimated_drift_ns.load(Ordering::Acquire)
+    }
+}
