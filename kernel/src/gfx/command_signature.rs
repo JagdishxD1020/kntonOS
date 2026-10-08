@@ -120,6 +120,214 @@ impl IndirectCommandPacket {
     }
 }
 
+// Aligns a byte offset up to the specified power-of-two alignment boundary.
+#[inline(always)]
+pub const fn align_up_usize(value: usize, alignment: usize) -> usize {
+    if alignment == 0 {
+        return value;
+    }
+    (value + (alignment - 1)) & !(alignment - 1)
+}
+
+// Suballocated region within the indirect argument ring buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndirectArgumentChunk {
+    // GPU virtual address of suballocated region.
+    pub gpu_virtual_address: u64,
+    // Byte offset within ring buffer.
+    pub offset: usize,
+    // Usable size in bytes.
+    pub size_bytes: usize,
+    // Aligned allocation footprint in bytes.
+    pub aligned_size_bytes: usize,
+    // Timeline fence value at which chunk can be safely reclaimed.
+    pub fence_value: u64,
+}
+
+// GPU indirect argument ring buffer suballocator with multi-frame fence progression.
+#[derive(Debug)]
+pub struct IndirectArgumentRingAllocator {
+    // Base GPU virtual address of mapped buffer.
+    pub base_gpu_va: u64,
+    // Total capacity in bytes.
+    pub capacity: usize,
+    // Allocation head byte offset.
+    pub head: usize,
+    // Reclamation tail byte offset.
+    pub tail: usize,
+    // Unused padding at end of buffer when wrapping occurred.
+    pub end_padding: usize,
+    // Currently in-flight chunks awaiting GPU retirement.
+    pub in_flight_chunks: alloc::vec::Vec<IndirectArgumentChunk>,
+    // Monotonic fence sequence number for submitted chunks.
+    pub current_fence: u64,
+    // Total active allocated bytes currently in flight.
+    pub active_allocated_bytes: usize,
+    // Cumulative allocations performed.
+    pub total_allocations: u64,
+    // Peak allocated bytes observed.
+    pub peak_allocated_bytes: usize,
+}
+
+impl IndirectArgumentRingAllocator {
+    // Creates a new indirect argument ring buffer allocator.
+    pub fn new(base_gpu_va: u64, capacity: usize) -> Self {
+        Self {
+            base_gpu_va,
+            capacity,
+            head: 0,
+            tail: 0,
+            end_padding: 0,
+            in_flight_chunks: alloc::vec::Vec::new(),
+            current_fence: 1,
+            active_allocated_bytes: 0,
+            total_allocations: 0,
+            peak_allocated_bytes: 0,
+        }
+    }
+
+    // Advances the internal timeline fence sequence counter.
+    pub fn advance_fence(&mut self) -> u64 {
+        self.current_fence += 1;
+        self.current_fence
+    }
+
+    // Suballocates an aligned memory chunk from the ring buffer.
+    pub fn suballocate(
+        &mut self,
+        size: usize,
+        alignment: usize,
+    ) -> Result<IndirectArgumentChunk, CommandSignatureError> {
+        let align = if alignment < D3D12_INDIRECT_ARGUMENT_BUFFER_ALIGNMENT {
+            D3D12_INDIRECT_ARGUMENT_BUFFER_ALIGNMENT
+        } else {
+            alignment
+        };
+        let aligned_size = align_up_usize(size, align);
+        if aligned_size > self.capacity {
+            return Err(CommandSignatureError::BufferOverflow {
+                required_bytes: aligned_size,
+                available_bytes: self.capacity,
+            });
+        }
+
+        let aligned_head = align_up_usize(self.head, align);
+        if self.head >= self.tail {
+            if aligned_head + aligned_size <= self.capacity {
+                let offset = aligned_head;
+                let gpu_va = self.base_gpu_va + offset as u64;
+                self.head = offset + aligned_size;
+                self.active_allocated_bytes += aligned_size;
+                if self.active_allocated_bytes > self.peak_allocated_bytes {
+                    self.peak_allocated_bytes = self.active_allocated_bytes;
+                }
+                self.total_allocations += 1;
+                let chunk = IndirectArgumentChunk {
+                    gpu_virtual_address: gpu_va,
+                    offset,
+                    size_bytes: size,
+                    aligned_size_bytes: aligned_size,
+                    fence_value: self.current_fence,
+                };
+                self.in_flight_chunks.push(chunk);
+                return Ok(chunk);
+            }
+            if aligned_size <= self.tail && self.tail > 0 {
+                self.end_padding = self.capacity - self.head;
+                let offset = 0;
+                let gpu_va = self.base_gpu_va;
+                self.head = aligned_size;
+                self.active_allocated_bytes += aligned_size;
+                if self.active_allocated_bytes > self.peak_allocated_bytes {
+                    self.peak_allocated_bytes = self.active_allocated_bytes;
+                }
+                self.total_allocations += 1;
+                let chunk = IndirectArgumentChunk {
+                    gpu_virtual_address: gpu_va,
+                    offset,
+                    size_bytes: size,
+                    aligned_size_bytes: aligned_size,
+                    fence_value: self.current_fence,
+                };
+                self.in_flight_chunks.push(chunk);
+                return Ok(chunk);
+            }
+        } else if aligned_head + aligned_size <= self.tail {
+            let offset = aligned_head;
+            let gpu_va = self.base_gpu_va + offset as u64;
+            self.head = offset + aligned_size;
+            self.active_allocated_bytes += aligned_size;
+            if self.active_allocated_bytes > self.peak_allocated_bytes {
+                self.peak_allocated_bytes = self.active_allocated_bytes;
+            }
+            self.total_allocations += 1;
+            let chunk = IndirectArgumentChunk {
+                gpu_virtual_address: gpu_va,
+                offset,
+                size_bytes: size,
+                aligned_size_bytes: aligned_size,
+                fence_value: self.current_fence,
+            };
+            self.in_flight_chunks.push(chunk);
+            return Ok(chunk);
+        }
+
+        let available = if self.head >= self.tail {
+            (self.capacity - self.head) + self.tail
+        } else {
+            self.tail - self.head
+        };
+        Err(CommandSignatureError::BufferOverflow {
+            required_bytes: aligned_size,
+            available_bytes: available,
+        })
+    }
+
+    // Retires completed chunks whose fence value has been signaled.
+    pub fn retire_frame(&mut self, completed_fence: u64) -> usize {
+        let mut retired_bytes = 0usize;
+        while let Some(chunk) = self.in_flight_chunks.first() {
+            if chunk.fence_value <= completed_fence {
+                let chunk = self.in_flight_chunks.remove(0);
+                retired_bytes += chunk.aligned_size_bytes;
+                self.active_allocated_bytes =
+                    self.active_allocated_bytes.saturating_sub(chunk.aligned_size_bytes);
+                if self.end_padding > 0
+                    && chunk.offset + chunk.aligned_size_bytes + self.end_padding >= self.capacity
+                {
+                    self.tail = 0;
+                    self.end_padding = 0;
+                } else {
+                    self.tail = chunk.offset + chunk.aligned_size_bytes;
+                }
+            } else {
+                break;
+            }
+        }
+        if self.in_flight_chunks.is_empty() {
+            self.head = 0;
+            self.tail = 0;
+            self.end_padding = 0;
+            self.active_allocated_bytes = 0;
+        }
+        retired_bytes
+    }
+
+    // Calculates the contiguous bytes available without wrapping.
+    pub fn available_contiguous(&self) -> usize {
+        if self.head >= self.tail {
+            self.capacity - self.head
+        } else {
+            self.tail - self.head
+        }
+    }
+
+    // Returns count of currently in-flight chunks.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight_chunks.len()
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_command_signature_subsystem() -> bool {
     true
