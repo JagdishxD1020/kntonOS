@@ -53,6 +53,7 @@ pub mod barrier_discard;
 pub mod bindless_heap;
 pub mod mesh_shader_payload;
 pub mod command_signature;
+pub mod coarse_pixel_shading;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -106,6 +107,7 @@ pub use barrier_discard::*;
 pub use bindless_heap::*;
 pub use mesh_shader_payload::*;
 pub use command_signature::*;
+pub use coarse_pixel_shading::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
