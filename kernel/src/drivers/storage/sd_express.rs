@@ -619,3 +619,221 @@ pub fn verify_hotplug_detection_and_journal_flusher() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: PCIe L1.1/L1.2 Low-Power Sub-State Governor for Battery Mode
+// ============================================================================
+
+/// Inactivity threshold in microseconds before stepping down to PCIe L1.1 (~40mW).
+pub const PCIE_L1_1_INACTIVITY_THRESHOLD_US: u32 = 2_000; // 2 ms
+/// Inactivity threshold in microseconds before stepping down to PCIe L1.2 (~8mW).
+pub const PCIE_L1_2_INACTIVITY_THRESHOLD_US: u32 = 10_000; // 10 ms
+/// Maximum allowable wakeup latency in microseconds from L1.2 back to active L0.
+pub const PCIE_L1_2_MAX_EXIT_LATENCY_US: u32 = 25;
+
+/// PCIe link power management sub-states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcieLinkPowerState {
+    /// Fully active PCIe L0 state (~900 mW).
+    L0_Active,
+    /// Base ASPM L1 state with common-mode bias active (~250 mW).
+    L1_0_Base,
+    /// ASPM L1.1 sub-state with CLKREQ# de-asserted (~40 mW).
+    L1_1_Substate,
+    /// ASPM L1.2 deep sub-state with PLLs disabled (~8 mW).
+    L1_2_DeepSubstate,
+}
+
+impl PcieLinkPowerState {
+    /// Approximate power draw in milliwatts for the sub-state.
+    pub const fn power_mw(&self) -> u32 {
+        match self {
+            Self::L0_Active => 900,
+            Self::L1_0_Base => 250,
+            Self::L1_1_Substate => 40,
+            Self::L1_2_DeepSubstate => 8,
+        }
+    }
+
+    /// Typical exit latency to L0 in microseconds.
+    pub const fn exit_latency_us(&self) -> u32 {
+        match self {
+            Self::L0_Active => 0,
+            Self::L1_0_Base => 4,
+            Self::L1_1_Substate => 12,
+            Self::L1_2_DeepSubstate => 22,
+        }
+    }
+}
+
+/// PCIe L1.1 and L1.2 low-power sub-state governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PcieSubstateGovernor {
+    /// Current PCIe link power sub-state.
+    pub current_state: PcieLinkPowerState,
+    /// Duration of continuous DMA inactivity in microseconds.
+    pub idle_duration_us: u32,
+    /// Whether handheld device is currently operating on battery power.
+    pub on_battery_power: bool,
+    /// Total transitions into L1.1.
+    pub total_l1_1_entries: u32,
+    /// Total transitions into L1.2 deep sleep.
+    pub total_l1_2_entries: u32,
+    /// Cumulative energy saved in milliwatt-seconds relative to continuous L0.
+    pub energy_saved_mw_s: u64,
+}
+
+impl PcieSubstateGovernor {
+    /// Constructs a PCIe sub-state governor in L0 Active state.
+    pub const fn new() -> Self {
+        Self {
+            current_state: PcieLinkPowerState::L0_Active,
+            idle_duration_us: 0,
+            on_battery_power: true,
+            total_l1_1_entries: 0,
+            total_l1_2_entries: 0,
+            energy_saved_mw_s: 0,
+        }
+    }
+
+    /// Advances inactivity tracker and manages sub-state transitions.
+    pub fn update_inactivity(&mut self, is_dma_busy: bool, elapsed_us: u32) -> PcieLinkPowerState {
+        if is_dma_busy {
+            // Immediate instantaneous restore to L0 Active for asset loading
+            self.current_state = PcieLinkPowerState::L0_Active;
+            self.idle_duration_us = 0;
+            return self.current_state;
+        }
+
+        self.idle_duration_us += elapsed_us;
+
+        // On battery power, progressively enter deeper L1 sub-states to save battery
+        if self.on_battery_power {
+            if self.idle_duration_us >= PCIE_L1_2_INACTIVITY_THRESHOLD_US {
+                if self.current_state != PcieLinkPowerState::L1_2_DeepSubstate {
+                    self.current_state = PcieLinkPowerState::L1_2_DeepSubstate;
+                    self.total_l1_2_entries += 1;
+                }
+            } else if self.idle_duration_us >= PCIE_L1_1_INACTIVITY_THRESHOLD_US {
+                if self.current_state != PcieLinkPowerState::L1_1_Substate {
+                    self.current_state = PcieLinkPowerState::L1_1_Substate;
+                    self.total_l1_1_entries += 1;
+                }
+            } else {
+                self.current_state = PcieLinkPowerState::L0_Active;
+            }
+        } else {
+            // AC wall power: maintain responsive L0 Active state
+            self.current_state = PcieLinkPowerState::L0_Active;
+        }
+
+        // Account energy savings compared to baseline L0 (900mW)
+        let delta_mw = 900 - self.current_state.power_mw();
+        self.energy_saved_mw_s += ((delta_mw as u64) * (elapsed_us as u64)) / 1_000_000;
+
+        self.current_state
+    }
+}
+
+/// Integrated Handheld SD Express & UHS-II Subsystem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldSdExpressSubsystem {
+    /// SD Express / UHS-II bus controller.
+    pub bus_ctrl: SdExpressController,
+    /// Zero-copy DMA ring buffer.
+    pub dma_ring: SdExpressDmaRing,
+    /// Hot-plug interrupt manager and journal unmount flusher.
+    pub hotplug_mgr: SdHotPlugManager,
+    /// PCIe low-power sub-state governor.
+    pub power_gov: PcieSubstateGovernor,
+}
+
+impl HandheldSdExpressSubsystem {
+    /// Constructs an integrated SD Express storage subsystem.
+    pub const fn new() -> Self {
+        Self {
+            bus_ctrl: SdExpressController::new(),
+            dma_ring: SdExpressDmaRing::new(),
+            hotplug_mgr: SdHotPlugManager::new(),
+            power_gov: PcieSubstateGovernor::new(),
+        }
+    }
+
+    /// Primary execution cycle for the SD Express driver.
+    pub fn process_cycle(
+        &mut self,
+        cd_pin_seated: bool,
+        elapsed_us: u32,
+        pending_journal_blocks: u32,
+    ) {
+        // 1. Hot-plug event handling
+        let hp_action = self.hotplug_mgr.process_pin_event(
+            cd_pin_seated,
+            elapsed_us / 1000,
+            pending_journal_blocks,
+            &mut self.dma_ring,
+        );
+
+        if hp_action == HotPlugAction::TriggerBusEnumeration {
+            // Card recently inserted and contacts debounced: negotiate high-speed PCIe bus
+            let caps = SdCardPinCapabilities {
+                has_row1_legacy: true,
+                has_row2_high_speed: true,
+                has_row3_dual_lane: false,
+                refclk_locked: true,
+            };
+            self.bus_ctrl.initialize_and_negotiate(caps, false);
+        }
+
+        // 2. Power management sub-state governor
+        let is_dma_busy = !self.dma_ring.is_empty();
+        self.power_gov.update_inactivity(is_dma_busy, elapsed_us);
+    }
+}
+
+/// Verification test for PCIe L1.1/L1.2 low-power sub-state governor and integrated subsystem.
+pub fn verify_pcie_l1_substate_governor_and_subsystem() -> bool {
+    let mut gov = PcieSubstateGovernor::new();
+
+    // 1. Active DMA: must remain in L0 Active
+    let s_busy = gov.update_inactivity(true, 1000);
+    if s_busy != PcieLinkPowerState::L0_Active {
+        return false;
+    }
+
+    // 2. Idle for 3 ms (> 2 ms threshold) on battery: must enter L1.1
+    let s_idle3ms = gov.update_inactivity(false, 3000);
+    if s_idle3ms != PcieLinkPowerState::L1_1_Substate || gov.total_l1_1_entries != 1 {
+        return false;
+    }
+
+    // 3. Idle for another 8 ms (total 11 ms > 10 ms threshold): must enter L1.2 Deep Substate
+    let s_idle11ms = gov.update_inactivity(false, 8000);
+    if s_idle11ms != PcieLinkPowerState::L1_2_DeepSubstate || gov.total_l1_2_entries != 1 {
+        return false;
+    }
+    // Verify power draw dropped to 8 mW and exit latency <= 25us
+    if s_idle11ms.power_mw() != 8 || s_idle11ms.exit_latency_us() > PCIE_L1_2_MAX_EXIT_LATENCY_US {
+        return false;
+    }
+
+    // 4. Instantaneous Wakeup: New DMA asset transfer arrives -> restores L0
+    let s_wakeup = gov.update_inactivity(true, 22);
+    if s_wakeup != PcieLinkPowerState::L0_Active || gov.idle_duration_us != 0 {
+        return false;
+    }
+
+    // 5. Test Integrated Subsystem
+    let mut subsys = HandheldSdExpressSubsystem::new();
+    // Simulate card insertion with 25ms elapsed (debounced)
+    subsys.process_cycle(true, 25_000, 0);
+    if subsys.hotplug_mgr.state != HotPlugCardState::CardPresentMounted {
+        return false;
+    }
+    if subsys.bus_ctrl.active_protocol != SdBusProtocol::SdExpress_PcieGen3x1 {
+        return false;
+    }
+
+    true
+}
