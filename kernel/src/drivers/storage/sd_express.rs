@@ -253,3 +253,169 @@ pub fn verify_sd_express_bus_init_and_negotiation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Scatter-Gather DMA Ring Buffer for Direct Zero-Copy Asset Loading
+// ============================================================================
+
+/// Maximum descriptor capacity of the SD Express DMA ring buffer.
+pub const SD_EXPRESS_DMA_RING_CAPACITY: usize = 128;
+/// Maximum transfer size per individual scatter-gather entry (4 MiB).
+pub const SD_EXPRESS_SG_MAX_BYTES: u32 = 4 * 1024 * 1024;
+
+/// Scatter-gather DMA entry flags.
+pub mod sg_flags {
+    /// End-of-transfer marker for a chain of scatter-gather entries.
+    pub const FLAG_EOT: u16 = 1 << 0;
+    /// Generate MSI-X interrupt on completion of this DMA segment.
+    pub const FLAG_IOC: u16 = 1 << 1;
+    /// Direct-to-GPU VRAM destination (bypassing CPU cache flush).
+    pub const FLAG_DIRECT_GPU: u16 = 1 << 2;
+    /// Hardware cache snooping / coherency enabled.
+    pub const FLAG_COHERENT: u16 = 1 << 3;
+}
+
+/// 64-bit Scatter-Gather DMA descriptor entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SdExpressSgEntry {
+    /// 64-bit physical host memory target address.
+    pub phys_addr: u64,
+    /// Transfer byte length (1 byte up to 4 MiB).
+    pub byte_len: u32,
+    /// Descriptor control flags (EOT, IOC, DIRECT_GPU, COHERENT).
+    pub flags: u16,
+    /// Transaction tracking tag or request ID.
+    pub tag: u16,
+}
+
+impl SdExpressSgEntry {
+    /// Constructs a standard scatter-gather descriptor.
+    pub const fn new(phys_addr: u64, byte_len: u32, flags: u16, tag: u16) -> Self {
+        Self {
+            phys_addr,
+            byte_len,
+            flags,
+            tag,
+        }
+    }
+}
+
+/// Circular Scatter-Gather DMA ring buffer for direct zero-copy asset loading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SdExpressDmaRing {
+    /// Ring descriptors storage.
+    pub descriptors: [SdExpressSgEntry; SD_EXPRESS_DMA_RING_CAPACITY],
+    /// Producer submission tail index.
+    pub tail: u16,
+    /// Consumer completion head index.
+    pub head: u16,
+    /// Active in-flight descriptor count.
+    pub pending_count: u16,
+    /// Total bytes moved via zero-copy DMA.
+    pub total_bytes_transferred: u64,
+    /// Total DMA transfer chains completed.
+    pub total_transfers_completed: u64,
+    /// Direct-to-GPU zero-copy transfers count.
+    pub direct_gpu_transfers: u64,
+}
+
+impl SdExpressDmaRing {
+    /// Constructs an empty DMA ring buffer.
+    pub const fn new() -> Self {
+        Self {
+            descriptors: [SdExpressSgEntry::new(0, 0, 0, 0); SD_EXPRESS_DMA_RING_CAPACITY],
+            tail: 0,
+            head: 0,
+            pending_count: 0,
+            total_bytes_transferred: 0,
+            total_transfers_completed: 0,
+            direct_gpu_transfers: 0,
+        }
+    }
+
+    /// Checks if the DMA ring buffer is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.pending_count == 0
+    }
+
+    /// Checks if the DMA ring buffer has available space for `count` descriptors.
+    pub const fn has_space_for(&self, count: usize) -> bool {
+        (SD_EXPRESS_DMA_RING_CAPACITY - self.pending_count as usize) >= count
+    }
+
+    /// Submits a chain of scatter-gather descriptors into the circular DMA ring.
+    pub fn submit_chain(&mut self, entries: &[SdExpressSgEntry]) -> Result<u16, ()> {
+        if entries.is_empty() || !self.has_space_for(entries.len()) {
+            return Err(());
+        }
+
+        let first_idx = self.tail;
+        for entry in entries {
+            let idx = self.tail as usize;
+            self.descriptors[idx] = *entry;
+            self.tail = (self.tail + 1) % (SD_EXPRESS_DMA_RING_CAPACITY as u16);
+            self.pending_count += 1;
+        }
+
+        Ok(first_idx)
+    }
+
+    /// Retires completed DMA descriptors and advances the completion head.
+    pub fn complete_transfers(&mut self, count: u16) -> u16 {
+        let to_complete = count.min(self.pending_count);
+        for _ in 0..to_complete {
+            let idx = self.head as usize;
+            let entry = &self.descriptors[idx];
+
+            self.total_bytes_transferred += entry.byte_len as u64;
+            if (entry.flags & sg_flags::FLAG_EOT) != 0 {
+                self.total_transfers_completed += 1;
+            }
+            if (entry.flags & sg_flags::FLAG_DIRECT_GPU) != 0 {
+                self.direct_gpu_transfers += 1;
+            }
+
+            self.head = (self.head + 1) % (SD_EXPRESS_DMA_RING_CAPACITY as u16);
+            self.pending_count -= 1;
+        }
+        to_complete
+    }
+}
+
+/// Verification test for scatter-gather DMA ring buffer and zero-copy game asset streaming.
+pub fn verify_zero_copy_scatter_gather_dma() -> bool {
+    let mut ring = SdExpressDmaRing::new();
+
+    if !ring.is_empty() || ring.pending_count != 0 {
+        return false;
+    }
+
+    // 1. Prepare a 3-part scatter-gather game asset chain (64KB mesh, 256KB texture, 1MB shader pack)
+    let sg_entries = [
+        SdExpressSgEntry::new(0x1000_0000, 65536, sg_flags::FLAG_COHERENT, 101),
+        SdExpressSgEntry::new(0x2000_0000, 262144, sg_flags::FLAG_DIRECT_GPU, 102),
+        SdExpressSgEntry::new(0x3000_0000, 1048576, sg_flags::FLAG_EOT | sg_flags::FLAG_IOC | sg_flags::FLAG_DIRECT_GPU, 103),
+    ];
+
+    let submit_res = ring.submit_chain(&sg_entries);
+    if submit_res.is_err() || ring.pending_count != 3 {
+        return false;
+    }
+
+    // 2. Complete the DMA chain
+    let completed = ring.complete_transfers(3);
+    if completed != 3 || !ring.is_empty() {
+        return false;
+    }
+
+    // Total bytes: 65536 + 262144 + 1048576 = 1376256 bytes (~1.31 MiB)
+    if ring.total_bytes_transferred != 1376256 {
+        return false;
+    }
+    if ring.total_transfers_completed != 1 || ring.direct_gpu_transfers != 2 {
+        return false;
+    }
+
+    true
+}
