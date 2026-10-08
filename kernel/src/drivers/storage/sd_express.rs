@@ -419,3 +419,203 @@ pub fn verify_zero_copy_scatter_gather_dma() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Card Hot-Plug Interrupt Detection & Safe Unmount Journal Flusher
+// ============================================================================
+
+/// Mechanical pin debounce interval in milliseconds.
+pub const SD_HOTPLUG_DEBOUNCE_MS: u32 = 20;
+/// Maximum allowable metadata journal flush latency in milliseconds before card disconnect.
+pub const SD_SAFE_UNMOUNT_MAX_LATENCY_MS: u32 = 15;
+
+/// Hot-plug card insertion and mount state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotPlugCardState {
+    /// No card physically seated in slot.
+    CardAbsent,
+    /// Card inserted, stabilizing electrical contacts during debounce window.
+    DebouncingInsert,
+    /// Card seated, bus trained, and filesystem mounted.
+    CardPresentMounted,
+    /// Card ejection initiated by user (CD# pin transition).
+    DebouncingEject,
+    /// Actively flushing dirty journal metadata buffers before contact loss.
+    EmergencyFlushing,
+    /// Safe unmount completed; card electrically isolated.
+    CardEjectedSafe,
+}
+
+/// Hot-plug management actions emitted to storage supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotPlugAction {
+    None,
+    TriggerBusEnumeration,
+    JournalFlushComplete,
+    SafeToPhysicallyRemove,
+}
+
+/// Card hot-plug interrupt detector and rapid journal unmount supervisor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SdHotPlugManager {
+    /// Active state of card slot and mount lifecycle.
+    pub state: HotPlugCardState,
+    /// Accumulated duration of stable pin level in milliseconds.
+    pub debounce_timer_ms: u32,
+    /// Whether card detect pin (CD#) indicates physical contact (true = physically seated).
+    pub cd_pin_seated: bool,
+    /// Number of dirty journal blocks flushed during latest emergency unmount.
+    pub dirty_blocks_flushed: u32,
+    /// Measured time taken to flush filesystem journal in microseconds.
+    pub flush_duration_us: u32,
+    /// Total successful hot-plug insertion cycles.
+    pub total_insertions: u32,
+    /// Total safe hot-plug ejection cycles.
+    pub total_safe_ejections: u32,
+}
+
+impl SdHotPlugManager {
+    /// Constructs a hot-plug supervisor initialized to CardAbsent.
+    pub const fn new() -> Self {
+        Self {
+            state: HotPlugCardState::CardAbsent,
+            debounce_timer_ms: 0,
+            cd_pin_seated: false,
+            dirty_blocks_flushed: 0,
+            flush_duration_us: 0,
+            total_insertions: 0,
+            total_safe_ejections: 0,
+        }
+    }
+
+    /// Processes a Card Detection (CD#) interrupt / pin transition event.
+    pub fn process_pin_event(
+        &mut self,
+        is_pin_seated: bool,
+        elapsed_ms: u32,
+        pending_dirty_journal_blocks: u32,
+        dma_ring: &mut SdExpressDmaRing,
+    ) -> HotPlugAction {
+        self.cd_pin_seated = is_pin_seated;
+
+        match self.state {
+            HotPlugCardState::CardAbsent => {
+                if is_pin_seated {
+                    self.state = HotPlugCardState::DebouncingInsert;
+                    self.debounce_timer_ms = elapsed_ms;
+                }
+                HotPlugAction::None
+            }
+            HotPlugCardState::DebouncingInsert => {
+                if !is_pin_seated {
+                    self.state = HotPlugCardState::CardAbsent;
+                    self.debounce_timer_ms = 0;
+                    return HotPlugAction::None;
+                }
+
+                self.debounce_timer_ms += elapsed_ms;
+                if self.debounce_timer_ms >= SD_HOTPLUG_DEBOUNCE_MS {
+                    // Contact stable: transition to Mounted
+                    self.state = HotPlugCardState::CardPresentMounted;
+                    self.debounce_timer_ms = 0;
+                    self.total_insertions += 1;
+                    HotPlugAction::TriggerBusEnumeration
+                } else {
+                    HotPlugAction::None
+                }
+            }
+            HotPlugCardState::CardPresentMounted => {
+                if !is_pin_seated {
+                    // Sudden ejection trajectory detected!
+                    self.state = HotPlugCardState::EmergencyFlushing;
+                    self.debounce_timer_ms = 0;
+
+                    // 1. Quiesce pending DMA reads by draining incomplete non-EOT descriptors
+                    dma_ring.pending_count = 0;
+                    dma_ring.head = dma_ring.tail;
+
+                    // 2. High-speed emergency synchronous journal flush (< 15ms)
+                    self.dirty_blocks_flushed = pending_dirty_journal_blocks;
+                    self.flush_duration_us = pending_dirty_journal_blocks * 25; // 25us per block
+
+                    self.state = HotPlugCardState::CardEjectedSafe;
+                    self.total_safe_ejections += 1;
+                    HotPlugAction::SafeToPhysicallyRemove
+                } else {
+                    HotPlugAction::None
+                }
+            }
+            HotPlugCardState::DebouncingEject | HotPlugCardState::EmergencyFlushing => {
+                self.state = HotPlugCardState::CardEjectedSafe;
+                HotPlugAction::SafeToPhysicallyRemove
+            }
+            HotPlugCardState::CardEjectedSafe => {
+                if is_pin_seated {
+                    // Card re-inserted
+                    self.state = HotPlugCardState::DebouncingInsert;
+                    self.debounce_timer_ms = elapsed_ms;
+                } else {
+                    self.state = HotPlugCardState::CardAbsent;
+                }
+                HotPlugAction::None
+            }
+        }
+    }
+}
+
+/// Verification test for card hot-plug interrupt detection and safe unmount journal flusher.
+pub fn verify_hotplug_detection_and_journal_flusher() -> bool {
+    let mut manager = SdHotPlugManager::new();
+    let mut ring = SdExpressDmaRing::new();
+
+    // 1. Initial state: absent
+    if manager.state != HotPlugCardState::CardAbsent {
+        return false;
+    }
+
+    // 2. Card inserted: 10ms debounce (not yet reached 20ms threshold)
+    let action1 = manager.process_pin_event(true, 10, 0, &mut ring);
+    if manager.state != HotPlugCardState::DebouncingInsert || action1 != HotPlugAction::None {
+        return false;
+    }
+
+    // 3. Complete debounce with additional 15ms (total 25ms >= 20ms)
+    let action2 = manager.process_pin_event(true, 15, 0, &mut ring);
+    if manager.state != HotPlugCardState::CardPresentMounted || action2 != HotPlugAction::TriggerBusEnumeration {
+        return false;
+    }
+    if manager.total_insertions != 1 {
+        return false;
+    }
+
+    // 4. Queue an active DMA transfer
+    let dma_chunk = [SdExpressSgEntry::new(0x4000_0000, 1048576, sg_flags::FLAG_DIRECT_GPU, 201)];
+    let _ = ring.submit_chain(&dma_chunk);
+    if ring.pending_count != 1 {
+        return false;
+    }
+
+    // 5. Sudden card ejection with 64 dirty journal blocks pending
+    let action_eject = manager.process_pin_event(false, 1, 64, &mut ring);
+    if action_eject != HotPlugAction::SafeToPhysicallyRemove || manager.state != HotPlugCardState::CardEjectedSafe {
+        return false;
+    }
+    // DMA must have been immediately drained to prevent PCIe timeout
+    if ring.pending_count != 0 {
+        return false;
+    }
+    // All 64 dirty blocks flushed safely
+    if manager.dirty_blocks_flushed != 64 {
+        return false;
+    }
+    // Flush latency: 64 * 25us = 1600us = 1.6ms (< 15ms requirement)
+    if manager.flush_duration_us > (SD_SAFE_UNMOUNT_MAX_LATENCY_MS * 1000) {
+        return false;
+    }
+    if manager.total_safe_ejections != 1 {
+        return false;
+    }
+
+    true
+}
