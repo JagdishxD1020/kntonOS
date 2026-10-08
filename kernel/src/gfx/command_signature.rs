@@ -328,6 +328,109 @@ impl IndirectArgumentRingAllocator {
     }
 }
 
+// Validator and bounds checker for indirect argument buffer strides and boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ArgumentBufferBoundsChecker {
+    // Total bounds checks performed successfully.
+    pub bounds_checks_passed: u64,
+    // Total overflow violations rejected.
+    pub overflow_violations_blocked: u64,
+    // Total stride alignment or limit violations rejected.
+    pub misaligned_strides_blocked: u64,
+}
+
+impl ArgumentBufferBoundsChecker {
+    // Creates a new indirect argument buffer bounds checker.
+    pub fn new() -> Self {
+        Self {
+            bounds_checks_passed: 0,
+            overflow_violations_blocked: 0,
+            misaligned_strides_blocked: 0,
+        }
+    }
+
+    // Validates byte stride against D3D12 alignment rules and descriptor minimum stride.
+    pub fn validate_stride(
+        &mut self,
+        byte_stride: u32,
+        desc: &D3D12_COMMAND_SIGNATURE_DESC,
+    ) -> Result<(), CommandSignatureError> {
+        if byte_stride % 4 != 0 {
+            self.misaligned_strides_blocked += 1;
+            return Err(CommandSignatureError::StrideNotMultipleOfFour(byte_stride));
+        }
+        let min_stride = desc.minimum_byte_stride();
+        if byte_stride < min_stride {
+            self.misaligned_strides_blocked += 1;
+            return Err(CommandSignatureError::InvalidByteStride {
+                stride: byte_stride,
+                min_required: min_stride,
+            });
+        }
+        if byte_stride > D3D12_MAX_INDIRECT_ARGUMENT_STRIDE {
+            self.misaligned_strides_blocked += 1;
+            return Err(CommandSignatureError::StrideExceedsMaximum(byte_stride));
+        }
+        Ok(())
+    }
+
+    // Validates that an indirect draw or dispatch call does not exceed buffer boundaries.
+    pub fn validate_buffer_bounds(
+        &mut self,
+        buffer_size_bytes: usize,
+        argument_buffer_offset: usize,
+        max_command_count: u32,
+        byte_stride: u32,
+    ) -> Result<usize, CommandSignatureError> {
+        if argument_buffer_offset % D3D12_INDIRECT_ARGUMENT_BUFFER_ALIGNMENT != 0 {
+            self.misaligned_strides_blocked += 1;
+            return Err(CommandSignatureError::InvalidBufferOffset(argument_buffer_offset));
+        }
+
+        if argument_buffer_offset > buffer_size_bytes {
+            self.overflow_violations_blocked += 1;
+            return Err(CommandSignatureError::BufferOverflow {
+                required_bytes: argument_buffer_offset,
+                available_bytes: buffer_size_bytes,
+            });
+        }
+
+        let total_command_bytes =
+            match (max_command_count as usize).checked_mul(byte_stride as usize) {
+                Some(bytes) => bytes,
+                None => {
+                    self.overflow_violations_blocked += 1;
+                    return Err(CommandSignatureError::BufferOverflow {
+                        required_bytes: usize::MAX,
+                        available_bytes: buffer_size_bytes,
+                    });
+                }
+            };
+
+        let total_required = match argument_buffer_offset.checked_add(total_command_bytes) {
+            Some(req) => req,
+            None => {
+                self.overflow_violations_blocked += 1;
+                return Err(CommandSignatureError::BufferOverflow {
+                    required_bytes: usize::MAX,
+                    available_bytes: buffer_size_bytes,
+                });
+            }
+        };
+
+        if total_required > buffer_size_bytes {
+            self.overflow_violations_blocked += 1;
+            return Err(CommandSignatureError::BufferOverflow {
+                required_bytes: total_required,
+                available_bytes: buffer_size_bytes,
+            });
+        }
+
+        self.bounds_checks_passed += 1;
+        Ok(total_required)
+    }
+}
+
 // Temporary stub for self-test during incremental commits.
 pub fn test_command_signature_subsystem() -> bool {
     true
