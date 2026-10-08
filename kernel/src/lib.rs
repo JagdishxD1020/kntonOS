@@ -917,6 +917,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld MicroSD game storage and auto-mounter self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld High-Speed SD/MicroSD UHS-II SD Express Bus Driver & Zero-Copy DMA Controller (TASK-KNT-245)
+    if !drivers::storage::test_sd_express_subsystem() {
+        serial_write_str("[KNT-PANIC] SD Express and UHS-II storage subsystem self-test failed!\r\n");
+    }
+
     // Initialize and verify Real-Time Audio Subsystem (Intel HDA / AC97 Codec & PCM Mixer)
     if !drivers::audio::test_audio_subsystem() {
         serial_write_str("[KNT-PANIC] Audio subsystem self-test failed!\r\n");

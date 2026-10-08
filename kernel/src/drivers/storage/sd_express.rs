@@ -504,6 +504,12 @@ impl SdHotPlugManager {
                 if is_pin_seated {
                     self.state = HotPlugCardState::DebouncingInsert;
                     self.debounce_timer_ms = elapsed_ms;
+                    if self.debounce_timer_ms >= SD_HOTPLUG_DEBOUNCE_MS {
+                        self.state = HotPlugCardState::CardPresentMounted;
+                        self.debounce_timer_ms = 0;
+                        self.total_insertions += 1;
+                        return HotPlugAction::TriggerBusEnumeration;
+                    }
                 }
                 HotPlugAction::None
             }
@@ -835,5 +841,42 @@ pub fn verify_pcie_l1_substate_governor_and_subsystem() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld High-Speed SD/MicroSD UHS-II SD Express Bus Driver.
+pub fn test_sd_express_subsystem() -> bool {
+    crate::serial_write_str("[KNT-STORAGE] Testing Handheld High-Speed SD/MicroSD UHS-II SD Express Subsystem...\r\n");
+
+    // 1. Verify SD Express & UHS-II bus initialization and speed negotiation
+    if !verify_sd_express_bus_init_and_negotiation() {
+        crate::serial_write_str("[KNT-PANIC] SD Express and UHS-II bus initialization verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify Scatter-Gather DMA ring buffer for zero-copy game asset loading
+    if !verify_zero_copy_scatter_gather_dma() {
+        crate::serial_write_str("[KNT-PANIC] Zero-copy scatter-gather DMA verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify card hot-plug interrupt detection and safe unmount journal flusher
+    if !verify_hotplug_detection_and_journal_flusher() {
+        crate::serial_write_str("[KNT-PANIC] Card hot-plug detection and safe unmount verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify PCIe L1.1/L1.2 low-power sub-state governor and integrated subsystem
+    if !verify_pcie_l1_substate_governor_and_subsystem() {
+        crate::serial_write_str("[KNT-PANIC] PCIe low-power sub-state governor verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-STORAGE-SD-EXPRESS-PASS] Handheld high-speed SD/MicroSD UHS-II SD Express bus driver verified\r\n");
     true
 }
