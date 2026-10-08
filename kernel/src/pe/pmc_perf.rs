@@ -155,3 +155,17 @@ pub fn win32_pmc_record_frame_telemetry(frame_duration_ns: u64) -> GamingFrameTe
         cache_miss_rate_ppm: miss_rate_ppm,
     }
 }
+
+/// Win32 sub-microsecond userland performance sampling syscall handler.
+/// Copies the latest hardware PMC snapshot into user-provided buffer.
+pub fn win32_pmc_sample_syscall(out_snapshot: *mut PmcHardwareSnapshot) -> u32 {
+    if out_snapshot.is_null() {
+        return crate::pe::ntdll::STATUS_INVALID_PARAMETER;
+    }
+
+    let snap = win32_pmc_sample_counters();
+    unsafe {
+        *out_snapshot = snap;
+    }
+    crate::pe::ntdll::STATUS_SUCCESS
+}
