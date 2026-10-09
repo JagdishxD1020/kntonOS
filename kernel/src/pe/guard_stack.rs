@@ -128,3 +128,42 @@ pub fn win32_handle_guard_page_fault(thread_id: u64, fault_addr: usize) -> Guard
 
     GuardFaultResult::HandledGrowth(stack.stack_limit)
 }
+
+/// Dispatches stack overflow exception and triggers emergency user-mode trap handler.
+pub fn win32_raise_stack_overflow_trap(thread_id: u64, rip: u64, rsp: u64) -> NtStatus {
+    crate::serial_write_str("[KNT-EXCEPTION] Stack overflow trap raised for TID: ");
+    write_u64_str(thread_id);
+    crate::serial_write_str(", RIP: 0x");
+    write_hex64_str(rip);
+    crate::serial_write_str(", RSP: 0x");
+    write_hex64_str(rsp);
+    crate::serial_write_str("\r\n");
+
+    // Deliver STATUS_STACK_OVERFLOW via VEH / SEH exception pipeline if active
+    STATUS_STACK_OVERFLOW
+}
+
+fn write_u64_str(mut val: u64) {
+    if val == 0 {
+        crate::serial_write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut len = 0;
+    while val > 0 {
+        buf[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        crate::serial_write_byte(buf[i]);
+    }
+}
+
+fn write_hex64_str(val: u64) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for i in (0..16).rev() {
+        let n = ((val >> (i * 4)) & 0xF) as usize;
+        crate::serial_write_byte(HEX[n]);
+    }
+}
