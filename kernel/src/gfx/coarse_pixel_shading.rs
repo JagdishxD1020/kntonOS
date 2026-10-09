@@ -700,7 +700,128 @@ impl CommandListShadingRateState {
     }
 }
 
-// Temporary stub for incremental commits.
+// Comprehensive verification self-test suite for Direct3D 12 Agility coarse pixel shading.
 pub fn test_coarse_pixel_shading_subsystem() -> bool {
+    // 1. Verify Tier 2 shading rate palette, encodings, and dimensions.
+    let palette = ShadingRatePalette::new_standard();
+    if palette.lookup(0) != CoarseShadingRate::Rate1x1
+        || palette.lookup(3) != CoarseShadingRate::Rate2x2
+        || palette.lookup(6) != CoarseShadingRate::Rate4x4
+    {
+        return false;
+    }
+    if palette.find_index(CoarseShadingRate::Rate2x4) != Some(4) {
+        return false;
+    }
+
+    if CoarseShadingRate::Rate1x1.to_d3d12_encoding() != 0x0
+        || CoarseShadingRate::Rate2x2.to_d3d12_encoding() != 0x5
+        || CoarseShadingRate::Rate4x4.to_d3d12_encoding() != 0xa
+        || CoarseShadingRate::from_d3d12_encoding(0x6) != Some(CoarseShadingRate::Rate2x4)
+    {
+        return false;
+    }
+
+    if CoarseShadingRate::Rate4x4.width() != 4
+        || CoarseShadingRate::Rate4x4.height() != 4
+        || CoarseShadingRate::Rate4x4.pixel_area() != 16
+    {
+        return false;
+    }
+
+    // 2. Verify screen-space tile mask compiler and edge-preserving contrast detector.
+    let detector = ContrastEdgeDetector::new();
+    let high_c = detector.compute_tile_contrast(&[10, 80]);
+    let mid_c = detector.compute_tile_contrast(&[20, 50]);
+    let low_c = detector.compute_tile_contrast(&[100, 105]);
+
+    if detector.classify_rate(high_c) != CoarseShadingRate::Rate1x1
+        || detector.classify_rate(mid_c) != CoarseShadingRate::Rate2x2
+        || detector.classify_rate(low_c) != CoarseShadingRate::Rate4x4
+    {
+        return false;
+    }
+
+    let mut compiler = TileShadingRateMaskCompiler::new(16);
+    let s_high: [u8; 2] = [10, 80];
+    let s_mid: [u8; 2] = [20, 50];
+    let s_low: [u8; 2] = [100, 105];
+    let tile_samples: [&[u8]; 4] = [&s_high, &s_mid, &s_low, &s_high];
+
+    let mask = compiler.compile_from_tile_samples(32, 32, &tile_samples);
+    if mask.get_rate(0, 0) != Some(CoarseShadingRate::Rate1x1)
+        || mask.get_rate(1, 0) != Some(CoarseShadingRate::Rate2x2)
+        || mask.get_rate(0, 1) != Some(CoarseShadingRate::Rate4x4)
+        || mask.get_rate(1, 1) != Some(CoarseShadingRate::Rate1x1)
+    {
+        return false;
+    }
+
+    // 3. Verify handheld peripheral foveated shading generator and workload reduction.
+    let fov_cfg = PeripheralFoveationConfig {
+        center_x: 320.0,
+        center_y: 200.0,
+        inner_radius: 100.0,
+        outer_radius: 200.0,
+        preserve_edges: true,
+    };
+    let mut fov_gen = PeripheralFoveatedShadingGenerator::new(fov_cfg);
+
+    if fov_gen.evaluate_tile_rate(320.0, 200.0) != CoarseShadingRate::Rate1x1
+        || fov_gen.evaluate_tile_rate(320.0, 320.0) != CoarseShadingRate::Rate2x2
+        || fov_gen.evaluate_tile_rate(10.0, 10.0) != CoarseShadingRate::Rate4x4
+    {
+        return false;
+    }
+
+    let fov_mask = fov_gen.generate_mask(640, 400, 16, palette, None);
+    let reduction =
+        PeripheralFoveatedShadingGenerator::compute_workload_reduction_percentage(&fov_mask);
+    if reduction < 30 {
+        return false;
+    }
+
+    // 4. Verify command list dynamic shading rate binding and combiner evaluation.
+    let mut cmd_state = CommandListShadingRateState::new();
+    cmd_state.set_shading_rate(
+        CoarseShadingRate::Rate2x2,
+        ShadingRateCombinerOp::Passthrough,
+        ShadingRateCombinerOp::Override,
+    );
+    if !cmd_state.is_dirty {
+        return false;
+    }
+    let flushed = cmd_state.commit_bindings();
+    if !flushed || cmd_state.is_dirty {
+        return false;
+    }
+
+    let effective = cmd_state.evaluate_effective_rate(Some(CoarseShadingRate::Rate1x2), None);
+    if effective != CoarseShadingRate::Rate2x2 {
+        return false;
+    }
+
+    let min_rate = evaluate_coarse_combiner_op(
+        CoarseShadingRate::Rate2x4,
+        CoarseShadingRate::Rate4x2,
+        ShadingRateCombinerOp::Min,
+    );
+    if min_rate != CoarseShadingRate::Rate2x2 {
+        return false;
+    }
+
+    let max_rate = evaluate_coarse_combiner_op(
+        CoarseShadingRate::Rate1x2,
+        CoarseShadingRate::Rate2x1,
+        ShadingRateCombinerOp::Max,
+    );
+    if max_rate != CoarseShadingRate::Rate2x2 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str(
+        "[KNT-D3D12-COARSE-SHADING-PASS] Direct3D 12 agility coarse pixel shading verified\r\n",
+    );
     true
 }
