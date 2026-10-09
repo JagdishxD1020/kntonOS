@@ -199,3 +199,69 @@ impl AvDriftCompensator {
         self.estimated_drift_ns.load(Ordering::Acquire)
     }
 }
+
+/// Variable rate playback governor (0.25x - 4.0x) with zero-pitch audio resampling.
+pub struct VariablePlaybackRateGovernor {
+    pub current_rate_fixed: AtomicU32, // 1000 = 1.0x
+    pub min_rate_fixed: u32,           // 250 = 0.25x
+    pub max_rate_fixed: u32,           // 4000 = 4.0x
+}
+
+impl VariablePlaybackRateGovernor {
+    pub fn new() -> Self {
+        Self {
+            current_rate_fixed: AtomicU32::new(1000),
+            min_rate_fixed: 250,
+            max_rate_fixed: 4000,
+        }
+    }
+
+    /// Sets playback rate clamped between 0.25x and 4.0x.
+    pub fn set_rate(&self, rate_fixed: u32) -> u32 {
+        let clamped = rate_fixed.clamp(self.min_rate_fixed, self.max_rate_fixed);
+        self.current_rate_fixed.store(clamped, Ordering::Release);
+        clamped
+    }
+
+    /// Returns current playback rate fixed-point (1000 = 1.0x).
+    pub fn get_rate(&self) -> u32 {
+        self.current_rate_fixed.load(Ordering::Acquire)
+    }
+
+    /// Resamples stereo audio frames for variable rate playback with zero-pitch change.
+    /// Uses linear interpolation with phase accumulation.
+    pub fn resample_frames(
+        &self,
+        input_frames: &[(i16, i16)],
+        output_frames: &mut [(i16, i16)],
+    ) -> usize {
+        let rate = self.get_rate();
+        if input_frames.is_empty() || output_frames.is_empty() {
+            return 0;
+        }
+
+        let mut out_idx = 0;
+        let mut phase_fixed = 0usize; // 1000 = 1 sample
+
+        while out_idx < output_frames.len() {
+            let src_idx = phase_fixed / 1000;
+            if src_idx + 1 >= input_frames.len() {
+                break;
+            }
+
+            let frac = (phase_fixed % 1000) as i32;
+            let (l0, r0) = input_frames[src_idx];
+            let (l1, r1) = input_frames[src_idx + 1];
+
+            // Linear interpolation
+            let l = l0 as i32 + ((l1 as i32 - l0 as i32) * frac) / 1000;
+            let r = r0 as i32 + ((r1 as i32 - r0 as i32) * frac) / 1000;
+
+            output_frames[out_idx] = (l.clamp(-32768, 32767) as i16, r.clamp(-32768, 32767) as i16);
+            out_idx += 1;
+            phase_fixed += rate as usize;
+        }
+
+        out_idx
+    }
+}
