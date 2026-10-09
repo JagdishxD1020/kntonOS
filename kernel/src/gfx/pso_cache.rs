@@ -307,6 +307,175 @@ impl D3D12PipelineLibrary {
     }
 }
 
+// Priority level for asynchronous shader compilation requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PsoCompilePriority {
+    Low = 0,
+    Normal = 1,
+    High = 2,
+    Critical = 3,
+}
+
+// Current compilation lifecycle state for an asynchronous job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PsoCompileStatus {
+    Queued,
+    Compiling,
+    Ready(CompiledPipelineBlob),
+    Failed,
+}
+
+// Work item submitted to the asynchronous PSO compiler queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsoCompileRequest {
+    // Unique request tracking identifier.
+    pub request_id: u64,
+    // Symbolic pipeline name.
+    pub name: String,
+    // Deterministic hash key.
+    pub hash_key: PsoHashKey,
+    // Pipeline classification kind.
+    pub kind: PipelineKind,
+    // Bound root signature ID.
+    pub root_signature_id: u64,
+    // Raw bytecode input payload.
+    pub raw_bytecode: Vec<u8>,
+    // Scheduled compilation priority.
+    pub priority: PsoCompilePriority,
+    // Current compilation status.
+    pub status: PsoCompileStatus,
+}
+
+// Asynchronous background PSO compiler queue preventing main-thread draw hitching.
+#[derive(Debug, Clone)]
+pub struct AsyncPsoCompilerQueue {
+    // List of pending and completed compile requests.
+    pub requests: Vec<PsoCompileRequest>,
+    // Monotonic request ID counter.
+    pub next_request_id: u64,
+    // Maximum concurrent worker jobs allowed per tick.
+    pub max_in_flight_workers: usize,
+    // Total jobs successfully compiled.
+    pub total_compiled_jobs: u64,
+    // Total runtime requests satisfied from cache or ready state without stutter.
+    pub total_stutter_free_hits: u64,
+}
+
+impl AsyncPsoCompilerQueue {
+    // Creates a new async compiler queue with specified concurrency limit.
+    pub fn new(max_workers: usize) -> Self {
+        Self {
+            requests: Vec::new(),
+            next_request_id: 1,
+            max_in_flight_workers: if max_workers == 0 { 4 } else { max_workers },
+            total_compiled_jobs: 0,
+            total_stutter_free_hits: 0,
+        }
+    }
+
+    // Submits a pipeline compilation request to background workers.
+    pub fn submit_request(
+        &mut self,
+        name: &str,
+        kind: PipelineKind,
+        root_sig_id: u64,
+        raw_bytecode: &[u8],
+        priority: PsoCompilePriority,
+    ) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        let hash_key = hash_bytes_128(raw_bytecode);
+
+        self.requests.push(PsoCompileRequest {
+            request_id,
+            name: String::from(name),
+            hash_key,
+            kind,
+            root_signature_id: root_sig_id,
+            raw_bytecode: raw_bytecode.to_vec(),
+            priority,
+            status: PsoCompileStatus::Queued,
+        });
+
+        request_id
+    }
+
+    // Steps background worker threads to compile queued requests.
+    pub fn step_workers(
+        &mut self,
+        max_steps: usize,
+        library: &mut D3D12PipelineLibrary,
+    ) -> usize {
+        let mut steps = 0;
+        let limit = core::cmp::min(max_steps, self.max_in_flight_workers);
+
+        while steps < limit {
+            let mut best_idx = None;
+            let mut highest_prio = PsoCompilePriority::Low;
+
+            for (i, req) in self.requests.iter().enumerate() {
+                if req.status == PsoCompileStatus::Queued {
+                    if best_idx.is_none() || req.priority >= highest_prio {
+                        highest_prio = req.priority;
+                        best_idx = Some(i);
+                    }
+                }
+            }
+
+            let idx = match best_idx {
+                Some(i) => i,
+                None => break,
+            };
+
+            self.requests[idx].status = PsoCompileStatus::Compiling;
+            let blob = CompiledPipelineBlob {
+                hash_key: self.requests[idx].hash_key,
+                kind: self.requests[idx].kind,
+                bytecode: self.requests[idx].raw_bytecode.clone(),
+                root_signature_id: self.requests[idx].root_signature_id,
+            };
+
+            let _ = library.store_pipeline(&self.requests[idx].name, blob.clone());
+            self.requests[idx].status = PsoCompileStatus::Ready(blob);
+            self.total_compiled_jobs += 1;
+            steps += 1;
+        }
+
+        steps
+    }
+
+    // Queries current status of a submitted compilation request.
+    pub fn poll_status(&self, request_id: u64) -> Option<&PsoCompileStatus> {
+        for req in &self.requests {
+            if req.request_id == request_id {
+                return Some(&req.status);
+            }
+        }
+        None
+    }
+
+    // Takes completed compiled pipeline blob if ready.
+    pub fn take_completed(&mut self, request_id: u64) -> Option<CompiledPipelineBlob> {
+        for req in &mut self.requests {
+            if req.request_id == request_id {
+                if let PsoCompileStatus::Ready(ref blob) = req.status {
+                    self.total_stutter_free_hits += 1;
+                    return Some(blob.clone());
+                }
+            }
+        }
+        None
+    }
+
+    // Returns count of jobs waiting in queued state.
+    pub fn queued_count(&self) -> usize {
+        self.requests
+            .iter()
+            .filter(|r| r.status == PsoCompileStatus::Queued)
+            .count()
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_pso_library_cache_subsystem() -> bool {
     true
