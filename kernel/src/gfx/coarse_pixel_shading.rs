@@ -508,6 +508,198 @@ impl PeripheralFoveatedShadingGenerator {
     }
 }
 
+// Operations supported by D3D12 shading rate combiners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShadingRateCombinerOp {
+    Passthrough,
+    Override,
+    Min,
+    Max,
+    Sum,
+}
+
+// Clamps arbitrary width and height to closest valid D3D12 Tier 2 coarse rate.
+pub const fn clamp_to_valid_rate(width: u32, height: u32) -> CoarseShadingRate {
+    let mut w = if width < 1 {
+        1
+    } else if width > 4 {
+        4
+    } else {
+        width
+    };
+    let mut h = if height < 1 {
+        1
+    } else if height > 4 {
+        4
+    } else {
+        height
+    };
+
+    if w == 3 {
+        w = 2;
+    }
+    if h == 3 {
+        h = 2;
+    }
+    if w == 1 && h == 4 {
+        h = 2;
+    }
+    if w == 4 && h == 1 {
+        w = 2;
+    }
+
+    match (w, h) {
+        (1, 1) => CoarseShadingRate::Rate1x1,
+        (1, 2) => CoarseShadingRate::Rate1x2,
+        (2, 1) => CoarseShadingRate::Rate2x1,
+        (2, 2) => CoarseShadingRate::Rate2x2,
+        (2, 4) => CoarseShadingRate::Rate2x4,
+        (4, 2) => CoarseShadingRate::Rate4x2,
+        _ => CoarseShadingRate::Rate4x4,
+    }
+}
+
+// Evaluates a single combiner operation between source and modifier rates.
+pub fn evaluate_coarse_combiner_op(
+    source: CoarseShadingRate,
+    modifier: CoarseShadingRate,
+    op: ShadingRateCombinerOp,
+) -> CoarseShadingRate {
+    match op {
+        ShadingRateCombinerOp::Passthrough => source,
+        ShadingRateCombinerOp::Override => modifier,
+        ShadingRateCombinerOp::Min => {
+            let w = core::cmp::min(source.width(), modifier.width());
+            let h = core::cmp::min(source.height(), modifier.height());
+            clamp_to_valid_rate(w, h)
+        }
+        ShadingRateCombinerOp::Max => {
+            let w = core::cmp::max(source.width(), modifier.width());
+            let h = core::cmp::max(source.height(), modifier.height());
+            clamp_to_valid_rate(w, h)
+        }
+        ShadingRateCombinerOp::Sum => {
+            let w = source.width() + modifier.width() - 1;
+            let h = source.height() + modifier.height() - 1;
+            clamp_to_valid_rate(w, h)
+        }
+    }
+}
+
+// Command list shading rate state tracker managing dynamic bindings and combiner pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandListShadingRateState {
+    // Current per-draw base coarse shading rate.
+    pub base_shading_rate: CoarseShadingRate,
+    // Combiner rule between primitive rate and image rate.
+    pub combiner_primitive_image: ShadingRateCombinerOp,
+    // Combiner rule between intermediate result and base rate.
+    pub combiner_result_base: ShadingRateCombinerOp,
+    // GPU virtual address of bound tile shading rate image, if any.
+    pub bound_image_gpu_va: Option<u64>,
+    // CPU-accessible tile mask for bound shading rate image, if provided.
+    pub bound_mask: Option<TileShadingRateMask>,
+    // Flag indicating state changes requiring hardware command packet update.
+    pub is_dirty: bool,
+    // Total RSSetShadingRate invocations recorded.
+    pub total_set_shading_rate_calls: u64,
+    // Total draws evaluated through combiner pipeline.
+    pub total_draws_evaluated: u64,
+}
+
+impl Default for CommandListShadingRateState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommandListShadingRateState {
+    // Creates a new command list shading rate state with default passthrough rules.
+    pub fn new() -> Self {
+        Self {
+            base_shading_rate: CoarseShadingRate::Rate1x1,
+            combiner_primitive_image: ShadingRateCombinerOp::Passthrough,
+            combiner_result_base: ShadingRateCombinerOp::Passthrough,
+            bound_image_gpu_va: None,
+            bound_mask: None,
+            is_dirty: false,
+            total_set_shading_rate_calls: 0,
+            total_draws_evaluated: 0,
+        }
+    }
+
+    // Updates base shading rate and combiner rules (matches RSSetShadingRate).
+    pub fn set_shading_rate(
+        &mut self,
+        base_rate: CoarseShadingRate,
+        combiner_prim_img: ShadingRateCombinerOp,
+        combiner_res_base: ShadingRateCombinerOp,
+    ) {
+        if self.base_shading_rate != base_rate
+            || self.combiner_primitive_image != combiner_prim_img
+            || self.combiner_result_base != combiner_res_base
+        {
+            self.base_shading_rate = base_rate;
+            self.combiner_primitive_image = combiner_prim_img;
+            self.combiner_result_base = combiner_res_base;
+            self.is_dirty = true;
+        }
+        self.total_set_shading_rate_calls += 1;
+    }
+
+    // Binds a screen-space shading rate image (matches RSSetShadingRateImage).
+    pub fn set_shading_rate_image(&mut self, gpu_va: u64, mask: Option<TileShadingRateMask>) {
+        if self.bound_image_gpu_va != Some(gpu_va) {
+            self.bound_image_gpu_va = Some(gpu_va);
+            self.is_dirty = true;
+        }
+        self.bound_mask = mask;
+    }
+
+    // Unbinds currently attached shading rate image.
+    pub fn clear_shading_rate_image(&mut self) {
+        if self.bound_image_gpu_va.is_some() {
+            self.bound_image_gpu_va = None;
+            self.bound_mask = None;
+            self.is_dirty = true;
+        }
+    }
+
+    // Evaluates final coarse shading rate for a draw given primitive rate and tile position.
+    pub fn evaluate_effective_rate(
+        &mut self,
+        primitive_rate: Option<CoarseShadingRate>,
+        tile_coord: Option<(u32, u32)>,
+    ) -> CoarseShadingRate {
+        self.total_draws_evaluated += 1;
+
+        let prim = primitive_rate.unwrap_or(CoarseShadingRate::Rate1x1);
+        let img = match (tile_coord, &self.bound_mask) {
+            (Some((tx, ty)), Some(mask)) => {
+                mask.get_rate(tx, ty).unwrap_or(CoarseShadingRate::Rate1x1)
+            }
+            _ => CoarseShadingRate::Rate1x1,
+        };
+
+        // Stage 1: combine primitive rate with image rate.
+        let intermediate = evaluate_coarse_combiner_op(prim, img, self.combiner_primitive_image);
+
+        // Stage 2: combine intermediate result with per-draw base rate.
+        evaluate_coarse_combiner_op(
+            intermediate,
+            self.base_shading_rate,
+            self.combiner_result_base,
+        )
+    }
+
+    // Clears dirty flag when state is flushed to command stream.
+    pub fn commit_bindings(&mut self) -> bool {
+        let was_dirty = self.is_dirty;
+        self.is_dirty = false;
+        was_dirty
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_coarse_pixel_shading_subsystem() -> bool {
     true
