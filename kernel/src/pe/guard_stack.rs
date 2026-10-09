@@ -84,3 +84,47 @@ pub fn win32_get_dynamic_stack_bounds(thread_id: u64) -> Option<(usize, usize, u
     let stacks = THREAD_STACKS.lock();
     stacks.get(&thread_id).map(|s| (s.stack_base, s.stack_limit, s.stack_reserve_bottom))
 }
+
+/// Result of guard page fault handling.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuardFaultResult {
+    HandledGrowth(usize), // Successfully expanded stack by 1 page (new stack limit)
+    StackOverflow,        // Hit stack reserved bottom boundary
+    NotGuardPage,         // Fault address is outside thread guard page
+}
+
+/// Intercepts PAGE_GUARD page faults, transparently committing a new page and moving guard page down.
+pub fn win32_handle_guard_page_fault(thread_id: u64, fault_addr: usize) -> GuardFaultResult {
+    let mut stacks = THREAD_STACKS.lock();
+    let stack = match stacks.get_mut(&thread_id) {
+        Some(s) => s,
+        None => return GuardFaultResult::NotGuardPage,
+    };
+
+    let fault_page = fault_addr & !(PAGE_SIZE - 1);
+    if fault_page != stack.guard_page_addr {
+        return GuardFaultResult::NotGuardPage;
+    }
+
+    // Check if new guard page would breach hard reserved boundary
+    if stack.guard_page_addr <= stack.stack_reserve_bottom {
+        stack.overflow_triggered = true;
+        return GuardFaultResult::StackOverflow;
+    }
+
+    // Grow committed region by 1 page
+    stack.stack_limit = stack.guard_page_addr;
+    stack.committed_bytes += PAGE_SIZE;
+
+    // Shift guard page lower by 1 page
+    stack.guard_page_addr = stack.stack_limit.saturating_sub(PAGE_SIZE);
+
+    // Sync TEB stack limit if registered
+    crate::pe::peb_teb::win32_register_thread_stack(
+        thread_id,
+        stack.stack_base as u64,
+        stack.stack_limit as u64,
+    );
+
+    GuardFaultResult::HandledGrowth(stack.stack_limit)
+}
