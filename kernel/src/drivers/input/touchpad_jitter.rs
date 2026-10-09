@@ -333,3 +333,136 @@ pub fn verify_imu_predictive_chassis_tremor_compensation() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Dynamic Palm Rejection & Edge Deadzone Filter
+// ============================================================================
+
+/// Maximum contact surface area in mm² for a valid thumb touch before being classified as a palm.
+pub const PALM_MAX_THUMB_AREA_MM2: f32 = 320.0;
+/// Maximum contact aspect ratio (major/minor axis) before being classified as a resting palm edge.
+pub const PALM_MAX_ASPECT_RATIO: f32 = 2.4;
+/// Fractional margin of the touchpad perimeter reserved for edge deadzone (5%).
+pub const TOUCHPAD_EDGE_DEADZONE_MARGIN_PCT: f32 = 0.05;
+
+/// Classification outcome for a capacitive touchpad contact point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactValidity {
+    /// Valid active thumb contact.
+    ValidThumb,
+    /// Large contact area or skin fold classified as resting palm heel.
+    RejectedPalm,
+    /// Contact initiated inside edge perimeter deadzone.
+    SuppressedEdge,
+}
+
+/// Dynamic Palm Rejection and Perimeter Deadzone Filter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PalmAndEdgeFilter {
+    /// Touchpad active physical width in coordinate units (nominally 1000.0).
+    pub pad_width: f32,
+    /// Touchpad active physical height in coordinate units (nominally 1000.0).
+    pub pad_height: f32,
+    /// Edge deadzone margin in percentage of width/height.
+    pub edge_margin_pct: f32,
+    /// Total palm contacts successfully rejected.
+    pub total_palms_rejected: u32,
+    /// Total edge deadzone contact initiations suppressed.
+    pub total_edge_suppressed: u32,
+    /// Total valid thumb interactions passed.
+    pub total_valid_contacts: u32,
+}
+
+impl PalmAndEdgeFilter {
+    /// Constructs a palm and edge filter with calibrated handheld touchpad dimensions.
+    pub const fn new(pad_width: f32, pad_height: f32) -> Self {
+        Self {
+            pad_width,
+            pad_height,
+            edge_margin_pct: TOUCHPAD_EDGE_DEADZONE_MARGIN_PCT,
+            total_palms_rejected: 0,
+            total_edge_suppressed: 0,
+            total_valid_contacts: 0,
+        }
+    }
+
+    /// Evaluates contact geometry and position to determine validity.
+    pub fn evaluate_contact(
+        &mut self,
+        x: f32,
+        y: f32,
+        major_axis_mm: f32,
+        minor_axis_mm: f32,
+        is_contact_origin: bool,
+    ) -> ContactValidity {
+        // 1. Palm Area Analysis: Elliptical contact area = PI * (major/2) * (minor/2)
+        let area_mm2 = (TOUCHPAD_TWO_PI / 2.0) * (major_axis_mm / 2.0) * (minor_axis_mm / 2.0);
+        let aspect_ratio = if minor_axis_mm > 0.1 {
+            major_axis_mm / minor_axis_mm
+        } else {
+            1.0
+        };
+
+        if area_mm2 >= PALM_MAX_THUMB_AREA_MM2 || aspect_ratio >= PALM_MAX_ASPECT_RATIO {
+            self.total_palms_rejected += 1;
+            return ContactValidity::RejectedPalm;
+        }
+
+        // 2. Edge Deadzone Analysis:
+        // Only reject if contact originates in the edge border. If a valid thumb glides
+        // into the edge from the center, allow it to continue.
+        let margin_x = self.pad_width * self.edge_margin_pct;
+        let margin_y = self.pad_height * self.edge_margin_pct;
+
+        let in_edge_zone = x < margin_x
+            || x > (self.pad_width - margin_x)
+            || y < margin_y
+            || y > (self.pad_height - margin_y);
+
+        if in_edge_zone && is_contact_origin {
+            self.total_edge_suppressed += 1;
+            return ContactValidity::SuppressedEdge;
+        }
+
+        self.total_valid_contacts += 1;
+        ContactValidity::ValidThumb
+    }
+}
+
+/// Verification test for dynamic palm rejection and edge deadzone filter.
+pub fn verify_palm_rejection_and_edge_deadzone() -> bool {
+    let mut filter = PalmAndEdgeFilter::new(1000.0, 1000.0);
+
+    // 1. Nominal thumb contact at center (500, 500), 12mm x 10mm: Must be ValidThumb
+    let val_thumb = filter.evaluate_contact(500.0, 500.0, 12.0, 10.0, true);
+    if val_thumb != ContactValidity::ValidThumb {
+        return false;
+    }
+
+    // 2. Large palm resting contact (400, 400), 28mm x 22mm (~480 mm² > 320 mm²): Must be RejectedPalm
+    let val_palm = filter.evaluate_contact(400.0, 400.0, 28.0, 22.0, true);
+    if val_palm != ContactValidity::RejectedPalm || filter.total_palms_rejected != 1 {
+        return false;
+    }
+
+    // 3. Elongated skin fold palm contact, 25mm x 8mm (aspect ratio 3.125 > 2.4): Must be RejectedPalm
+    let val_fold = filter.evaluate_contact(300.0, 300.0, 25.0, 8.0, true);
+    if val_fold != ContactValidity::RejectedPalm || filter.total_palms_rejected != 2 {
+        return false;
+    }
+
+    // 4. Edge Deadzone Initiation: Touch originates at (20, 500) (< 50 margin = 5% of 1000)
+    let val_edge_start = filter.evaluate_contact(20.0, 500.0, 10.0, 10.0, true);
+    if val_edge_start != ContactValidity::SuppressedEdge || filter.total_edge_suppressed != 1 {
+        return false;
+    }
+
+    // 5. Gesture Continuation: Touch originated at center, but glides into edge zone
+    let val_edge_glide = filter.evaluate_contact(20.0, 500.0, 10.0, 10.0, false);
+    if val_edge_glide != ContactValidity::ValidThumb {
+        return false;
+    }
+
+    true
+}
