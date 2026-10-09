@@ -786,6 +786,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld haptic waveform synthesizer and VCA force profiler self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Gyroscope-Assisted Predictive Touchpad Smoothing & Anti-Jitter Filter (TASK-KNT-246)
+    if !drivers::input::test_touchpad_jitter_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld touchpad smoothing and anti-jitter self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");

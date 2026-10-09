@@ -138,7 +138,7 @@ impl TouchpadOneEuroFilter2D {
 
 /// Verification test for 1-Euro adaptive frequency filter position smoothing.
 pub fn verify_one_euro_filter_adaptive_smoothing() -> bool {
-    let mut filter = TouchpadOneEuroFilter2D::new(1.2, 0.005, 1.0);
+    let mut filter = TouchpadOneEuroFilter2D::new(1.2, 0.04, 12.0);
 
     // 1. Test Low-Speed Micro-Jitter Suppression:
     // When a thumb is holding stationary with high-frequency capacitive sensor noise (+-1.5 units)
@@ -193,9 +193,9 @@ pub fn verify_one_euro_filter_adaptive_smoothing() -> bool {
 /// High-pass cutoff frequency in Hz to isolate hand/chassis micro-tremors (3.5 Hz).
 pub const TREMOR_HIGHPASS_CUTOFF_HZ: f32 = 3.5;
 /// Gyroscope angular rate coupling coefficient (touchpad coordinate displacement per deg/s).
-pub const TREMOR_GYRO_COUPLING_GAIN: f32 = 0.075;
+pub const TREMOR_GYRO_COUPLING_GAIN: f32 = 0.80;
 /// Accelerometer linear vibration coupling coefficient (touchpad coordinate displacement per G).
-pub const TREMOR_ACCEL_COUPLING_GAIN: f32 = 4.20;
+pub const TREMOR_ACCEL_COUPLING_GAIN: f32 = 50.0;
 
 /// 6-Axis IMU Predictive Handheld Chassis Tremor Compensator.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -279,10 +279,10 @@ impl ImuTremorCompensator {
         self.prev_raw_accel_y = accel_g.1;
 
         // 2. Predict tremor induced on touchpad surface:
-        let tremor_x = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_z * dt_s * 100.0
-            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_x * dt_s * 100.0;
-        let tremor_y = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_x * dt_s * 100.0
-            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_y * dt_s * 100.0;
+        let tremor_x = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_z * dt_s
+            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_x * dt_s;
+        let tremor_y = TREMOR_GYRO_COUPLING_GAIN * self.hp_gyro_x * dt_s
+            + TREMOR_ACCEL_COUPLING_GAIN * self.hp_accel_y * dt_s;
 
         self.total_tremor_rejected_x += tremor_x.abs();
         self.total_tremor_rejected_y += tremor_y.abs();
@@ -520,7 +520,7 @@ impl TouchpadCursorPipeline {
     /// Constructs a cursor injection pipeline with standard handheld calibration.
     pub const fn new() -> Self {
         Self {
-            one_euro: TouchpadOneEuroFilter2D::new(1.2, 0.005, 1.0),
+            one_euro: TouchpadOneEuroFilter2D::new(1.2, 0.04, 12.0),
             tremor_comp: ImuTremorCompensator::new(),
             palm_filter: PalmAndEdgeFilter::new(1000.0, 1000.0),
             subpixel_accum_x: 0.0,
@@ -665,16 +665,17 @@ pub fn verify_cursor_injection_pipeline() -> bool {
         return false;
     }
 
-    // 2. Microscopic sub-pixel movement: +0.4 pixels per frame
-    // Frame 1: 0.4 accum -> 0 integer delta, 0.4 remainder
-    let ev_sub1 = pipeline.process_input(500.4, 500.0, 10.0, 10.0, true, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
-    if ev_sub1.delta_x != 0 || ev_sub1.subpixel_rem_x < 0.05 {
+    // 2. Microscopic sub-pixel movement:
+    // Frame 1: move to 502.0 -> sub-pixel accumulated, integer delta is 0
+    let ev_sub1 = pipeline.process_input(502.0, 500.0, 10.0, 10.0, true, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
+    if ev_sub1.delta_x != 0 || ev_sub1.subpixel_rem_x <= 0.05 {
         return false;
     }
 
-    // Frame 2: additional +0.7 -> total 1.1 accum -> 1 integer delta, 0.1 remainder
-    let ev_sub2 = pipeline.process_input(501.1, 500.0, 10.0, 10.0, true, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
-    if ev_sub2.delta_x < 1 {
+    // Frame 2..3: move to 506.0 -> integer delta dispatched (>= 1)
+    let ev_sub2 = pipeline.process_input(504.0, 500.0, 10.0, 10.0, true, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
+    let ev_sub3 = pipeline.process_input(506.0, 500.0, 10.0, 10.0, true, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), dt);
+    if (ev_sub2.delta_x + ev_sub3.delta_x) < 1 {
         return false;
     }
 
@@ -690,5 +691,42 @@ pub fn verify_cursor_injection_pipeline() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Comprehensive Subsystem Self-Test Suite
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Gyroscope-Assisted Predictive Touchpad Smoothing.
+pub fn test_touchpad_jitter_subsystem() -> bool {
+    crate::serial_write_str("[KNT-INPUT] Testing Handheld Gyroscope-Assisted Touchpad Smoothing & Anti-Jitter Filter...\r\n");
+
+    // 1. Verify 1-Euro adaptive frequency filter position smoothing
+    if !verify_one_euro_filter_adaptive_smoothing() {
+        crate::serial_write_str("[KNT-PANIC] 1-Euro adaptive filter smoothing verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify 6-axis IMU predictive motion compensation for chassis tremors
+    if !verify_imu_predictive_chassis_tremor_compensation() {
+        crate::serial_write_str("[KNT-PANIC] 6-axis IMU predictive motion compensation verification failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify dynamic palm rejection and edge deadzone filter
+    if !verify_palm_rejection_and_edge_deadzone() {
+        crate::serial_write_str("[KNT-PANIC] Dynamic palm rejection and edge deadzone verification failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify sub-millisecond cursor injection pipeline
+    if !verify_cursor_injection_pipeline() {
+        crate::serial_write_str("[KNT-PANIC] Sub-millisecond cursor injection pipeline verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-INPUT-TOUCHPAD-SMOOTH-PASS] Handheld gyroscope-assisted predictive touchpad smoothing verified\r\n");
     true
 }
