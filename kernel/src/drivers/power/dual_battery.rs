@@ -196,3 +196,161 @@ pub fn verify_impedance_tracking_and_power_sharing() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Hot-Swap Bridge Hold-Up Time Estimator (Zero Reboot Pack Swap)
+// ============================================================================
+
+/// Minimum system main power rail brownout threshold in millivolts (6,200 mV).
+pub const SYSTEM_BROWNOUT_THRESHOLD_MV: u32 = 6200;
+/// Nominal bridge buffer capacitor / micro-cell energy capacity in Joules (e.g. 600 Joules).
+pub const BRIDGE_BUFFER_CAPACITY_JOULES: f32 = 600.0;
+/// Critical hold-up time remaining threshold in seconds triggering emergency hibernate.
+pub const CRITICAL_BROWNOUT_WARNING_SEC: f32 = 5.0;
+
+/// Hot-swap lifecycle state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotSwapState {
+    /// Both packs connected and online.
+    DualPacksOnline,
+    /// Only primary internal pack online.
+    SinglePackOnline,
+    /// Hot-swap bridge holding up system rail during active pack exchange.
+    BridgeHoldActive,
+    /// New pack inserted, contacts debounced, and supply rail locked.
+    HotSwapComplete,
+    /// Hold-up energy critically depleted (< 5s remaining).
+    CriticalBrownoutWarning,
+}
+
+/// Status report emitted by the hot-swap supervisor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HotSwapStatus {
+    pub state: HotSwapState,
+    pub estimated_hold_up_sec: f32,
+    pub power_pinch_active: bool,
+    pub throttled_system_power_w: f32,
+}
+
+/// Hot-swap bridge hold-up energy estimator and power-pinch governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HotSwapBridgeEstimator {
+    /// Active state of the hot-swap bridge supervisor.
+    pub state: HotSwapState,
+    /// Usable energy remaining in the bridge hold-up buffer in Joules.
+    pub remaining_energy_joules: f32,
+    /// Current measured or throttled system power consumption in Watts.
+    pub current_power_draw_w: f32,
+    /// Calculated hold-up time remaining in seconds until brownout shutdown.
+    pub estimated_hold_up_sec: f32,
+    /// Whether emergency power-pinch mode is actively reducing APU/display load.
+    pub power_pinch_active: bool,
+    /// Lifetime count of hot-swap pack exchanges completed without reboot.
+    pub total_swaps_completed: u32,
+}
+
+impl HotSwapBridgeEstimator {
+    /// Constructs a hot-swap bridge estimator with fully charged buffer defaults.
+    pub const fn new() -> Self {
+        Self {
+            state: HotSwapState::DualPacksOnline,
+            remaining_energy_joules: BRIDGE_BUFFER_CAPACITY_JOULES,
+            current_power_draw_w: 20.0,
+            estimated_hold_up_sec: 30.0,
+            power_pinch_active: false,
+            total_swaps_completed: 0,
+        }
+    }
+
+    /// Evaluates pack presence, updates hold-up energy dissipation, and manages power-pinch load shedding.
+    pub fn update(&mut self, is_pack_b_present: bool, raw_system_power_w: f32, dt_s: f32) -> HotSwapStatus {
+        if is_pack_b_present {
+            if self.state == HotSwapState::BridgeHoldActive || self.state == HotSwapState::CriticalBrownoutWarning {
+                // New pack inserted! Recover from bridge hold
+                self.state = HotSwapState::HotSwapComplete;
+                self.power_pinch_active = false;
+                self.total_swaps_completed += 1;
+            } else if self.state == HotSwapState::HotSwapComplete {
+                self.state = HotSwapState::DualPacksOnline;
+            }
+
+            // Recharge bridge buffer when main packs are online
+            self.remaining_energy_joules = (self.remaining_energy_joules + 15.0 * dt_s).min(BRIDGE_BUFFER_CAPACITY_JOULES);
+            self.current_power_draw_w = raw_system_power_w;
+            self.estimated_hold_up_sec = self.remaining_energy_joules / self.current_power_draw_w.max(1.0);
+
+            return HotSwapStatus {
+                state: self.state,
+                estimated_hold_up_sec: self.estimated_hold_up_sec,
+                power_pinch_active: false,
+                throttled_system_power_w: self.current_power_draw_w,
+            };
+        }
+
+        // Pack B is ABSENT / Disconnected:
+        // Engage Hot-Swap Bridge Hold mode!
+        self.state = HotSwapState::BridgeHoldActive;
+        self.power_pinch_active = true;
+
+        // Emergency Power Pinch: Clamp system load to 7.5W max (downclock APU, dim screen)
+        self.current_power_draw_w = raw_system_power_w.min(7.5);
+
+        // Deplete bridge energy: E = E - P * dt
+        let energy_consumed = self.current_power_draw_w * dt_s;
+        self.remaining_energy_joules = (self.remaining_energy_joules - energy_consumed).max(0.0);
+
+        self.estimated_hold_up_sec = self.remaining_energy_joules / self.current_power_draw_w.max(0.5);
+
+        if self.estimated_hold_up_sec <= CRITICAL_BROWNOUT_WARNING_SEC {
+            self.state = HotSwapState::CriticalBrownoutWarning;
+        }
+
+        HotSwapStatus {
+            state: self.state,
+            estimated_hold_up_sec: self.estimated_hold_up_sec,
+            power_pinch_active: true,
+            throttled_system_power_w: self.current_power_draw_w,
+        }
+    }
+}
+
+/// Verification test for hot-swap bridge hold-up time estimator ensuring zero reboot on pack swap.
+pub fn verify_hot_swap_bridge_hold_up_estimator() -> bool {
+    let mut estimator = HotSwapBridgeEstimator::new();
+
+    // 1. Dual-pack online gaming at 25W load: bridge buffer is fully charged
+    let s_online = estimator.update(true, 25.0, 0.10);
+    if s_online.state != HotSwapState::DualPacksOnline || s_online.power_pinch_active {
+        return false;
+    }
+    if estimator.remaining_energy_joules < 590.0 {
+        return false;
+    }
+
+    // 2. User unlatches Pack B during active gaming (raw power 28W):
+    // Bridge mode MUST engage and trigger Power Pinch (< 8W load)
+    let s_swap = estimator.update(false, 28.0, 1.0);
+    if s_swap.state != HotSwapState::BridgeHoldActive || !s_swap.power_pinch_active {
+        return false;
+    }
+    // Power draw must be clamped to 7.5W max to maximize hold-up window
+    if s_swap.throttled_system_power_w > 7.5 || estimator.current_power_draw_w > 7.5 {
+        return false;
+    }
+    // At 7.5W with ~590 Joules, hold-up time must be > 70 seconds!
+    if s_swap.estimated_hold_up_sec < 70.0 {
+        return false;
+    }
+
+    // 3. User inserts fresh Pack B after 15 seconds:
+    let s_restored = estimator.update(true, 20.0, 1.0);
+    if s_restored.state != HotSwapState::HotSwapComplete || s_restored.power_pinch_active {
+        return false;
+    }
+    if estimator.total_swaps_completed != 1 {
+        return false;
+    }
+
+    true
+}
