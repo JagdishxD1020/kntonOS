@@ -167,3 +167,41 @@ fn write_hex64_str(val: u64) {
         crate::serial_write_byte(HEX[n]);
     }
 }
+
+/// Marks a thread as idle or active for background stack reclamation.
+pub fn win32_set_thread_idle_state(thread_id: u64, is_idle: bool) {
+    let mut stacks = THREAD_STACKS.lock();
+    if let Some(stack) = stacks.get_mut(&thread_id) {
+        stack.is_idle = is_idle;
+    }
+}
+
+/// Handheld stack page reclamation governor for idle background game threads.
+/// Trims excess committed stack pages back down towards minimum commit baseline,
+/// moving the guard page up and releasing frames to the physical memory allocator.
+pub fn win32_reclaim_idle_thread_stacks(min_keep_commit_bytes: usize) -> usize {
+    let baseline = (min_keep_commit_bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut stacks = THREAD_STACKS.lock();
+    let mut total_reclaimed_pages = 0;
+
+    for stack in stacks.values_mut() {
+        if stack.is_idle && stack.committed_bytes > baseline {
+            let excess_bytes = stack.committed_bytes - baseline;
+            let excess_pages = excess_bytes / PAGE_SIZE;
+
+            stack.committed_bytes = baseline;
+            stack.stack_limit = stack.stack_base.saturating_sub(baseline);
+            stack.guard_page_addr = stack.stack_limit.saturating_sub(PAGE_SIZE);
+
+            crate::pe::peb_teb::win32_register_thread_stack(
+                stack.thread_id,
+                stack.stack_base as u64,
+                stack.stack_limit as u64,
+            );
+
+            total_reclaimed_pages += excess_pages;
+        }
+    }
+
+    total_reclaimed_pages
+}
