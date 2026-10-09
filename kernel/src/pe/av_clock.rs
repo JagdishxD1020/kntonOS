@@ -308,3 +308,89 @@ impl BackgroundAudioCoalescingGovernor {
         self.is_background_playback.load(Ordering::Acquire)
     }
 }
+
+static TEST_SINK_TRIGGERED: AtomicBool = AtomicBool::new(false);
+fn test_clock_state_sink(_state: ClockState, _time_hns: i64) {
+    TEST_SINK_TRIGGERED.store(true, Ordering::SeqCst);
+}
+
+/// Self-test suite verifying Win32 AV timeline, presentation clock, and drift compensator.
+pub fn test_win32_av_clock_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 AV Timeline & Media Foundation Clock self-test...\r\n");
+
+    // 1. Test MFCreatePresentationClock and sink registration
+    let clock = MFCreatePresentationClock();
+    if clock == 0 {
+        crate::serial_write_str("[KNT-ERROR] MFCreatePresentationClock failed\r\n");
+        return false;
+    }
+
+    if !MFAddClockStateSink(clock, test_clock_state_sink) {
+        crate::serial_write_str("[KNT-ERROR] MFAddClockStateSink failed\r\n");
+        return false;
+    }
+
+    // 2. Start clock and verify state notification
+    if !MFStartPresentationClock(clock, 50_000_000) { // 5 seconds in hns
+        crate::serial_write_str("[KNT-ERROR] MFStartPresentationClock failed\r\n");
+        return false;
+    }
+
+    if !TEST_SINK_TRIGGERED.load(Ordering::SeqCst) {
+        crate::serial_write_str("[KNT-ERROR] Clock state sink was not invoked\r\n");
+        return false;
+    }
+
+    if MFGetPresentationTime(clock) != Some(50_000_000) {
+        crate::serial_write_str("[KNT-ERROR] MFGetPresentationTime mismatch\r\n");
+        return false;
+    }
+
+    // 3. Pause & Stop clock
+    if !MFPausePresentationClock(clock) || !MFStopPresentationClock(clock) {
+        crate::serial_write_str("[KNT-ERROR] Pause/Stop clock failed\r\n");
+        return false;
+    }
+
+    // 4. Test AvDriftCompensator
+    let compensator = AvDriftCompensator::new(16_666_667, 48000); // 60Hz VSync, 48kHz audio
+    compensator.record_vsync(16_666_667);
+    compensator.record_audio_frames(800, 16_666_667);
+    let correction = compensator.calculate_drift_correction_ppb(16_666_667, 16_664_000);
+    if correction == 0 {
+        crate::serial_write_str("[KNT-ERROR] Drift compensator produced zero correction\r\n");
+        return false;
+    }
+
+    // 5. Test VariablePlaybackRateGovernor & linear audio resampler
+    let gov = VariablePlaybackRateGovernor::new();
+    let effective_rate = gov.set_rate(1500); // 1.5x
+    if effective_rate != 1500 || gov.get_rate() != 1500 {
+        crate::serial_write_str("[KNT-ERROR] Playback rate set mismatch\r\n");
+        return false;
+    }
+
+    let input_pcm = [(1000i16, 1000i16), (2000i16, 2000i16), (3000i16, 3000i16), (4000i16, 4000i16)];
+    let mut output_pcm = [(0i16, 0i16); 4];
+    let n_resampled = gov.resample_frames(&input_pcm, &mut output_pcm);
+    if n_resampled == 0 || output_pcm[0].0 == 0 {
+        crate::serial_write_str("[KNT-ERROR] Resampling produced empty or zero frames\r\n");
+        return false;
+    }
+
+    // 6. Test BackgroundAudioCoalescingGovernor
+    let coalescing = BackgroundAudioCoalescingGovernor::new();
+    coalescing.set_background_mode(true);
+    if !coalescing.is_background_active() || coalescing.effective_quantum_ms() != 10 {
+        crate::serial_write_str("[KNT-ERROR] Background coalescing failed to activate 10ms quantum\r\n");
+        return false;
+    }
+    coalescing.set_background_mode(false);
+    if coalescing.effective_quantum_ms() != 1 {
+        crate::serial_write_str("[KNT-ERROR] Background coalescing failed to restore 1ms quantum\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-AV-CLOCK-PASS] Win32 high-resolution AV timeline and media clock verified\r\n");
+    true
+}

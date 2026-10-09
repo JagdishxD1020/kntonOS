@@ -1153,6 +1153,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 High-Resolution Audio/Video Timeline & Media Foundation Clock Engine (TASK-KNT-248)
+    if !pe::test_win32_av_clock_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 AV clock subsystem self-test failed!\r\n");
+    }
+
     // Verify Win32 Hardware Performance Monitor Counters & Low-Overhead Frame Telemetry (TASK-KNT-244)
     if !pe::test_win32_pmc_perf_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 PMC performance subsystem self-test failed!\r\n");
