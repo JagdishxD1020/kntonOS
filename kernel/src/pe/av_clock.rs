@@ -265,3 +265,46 @@ impl VariablePlaybackRateGovernor {
         out_idx
     }
 }
+
+/// Handheld power-aware timer coalescing governor during background audio playback.
+pub struct BackgroundAudioCoalescingGovernor {
+    pub is_background_playback: AtomicBool,
+    pub active_quantum_ms: AtomicU32,     // Default active quantum: 1ms
+    pub coalesced_quantum_ms: AtomicU32,  // Default coalesced quantum: 10ms
+}
+
+impl BackgroundAudioCoalescingGovernor {
+    pub fn new() -> Self {
+        Self {
+            is_background_playback: AtomicBool::new(false),
+            active_quantum_ms: AtomicU32::new(1),
+            coalesced_quantum_ms: AtomicU32::new(10),
+        }
+    }
+
+    /// Sets background playback mode, dynamically expanding timer quantum to save energy.
+    pub fn set_background_mode(&self, background: bool) {
+        self.is_background_playback.store(background, Ordering::Release);
+        if background {
+            // Coalesce timer resolution to 10ms for deep C-states
+            crate::pe::perf_counter::win32_time_end_period(1);
+        } else {
+            // Restore 1ms low-jitter interactive gaming resolution
+            crate::pe::perf_counter::win32_time_begin_period(1);
+        }
+    }
+
+    /// Returns current effective timer quantum in milliseconds.
+    pub fn effective_quantum_ms(&self) -> u32 {
+        if self.is_background_playback.load(Ordering::Acquire) {
+            self.coalesced_quantum_ms.load(Ordering::Relaxed)
+        } else {
+            self.active_quantum_ms.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Returns whether background audio power-saving mode is active.
+    pub fn is_background_active(&self) -> bool {
+        self.is_background_playback.load(Ordering::Acquire)
+    }
+}
