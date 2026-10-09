@@ -366,6 +366,148 @@ impl TileShadingRateMaskCompiler {
     }
 }
 
+// Configuration for handheld peripheral foveated shading rate generation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeripheralFoveationConfig {
+    // Horizontal focal center coordinate in screen pixels.
+    pub center_x: f32,
+    // Vertical focal center coordinate in screen pixels.
+    pub center_y: f32,
+    // Inner foveal radius in pixels where full 1x1 detail is maintained.
+    pub inner_radius: f32,
+    // Mid transition radius in pixels beyond which coarse 4x4 shading applies.
+    pub outer_radius: f32,
+    // Whether to preserve high-contrast edges in peripheral regions.
+    pub preserve_edges: bool,
+}
+
+impl Default for PeripheralFoveationConfig {
+    fn default() -> Self {
+        Self {
+            center_x: 640.0,
+            center_y: 400.0,
+            inner_radius: 200.0,
+            outer_radius: 400.0,
+            preserve_edges: true,
+        }
+    }
+}
+
+// Handheld peripheral foveated shading generator reducing GPU load at display edges.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeripheralFoveatedShadingGenerator {
+    // Active foveation configuration.
+    pub config: PeripheralFoveationConfig,
+    // Contrast detector for edge preservation.
+    pub contrast_detector: ContrastEdgeDetector,
+    // Total generated foveated masks.
+    pub generated_count: u64,
+}
+
+impl PeripheralFoveatedShadingGenerator {
+    // Creates a new peripheral foveated shading generator.
+    pub fn new(config: PeripheralFoveationConfig) -> Self {
+        Self {
+            config,
+            contrast_detector: ContrastEdgeDetector::new(),
+            generated_count: 0,
+        }
+    }
+
+    // Evaluates radial coarse shading rate at specified tile center.
+    pub fn evaluate_tile_rate(&self, tile_center_x: f32, tile_center_y: f32) -> CoarseShadingRate {
+        let dx = tile_center_x - self.config.center_x;
+        let dy = tile_center_y - self.config.center_y;
+        let dist_sq = dx * dx + dy * dy;
+        let inner_sq = self.config.inner_radius * self.config.inner_radius;
+        let outer_sq = self.config.outer_radius * self.config.outer_radius;
+
+        if dist_sq <= inner_sq {
+            CoarseShadingRate::Rate1x1
+        } else if dist_sq <= outer_sq {
+            CoarseShadingRate::Rate2x2
+        } else {
+            CoarseShadingRate::Rate4x4
+        }
+    }
+
+    // Generates a foveated tile shading rate mask for given screen dimensions.
+    pub fn generate_mask(
+        &mut self,
+        screen_width: u32,
+        screen_height: u32,
+        tile_size: u32,
+        palette: ShadingRatePalette,
+        tile_contrasts: Option<&[u8]>,
+    ) -> TileShadingRateMask {
+        let ts = if tile_size == 0 { 16 } else { tile_size };
+        let width_tiles = (screen_width + ts - 1) / ts;
+        let height_tiles = (screen_height + ts - 1) / ts;
+        let mut mask = TileShadingRateMask::new(width_tiles, height_tiles, ts, palette);
+
+        let half_tile = (ts as f32) * 0.5;
+        let total_tiles = (width_tiles * height_tiles) as usize;
+
+        let mut i = 0usize;
+        while i < total_tiles {
+            let tx = (i as u32) % width_tiles;
+            let ty = (i as u32) / width_tiles;
+            let px = (tx * ts) as f32 + half_tile;
+            let py = (ty * ts) as f32 + half_tile;
+
+            let mut rate = self.evaluate_tile_rate(px, py);
+
+            // If edge preservation enabled, clamp rate on high contrast edges.
+            if self.config.preserve_edges {
+                if let Some(contrasts) = tile_contrasts {
+                    if i < contrasts.len() {
+                        let c = contrasts[i];
+                        if c >= self.contrast_detector.thresholds.high_contrast_threshold {
+                            rate = CoarseShadingRate::Rate1x1;
+                        } else if c >= self.contrast_detector.thresholds.medium_contrast_threshold
+                            && rate == CoarseShadingRate::Rate4x4
+                        {
+                            rate = CoarseShadingRate::Rate2x2;
+                        }
+                    }
+                }
+            }
+
+            mask.set_rate(tx, ty, rate);
+            i += 1;
+        }
+
+        self.generated_count += 1;
+        mask
+    }
+
+    // Computes estimated fragment shading workload reduction percentage (0 to 100).
+    pub fn compute_workload_reduction_percentage(mask: &TileShadingRateMask) -> u32 {
+        let total_tiles = mask.total_tiles();
+        if total_tiles == 0 {
+            return 0;
+        }
+        let mut total_effective_invocations = 0u64;
+        let tile_pixels = (mask.tile_size * mask.tile_size) as u64;
+        let total_baseline_invocations = (total_tiles as u64) * tile_pixels;
+
+        let mut i = 0usize;
+        while i < mask.tile_indices.len() {
+            let idx = mask.tile_indices[i];
+            let rate = mask.palette.lookup(idx);
+            let invocations = tile_pixels / (rate.pixel_area() as u64);
+            total_effective_invocations += invocations;
+            i += 1;
+        }
+
+        if total_baseline_invocations == 0 {
+            return 0;
+        }
+        let saved = total_baseline_invocations.saturating_sub(total_effective_invocations);
+        ((saved * 100) / total_baseline_invocations) as u32
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_coarse_pixel_shading_subsystem() -> bool {
     true
