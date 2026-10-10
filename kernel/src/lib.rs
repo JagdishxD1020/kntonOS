@@ -895,6 +895,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld cooling pump governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Dual-Battery Hot-Swap Power Balancing & Charge Current Multiplexer (TASK-KNT-251)
+    if !drivers::power::test_dual_battery_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld dual-battery hot-swap power balancer self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
     if !drivers::power::test_thermal_governor_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld thermal governor and dynamic fan curve engine self-test failed!\r\n");
