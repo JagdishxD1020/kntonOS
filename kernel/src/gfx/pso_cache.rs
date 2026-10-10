@@ -476,6 +476,139 @@ impl AsyncPsoCompilerQueue {
     }
 }
 
+// Configuration for handheld DirectStorage persistent PSO cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectStoragePsoCacheConfig {
+    // Disk sector alignment in bytes (e.g. 4096).
+    pub block_size_bytes: usize,
+    // Maximum persistent cache storage capacity in bytes.
+    pub max_cache_file_size_bytes: usize,
+}
+
+impl Default for DirectStoragePsoCacheConfig {
+    fn default() -> Self {
+        Self {
+            block_size_bytes: 4096,
+            max_cache_file_size_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+// Handheld DirectStorage persistent cache backing for zero-stutter runtime PSO lookups.
+#[derive(Debug, Clone)]
+pub struct DirectStoragePsoCache {
+    // Cache configuration parameters.
+    pub config: DirectStoragePsoCacheConfig,
+    // Persistent NVMe storage byte backing.
+    pub disk_storage: Vec<u8>,
+    // Successful cache hit counter.
+    pub cache_hits: u64,
+    // Cache miss counter requiring runtime fallback.
+    pub cache_misses: u64,
+    // Cumulative bytes streamed from NVMe.
+    pub bytes_read_from_disk: u64,
+    // Cumulative bytes written to NVMe.
+    pub bytes_written_to_disk: u64,
+    // Total pipelines loaded during pre-warming phase.
+    pub prewarmed_pipeline_count: u64,
+}
+
+impl DirectStoragePsoCache {
+    // Creates a new DirectStorage cache backing with specified configuration.
+    pub fn new(config: DirectStoragePsoCacheConfig) -> Self {
+        Self {
+            config,
+            disk_storage: Vec::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+            bytes_read_from_disk: 0,
+            bytes_written_to_disk: 0,
+            prewarmed_pipeline_count: 0,
+        }
+    }
+
+    // Persists the in-memory pipeline library into DirectStorage aligned disk backing.
+    pub fn write_library_to_disk(
+        &mut self,
+        library: &D3D12PipelineLibrary,
+    ) -> Result<usize, PipelineLibraryError> {
+        let serialized = library.serialize();
+        let block_sz = self.config.block_size_bytes;
+        let padded_size = if block_sz > 0 {
+            ((serialized.len() + block_sz - 1) / block_sz) * block_sz
+        } else {
+            serialized.len()
+        };
+
+        if padded_size > self.config.max_cache_file_size_bytes {
+            return Err(PipelineLibraryError::BufferTooSmall {
+                required: padded_size,
+                provided: self.config.max_cache_file_size_bytes,
+            });
+        }
+
+        self.disk_storage.clear();
+        self.disk_storage.extend_from_slice(&serialized);
+        if self.disk_storage.len() < padded_size {
+            self.disk_storage.resize(padded_size, 0);
+        }
+
+        self.bytes_written_to_disk += padded_size as u64;
+        Ok(padded_size)
+    }
+
+    // Pre-warms the in-memory pipeline library by streaming cache from DirectStorage.
+    pub fn prewarm_library_from_disk(
+        &mut self,
+        library: &mut D3D12PipelineLibrary,
+    ) -> Result<usize, PipelineLibraryError> {
+        if self.disk_storage.is_empty() {
+            return Ok(0);
+        }
+
+        let loaded_lib = D3D12PipelineLibrary::deserialize(&self.disk_storage)?;
+        let mut loaded_count = 0;
+
+        for entry in loaded_lib.entries {
+            if library.store_pipeline(&entry.name, entry.blob).is_ok() {
+                loaded_count += 1;
+            }
+        }
+
+        self.bytes_read_from_disk += self.disk_storage.len() as u64;
+        self.prewarmed_pipeline_count += loaded_count as u64;
+        Ok(loaded_count)
+    }
+
+    // Queries a pipeline from the pre-warmed library, tracking cache hit/miss telemetry.
+    pub fn query_pipeline(
+        &mut self,
+        name: &str,
+        library: &D3D12PipelineLibrary,
+    ) -> Option<CompiledPipelineBlob> {
+        match library.load_pipeline(name) {
+            Ok(blob) => {
+                self.cache_hits += 1;
+                Some(blob)
+            }
+            Err(_) => {
+                self.cache_misses += 1;
+                None
+            }
+        }
+    }
+
+    // Calculates current runtime cache hit ratio percentage (0 to 100).
+    pub fn hit_ratio_percentage(&self) -> u32 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0
+        } else {
+            ((self.cache_hits * 100) / total) as u32
+        }
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_pso_library_cache_subsystem() -> bool {
     true
