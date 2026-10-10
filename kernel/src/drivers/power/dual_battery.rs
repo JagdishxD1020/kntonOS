@@ -354,3 +354,146 @@ pub fn verify_hot_swap_bridge_hold_up_estimator() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: USB-PD PPS Fast-Charge Thermal Governor (Grip Temp < 42°C)
+// ============================================================================
+
+/// Maximum allowable handheld chassis/grip surface temperature in °C (IEC 62368-1 compliance).
+pub const GRIP_SURFACE_TEMP_MAX_C: f32 = 42.0;
+/// Early thermal warning threshold in °C where PPS charging current begins progressive derating.
+pub const GRIP_SURFACE_DERATE_START_C: f32 = 38.0;
+/// Minimum trickle charge current in milliamps when under severe thermal constraint.
+pub const PPS_MIN_SAFE_CHARGE_CURRENT_MA: u32 = 500;
+
+/// Operating thermal zone for USB-PD PPS fast charging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpsThermalZone {
+    /// Full unconstrained fast charging (Grip <= 38°C).
+    Optimal,
+    /// Progressive current throttling (38°C < Grip <= 40.5°C).
+    WarmThrottled,
+    /// Heavy thermal derating (40.5°C < Grip <= 42.0°C).
+    HotThrottled,
+    /// Thermal limit exceeded (Grip > 42.0°C): clamped to minimum safe trickle.
+    CriticalClamped,
+}
+
+/// USB-PD Programmable Power Supply (PPS) Thermal Governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsbPdPpsThermalGovernor {
+    /// Active negotiated PPS voltage in millivolts (e.g. 9000 mV).
+    pub negotiated_voltage_mv: u32,
+    /// Active modulated PPS current limit in milliamps.
+    pub negotiated_current_ma: u32,
+    /// Measured handheld palm grip surface temperature in °C.
+    pub current_grip_temp_c: f32,
+    /// Active PPS thermal zone.
+    pub thermal_zone: PpsThermalZone,
+    /// Whether fast-charge current is currently being throttled due to heat.
+    pub is_thermally_throttled: bool,
+    /// Lifetime count of PPS thermal derating events.
+    pub total_derate_events: u32,
+}
+
+impl UsbPdPpsThermalGovernor {
+    /// Constructs a PPS thermal governor with default 9V/4.5A (40.5W) fast charging.
+    pub const fn new() -> Self {
+        Self {
+            negotiated_voltage_mv: 9000,
+            negotiated_current_ma: 4500,
+            current_grip_temp_c: 28.0,
+            thermal_zone: PpsThermalZone::Optimal,
+            is_thermally_throttled: false,
+            total_derate_events: 0,
+        }
+    }
+
+    /// Computes safe PPS voltage and current contract based on grip surface thermistor readings.
+    pub fn update_thermal_governor(
+        &mut self,
+        grip_temp_c: f32,
+        battery_temp_c: f32,
+        target_v_mv: u32,
+        requested_i_ma: u32,
+    ) -> (u32, u32) {
+        self.current_grip_temp_c = grip_temp_c;
+        self.negotiated_voltage_mv = target_v_mv;
+
+        // Effective thermal pressure is dominated by grip surface, with battery core safety check
+        let effective_temp = grip_temp_c.max(battery_temp_c - 5.0);
+
+        if effective_temp <= GRIP_SURFACE_DERATE_START_C {
+            // Zone 1: Optimal fast charging
+            self.thermal_zone = PpsThermalZone::Optimal;
+            self.negotiated_current_ma = requested_i_ma;
+            self.is_thermally_throttled = false;
+        } else if effective_temp <= 40.5 {
+            // Zone 2: Warm throttling (linearly derate between 38°C and 40.5°C)
+            if self.thermal_zone == PpsThermalZone::Optimal {
+                self.total_derate_events += 1;
+            }
+            self.thermal_zone = PpsThermalZone::WarmThrottled;
+            self.is_thermally_throttled = true;
+
+            let factor = 1.0 - ((effective_temp - GRIP_SURFACE_DERATE_START_C) / 2.5) * 0.45; // derate to ~55%
+            self.negotiated_current_ma = ((requested_i_ma as f32) * factor) as u32;
+        } else if effective_temp <= GRIP_SURFACE_TEMP_MAX_C {
+            // Zone 3: Hot throttling (derate down to 1500 mA)
+            self.thermal_zone = PpsThermalZone::HotThrottled;
+            self.is_thermally_throttled = true;
+
+            let factor = 0.55 - ((effective_temp - 40.5) / 1.5) * 0.25; // derate to ~30%
+            self.negotiated_current_ma = ((requested_i_ma as f32) * factor).max(1200.0) as u32;
+        } else {
+            // Zone 4: Critical safety clamp (Grip > 42°C): force 500 mA trickle
+            self.thermal_zone = PpsThermalZone::CriticalClamped;
+            self.is_thermally_throttled = true;
+            self.negotiated_current_ma = PPS_MIN_SAFE_CHARGE_CURRENT_MA;
+        }
+
+        // Align current to standard USB-PD PPS 50mA step resolution
+        self.negotiated_current_ma = (self.negotiated_current_ma / 50) * 50;
+
+        (self.negotiated_voltage_mv, self.negotiated_current_ma)
+    }
+}
+
+/// Verification test for USB-PD PPS fast-charge thermal governor.
+pub fn verify_usb_pd_pps_thermal_governor() -> bool {
+    let mut gov = UsbPdPpsThermalGovernor::new();
+
+    // 1. Cool grip surface (32°C): Full unconstrained 4500 mA fast charging
+    let (v1, i1) = gov.update_thermal_governor(32.0, 34.0, 9000, 4500);
+    if v1 != 9000 || i1 != 4500 || gov.is_thermally_throttled {
+        return false;
+    }
+    if gov.thermal_zone != PpsThermalZone::Optimal {
+        return false;
+    }
+
+    // 2. Grip warms to 39.5°C during intense gameplay: Warm throttling derates current
+    let (_, i2) = gov.update_thermal_governor(39.5, 41.0, 9000, 4500);
+    if i2 >= 4500 || i2 < 2000 || !gov.is_thermally_throttled {
+        return false;
+    }
+    if gov.thermal_zone != PpsThermalZone::WarmThrottled || gov.total_derate_events != 1 {
+        return false;
+    }
+
+    // 3. Grip heats to 41.2°C: Hot throttling derates further
+    let (_, i3) = gov.update_thermal_governor(41.2, 43.0, 9000, 4500);
+    if i3 >= i2 || i3 > 2500 || gov.thermal_zone != PpsThermalZone::HotThrottled {
+        return false;
+    }
+
+    // 4. Grip breaches critical 42.0°C limit (reaches 42.4°C):
+    // Must immediately clamp to minimum safe trickle (500 mA) to prevent palm discomfort
+    let (_, i4) = gov.update_thermal_governor(42.4, 44.0, 9000, 4500);
+    if i4 != PPS_MIN_SAFE_CHARGE_CURRENT_MA || gov.thermal_zone != PpsThermalZone::CriticalClamped {
+        return false;
+    }
+
+    true
+}
