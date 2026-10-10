@@ -205,3 +205,91 @@ pub fn win32_reclaim_idle_thread_stacks(min_keep_commit_bytes: usize) -> usize {
 
     total_reclaimed_pages
 }
+
+/// Self-test suite verifying Win32 dynamic stack expansion, PAGE_GUARD fault interception, and reclamation.
+pub fn test_win32_guard_stack_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Dynamic Thread Stack & Guard Page Fault self-test...\r\n");
+
+    let test_tid = 9001;
+    let stack_base = 0x0000_7FFF_8000_0000;
+    let reserve = 64 * 1024; // 64 KiB reserve
+    let commit = 8 * 1024;   // 8 KiB commit (2 pages)
+
+    // 1. Register dynamic thread stack
+    if !win32_register_dynamic_stack(test_tid, stack_base, reserve, commit) {
+        crate::serial_write_str("[KNT-ERROR] win32_register_dynamic_stack failed\r\n");
+        return false;
+    }
+
+    let (base, limit, bottom) = match win32_get_dynamic_stack_bounds(test_tid) {
+        Some(b) => b,
+        None => {
+            crate::serial_write_str("[KNT-ERROR] win32_get_dynamic_stack_bounds failed\r\n");
+            return false;
+        }
+    };
+    if base != stack_base || limit != stack_base - 8192 || bottom != stack_base - 65536 {
+        crate::serial_write_str("[KNT-ERROR] Stack bounds mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test guard page fault interception and transparent expansion
+    let guard_fault_addr = limit - 100; // Inside current guard page
+    let res = win32_handle_guard_page_fault(test_tid, guard_fault_addr);
+    match res {
+        GuardFaultResult::HandledGrowth(new_limit) => {
+            if new_limit != limit - PAGE_SIZE {
+                crate::serial_write_str("[KNT-ERROR] Stack growth limit incorrect\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-ERROR] Guard page fault was not handled\r\n");
+            return false;
+        }
+    }
+
+    // 3. Test non-guard address fault
+    if win32_handle_guard_page_fault(test_tid, 0x1000) != GuardFaultResult::NotGuardPage {
+        crate::serial_write_str("[KNT-ERROR] Random address reported as guard page\r\n");
+        return false;
+    }
+
+    // 4. Force stack down to reserve bottom and verify stack overflow protection
+    let mut current_res = GuardFaultResult::NotGuardPage;
+    for _ in 0..20 {
+        let (_, cur_limit, _) = win32_get_dynamic_stack_bounds(test_tid).unwrap();
+        current_res = win32_handle_guard_page_fault(test_tid, cur_limit - 100);
+        if current_res == GuardFaultResult::StackOverflow {
+            break;
+        }
+    }
+    if current_res != GuardFaultResult::StackOverflow {
+        crate::serial_write_str("[KNT-ERROR] Stack overflow did not trigger at reserve bottom\r\n");
+        return false;
+    }
+
+    // 5. Verify emergency stack overflow trap
+    let trap_status = win32_raise_stack_overflow_trap(test_tid, 0x0040_1000, bottom as u64);
+    if trap_status != STATUS_STACK_OVERFLOW {
+        crate::serial_write_str("[KNT-ERROR] Stack overflow trap status mismatch\r\n");
+        return false;
+    }
+
+    // 6. Test idle stack reclamation governor
+    win32_set_thread_idle_state(test_tid, true);
+    let reclaimed_pages = win32_reclaim_idle_thread_stacks(8 * 1024);
+    if reclaimed_pages == 0 {
+        crate::serial_write_str("[KNT-ERROR] Idle stack reclamation failed to reclaim pages\r\n");
+        return false;
+    }
+
+    let (_, reclaimed_limit, _) = win32_get_dynamic_stack_bounds(test_tid).unwrap();
+    if reclaimed_limit != stack_base - (8 * 1024) {
+        crate::serial_write_str("[KNT-ERROR] Reclaimed stack limit mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-GUARD-STACK-PASS] Win32 dynamic stack expansion and guard page trap verified\r\n");
+    true
+}
