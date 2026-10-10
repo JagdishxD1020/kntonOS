@@ -497,3 +497,189 @@ pub fn verify_usb_pd_pps_thermal_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: USB OTG Reverse Power Bank Discharge Controller (Up to 15W)
+// ============================================================================
+
+/// Minimum host battery SoC percentage required to permit reverse power bank discharge (25%).
+pub const OTG_HOST_RESERVE_MIN_SOC_PCT: f32 = 25.0;
+/// Maximum rated reverse power bank output power in milliwatts (15,000 mW = 15W @ 5V/3A).
+pub const OTG_MAX_REVERSE_POWER_MW: u32 = 15_000;
+/// Hardware overcurrent trip threshold in milliamps (3,300 mA = 3.3A).
+pub const OTG_OVERCURRENT_TRIP_MA: u32 = 3300;
+/// Maximum allowable battery core temperature in °C during reverse discharge (45°C).
+pub const OTG_MAX_SAFE_BATTERY_TEMP_C: f32 = 45.0;
+
+/// Safety trip reasons for reverse power bank shutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtgTripReason {
+    None,
+    LowHostBatteryReserve,
+    OvercurrentFault,
+    ThermalOvertemp,
+    DisabledByUser,
+}
+
+/// USB OTG 15W Reverse Power Bank Boost Controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsbOtgReversePowerBank {
+    /// Whether reverse boost power delivery is actively enabled.
+    pub is_enabled: bool,
+    /// Commanded output voltage in millivolts (nominally 5000 mV).
+    pub output_voltage_mv: u32,
+    /// Negotiated current limit in milliamps (e.g. 1500 mA or 3000 mA).
+    pub current_limit_ma: u32,
+    /// Real-time measured load current drawn by external accessory in milliamps.
+    pub measured_load_ma: u32,
+    /// Cumulative energy delivered to external devices in milliwatt-hours.
+    pub total_energy_delivered_mwh: f32,
+    /// Active safety trip status.
+    pub trip_status: OtgTripReason,
+}
+
+impl UsbOtgReversePowerBank {
+    /// Constructs a reverse power bank controller configured for 5V/3A (15W) max delivery.
+    pub const fn new() -> Self {
+        Self {
+            is_enabled: false,
+            output_voltage_mv: 5000,
+            current_limit_ma: 3000,
+            measured_load_ma: 0,
+            total_energy_delivered_mwh: 0.0,
+            trip_status: OtgTripReason::DisabledByUser,
+        }
+    }
+
+    /// Enables reverse power bank mode with specified current ceiling (e.g. 1500mA or 3000mA).
+    pub fn enable_reverse_boost(&mut self, max_current_ma: u32) {
+        self.is_enabled = true;
+        self.output_voltage_mv = 5000;
+        self.current_limit_ma = max_current_ma.min(3000);
+        self.trip_status = OtgTripReason::None;
+    }
+
+    /// Disables reverse power bank mode.
+    pub fn disable_reverse_boost(&mut self) {
+        self.is_enabled = false;
+        self.measured_load_ma = 0;
+        self.trip_status = OtgTripReason::DisabledByUser;
+    }
+
+    /// Evaluates safety protections and updates energy delivery telemetry.
+    pub fn update(
+        &mut self,
+        host_soc_pct: f32,
+        battery_temp_c: f32,
+        actual_load_ma: u32,
+        dt_s: f32,
+    ) -> Result<u32, OtgTripReason> {
+        if !self.is_enabled {
+            return Err(OtgTripReason::DisabledByUser);
+        }
+
+        // 1. Host Gaming Battery Reserve Protection:
+        // Cut off reverse charging if host battery drops below 25% to protect gaming session
+        if host_soc_pct <= OTG_HOST_RESERVE_MIN_SOC_PCT {
+            self.disable_reverse_boost();
+            self.trip_status = OtgTripReason::LowHostBatteryReserve;
+            return Err(self.trip_status);
+        }
+
+        // 2. Battery Thermal Over-temperature Protection
+        if battery_temp_c >= OTG_MAX_SAFE_BATTERY_TEMP_C {
+            self.disable_reverse_boost();
+            self.trip_status = OtgTripReason::ThermalOvertemp;
+            return Err(self.trip_status);
+        }
+
+        // 3. Hardware Overcurrent Trip
+        if actual_load_ma >= OTG_OVERCURRENT_TRIP_MA {
+            self.disable_reverse_boost();
+            self.trip_status = OtgTripReason::OvercurrentFault;
+            return Err(self.trip_status);
+        }
+
+        self.measured_load_ma = actual_load_ma.min(self.current_limit_ma);
+
+        // Telemetry: P = V * I (mWh = (mV * mA * dt_s) / (1000 * 3600))
+        let power_mw = ((self.output_voltage_mv as u64 * self.measured_load_ma as u64) / 1000) as u32;
+        let delivered_mwh = (power_mw as f32 * dt_s) / 3600.0;
+        self.total_energy_delivered_mwh += delivered_mwh;
+
+        Ok(power_mw)
+    }
+}
+
+/// Integrated Handheld Dual-Battery Hot-Swap & Charge Multiplexer Governor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualBatteryPowerGovernor {
+    /// Dual-cell dynamic impedance power balancer.
+    pub balancer: DualBatteryBalancer,
+    /// Hot-swap bridge hold-up energy estimator.
+    pub hot_swap_estimator: HotSwapBridgeEstimator,
+    /// USB-PD PPS fast-charge thermal governor.
+    pub pps_governor: UsbPdPpsThermalGovernor,
+    /// USB OTG 15W reverse power bank controller.
+    pub reverse_power_bank: UsbOtgReversePowerBank,
+}
+
+impl DualBatteryPowerGovernor {
+    /// Constructs an integrated dual-battery power governor.
+    pub const fn new() -> Self {
+        Self {
+            balancer: DualBatteryBalancer::new(),
+            hot_swap_estimator: HotSwapBridgeEstimator::new(),
+            pps_governor: UsbPdPpsThermalGovernor::new(),
+            reverse_power_bank: UsbOtgReversePowerBank::new(),
+        }
+    }
+}
+
+/// Verification test for USB OTG reverse power bank discharge controller up to 15W.
+pub fn verify_usb_otg_reverse_power_bank() -> bool {
+    let mut otg = UsbOtgReversePowerBank::new();
+
+    // 1. Initial state: disabled
+    if otg.is_enabled || otg.trip_status != OtgTripReason::DisabledByUser {
+        return false;
+    }
+
+    // 2. Enable 15W mode (5V @ 3000 mA) with host battery at 80% SoC, 30°C
+    otg.enable_reverse_boost(3000);
+    if !otg.is_enabled || otg.current_limit_ma != 3000 {
+        return false;
+    }
+
+    // Normal discharge at 2400 mA (12W delivery)
+    let pwr_res = otg.update(80.0, 32.0, 2400, 1.0);
+    if pwr_res.is_err() || pwr_res.unwrap() != 12000 {
+        return false;
+    }
+    if otg.total_energy_delivered_mwh <= 0.0 {
+        return false;
+    }
+
+    // 3. Overcurrent protection test: External device attempts to draw 3500 mA (> 3300 mA trip)
+    let oc_res = otg.update(75.0, 33.0, 3500, 0.1);
+    if oc_res != Err(OtgTripReason::OvercurrentFault) || otg.is_enabled {
+        return false;
+    }
+
+    // 4. Low battery gaming reserve protection: Re-enable, but host SoC drops to 24% (< 25% cutoff)
+    otg.enable_reverse_boost(1500);
+    let low_soc_res = otg.update(24.0, 32.0, 1000, 0.1);
+    if low_soc_res != Err(OtgTripReason::LowHostBatteryReserve) || otg.is_enabled {
+        return false;
+    }
+
+    // 5. Test Integrated Governor instantiation
+    let mut gov = DualBatteryPowerGovernor::new();
+    let (ca, cb) = gov.balancer.balance_discharge(3000);
+    if ca + cb != 3000 {
+        return false;
+    }
+
+    true
+}
