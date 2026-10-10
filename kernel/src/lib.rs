@@ -514,6 +514,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_coarse_pixel_shading_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility coarse pixel shading self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility PSO Binary Library Caching Engine (TASK-KNT-250)
+    if !gfx::test_pso_library_cache_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility PSO binary library cache self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
