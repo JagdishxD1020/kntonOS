@@ -345,3 +345,61 @@ pub unsafe extern "system" fn EventWriteTransfer(
     ring.push(rec);
     0 // ERROR_SUCCESS
 }
+
+/// Circular overwrite mode for handheld gaming profile sessions with strict RAM budgets.
+pub struct HandheldCircularOverwriteRing {
+    pub buffer: [GamingTelemetryRecord; 256],
+    pub cursor: AtomicUsize,
+    pub total_written: AtomicU64,
+}
+
+impl HandheldCircularOverwriteRing {
+    pub const fn new() -> Self {
+        Self {
+            buffer: [GamingTelemetryRecord {
+                timestamp_tsc: 0,
+                event_type: 0,
+                payload_u16: 0,
+                payload_u32: 0,
+                payload_u64: 0,
+            }; 256],
+            cursor: AtomicUsize::new(0),
+            total_written: AtomicU64::new(0),
+        }
+    }
+
+    /// Overwrites the oldest telemetry sample once 256 records are reached.
+    pub fn push_overwrite(&mut self, record: GamingTelemetryRecord) {
+        let idx = self.cursor.load(Ordering::Relaxed) % 256;
+        self.buffer[idx] = record;
+        self.cursor.store((idx + 1) % 256, Ordering::Release);
+        self.total_written.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reads latest N records from circular buffer.
+    pub fn read_latest(&self, out: &mut [GamingTelemetryRecord]) -> usize {
+        let count = out.len().min(256).min(self.total_written.load(Ordering::Relaxed) as usize);
+        let cur = self.cursor.load(Ordering::Acquire);
+
+        for i in 0..count {
+            let idx = (cur + 256 - count + i) % 256;
+            out[i] = self.buffer[idx];
+        }
+        count
+    }
+}
+
+static CIRCULAR_OVERWRITE_RING: Spinlock<HandheldCircularOverwriteRing> =
+    Spinlock::new(HandheldCircularOverwriteRing::new());
+
+/// Appends record to compact circular overwrite ring buffer.
+pub fn win32_etw_push_circular_record(record: GamingTelemetryRecord) {
+    let mut ring = CIRCULAR_OVERWRITE_RING.lock();
+    ring.push_overwrite(record);
+}
+
+/// Reads recent records from circular overwrite buffer.
+pub fn win32_etw_read_circular_records(out: &mut [GamingTelemetryRecord]) -> usize {
+    let ring = CIRCULAR_OVERWRITE_RING.lock();
+    ring.read_latest(out)
+}
