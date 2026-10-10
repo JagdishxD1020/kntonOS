@@ -609,7 +609,126 @@ impl DirectStoragePsoCache {
     }
 }
 
-// Temporary stub for incremental commits.
+// Comprehensive verification self-test suite for D3D12 Agility PSO binary library cache.
 pub fn test_pso_library_cache_subsystem() -> bool {
+    // 1. Verify 128-bit fast hash key indexing and determinism.
+    let h1 = hash_bytes_128(b"vs_main_dxbc");
+    let h2 = hash_bytes_128(b"vs_main_dxbc");
+    let h3 = hash_bytes_128(b"ps_main_dxbc");
+
+    if h1 != h2 || h1 == h3 || h1 == PsoHashKey::ZERO {
+        return false;
+    }
+
+    // 2. Verify D3D12 pipeline library serialization and deserialization.
+    let mut lib = D3D12PipelineLibrary::new(*b"KntonGpuDrv-RDNA");
+    let blob_gfx = CompiledPipelineBlob {
+        hash_key: h1,
+        kind: PipelineKind::Graphics,
+        bytecode: alloc::vec![10, 20, 30, 40],
+        root_signature_id: 100,
+    };
+    let blob_comp = CompiledPipelineBlob {
+        hash_key: h3,
+        kind: PipelineKind::Compute,
+        bytecode: alloc::vec![50, 60, 70, 80],
+        root_signature_id: 200,
+    };
+
+    if lib.store_pipeline("OpaqueDraw", blob_gfx.clone()).is_err() {
+        return false;
+    }
+    if lib.store_pipeline("PostProcessCS", blob_comp.clone()).is_err() {
+        return false;
+    }
+    // Reject duplicate pipeline name.
+    if lib.store_pipeline("OpaqueDraw", blob_gfx.clone()) != Err(PipelineLibraryError::DuplicateName) {
+        return false;
+    }
+
+    let serialized = lib.serialize();
+    if serialized.len() != lib.get_serialized_size() {
+        return false;
+    }
+
+    let deserialized = match D3D12PipelineLibrary::deserialize(&serialized) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
+    if deserialized.pipeline_count() != 2 {
+        return false;
+    }
+    let loaded = match deserialized.load_pipeline("OpaqueDraw") {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if loaded.bytecode != blob_gfx.bytecode || loaded.root_signature_id != 100 {
+        return false;
+    }
+    if deserialized.load_pipeline("MissingPSO") != Err(PipelineLibraryError::NotFound) {
+        return false;
+    }
+
+    // 3. Verify asynchronous background PSO compiler queue.
+    let mut queue = AsyncPsoCompilerQueue::new(4);
+    let _req1 = queue.submit_request("ShadowPass", PipelineKind::Graphics, 10, &[1, 2], PsoCompilePriority::Normal);
+    let req2 = queue.submit_request("UIPass", PipelineKind::Graphics, 10, &[3, 4], PsoCompilePriority::Critical);
+    let _req3 = queue.submit_request("BloomPass", PipelineKind::Compute, 20, &[5, 6], PsoCompilePriority::Low);
+
+    if queue.queued_count() != 3 {
+        return false;
+    }
+
+    let mut worker_lib = D3D12PipelineLibrary::new(*b"KntonGpuDrv-RDNA");
+    let processed = queue.step_workers(2, &mut worker_lib);
+    if processed != 2 || queue.queued_count() != 1 {
+        return false;
+    }
+
+    // Critical priority job must be ready.
+    let taken = match queue.take_completed(req2) {
+        Some(b) => b,
+        None => return false,
+    };
+    if taken.bytecode != alloc::vec![3, 4] {
+        return false;
+    }
+
+    // 4. Verify handheld DirectStorage persistent cache backing and pre-warming.
+    let mut ds_cache = DirectStoragePsoCache::new(DirectStoragePsoCacheConfig::default());
+    let write_size = match ds_cache.write_library_to_disk(&lib) {
+        Ok(sz) => sz,
+        Err(_) => return false,
+    };
+    if write_size < 4096 || write_size % 4096 != 0 {
+        return false;
+    }
+
+    let mut fresh_lib = D3D12PipelineLibrary::new(*b"KntonGpuDrv-RDNA");
+    let prewarmed = match ds_cache.prewarm_library_from_disk(&mut fresh_lib) {
+        Ok(cnt) => cnt,
+        Err(_) => return false,
+    };
+    if prewarmed != 2 || fresh_lib.pipeline_count() != 2 {
+        return false;
+    }
+
+    let hit_blob = ds_cache.query_pipeline("OpaqueDraw", &fresh_lib);
+    if hit_blob.is_none() {
+        return false;
+    }
+    let miss_blob = ds_cache.query_pipeline("MissingPSO", &fresh_lib);
+    if miss_blob.is_some() {
+        return false;
+    }
+
+    if ds_cache.cache_hits != 1 || ds_cache.cache_misses != 1 || ds_cache.hit_ratio_percentage() != 50 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str(
+        "[KNT-D3D12-PSO-CACHE-PASS] Direct3D 12 agility PSO binary library caching verified\r\n",
+    );
     true
 }
