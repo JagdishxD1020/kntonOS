@@ -683,3 +683,33 @@ pub fn verify_usb_otg_reverse_power_bank() -> bool {
 
     true
 }
+
+/// Comprehensive self-test suite for the Dual-Battery Hot-Swap Power Balancing &
+/// Charge Current Multiplexer subsystem (TASK-KNT-251).
+pub fn test_dual_battery_subsystem() -> bool {
+    crate::serial_write_str("[DUAL-BATTERY] Initiating Handheld Dual-Battery Hot-Swap Subsystem Verification...\r\n");
+
+    if !verify_impedance_tracking_and_power_sharing() {
+        crate::serial_write_str("[DUAL-BATTERY-ERR] Cell impedance tracking and power sharing test failed!\r\n");
+        return false;
+    }
+
+    if !verify_hot_swap_bridge_hold_up_estimator() {
+        crate::serial_write_str("[DUAL-BATTERY-ERR] Hot-swap bridge hold-up time estimator test failed!\r\n");
+        return false;
+    }
+
+    if !verify_usb_pd_pps_thermal_governor() {
+        crate::serial_write_str("[DUAL-BATTERY-ERR] USB-PD PPS fast-charge thermal governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_usb_otg_reverse_power_bank() {
+        crate::serial_write_str("[DUAL-BATTERY-ERR] USB OTG reverse power bank discharge controller test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-DUAL-BATTERY-PASS] Dual-battery hot-swap power balancer & multiplexer verified!\r\n");
+    true
+}
+
