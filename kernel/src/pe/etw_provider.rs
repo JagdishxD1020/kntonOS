@@ -256,3 +256,92 @@ pub fn win32_etw_pop_telemetry_event() -> Option<GamingTelemetryRecord> {
     let mut ring = GLOBAL_TELEMETRY_RING.lock();
     ring.pop()
 }
+
+/// Compact binary ETW packet serialization header.
+pub const ETW_PACKET_MAGIC: u32 = 0x45545750; // 'ETWP'
+
+/// Serializes an ETW event record into a compact 32-byte binary packet with zero heap allocations.
+pub fn win32_etw_serialize_record(rec: &GamingTelemetryRecord, out_buf: &mut [u8; 32]) -> usize {
+    out_buf[0..4].copy_from_slice(&ETW_PACKET_MAGIC.to_le_bytes());
+    out_buf[4..12].copy_from_slice(&rec.timestamp_tsc.to_le_bytes());
+    out_buf[12..14].copy_from_slice(&rec.event_type.to_le_bytes());
+    out_buf[14..16].copy_from_slice(&rec.payload_u16.to_le_bytes());
+    out_buf[16..20].copy_from_slice(&rec.payload_u32.to_le_bytes());
+    out_buf[20..28].copy_from_slice(&rec.payload_u64.to_le_bytes());
+
+    // Simple 4-byte CRC32 / XOR checksum
+    let mut csum: u32 = 0;
+    for i in 0..7 {
+        let chunk = u32::from_le_bytes([out_buf[i * 4], out_buf[i * 4 + 1], out_buf[i * 4 + 2], out_buf[i * 4 + 3]]);
+        csum ^= chunk.rotate_left((i as u32) + 1);
+    }
+    out_buf[28..32].copy_from_slice(&csum.to_le_bytes());
+    32
+}
+
+/// Deserializes a compact 32-byte binary ETW packet into a GamingTelemetryRecord.
+pub fn win32_etw_deserialize_record(packet: &[u8; 32]) -> Option<GamingTelemetryRecord> {
+    let magic = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    if magic != ETW_PACKET_MAGIC {
+        return None;
+    }
+
+    let mut expected_csum: u32 = 0;
+    for i in 0..7 {
+        let chunk = u32::from_le_bytes([packet[i * 4], packet[i * 4 + 1], packet[i * 4 + 2], packet[i * 4 + 3]]);
+        expected_csum ^= chunk.rotate_left((i as u32) + 1);
+    }
+    let actual_csum = u32::from_le_bytes([packet[28], packet[29], packet[30], packet[31]]);
+    if expected_csum != actual_csum {
+        return None;
+    }
+
+    let timestamp_tsc = u64::from_le_bytes([
+        packet[4], packet[5], packet[6], packet[7], packet[8], packet[9], packet[10], packet[11],
+    ]);
+    let event_type = u16::from_le_bytes([packet[12], packet[13]]);
+    let payload_u16 = u16::from_le_bytes([packet[14], packet[15]]);
+    let payload_u32 = u32::from_le_bytes([packet[16], packet[17], packet[18], packet[19]]);
+    let payload_u64 = u64::from_le_bytes([
+        packet[20], packet[21], packet[22], packet[23], packet[24], packet[25], packet[26], packet[27],
+    ]);
+
+    Some(GamingTelemetryRecord {
+        timestamp_tsc,
+        event_type,
+        payload_u16,
+        payload_u32,
+        payload_u64,
+    })
+}
+
+/// Writes an event transfer via EventWriteTransfer API.
+pub unsafe extern "system" fn EventWriteTransfer(
+    RegHandle: REGHANDLE,
+    EventDescriptor: *const EVENT_DESCRIPTOR,
+    _ActivityId: *const GUID,
+    _RelatedActivityId: *const GUID,
+    UserDataCount: u32,
+    _UserData: *const core::ffi::c_void,
+) -> u32 {
+    if RegHandle == 0 || EventDescriptor.is_null() {
+        return 87; // ERROR_INVALID_PARAMETER
+    }
+
+    let desc = *EventDescriptor;
+    if !win32_etw_provider_is_enabled(RegHandle, desc.Level, desc.Keyword) {
+        return 0; // Filtered out
+    }
+
+    let rec = GamingTelemetryRecord {
+        timestamp_tsc: crate::pe::perf_counter::win32_read_tsc(),
+        event_type: desc.Id,
+        payload_u16: desc.Task,
+        payload_u32: UserDataCount,
+        payload_u64: desc.Keyword,
+    };
+
+    let mut ring = GLOBAL_TELEMETRY_RING.lock();
+    ring.push(rec);
+    0 // ERROR_SUCCESS
+}
