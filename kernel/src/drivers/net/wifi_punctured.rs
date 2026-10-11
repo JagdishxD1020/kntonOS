@@ -235,3 +235,218 @@ pub fn verify_wifi7_preamble_puncturing() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Microsecond Beacon Sync Governor for Local Handheld Mesh Multiplayer
+// ============================================================================
+
+/// Beacon frame timing configuration and metrics for low-latency ad-hoc/mesh synchronization.
+pub const TARGET_BEACON_TRANSMIT_TIME_US: u32 = 102_400; // 102.4 ms (100 TU standard)
+pub const MAX_ACCEPTABLE_CLOCK_DRIFT_PPM: f32 = 20.0;     // ±20 ppm hardware crystal tolerance
+pub const MAX_BEACON_JITTER_TOLERANCE_US: i32 = 25;       // Target mesh jitter envelope: ±25 µs
+
+/// Mesh role in local wireless multiplayer session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshSyncRole {
+    /// Designated Mesh Group Coordinator (Grandmaster clock leader).
+    MeshCoordinator,
+    /// Mesh peer client participating in synchronous frame pacing.
+    MeshPeer,
+    /// Disconnected or probing mesh discovery state.
+    Probing,
+}
+
+/// Timing Synchronization Function (TSF) microsecond tracking state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeshTsfSyncState {
+    /// 64-bit local hardware TSF microsecond timestamp.
+    pub local_tsf_us: u64,
+    /// 64-bit remote leader TSF microsecond timestamp received in beacon.
+    pub remote_leader_tsf_us: u64,
+    /// Computed clock offset in microseconds (local - remote). Positive means local is ahead.
+    pub clock_offset_us: i64,
+    /// Estimated frequency drift in parts-per-million (PPM).
+    pub estimated_drift_ppm: f32,
+    /// Phase adjustment applied to next beacon period in microseconds.
+    pub phase_correction_us: i32,
+    /// Current sync quality status.
+    pub is_synchronized: bool,
+    /// Consecutive synchronized beacons count.
+    pub sync_lock_counter: u32,
+}
+
+impl MeshTsfSyncState {
+    /// Constructs default un-synchronized TSF state.
+    pub const fn new() -> Self {
+        Self {
+            local_tsf_us: 0,
+            remote_leader_tsf_us: 0,
+            clock_offset_us: 0,
+            estimated_drift_ppm: 0.0,
+            phase_correction_us: 0,
+            is_synchronized: false,
+            sync_lock_counter: 0,
+        }
+    }
+}
+
+/// Handheld local mesh multiplayer beacon synchronization governor.
+///
+/// Ensures peer-to-peer frame alignment within sub-50µs jitter bounds,
+/// synchronizing TSF clocks between handhelds to eliminate packet collision
+/// and scheduling jitter in ad-hoc local gaming sessions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeshBeaconSyncGovernor {
+    /// Node role in the local mesh network.
+    pub role: MeshSyncRole,
+    /// Target Beacon Transmission Time (TBTT) interval in microseconds.
+    pub tbtt_interval_us: u32,
+    /// Next scheduled Target Beacon Transmission Time (TSF µs).
+    pub next_tbtt_us: u64,
+    /// Detailed TSF sync tracking state.
+    pub tsf_state: MeshTsfSyncState,
+    /// Measured peer-to-peer beacon delivery jitter in microseconds.
+    pub last_beacon_jitter_us: i32,
+    /// Total beacons received from mesh peers.
+    pub beacons_received_count: u32,
+    /// Total beacons transmitted by this node.
+    pub beacons_transmitted_count: u32,
+}
+
+impl MeshBeaconSyncGovernor {
+    /// Initializes a new mesh beacon sync governor.
+    pub fn new(role: MeshSyncRole) -> Self {
+        Self {
+            role,
+            tbtt_interval_us: TARGET_BEACON_TRANSMIT_TIME_US,
+            next_tbtt_us: TARGET_BEACON_TRANSMIT_TIME_US as u64,
+            tsf_state: MeshTsfSyncState::new(),
+            last_beacon_jitter_us: 0,
+            beacons_received_count: 0,
+            beacons_transmitted_count: 0,
+        }
+    }
+
+    /// Advances local hardware TSF timer by `delta_us` microseconds.
+    pub fn advance_local_tsf(&mut self, delta_us: u64) {
+        self.tsf_state.local_tsf_us += delta_us;
+    }
+
+    /// Processes an incoming beacon frame carrying leader TSF and arrival timestamp.
+    /// Returns true if phase locked and synchronized within jitter limits.
+    pub fn process_rx_beacon(&mut self, leader_tsf_us: u64, rx_local_tsf_us: u64, propagation_delay_us: u32) -> bool {
+        self.beacons_received_count += 1;
+        self.tsf_state.local_tsf_us = rx_local_tsf_us;
+        self.tsf_state.remote_leader_tsf_us = leader_tsf_us;
+
+        // Effective leader timestamp at arrival = leader_tsf + propagation_delay
+        let effective_leader_tsf = leader_tsf_us + propagation_delay_us as u64;
+
+        // Offset = local_tsf - effective_leader_tsf
+        let offset = rx_local_tsf_us as i64 - effective_leader_tsf as i64;
+        self.tsf_state.clock_offset_us = offset;
+
+        // Jitter relative to expected TBTT slot
+        let phase_in_period = (rx_local_tsf_us % self.tbtt_interval_us as u64) as i32;
+        let half_period = (self.tbtt_interval_us / 2) as i32;
+        self.last_beacon_jitter_us = if phase_in_period > half_period {
+            phase_in_period - self.tbtt_interval_us as i32
+        } else {
+            phase_in_period
+        };
+
+        // Standard 802.11 TSF update rule:
+        // If received TSF is faster than local TSF, adopt the faster clock (or adjust PLL).
+        if self.role == MeshSyncRole::MeshPeer {
+            if offset < 0 {
+                // Local is behind leader, slew local clock forward immediately
+                self.tsf_state.phase_correction_us = (-offset).min(500) as i32;
+                self.tsf_state.local_tsf_us = effective_leader_tsf;
+            } else {
+                // Local is ahead: slowly slew by stretching TBTT
+                self.tsf_state.phase_correction_us = -(offset.min(500) as i32);
+            }
+
+            // Estimate clock drift in ppm
+            if self.tbtt_interval_us > 0 {
+                self.tsf_state.estimated_drift_ppm = (offset.abs() as f32 / self.tbtt_interval_us as f32) * 1_000_000.0;
+            }
+
+            // Lock detection: offset within ±50µs and jitter within tolerance
+            if offset.abs() <= 50 && self.last_beacon_jitter_us.abs() <= MAX_BEACON_JITTER_TOLERANCE_US {
+                self.tsf_state.sync_lock_counter += 1;
+                if self.tsf_state.sync_lock_counter >= 3 {
+                    self.tsf_state.is_synchronized = true;
+                }
+            } else {
+                self.tsf_state.sync_lock_counter = 0;
+                self.tsf_state.is_synchronized = false;
+            }
+        } else {
+            // Coordinator maintains master clock
+            self.tsf_state.is_synchronized = true;
+        }
+
+        // Schedule next TBTT
+        let elapsed_in_period = self.tsf_state.local_tsf_us % self.tbtt_interval_us as u64;
+        self.next_tbtt_us = self.tsf_state.local_tsf_us + (self.tbtt_interval_us as u64 - elapsed_in_period);
+
+        self.tsf_state.is_synchronized
+    }
+
+    /// Evaluates whether the current local TSF is inside the transmission window for a multiplayer game packet.
+    /// Handheld mesh schedules game packets right after beacon transmission (TBTT + guard time).
+    pub fn is_gaming_tx_window(&self, guard_window_us: u32) -> bool {
+        let current = self.tsf_state.local_tsf_us;
+        let slot_start = self.next_tbtt_us.saturating_sub(self.tbtt_interval_us as u64);
+        let time_since_beacon = current.saturating_sub(slot_start);
+        time_since_beacon >= guard_window_us as u64 && time_since_beacon <= (self.tbtt_interval_us as u64 / 2)
+    }
+}
+
+/// Verification test for microsecond beacon sync governor for mesh multiplayer.
+pub fn verify_mesh_beacon_sync_governor() -> bool {
+    let mut peer = MeshBeaconSyncGovernor::new(MeshSyncRole::MeshPeer);
+
+    // Initial check: not synchronized
+    if peer.tsf_state.is_synchronized || peer.beacons_received_count != 0 {
+        return false;
+    }
+
+    // Leader sends 3 consecutive beacons at TBTT intervals (102,400 µs)
+    let propagation_delay_us = 4; // 4 µs RF transit time across room (~1.2 km equivalent, standard delay model)
+
+    // Beacon 1: Peer clock is 40 µs behind leader
+    let leader_tsf_1 = 102_400u64;
+    let peer_rx_tsf_1 = 102_400u64 - 40 + propagation_delay_us as u64;
+    let sync1 = peer.process_rx_beacon(leader_tsf_1, peer_rx_tsf_1, propagation_delay_us);
+    if sync1 {
+        return false; // Requires 3 locks for filter stabilization
+    }
+    if peer.tsf_state.clock_offset_us.abs() > 50 {
+        return false;
+    }
+
+    // Beacon 2: Clock aligned closely, within 10 µs
+    let leader_tsf_2 = 204_800u64;
+    let peer_rx_tsf_2 = 204_800u64 + 10 + propagation_delay_us as u64;
+    peer.process_rx_beacon(leader_tsf_2, peer_rx_tsf_2, propagation_delay_us);
+
+    // Beacon 3: Clock within 5 µs
+    let leader_tsf_3 = 307_200u64;
+    let peer_rx_tsf_3 = 307_200u64 + 5 + propagation_delay_us as u64;
+    let sync3 = peer.process_rx_beacon(leader_tsf_3, peer_rx_tsf_3, propagation_delay_us);
+    if !sync3 || !peer.tsf_state.is_synchronized {
+        return false;
+    }
+
+    // Test game tx window timing:
+    // Slot start is 307,200. Check at 307,200 + 2,000 µs (inside slot with 1000 µs guard window)
+    peer.advance_local_tsf(2000);
+    if !peer.is_gaming_tx_window(1000) {
+        return false;
+    }
+
+    true
+}
+
