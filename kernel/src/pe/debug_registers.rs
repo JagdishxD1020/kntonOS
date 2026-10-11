@@ -195,3 +195,46 @@ pub fn win32_get_thread_debug_registers(thread_id: u64) -> VirtualDebugRegisters
     let regs = THREAD_DEBUG_REGS.lock();
     regs.get(&thread_id).copied().unwrap_or_default()
 }
+
+/// Sets a hardware data watchpoint on a thread.
+pub fn win32_set_hardware_data_watchpoint(
+    thread_id: u64,
+    slot: usize,
+    address: usize,
+    access: WatchpointAccessType,
+    width: WatchpointDataWidth,
+) -> bool {
+    let mut regs = win32_get_thread_debug_registers(thread_id);
+    if regs.configure_watchpoint(slot, address, access, width) {
+        win32_set_thread_debug_registers(thread_id, regs);
+        true
+    } else {
+        false
+    }
+}
+
+/// Clears a hardware watchpoint on a thread.
+pub fn win32_clear_hardware_data_watchpoint(thread_id: u64, slot: usize) -> bool {
+    let mut regs = win32_get_thread_debug_registers(thread_id);
+    if regs.clear_watchpoint(slot) {
+        win32_set_thread_debug_registers(thread_id, regs);
+        true
+    } else {
+        false
+    }
+}
+
+/// Evaluates a thread's memory access against its hardware watchpoints.
+pub fn win32_evaluate_thread_watchpoints(
+    thread_id: u64,
+    address: usize,
+    size: usize,
+    is_write: bool,
+) -> Option<usize> {
+    let mut regs = win32_get_thread_debug_registers(thread_id);
+    let hit = regs.evaluate_memory_access(address, size, is_write);
+    if hit.is_some() {
+        win32_set_thread_debug_registers(thread_id, regs);
+    }
+    hit
+}
