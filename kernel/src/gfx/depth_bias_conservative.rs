@@ -354,6 +354,92 @@ impl ConservativeOcclusionAccelerator {
     }
 }
 
+// Handheld shadow map resolution governor dynamically scaling cascades to save memory bandwidth.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldShadowGovernor {
+    // Baseline unconstrained shadow map resolution per cascade (e.g. 2048).
+    pub baseline_resolution: u32,
+    // Active shadow map resolution per cascade.
+    pub current_resolution: u32,
+    // Total directional light shadow cascades.
+    pub cascade_count: u32,
+    // Bytes per depth texel (e.g. 4 for D32_FLOAT).
+    pub bytes_per_pixel: u32,
+    // Cumulative memory bandwidth bytes saved across frames.
+    pub total_bandwidth_saved_bytes: u64,
+    // Whether battery saving or thermal throttling profile is engaged.
+    pub thermal_throttling_active: bool,
+}
+
+impl Default for HandheldShadowGovernor {
+    fn default() -> Self {
+        Self::new(2048, 4)
+    }
+}
+
+impl HandheldShadowGovernor {
+    // Creates a new handheld shadow governor with baseline resolution and cascade count.
+    pub fn new(baseline_resolution: u32, cascade_count: u32) -> Self {
+        Self {
+            baseline_resolution,
+            current_resolution: baseline_resolution,
+            cascade_count,
+            bytes_per_pixel: 4,
+            total_bandwidth_saved_bytes: 0,
+            thermal_throttling_active: false,
+        }
+    }
+
+    // Toggles handheld thermal power saving profile.
+    pub fn set_throttling_mode(&mut self, throttled: bool) {
+        self.thermal_throttling_active = throttled;
+        if throttled {
+            self.current_resolution = (self.baseline_resolution / 2).max(256);
+        } else {
+            self.current_resolution = self.baseline_resolution;
+        }
+    }
+
+    // Calculates scaling factor applied to depth bias due to texel footprint enlargement.
+    pub fn depth_bias_scale_factor(&self) -> f32 {
+        if self.current_resolution == 0 {
+            1.0
+        } else {
+            (self.baseline_resolution as f32) / (self.current_resolution as f32)
+        }
+    }
+
+    // Adapts depth bias configuration proportionally to current shadow map resolution.
+    pub fn compute_adjusted_depth_bias(
+        &self,
+        base_cfg: DynamicDepthBiasConfig,
+    ) -> DynamicDepthBiasConfig {
+        let scale = self.depth_bias_scale_factor();
+        DynamicDepthBiasConfig {
+            depth_bias: base_cfg.depth_bias * scale,
+            depth_bias_clamp: base_cfg.depth_bias_clamp * scale,
+            slope_scaled_depth_bias: base_cfg.slope_scaled_depth_bias * scale,
+        }
+    }
+
+    // Records bandwidth savings for a frame and accumulates total bytes saved.
+    pub fn record_frame_bandwidth_savings(&mut self) -> u64 {
+        let base_footprint = (self.baseline_resolution as u64)
+            * (self.baseline_resolution as u64)
+            * (self.cascade_count as u64)
+            * (self.bytes_per_pixel as u64);
+
+        let cur_footprint = (self.current_resolution as u64)
+            * (self.current_resolution as u64)
+            * (self.cascade_count as u64)
+            * (self.bytes_per_pixel as u64);
+
+        let saved = base_footprint.saturating_sub(cur_footprint);
+        self.total_bandwidth_saved_bytes += saved;
+        saved
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_depth_bias_conservative_subsystem() -> bool {
     true
