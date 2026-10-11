@@ -403,3 +403,123 @@ pub fn win32_etw_read_circular_records(out: &mut [GamingTelemetryRecord]) -> usi
     let ring = CIRCULAR_OVERWRITE_RING.lock();
     ring.read_latest(out)
 }
+
+/// Self-test suite verifying Win32 ETW providers, lock-free telemetry ring buffer, and compact serialization.
+pub fn test_win32_etw_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Performance Telemetry Ring Buffer & ETW self-test...\r\n");
+
+    // 1. Test EventRegister
+    let prov_guid = GUID {
+        Data1: 0x12345678,
+        Data2: 0x9ABC,
+        Data3: 0xDEF0,
+        Data4: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+    };
+
+    let mut reg_handle: REGHANDLE = 0;
+    let status = unsafe {
+        EventRegister(
+            &prov_guid,
+            None,
+            core::ptr::null_mut(),
+            &mut reg_handle,
+        )
+    };
+    if status != 0 || reg_handle == 0 {
+        crate::serial_write_str("[KNT-ERROR] EventRegister failed\r\n");
+        return false;
+    }
+
+    if !win32_etw_provider_is_enabled(reg_handle, 3, 0) {
+        crate::serial_write_str("[KNT-ERROR] win32_etw_provider_is_enabled returned false\r\n");
+        return false;
+    }
+
+    // 2. Test EventWriteTransfer
+    let desc = EVENT_DESCRIPTOR {
+        Id: 101,
+        Version: 1,
+        Channel: 0,
+        Level: 4,
+        Opcode: 0,
+        Task: 1,
+        Keyword: 0x01,
+    };
+    let write_status = unsafe {
+        EventWriteTransfer(
+            reg_handle,
+            &desc,
+            core::ptr::null(),
+            core::ptr::null(),
+            42,
+            core::ptr::null(),
+        )
+    };
+    if write_status != 0 {
+        crate::serial_write_str("[KNT-ERROR] EventWriteTransfer failed\r\n");
+        return false;
+    }
+
+    // 3. Test telemetry ring buffer push & pop
+    win32_etw_trace_frame_boundary(1, 16_666);
+    win32_etw_trace_gpu_present(0x1000, 1);
+    win32_etw_trace_draw_calls(150, 450_000);
+
+    let mut popped_count = 0;
+    while let Some(evt) = win32_etw_pop_telemetry_event() {
+        popped_count += 1;
+        // 4. Test compact binary packet serialization
+        let mut packet = [0u8; 32];
+        let bytes = win32_etw_serialize_record(&evt, &mut packet);
+        if bytes != 32 {
+            crate::serial_write_str("[KNT-ERROR] Serialization byte count mismatch\r\n");
+            return false;
+        }
+
+        let deserialized = match win32_etw_deserialize_record(&packet) {
+            Some(d) => d,
+            None => {
+                crate::serial_write_str("[KNT-ERROR] Deserialization failed or checksum mismatch\r\n");
+                return false;
+            }
+        };
+
+        if deserialized.event_type != evt.event_type || deserialized.payload_u64 != evt.payload_u64 {
+            crate::serial_write_str("[KNT-ERROR] Deserialized record field mismatch\r\n");
+            return false;
+        }
+    }
+
+    if popped_count < 4 {
+        crate::serial_write_str("[KNT-ERROR] Popped telemetry records fewer than expected\r\n");
+        return false;
+    }
+
+    // 5. Test circular overwrite mode with 300 samples (exceeding 256 capacity)
+    for i in 0..300 {
+        win32_etw_push_circular_record(GamingTelemetryRecord {
+            timestamp_tsc: i,
+            event_type: 1,
+            payload_u16: 0,
+            payload_u32: i as u32,
+            payload_u64: i * 10,
+        });
+    }
+
+    let mut latest = [GamingTelemetryRecord::default(); 16];
+    let n_read = win32_etw_read_circular_records(&mut latest);
+    if n_read != 16 || latest[15].payload_u32 != 299 {
+        crate::serial_write_str("[KNT-ERROR] Circular overwrite buffer read mismatch\r\n");
+        return false;
+    }
+
+    // 6. Test EventUnregister
+    let unreg_status = unsafe { EventUnregister(reg_handle) };
+    if unreg_status != 0 {
+        crate::serial_write_str("[KNT-ERROR] EventUnregister failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-ETW-PASS] Win32 high-resolution ETW telemetry provider and SPSC ring buffer verified\r\n");
+    true
+}
