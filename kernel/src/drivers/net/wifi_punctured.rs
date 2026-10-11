@@ -674,4 +674,246 @@ pub fn verify_antenna_diversity_switch_governor() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Low-Latency UDP Gaming Socket Packet Classifier
+// ============================================================================
+
+/// Differentiated Services Code Point (DSCP) traffic classification tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamingPacketPriority {
+    /// DSCP 46 (0x2E) - Expedited Forwarding (EF): Real-time input ticks & player positioning (< 2ms deadline).
+    CriticalGameTick = 46,
+    /// DSCP 34 (0x22) - Assured Forwarding 41 (AF41): Real-time spatial game audio & voice chat (< 10ms deadline).
+    SpatialVoiceAudio = 34,
+    /// DSCP 26 (0x1A) - Assured Forwarding 31 (AF31): State synchronization & physics snapshot delta (< 25ms deadline).
+    StateSyncSnapshot = 26,
+    /// DSCP 0 (0x00) - Best Effort (BE): Background game telemetry, match stats, asset streaming.
+    BestEffortTelemetry = 0,
+}
+
+/// Wi-Fi Enhanced Distributed Channel Access (EDCA) Access Category (AC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WifiEdcaAccessCategory {
+    /// AC_VO (Voice): Highest priority Wi-Fi transmit queue with shortest AIFS and contention window.
+    AcVoice = 0,
+    /// AC_VI (Video): High priority stream queue.
+    AcVideo = 1,
+    /// AC_BE (Best Effort): Standard medium priority queue.
+    AcBestEffort = 2,
+    /// AC_BK (Background): Low priority non-urgent queue.
+    AcBackground = 3,
+}
+
+/// Metadata extracted from a gaming UDP datagram.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UdpGamingPacket {
+    /// 32-bit packet sequence number.
+    pub sequence_number: u32,
+    /// Destination UDP port (e.g., 27015 for Source Engine, 7777 for Unreal Engine).
+    pub dst_port: u16,
+    /// Datagram payload length in bytes.
+    pub payload_len: u16,
+    /// DSCP priority classification.
+    pub priority: GamingPacketPriority,
+    /// Mapped 802.11 EDCA access category.
+    pub edca_ac: WifiEdcaAccessCategory,
+    /// Hardware enqueue timestamp in microseconds.
+    pub enqueue_time_us: u64,
+    /// Deadline in microseconds by which this packet must be placed on RF channel.
+    pub deadline_us: u64,
+    /// Whether packet header indicates critical player input tick.
+    pub is_player_input: bool,
+}
+
+/// Fast packet classifier and priority queue governor for handheld multiplayer UDP streams.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UdpGamingPacketClassifier {
+    /// Registered multiplayer game ports (e.g. 27015, 7777, 3074, 9987).
+    pub registered_game_ports: [u16; 4],
+    /// Total classified critical tick packets.
+    pub critical_packets_count: u32,
+    /// Total classified audio packets.
+    pub audio_packets_count: u32,
+    /// Total classified state sync packets.
+    pub sync_packets_count: u32,
+    /// Total classified background packets.
+    pub best_effort_packets_count: u32,
+    /// Total packets that violated deadline (jitter drop telemetry).
+    pub deadline_miss_count: u32,
+}
+
+impl UdpGamingPacketClassifier {
+    /// Creates a packet classifier with standard gaming UDP ports pre-registered.
+    pub fn new() -> Self {
+        Self {
+            registered_game_ports: [27015, 7777, 3074, 9987],
+            critical_packets_count: 0,
+            audio_packets_count: 0,
+            sync_packets_count: 0,
+            best_effort_packets_count: 0,
+            deadline_miss_count: 0,
+        }
+    }
+
+    /// Classifies an incoming or outgoing UDP gaming packet based on port, size, and header flags.
+    pub fn classify_packet(
+        &mut self,
+        dst_port: u16,
+        payload: &[u8],
+        enqueue_time_us: u64,
+        is_user_input: bool,
+    ) -> UdpGamingPacket {
+        let payload_len = payload.len() as u16;
+
+        // Check if destination port is one of the registered competitive game ports
+        let is_game_port = self.registered_game_ports.iter().any(|&p| p == dst_port);
+
+        let (priority, edca_ac, max_lead_time_us) = if is_user_input || (is_game_port && payload_len <= 128) {
+            // Small packets on game port or explicitly flagged user input: Critical Game Tick
+            self.critical_packets_count += 1;
+            (
+                GamingPacketPriority::CriticalGameTick,
+                WifiEdcaAccessCategory::AcVoice,
+                2_000u64, // 2 ms deadline
+            )
+        } else if dst_port == 9987 || (payload_len >= 129 && payload_len <= 320 && is_game_port) {
+            // Voice / Audio stream packet
+            self.audio_packets_count += 1;
+            (
+                GamingPacketPriority::SpatialVoiceAudio,
+                WifiEdcaAccessCategory::AcVoice,
+                10_000u64, // 10 ms deadline
+            )
+        } else if is_game_port && payload_len <= 1200 {
+            // World state snapshot delta
+            self.sync_packets_count += 1;
+            (
+                GamingPacketPriority::StateSyncSnapshot,
+                WifiEdcaAccessCategory::AcVideo,
+                25_000u64, // 25 ms deadline
+            )
+        } else {
+            // Telemetry / asset download
+            self.best_effort_packets_count += 1;
+            (
+                GamingPacketPriority::BestEffortTelemetry,
+                WifiEdcaAccessCategory::AcBestEffort,
+                100_000u64, // 100 ms deadline
+            )
+        };
+
+        UdpGamingPacket {
+            sequence_number: 0,
+            dst_port,
+            payload_len,
+            priority,
+            edca_ac,
+            enqueue_time_us,
+            deadline_us: enqueue_time_us + max_lead_time_us,
+            is_player_input: is_user_input,
+        }
+    }
+
+    /// Evaluates whether a packet is still valid to transmit or has expired its real-time deadline.
+    pub fn check_packet_deadline(&mut self, packet: &UdpGamingPacket, current_time_us: u64) -> bool {
+        if current_time_us > packet.deadline_us {
+            self.deadline_miss_count += 1;
+            false // Expired, discard to save RF airtime for fresh state
+        } else {
+            true // Valid
+        }
+    }
+}
+
+/// Integrated Handheld Wi-Fi 7 Subsystem Controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldWifi7Controller {
+    /// Wi-Fi 7 dynamic preamble puncturing engine.
+    pub puncture_engine: Wifi7PunctureEngine,
+    /// Mesh multiplayer microsecond beacon synchronization governor.
+    pub beacon_governor: MeshBeaconSyncGovernor,
+    /// Chassis grip antenna diversity switch governor.
+    pub antenna_governor: HandheldAntennaDiversityGovernor,
+    /// Low-latency UDP gaming packet classifier.
+    pub classifier: UdpGamingPacketClassifier,
+}
+
+impl HandheldWifi7Controller {
+    /// Initializes the integrated Wi-Fi 7 controller.
+    pub fn new() -> Self {
+        Self {
+            puncture_engine: Wifi7PunctureEngine::new(Wifi7Bandwidth::Width160MHz, 5260),
+            beacon_governor: MeshBeaconSyncGovernor::new(MeshSyncRole::MeshPeer),
+            antenna_governor: HandheldAntennaDiversityGovernor::new(),
+            classifier: UdpGamingPacketClassifier::new(),
+        }
+    }
+}
+
+/// Verification test for low-latency UDP gaming socket packet classifier.
+pub fn verify_udp_gaming_packet_classifier() -> bool {
+    let mut classifier = UdpGamingPacketClassifier::new();
+
+    // 1. Classify 64-byte user input tick to game port 27015
+    let dummy_tick = [0xAAu8; 64];
+    let pkt1 = classifier.classify_packet(27015, &dummy_tick, 100_000, true);
+
+    if pkt1.priority != GamingPacketPriority::CriticalGameTick {
+        return false;
+    }
+    if pkt1.edca_ac != WifiEdcaAccessCategory::AcVoice {
+        return false;
+    }
+    if pkt1.deadline_us != 102_000 { // 100,000 + 2,000 us
+        return false;
+    }
+    if classifier.critical_packets_count != 1 {
+        return false;
+    }
+
+    // 2. Classify 250-byte voice audio datagram to port 9987
+    let dummy_voice = [0x55u8; 250];
+    let pkt2 = classifier.classify_packet(9987, &dummy_voice, 100_000, false);
+    if pkt2.priority != GamingPacketPriority::SpatialVoiceAudio {
+        return false;
+    }
+    if pkt2.edca_ac != WifiEdcaAccessCategory::AcVoice {
+        return false;
+    }
+    if classifier.audio_packets_count != 1 {
+        return false;
+    }
+
+    // 3. Classify 800-byte game state snapshot on port 7777
+    let dummy_snap = [0x11u8; 800];
+    let pkt3 = classifier.classify_packet(7777, &dummy_snap, 100_000, false);
+    if pkt3.priority != GamingPacketPriority::StateSyncSnapshot {
+        return false;
+    }
+    if pkt3.edca_ac != WifiEdcaAccessCategory::AcVideo {
+        return false;
+    }
+
+    // 4. Test deadline expiration:
+    // Packet 1 has deadline 102,000 µs. At 101,500 µs it is valid; at 102,500 µs it is expired.
+    if !classifier.check_packet_deadline(&pkt1, 101_500) {
+        return false;
+    }
+    if classifier.check_packet_deadline(&pkt1, 102_500) {
+        return false;
+    }
+    if classifier.deadline_miss_count != 1 {
+        return false;
+    }
+
+    // 5. Test integrated controller instantiation
+    let controller = HandheldWifi7Controller::new();
+    if controller.puncture_engine.active_bandwidth_mhz != 160 {
+        return false;
+    }
+
+    true
+}
+
+
 
