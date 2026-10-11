@@ -450,3 +450,228 @@ pub fn verify_mesh_beacon_sync_governor() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: Antenna Diversity Switch Governor Detecting Hand Grip RF Attenuation
+// ============================================================================
+
+/// Physical antenna placement locations on the handheld gaming console chassis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldAntennaId {
+    /// Top-edge primary antenna (free of user palm obstruction in standard grip).
+    TopPrimary = 0,
+    /// Left grip internal antenna (subject to left palm capacitive loading/attenuation).
+    LeftGrip = 1,
+    /// Right grip internal antenna (subject to right palm capacitive loading/attenuation).
+    RightGrip = 2,
+    /// Bottom-edge auxiliary diversity antenna.
+    BottomAux = 3,
+}
+
+/// RF metrics and grip attenuation state for an antenna element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AntennaMetrics {
+    /// Antenna identifier.
+    pub id: HandheldAntennaId,
+    /// Raw RSSI in dBm (-100 dBm to -30 dBm).
+    pub rssi_dbm: i8,
+    /// Estimated Signal-to-Interference-plus-Noise Ratio (SINR) in dB.
+    pub sinr_db: i8,
+    /// Grip capacitive sensor proximity reading (0..255, > 180 indicates firm palm contact).
+    pub grip_proximity_raw: u8,
+    /// Estimated RF human-body attenuation in dB (typically 0 dB to 25 dB).
+    pub body_attenuation_db: u8,
+    /// Total transmission errors / retries logged while this antenna was active.
+    pub tx_retries: u32,
+    /// Whether this antenna is currently marked as severely attenuated ("death grip").
+    pub is_chassis_blocked: bool,
+}
+
+impl AntennaMetrics {
+    /// Constructs default metrics for an antenna.
+    pub const fn new(id: HandheldAntennaId) -> Self {
+        Self {
+            id,
+            rssi_dbm: -60,
+            sinr_db: 25,
+            grip_proximity_raw: 0,
+            body_attenuation_db: 0,
+            tx_retries: 0,
+            is_chassis_blocked: false,
+        }
+    }
+}
+
+/// Dynamic Handheld Antenna Diversity Switching Governor.
+///
+/// Handheld devices suffer severe RF degradation (up to 18-24 dB) when a player's
+/// sweaty palms wrap around side grip antennas ("death grip"). This governor
+/// fuses capacitive touch grip sensor data with live per-antenna RSSI/SINR metrics
+/// and sub-millisecond RF switch GPIO controls to select the optimal RF path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldAntennaDiversityGovernor {
+    /// Metrics for all 4 chassis antennas.
+    pub antennas: [AntennaMetrics; 4],
+    /// Currently active TX/RX primary antenna.
+    pub active_primary_antenna: HandheldAntennaId,
+    /// Currently active secondary diversity antenna.
+    pub active_secondary_antenna: HandheldAntennaId,
+    /// Hysteresis threshold in dB required to switch antennas (prevents rapid flapping).
+    pub switch_hysteresis_db: u8,
+    /// Total dynamic antenna switches executed.
+    pub switch_event_count: u32,
+    /// Timestamp of last antenna switch in microseconds.
+    pub last_switch_ts_us: u64,
+}
+
+impl HandheldAntennaDiversityGovernor {
+    /// Initializes the antenna diversity governor with default antennas (TopPrimary & BottomAux).
+    pub fn new() -> Self {
+        let antennas = [
+            AntennaMetrics::new(HandheldAntennaId::TopPrimary),
+            AntennaMetrics::new(HandheldAntennaId::LeftGrip),
+            AntennaMetrics::new(HandheldAntennaId::RightGrip),
+            AntennaMetrics::new(HandheldAntennaId::BottomAux),
+        ];
+
+        Self {
+            antennas,
+            active_primary_antenna: HandheldAntennaId::TopPrimary,
+            active_secondary_antenna: HandheldAntennaId::BottomAux,
+            switch_hysteresis_db: 4, // 4 dB switching hysteresis
+            switch_event_count: 0,
+            last_switch_ts_us: 0,
+        }
+    }
+
+    /// Updates capacitive grip sensor reading for an antenna and computes body attenuation.
+    pub fn update_grip_sensor(&mut self, id: HandheldAntennaId, proximity_raw: u8) {
+        let idx = id as usize;
+        self.antennas[idx].grip_proximity_raw = proximity_raw;
+
+        // Model RF attenuation based on grip proximity (0..255)
+        // Above 128: progressive attenuation up to 20 dB. Above 200: blocked.
+        if proximity_raw > 200 {
+            self.antennas[idx].body_attenuation_db = 18;
+            self.antennas[idx].is_chassis_blocked = true;
+        } else if proximity_raw > 128 {
+            let scale = (proximity_raw - 128) as f32 / 72.0;
+            self.antennas[idx].body_attenuation_db = (scale * 15.0) as u8;
+            self.antennas[idx].is_chassis_blocked = false;
+        } else {
+            self.antennas[idx].body_attenuation_db = 0;
+            self.antennas[idx].is_chassis_blocked = false;
+        }
+    }
+
+    /// Updates live RF measurements (raw RSSI and SINR) for an antenna.
+    pub fn update_rf_metrics(&mut self, id: HandheldAntennaId, raw_rssi_dbm: i8, sinr_db: i8) {
+        let idx = id as usize;
+        self.antennas[idx].rssi_dbm = raw_rssi_dbm;
+        self.antennas[idx].sinr_db = sinr_db;
+    }
+
+    /// Evaluates effective signal quality accounting for grip attenuation.
+    pub fn get_effective_rssi(&self, id: HandheldAntennaId) -> i8 {
+        let idx = id as usize;
+        self.antennas[idx].rssi_dbm - (self.antennas[idx].body_attenuation_db as i8)
+    }
+
+    /// Runs the antenna selection arbitration logic. Returns true if a switch was performed.
+    pub fn arbitrate_best_antennas(&mut self, current_time_us: u64) -> bool {
+        // Enforce minimum dwell time of 5,000 µs (5ms) to prevent RF front-end oscillation
+        if current_time_us.saturating_sub(self.last_switch_ts_us) < 5_000 {
+            return false;
+        }
+
+        let current_primary_effective = self.get_effective_rssi(self.active_primary_antenna);
+
+        // Find candidate with highest effective RSSI that is not blocked
+        let mut best_id = self.active_primary_antenna;
+        let mut best_score = current_primary_effective;
+
+        let all_ids = [
+            HandheldAntennaId::TopPrimary,
+            HandheldAntennaId::LeftGrip,
+            HandheldAntennaId::RightGrip,
+            HandheldAntennaId::BottomAux,
+        ];
+
+        for &id in &all_ids {
+            let eff = self.get_effective_rssi(id);
+            // If current primary is blocked, switch immediately without hysteresis
+            let hysteresis = if self.antennas[self.active_primary_antenna as usize].is_chassis_blocked {
+                0
+            } else {
+                self.switch_hysteresis_db as i8
+            };
+
+            if eff > best_score + hysteresis {
+                best_score = eff;
+                best_id = id;
+            }
+        }
+
+        if best_id != self.active_primary_antenna {
+            // Perform antenna diversity switch
+            self.active_secondary_antenna = self.active_primary_antenna;
+            self.active_primary_antenna = best_id;
+            self.switch_event_count += 1;
+            self.last_switch_ts_us = current_time_us;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Verification test for antenna diversity switch governor.
+pub fn verify_antenna_diversity_switch_governor() -> bool {
+    let mut gov = HandheldAntennaDiversityGovernor::new();
+
+    // 1. Initial configuration: TopPrimary is active, effective RSSI = -60 dBm
+    if gov.active_primary_antenna != HandheldAntennaId::TopPrimary {
+        return false;
+    }
+    if gov.get_effective_rssi(HandheldAntennaId::TopPrimary) != -60 {
+        return false;
+    }
+
+    // 2. Set RightGrip with slightly better raw RSSI (-58 dBm vs -60 dBm), but difference (2 dB) < 4 dB hysteresis
+    gov.update_rf_metrics(HandheldAntennaId::RightGrip, -58, 26);
+    let switched_no = gov.arbitrate_best_antennas(10_000);
+    if switched_no || gov.active_primary_antenna != HandheldAntennaId::TopPrimary {
+        return false; // Hysteresis prevented false switch
+    }
+
+    // 3. User firmly grips the top chassis edge (capacitive proximity = 220 -> death grip on TopPrimary)
+    gov.update_grip_sensor(HandheldAntennaId::TopPrimary, 220);
+    if !gov.antennas[HandheldAntennaId::TopPrimary as usize].is_chassis_blocked {
+        return false;
+    }
+    // Effective RSSI drops from -60 to -78 dBm (-60 - 18 dB)
+    if gov.get_effective_rssi(HandheldAntennaId::TopPrimary) != -78 {
+        return false;
+    }
+
+    // 4. Arbitrate at t = 20,000 µs: RightGrip (-58 dBm) is clear and wins immediate switch
+    let switched = gov.arbitrate_best_antennas(20_000);
+    if !switched || gov.active_primary_antenna != HandheldAntennaId::RightGrip {
+        return false;
+    }
+    if gov.active_secondary_antenna != HandheldAntennaId::TopPrimary {
+        return false;
+    }
+    if gov.switch_event_count != 1 {
+        return false;
+    }
+
+    // 5. Verify dwell time guard: attempted switch at 22,000 µs (< 5,000 µs dwell) is rejected
+    let early_switch = gov.arbitrate_best_antennas(22_000);
+    if early_switch {
+        return false;
+    }
+
+    true
+}
+
+
