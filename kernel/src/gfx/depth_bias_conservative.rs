@@ -198,6 +198,162 @@ impl Tier3InnerCoverageEvaluator {
     }
 }
 
+// Screen-space 2D bounding rectangle with nearest depth for occlusion culling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenAABB2D {
+    // Minimum horizontal screen coordinate in pixels.
+    pub min_x: f32,
+    // Minimum vertical screen coordinate in pixels.
+    pub min_y: f32,
+    // Maximum horizontal screen coordinate in pixels.
+    pub max_x: f32,
+    // Maximum vertical screen coordinate in pixels.
+    pub max_y: f32,
+    // Nearest Z depth value of bounding box in range 0.0 to 1.0.
+    pub nearest_z: f32,
+}
+
+impl ScreenAABB2D {
+    // Constructs a new screen-space bounding rectangle.
+    pub const fn new(min_x: f32, min_y: f32, max_x: f32, max_y: f32, nearest_z: f32) -> Self {
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            nearest_z,
+        }
+    }
+
+    // Dilates the bounding rectangle outward by subpixel expansion margin.
+    pub fn dilate(&self, expansion: f32) -> Self {
+        Self {
+            min_x: self.min_x - expansion,
+            min_y: self.min_y - expansion,
+            max_x: self.max_x + expansion,
+            max_y: self.max_y + expansion,
+            nearest_z: self.nearest_z,
+        }
+    }
+}
+
+// GPU occlusion culling bounding box accelerator using conservative footprints.
+#[derive(Debug, Clone)]
+pub struct ConservativeOcclusionAccelerator {
+    // Width of low-resolution hierarchical depth buffer.
+    pub depth_width: u32,
+    // Height of low-resolution hierarchical depth buffer.
+    pub depth_height: u32,
+    // Coarse depth buffer storing maximum depth per cell.
+    pub depth_buffer: Vec<f32>,
+    // Total bounding boxes tested.
+    pub total_tested: u64,
+    // Total bounding boxes determined to be occluded.
+    pub total_culled: u64,
+    // Total bounding boxes visible.
+    pub total_visible: u64,
+}
+
+impl ConservativeOcclusionAccelerator {
+    // Creates a new conservative occlusion accelerator with specified buffer dimensions.
+    pub fn new(depth_width: u32, depth_height: u32) -> Self {
+        let size = (depth_width as usize) * (depth_height as usize);
+        let mut depth_buffer = Vec::new();
+        depth_buffer.resize(size, 1.0);
+        Self {
+            depth_width,
+            depth_height,
+            depth_buffer,
+            total_tested: 0,
+            total_culled: 0,
+            total_visible: 0,
+        }
+    }
+
+    // Clears hierarchical depth buffer with specified depth clear value.
+    pub fn clear_depth(&mut self, clear_value: f32) {
+        for d in &mut self.depth_buffer {
+            *d = clear_value;
+        }
+    }
+
+    // Rasterizes an occluder rectangle writing maximum depth into buffer.
+    pub fn write_occluder(&mut self, rect: &ScreenAABB2D, depth: f32) {
+        let x0 = (rect.min_x.max(0.0) as u32).min(self.depth_width);
+        let y0 = (rect.min_y.max(0.0) as u32).min(self.depth_height);
+        let x1 = ((rect.max_x + 1.0).max(0.0) as u32).min(self.depth_width);
+        let y1 = ((rect.max_y + 1.0).max(0.0) as u32).min(self.depth_height);
+
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                let idx = (y * self.depth_width + x) as usize;
+                if idx < self.depth_buffer.len() && depth < self.depth_buffer[idx] {
+                    self.depth_buffer[idx] = depth;
+                }
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+
+    // Tests whether a bounding box is occluded behind existing geometry.
+    pub fn is_occluded(&mut self, query_box: &ScreenAABB2D, conservative_dilate: bool) -> bool {
+        self.total_tested += 1;
+
+        let rect = if conservative_dilate {
+            query_box.dilate(0.5)
+        } else {
+            *query_box
+        };
+
+        let x0 = (rect.min_x.max(0.0) as u32).min(self.depth_width);
+        let y0 = (rect.min_y.max(0.0) as u32).min(self.depth_height);
+        let x1 = ((rect.max_x + 1.0).max(0.0) as u32).min(self.depth_width);
+        let y1 = ((rect.max_y + 1.0).max(0.0) as u32).min(self.depth_height);
+
+        if x0 >= x1 || y0 >= y1 {
+            self.total_visible += 1;
+            return false;
+        }
+
+        let mut max_buffer_depth: f32 = 0.0;
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                let idx = (y * self.depth_width + x) as usize;
+                if idx < self.depth_buffer.len() {
+                    let d = self.depth_buffer[idx];
+                    if d > max_buffer_depth {
+                        max_buffer_depth = d;
+                    }
+                }
+                x += 1;
+            }
+            y += 1;
+        }
+
+        if rect.nearest_z > max_buffer_depth {
+            self.total_culled += 1;
+            true
+        } else {
+            self.total_visible += 1;
+            false
+        }
+    }
+
+    // Computes percentage of tested boxes successfully culled in range 0 to 100.
+    pub fn cull_efficiency_percentage(&self) -> u32 {
+        if self.total_tested == 0 {
+            0
+        } else {
+            ((self.total_culled * 100) / self.total_tested) as u32
+        }
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_depth_bias_conservative_subsystem() -> bool {
     true
