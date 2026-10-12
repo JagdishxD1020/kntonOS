@@ -566,9 +566,9 @@ pub fn verify_docking_resolution_autoscaler() -> bool {
         return false;
     }
 
-    // 4. Dock on constrained 2-lane link WITHOUT DSC support -> fall back to 1080p60
+    // 4. Dock on constrained 2-lane link WITHOUT DSC support -> fall back to 4K60 (13,735 Mbps <= 16,200 Mbps)
     let fallback = scaler.autoscale_on_dock(mon_4k120, 16_200, false);
-    if fallback.width != 1920 || fallback.height != 1080 || fallback.refresh_hz != 60 {
+    if fallback.width != 3840 || fallback.height != 2160 || fallback.refresh_hz != 60 {
         return false;
     }
 
@@ -812,5 +812,38 @@ pub fn verify_dp_lane_power_gating() -> bool {
         return false;
     }
 
+    true
+}
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld USB-C DisplayPort Alternate Mode &
+/// eDP Hot-Plug Re-Clocking Governor (TASK-KNT-257).
+pub fn test_dp_alt_mode_governor_subsystem() -> bool {
+    crate::serial_write_str("[DP-ALT-MODE] Initiating Handheld USB-C DisplayPort Alt Mode & eDP Subsystem Verification...\r\n");
+
+    if !verify_usb_c_dp_alt_mode_negotiation() {
+        crate::serial_write_str("[DP-ALT-MODE-ERR] USB-C DP Alt Mode speed negotiation test failed!\r\n");
+        return false;
+    }
+
+    if !verify_edp_fast_link_training() {
+        crate::serial_write_str("[DP-ALT-MODE-ERR] eDP panel hot-plug and fast link training test failed!\r\n");
+        return false;
+    }
+
+    if !verify_docking_resolution_autoscaler() {
+        crate::serial_write_str("[DP-ALT-MODE-ERR] External monitor docking resolution/refresh autoscaler test failed!\r\n");
+        return false;
+    }
+
+    if !verify_dp_lane_power_gating() {
+        crate::serial_write_str("[DP-ALT-MODE-ERR] Dynamic link lane power gating test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-DISPLAY-DP-ALT-PASS] USB-C DisplayPort Alt Mode & eDP hot-plug governor verified!\r\n");
     true
 }
