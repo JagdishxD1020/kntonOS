@@ -366,3 +366,112 @@ fn write_u64(mut val: u64) {
         crate::serial_write_byte(buf[i]);
     }
 }
+
+/// Self-test suite verifying x86-64 debug registers, watchpoints, context switching, and anti-cheat hooks.
+pub fn test_win32_debug_registers_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Hardware Watchpoints & Debug Registers self-test...\r\n");
+
+    let tid_a = 501;
+    let tid_b = 502;
+    let target_mem = 0x0000_7FFF_1234_0000;
+
+    // 1. Configure 4-byte break-on-write watchpoint in slot 0 for Thread A
+    if !win32_set_hardware_data_watchpoint(
+        tid_a,
+        0,
+        target_mem,
+        WatchpointAccessType::Write,
+        WatchpointDataWidth::Byte4,
+    ) {
+        crate::serial_write_str("[KNT-ERROR] Failed to set hardware watchpoint slot 0\r\n");
+        return false;
+    }
+
+    let regs_a = win32_get_thread_debug_registers(tid_a);
+    if regs_a.dr0 != target_mem || (regs_a.dr7 & 0x01) == 0 {
+        crate::serial_write_str("[KNT-ERROR] DR0 or DR7 bit 0 not configured correctly\r\n");
+        return false;
+    }
+
+    // 2. Configure 8-byte break-on-readwrite watchpoint in slot 1 for Thread A
+    let target_mem_rw = 0x0000_7FFF_1234_0080;
+    if !win32_set_hardware_data_watchpoint(
+        tid_a,
+        1,
+        target_mem_rw,
+        WatchpointAccessType::ReadWrite,
+        WatchpointDataWidth::Byte8,
+    ) {
+        crate::serial_write_str("[KNT-ERROR] Failed to set hardware watchpoint slot 1\r\n");
+        return false;
+    }
+
+    // 3. Test memory access hit evaluation
+    let hit_write = win32_evaluate_thread_watchpoints(tid_a, target_mem + 2, 2, true);
+    if hit_write != Some(0) {
+        crate::serial_write_str("[KNT-ERROR] Watchpoint slot 0 write hit evaluation failed\r\n");
+        return false;
+    }
+
+    let regs_a_hit = win32_get_thread_debug_registers(tid_a);
+    if (regs_a_hit.dr6 & 0x01) == 0 {
+        crate::serial_write_str("[KNT-ERROR] DR6 status bit 0 not set on hit\r\n");
+        return false;
+    }
+
+    // Read to break-on-write watchpoint should NOT hit
+    let miss_read = win32_evaluate_thread_watchpoints(tid_a, target_mem, 4, false);
+    if miss_read.is_some() {
+        crate::serial_write_str("[KNT-ERROR] Read access incorrectly hit write-only watchpoint\r\n");
+        return false;
+    }
+
+    // Read to break-on-readwrite watchpoint should hit slot 1
+    let hit_rw = win32_evaluate_thread_watchpoints(tid_a, target_mem_rw + 4, 4, false);
+    if hit_rw != Some(1) {
+        crate::serial_write_str("[KNT-ERROR] Watchpoint slot 1 read-write hit evaluation failed\r\n");
+        return false;
+    }
+
+    // 4. Test debug register context switching from Thread A to Thread B
+    win32_switch_thread_debug_context(tid_a, tid_b);
+    let regs_b = win32_get_thread_debug_registers(tid_b);
+    if regs_b.dr0 != 0 || (regs_b.dr7 & 0x01) != 0 {
+        crate::serial_write_str("[KNT-ERROR] Thread B debug registers not clean\r\n");
+        return false;
+    }
+
+    // Restore Thread A context
+    win32_switch_thread_debug_context(tid_b, tid_a);
+
+    // 5. Test anti-cheat memory hook guard
+    let critical_game_code = 0x0000_0040_5000;
+    win32_protect_anti_cheat_region(critical_game_code, 4096, ".text:Direct3D12HookShield");
+
+    let clean_write = win32_check_anti_cheat_write_violation(tid_a, 0x0000_0050_0000, 4);
+    if clean_write {
+        crate::serial_write_str("[KNT-ERROR] Anti-cheat triggered false positive\r\n");
+        return false;
+    }
+
+    let unauthorized_write = win32_check_anti_cheat_write_violation(tid_a, critical_game_code + 0x20, 8);
+    if !unauthorized_write || ANTI_CHEAT_GUARD.tampering_violations() == 0 {
+        crate::serial_write_str("[KNT-ERROR] Anti-cheat failed to detect unauthorized write\r\n");
+        return false;
+    }
+
+    // 6. Test clear watchpoints
+    if !win32_clear_hardware_data_watchpoint(tid_a, 0) || !win32_clear_hardware_data_watchpoint(tid_a, 1) {
+        crate::serial_write_str("[KNT-ERROR] Failed to clear hardware watchpoints\r\n");
+        return false;
+    }
+
+    let regs_cleared = win32_get_thread_debug_registers(tid_a);
+    if regs_cleared.dr0 != 0 || (regs_cleared.dr7 & 0x01) != 0 {
+        crate::serial_write_str("[KNT-ERROR] Watchpoint slot 0 not cleared\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-DEBUG-REG-PASS] Win32 hardware watchpoints and debug registers verified\r\n");
+    true
+}

@@ -1171,6 +1171,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Hardware Watchpoint Breakpoint Virtualization & Debug Registers (TASK-KNT-255)
+    if !pe::test_win32_debug_registers_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 debug registers subsystem self-test failed!\r\n");
+    }
+
     // Verify Win32 Performance Telemetry Ring Buffer & Real-Time ETW Provider (TASK-KNT-252)
     if !pe::test_win32_etw_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 ETW telemetry subsystem self-test failed!\r\n");
