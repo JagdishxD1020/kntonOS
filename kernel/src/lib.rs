@@ -518,6 +518,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_pso_library_cache_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility PSO binary library cache self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Dynamic Depth Bias & Conservative Raster (TASK-KNT-254)
+    if !gfx::test_depth_bias_conservative_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility depth bias & conservative raster self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
