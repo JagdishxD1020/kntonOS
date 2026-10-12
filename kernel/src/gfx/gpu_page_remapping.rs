@@ -182,6 +182,104 @@ impl SparseResourceMappingTable {
     }
 }
 
+// GPU hardware virtual memory page table leaf entry (64 KiB tile granularity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuPteLeaf {
+    // Flag indicating whether mapping is active and valid in hardware.
+    pub valid: bool,
+    // Physical frame byte address in GPU VRAM or system memory.
+    pub physical_address: u64,
+    // Whether this entry points to the shared zeroed dummy null tile.
+    pub is_null_tile: bool,
+    // Read-only permission flag preventing tile corruption from shader writes.
+    pub read_only: bool,
+}
+
+impl Default for GpuPteLeaf {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            physical_address: 0,
+            is_null_tile: true,
+            read_only: false,
+        }
+    }
+}
+
+// Scope classification for GPU Translation Lookaside Buffer (TLB) flush operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuTlbFlushScope {
+    // Selective range invalidation for specific virtual page span.
+    Range {
+        start_page: usize,
+        page_count: usize,
+    },
+    // Global invalidation flushing entire shader engine L1/L2 TLB hierarchy.
+    Global,
+}
+
+// Hardware GPU TLB flush and page table leaf invalidation engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuTlbEngine {
+    // Current monotonic TLB flush generation sequence number.
+    pub tlb_generation: u64,
+    // Total range or global TLB flushes executed.
+    pub total_flushes: u64,
+    // Total page table entries invalidated.
+    pub total_invalidated_leaves: u64,
+}
+
+impl Default for GpuTlbEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GpuTlbEngine {
+    // Creates a new GPU TLB invalidation engine.
+    pub fn new() -> Self {
+        Self {
+            tlb_generation: 1,
+            total_flushes: 0,
+            total_invalidated_leaves: 0,
+        }
+    }
+
+    // Invalidates a range of page table entries and generates a TLB flush token.
+    pub fn invalidate_page_range(
+        &mut self,
+        page_table: &mut [GpuPteLeaf],
+        start_page: usize,
+        page_count: usize,
+    ) -> u64 {
+        let mut count = 0;
+        let end = (start_page + page_count).min(page_table.len());
+
+        let mut i = start_page;
+        while i < end {
+            if page_table[i].valid {
+                page_table[i].valid = false;
+                page_table[i].is_null_tile = true;
+                page_table[i].physical_address = 0;
+                count += 1;
+            }
+            i += 1;
+        }
+
+        self.tlb_generation += 1;
+        self.total_flushes += 1;
+        self.total_invalidated_leaves += count as u64;
+        self.tlb_generation
+    }
+
+    // Flushes all TLB caches across all GPU shader cores globally.
+    pub fn flush_global(&mut self) -> u64 {
+        self.tlb_generation += 1;
+        self.total_flushes += 1;
+        self.tlb_generation
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_gpu_page_remapping_subsystem() -> bool {
     true
