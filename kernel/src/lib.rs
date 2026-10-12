@@ -644,6 +644,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld Wi-Fi 7 MLO and game packet pacer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Wi-Fi 7 Punctured Channel Pacing & Ultra-Low-Latency Beacon Synchronization (TASK-KNT-253)
+    if !drivers::net::test_wifi_punctured_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld Wi-Fi 7 punctured channel pacing and beacon sync self-test failed!\r\n");
+    }
+
     // Verify Unified Handheld PC Wi-Fi 6E/7 Latency-Optimized Packet Scheduler & Roaming Daemon (TASK-KNT-110)
     if !net::test_wifi_scheduler_and_roaming_subsystem() {
         serial_write_str("[KNT-PANIC] Wi-Fi 6E/7 packet scheduler and roaming daemon self-test failed!\r\n");

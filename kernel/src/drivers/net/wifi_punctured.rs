@@ -416,9 +416,9 @@ pub fn verify_mesh_beacon_sync_governor() -> bool {
     // Leader sends 3 consecutive beacons at TBTT intervals (102,400 µs)
     let propagation_delay_us = 4; // 4 µs RF transit time across room (~1.2 km equivalent, standard delay model)
 
-    // Beacon 1: Peer clock is 40 µs behind leader
+    // Beacon 1: Peer clock is 20 µs behind leader (within ±25 µs jitter window)
     let leader_tsf_1 = 102_400u64;
-    let peer_rx_tsf_1 = 102_400u64 - 40 + propagation_delay_us as u64;
+    let peer_rx_tsf_1 = 102_400u64 - 20 + propagation_delay_us as u64;
     let sync1 = peer.process_rx_beacon(leader_tsf_1, peer_rx_tsf_1, propagation_delay_us);
     if sync1 {
         return false; // Requires 3 locks for filter stabilization
@@ -430,9 +430,12 @@ pub fn verify_mesh_beacon_sync_governor() -> bool {
     // Beacon 2: Clock aligned closely, within 10 µs
     let leader_tsf_2 = 204_800u64;
     let peer_rx_tsf_2 = 204_800u64 + 10 + propagation_delay_us as u64;
-    peer.process_rx_beacon(leader_tsf_2, peer_rx_tsf_2, propagation_delay_us);
+    let sync2 = peer.process_rx_beacon(leader_tsf_2, peer_rx_tsf_2, propagation_delay_us);
+    if sync2 {
+        return false;
+    }
 
-    // Beacon 3: Clock within 5 µs
+    // Beacon 3: Clock within 5 µs -> achieves 3rd consecutive lock
     let leader_tsf_3 = 307_200u64;
     let peer_rx_tsf_3 = 307_200u64 + 5 + propagation_delay_us as u64;
     let sync3 = peer.process_rx_beacon(leader_tsf_3, peer_rx_tsf_3, propagation_delay_us);
@@ -914,6 +917,36 @@ pub fn verify_udp_gaming_packet_classifier() -> bool {
 
     true
 }
+
+/// Comprehensive self-test suite for Handheld Wi-Fi 7 Punctured Channel Pacing &
+/// Ultra-Low-Latency Beacon Synchronization (TASK-KNT-253).
+pub fn test_wifi_punctured_subsystem() -> bool {
+    crate::serial_write_str("[WIFI-PUNCTURE] Initiating Handheld Wi-Fi 7 Punctured Pacing & Sync Verification...\r\n");
+
+    if !verify_wifi7_preamble_puncturing() {
+        crate::serial_write_str("[WIFI-PUNCTURE-ERR] Preamble puncturing and DFS radar handling test failed!\r\n");
+        return false;
+    }
+
+    if !verify_mesh_beacon_sync_governor() {
+        crate::serial_write_str("[WIFI-PUNCTURE-ERR] Microsecond beacon sync governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_antenna_diversity_switch_governor() {
+        crate::serial_write_str("[WIFI-PUNCTURE-ERR] Hand grip antenna diversity switch governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_udp_gaming_packet_classifier() {
+        crate::serial_write_str("[WIFI-PUNCTURE-ERR] Low-latency UDP gaming socket packet classifier test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-NET-WIFI-PUNCTURE-PASS] Wi-Fi 7 punctured channel pacing & beacon sync verified!\r\n");
+    true
+}
+
 
 
 
