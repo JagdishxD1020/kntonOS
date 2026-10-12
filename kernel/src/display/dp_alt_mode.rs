@@ -388,3 +388,198 @@ pub fn verify_edp_fast_link_training() -> bool {
     true
 }
 
+
+// ============================================================================
+// Feature 3: External Monitor Docking Resolution/Refresh Rate Autoscaler
+// ============================================================================
+
+/// Handheld docking profile mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldDockProfile {
+    /// Handheld mode: internal 7-inch to 8-inch screen active (typically 1280x800 or 1920x1080 @ 60/120Hz).
+    HandheldInternalOnly,
+    /// Desktop Docked mode: external high-resolution monitor attached via USB-C DP Alt Mode / HDMI dock.
+    DockedExternalAttached,
+    /// Dual-display hybrid mode (handheld screen used as auxiliary controller / telemetry screen).
+    HybridExtendedDisplay,
+}
+
+/// Display mode timing definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayModeTiming {
+    /// Horizontal active resolution in pixels.
+    pub width: u16,
+    /// Vertical active resolution in lines.
+    pub height: u16,
+    /// Vertical refresh rate in Hertz.
+    pub refresh_hz: u16,
+    /// Color bit depth per channel (e.g. 8 for RGB888, 10 for HDR10).
+    pub bpc: u8,
+    /// Pixel clock in kHz.
+    pub pixel_clock_khz: u32,
+    /// Required raw uncompressed video bandwidth in Mbps.
+    pub required_bandwidth_mbps: u32,
+}
+
+impl DisplayModeTiming {
+    /// Calculates bandwidth requirements for a display mode timing.
+    pub const fn new(width: u16, height: u16, refresh_hz: u16, bpc: u8) -> Self {
+        // Blanking overhead factor is approx 1.15 (15% blanking interval)
+        // Bandwidth = width * height * 1.15 * refresh_hz * (bpc * 3) / 1,000,000
+        let total_pixels = (width as u64) * (height as u64);
+        let bits_per_pixel = (bpc as u64) * 3;
+        let pclk = ((total_pixels * 115 / 100) * (refresh_hz as u64)) / 1000;
+        let bw_mbps = (pclk * bits_per_pixel) / 1000;
+
+        Self {
+            width,
+            height,
+            refresh_hz,
+            bpc,
+            pixel_clock_khz: pclk as u32,
+            required_bandwidth_mbps: bw_mbps as u32,
+        }
+    }
+}
+
+/// External Monitor Docking Resolution/Refresh Rate Autoscaler.
+///
+/// Seamlessly transitions between Handheld battery-optimized profiles
+/// and Docked desktop performance profiles without requiring reboot.
+/// Matches monitor EDID native modes against available DP Alt Mode link budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DockingResolutionAutoscaler {
+    /// Current docking profile.
+    pub current_profile: HandheldDockProfile,
+    /// Handheld native internal display timing (e.g. 1920x1080 @ 120Hz 8bpc).
+    pub internal_timing: DisplayModeTiming,
+    /// Active display timing on output.
+    pub active_timing: DisplayModeTiming,
+    /// Render resolution scaling factor percentage (e.g. 100 = native, 75 = FSR 1440p upscaled to 4K).
+    pub render_scale_pct: u8,
+    /// Target frame rate cap (e.g. 60 FPS or 120 FPS).
+    pub fps_cap: u16,
+    /// Mode change / modeset count.
+    pub modeset_count: u32,
+}
+
+impl DockingResolutionAutoscaler {
+    /// Constructs a docking autoscaler with default internal 1080p120 panel parameters.
+    pub const fn new() -> Self {
+        let internal = DisplayModeTiming::new(1920, 1080, 120, 8);
+        Self {
+            current_profile: HandheldDockProfile::HandheldInternalOnly,
+            internal_timing: internal,
+            active_timing: internal,
+            render_scale_pct: 100,
+            fps_cap: 120,
+            modeset_count: 0,
+        }
+    }
+
+    /// Selects optimal external display mode based on sink EDID target and available link bandwidth.
+    /// Automatically applies DSC (Display Stream Compression) 3:1 ratio if bandwidth exceeds uncompressed limits.
+    pub fn autoscale_on_dock(
+        &mut self,
+        external_target: DisplayModeTiming,
+        available_dp_bandwidth_mbps: u32,
+        dsc_supported: bool,
+    ) -> DisplayModeTiming {
+        self.modeset_count += 1;
+        self.current_profile = HandheldDockProfile::DockedExternalAttached;
+
+        let uncompressed_req = external_target.required_bandwidth_mbps;
+
+        if uncompressed_req <= available_dp_bandwidth_mbps {
+            // Uncompressed link budget sufficient: drive native target
+            self.active_timing = external_target;
+            self.render_scale_pct = 100;
+            self.fps_cap = external_target.refresh_hz;
+        } else if dsc_supported && (uncompressed_req / 3) <= available_dp_bandwidth_mbps {
+            // DSC 3:1 compression enables native high resolution/refresh
+            self.active_timing = external_target;
+            self.render_scale_pct = 100;
+            self.fps_cap = external_target.refresh_hz;
+        } else {
+            // Fallback: scale down refresh rate or resolution to fit link budget
+            let fallback_timing = if external_target.refresh_hz > 60 {
+                // First try reducing 120/144Hz to 60Hz
+                let half_rate = DisplayModeTiming::new(external_target.width, external_target.height, 60, external_target.bpc);
+                if half_rate.required_bandwidth_mbps <= available_dp_bandwidth_mbps {
+                    half_rate
+                } else {
+                    DisplayModeTiming::new(1920, 1080, 60, 8)
+                }
+            } else {
+                DisplayModeTiming::new(1920, 1080, 60, 8)
+            };
+
+            self.active_timing = fallback_timing;
+            self.render_scale_pct = 100;
+            self.fps_cap = fallback_timing.refresh_hz;
+        }
+
+        self.active_timing
+    }
+
+    /// Reverts to handheld internal display profile upon USB-C undocking.
+    pub fn handle_undock(&mut self) -> DisplayModeTiming {
+        self.modeset_count += 1;
+        self.current_profile = HandheldDockProfile::HandheldInternalOnly;
+        self.active_timing = self.internal_timing;
+        self.render_scale_pct = 100;
+        self.fps_cap = self.internal_timing.refresh_hz;
+        self.active_timing
+    }
+}
+
+/// Verification test for docking resolution/refresh rate autoscaler.
+pub fn verify_docking_resolution_autoscaler() -> bool {
+    let mut scaler = DockingResolutionAutoscaler::new();
+
+    // 1. Initial state: Handheld profile, 1920x1080 @ 120Hz
+    if scaler.current_profile != HandheldDockProfile::HandheldInternalOnly {
+        return false;
+    }
+    if scaler.active_timing.width != 1920 || scaler.active_timing.height != 1080 || scaler.active_timing.refresh_hz != 120 {
+        return false;
+    }
+
+    // 2. Dock to 4K144 external monitor (3840x2160 @ 144Hz 10bpc) over 4-lane UHBR20 (80,000 Mbps)
+    let mon_4k144 = DisplayModeTiming::new(3840, 2160, 144, 10);
+    let docked_timing = scaler.autoscale_on_dock(mon_4k144, 80_000, true);
+    if scaler.current_profile != HandheldDockProfile::DockedExternalAttached {
+        return false;
+    }
+    if docked_timing.width != 3840 || docked_timing.height != 2160 || docked_timing.refresh_hz != 144 {
+        return false;
+    }
+    if scaler.fps_cap != 144 {
+        return false;
+    }
+
+    // 3. Dock to 4K120 on constrained 2-lane DP + USB 3.2 link (16,200 Mbps) with DSC enabled
+    // 4K120 uncompressed is ~34 Gbps, DSC 3:1 is ~11.5 Gbps <= 16,200 Mbps
+    let mon_4k120 = DisplayModeTiming::new(3840, 2160, 120, 8);
+    let dsc_docked = scaler.autoscale_on_dock(mon_4k120, 16_200, true);
+    if dsc_docked.width != 3840 || dsc_docked.height != 2160 || dsc_docked.refresh_hz != 120 {
+        return false;
+    }
+
+    // 4. Dock on constrained 2-lane link WITHOUT DSC support -> fall back to 1080p60
+    let fallback = scaler.autoscale_on_dock(mon_4k120, 16_200, false);
+    if fallback.width != 1920 || fallback.height != 1080 || fallback.refresh_hz != 60 {
+        return false;
+    }
+
+    // 5. Undock -> return to handheld 1080p120
+    let undocked = scaler.handle_undock();
+    if scaler.current_profile != HandheldDockProfile::HandheldInternalOnly {
+        return false;
+    }
+    if undocked.width != 1920 || undocked.height != 1080 || undocked.refresh_hz != 120 {
+        return false;
+    }
+
+    true
+}
