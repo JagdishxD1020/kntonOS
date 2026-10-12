@@ -411,6 +411,97 @@ impl HandheldSparseTextureGovernor {
     }
 }
 
+// Shared physical null tile manager routing uncommitted sparse regions to a single zeroed page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedNullTileManager {
+    // Dedicated physical frame address of the shared zeroed dummy tile.
+    pub null_tile_physical_address: u64,
+    // Cumulative virtual tiles mapped to the shared null tile.
+    pub total_bound_null_tiles: u64,
+    // Cumulative virtual tiles reclaimed from the null tile mapping.
+    pub total_unbound_null_tiles: u64,
+}
+
+impl Default for SharedNullTileManager {
+    fn default() -> Self {
+        Self::new(0x1000_0000)
+    }
+}
+
+impl SharedNullTileManager {
+    // Creates a new shared null tile manager with specified physical address.
+    pub fn new(null_tile_physical_address: u64) -> Self {
+        Self {
+            null_tile_physical_address,
+            total_bound_null_tiles: 0,
+            total_unbound_null_tiles: 0,
+        }
+    }
+
+    // Binds a range of virtual page table entries to the shared null tile.
+    pub fn bind_null_range(
+        &mut self,
+        page_table: &mut [GpuPteLeaf],
+        start_page: usize,
+        page_count: usize,
+    ) -> usize {
+        let mut count = 0;
+        let end = (start_page + page_count).min(page_table.len());
+
+        let mut i = start_page;
+        while i < end {
+            page_table[i].valid = true;
+            page_table[i].is_null_tile = true;
+            page_table[i].physical_address = self.null_tile_physical_address;
+            page_table[i].read_only = true;
+            count += 1;
+            i += 1;
+        }
+
+        self.total_bound_null_tiles += count as u64;
+        count
+    }
+
+    // Reclaims a range of virtual page table entries from null tile binding.
+    pub fn unbind_null_range(
+        &mut self,
+        page_table: &mut [GpuPteLeaf],
+        start_page: usize,
+        page_count: usize,
+    ) -> usize {
+        let mut count = 0;
+        let end = (start_page + page_count).min(page_table.len());
+
+        let mut i = start_page;
+        while i < end {
+            if page_table[i].is_null_tile && page_table[i].valid {
+                page_table[i].valid = false;
+                page_table[i].physical_address = 0;
+                count += 1;
+            }
+            i += 1;
+        }
+
+        self.total_unbound_null_tiles += count as u64;
+        count
+    }
+
+    // Total active virtual tiles currently sharing the single null tile.
+    pub fn active_null_tiles(&self) -> u64 {
+        self.total_bound_null_tiles.saturating_sub(self.total_unbound_null_tiles)
+    }
+
+    // Computes physical VRAM saved by sharing a single 64 KiB tile across all null mappings.
+    pub fn calculate_vram_saved_bytes(&self) -> u64 {
+        let active = self.active_null_tiles();
+        if active > 1 {
+            (active - 1) * (D3D12_SPARSE_TILE_SIZE_BYTES as u64)
+        } else {
+            0
+        }
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_gpu_page_remapping_subsystem() -> bool {
     true
