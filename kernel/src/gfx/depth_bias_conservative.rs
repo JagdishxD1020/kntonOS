@@ -440,7 +440,102 @@ impl HandheldShadowGovernor {
     }
 }
 
-// Temporary stub for incremental commits.
+// Comprehensive verification self-test suite for D3D12 dynamic depth bias and conservative raster.
 pub fn test_depth_bias_conservative_subsystem() -> bool {
+    // 1. Verify dynamic depth bias calculation, slope scaling, and clamping.
+    let bias_cfg = DynamicDepthBiasConfig::new(0.05, 0.1, 1.0);
+    let mut bias_eval = DepthBiasEvaluator::new(bias_cfg);
+
+    let d1 = bias_eval.compute_biased_depth(0.5, 0.0);
+    if (d1 - 0.55).abs() > 0.0001 {
+        return false;
+    }
+
+    let d2 = bias_eval.compute_biased_depth(0.5, 0.02);
+    if (d2 - 0.57).abs() > 0.0001 {
+        return false;
+    }
+
+    // Bias clamping activation (0.2 + 0.05 = 0.25 > 0.1 clamp).
+    let d3 = bias_eval.compute_biased_depth(0.5, 0.2);
+    if (d3 - 0.60).abs() > 0.0001 || bias_eval.total_clamps != 1 {
+        return false;
+    }
+
+    // 2. Verify Tier 3 Conservative Rasterization inner coverage evaluation (SV_InnerCoverage).
+    let tri = Triangle2D::new([0.0, 0.0], [10.0, 0.0], [0.0, 10.0]);
+    let mut cov_eval = Tier3InnerCoverageEvaluator::new();
+
+    // Interior pixel fully covered -> inner_coverage = true.
+    let r_inner = cov_eval.evaluate_pixel(&tri, 2.0, 2.0);
+    if !r_inner.conservative_covered || !r_inner.inner_coverage {
+        return false;
+    }
+
+    // Boundary pixel with edge crossing -> conservative_covered = true, inner_coverage = false.
+    let r_edge = cov_eval.evaluate_pixel(&tri, 0.0, 5.0);
+    if !r_edge.conservative_covered || r_edge.inner_coverage {
+        return false;
+    }
+
+    // Outside pixel -> conservative_covered = false, inner_coverage = false.
+    let r_out = cov_eval.evaluate_pixel(&tri, 20.0, 20.0);
+    if r_out.conservative_covered || r_out.inner_coverage {
+        return false;
+    }
+
+    if cov_eval.total_inner_covered != 1 || cov_eval.total_conservative_covered != 2 {
+        return false;
+    }
+
+    // 3. Verify GPU occlusion culling bounding box accelerator using conservative footprints.
+    let mut accel = ConservativeOcclusionAccelerator::new(32, 32);
+    let occluder = ScreenAABB2D::new(5.0, 5.0, 25.0, 25.0, 0.5);
+    accel.write_occluder(&occluder, 0.5);
+
+    // Box 1 behind occluder (nearest_z 0.8 > 0.5).
+    let q1 = ScreenAABB2D::new(10.0, 10.0, 20.0, 20.0, 0.8);
+    if !accel.is_occluded(&q1, true) {
+        return false;
+    }
+
+    // Box 2 in front of occluder (nearest_z 0.3 < 0.5).
+    let q2 = ScreenAABB2D::new(10.0, 10.0, 20.0, 20.0, 0.3);
+    if accel.is_occluded(&q2, true) {
+        return false;
+    }
+
+    // Box 3 outside occluder footprint (nearest_z 0.8, clear depth is 1.0).
+    let q3 = ScreenAABB2D::new(26.0, 26.0, 30.0, 30.0, 0.8);
+    if accel.is_occluded(&q3, true) {
+        return false;
+    }
+
+    if accel.total_culled != 1 || accel.total_visible != 2 || accel.cull_efficiency_percentage() != 33 {
+        return false;
+    }
+
+    // 4. Verify handheld shadow map resolution governor and bandwidth savings.
+    let mut gov = HandheldShadowGovernor::new(2048, 4);
+    gov.set_throttling_mode(true);
+
+    if gov.current_resolution != 1024 || (gov.depth_bias_scale_factor() - 2.0).abs() > 0.001 {
+        return false;
+    }
+
+    let adj_bias = gov.compute_adjusted_depth_bias(bias_cfg);
+    if (adj_bias.depth_bias - 0.1).abs() > 0.0001 {
+        return false;
+    }
+
+    let saved = gov.record_frame_bandwidth_savings();
+    if saved != 50_331_648 || gov.total_bandwidth_saved_bytes != 50_331_648 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str(
+        "[KNT-D3D12-DEPTH-CONSERVATIVE-PASS] Direct3D 12 agility depth bias & conservative raster verified\r\n",
+    );
     true
 }
