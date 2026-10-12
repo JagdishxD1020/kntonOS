@@ -238,3 +238,57 @@ pub fn win32_evaluate_thread_watchpoints(
     }
     hit
 }
+
+/// Active hardware debug register context switch manager.
+pub struct HardwareDebugContextManager {
+    pub current_thread_id: AtomicU64,
+}
+
+impl HardwareDebugContextManager {
+    pub const fn new() -> Self {
+        Self {
+            current_thread_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Performs context switch of debug registers from prev_tid to next_tid.
+    /// Updates physical CPU debug registers (DR0-DR3, DR7) when running bare-metal.
+    pub fn switch_context(&self, prev_tid: u64, next_tid: u64) {
+        if prev_tid == next_tid {
+            return;
+        }
+
+        self.current_thread_id.store(next_tid, Ordering::Release);
+        let next_regs = win32_get_thread_debug_registers(next_tid);
+
+        // Load debug registers into active CPU state
+        unsafe {
+            let dr0 = next_regs.dr0;
+            let dr1 = next_regs.dr1;
+            let dr2 = next_regs.dr2;
+            let dr3 = next_regs.dr3;
+            let dr7 = next_regs.dr7;
+
+            core::arch::asm!(
+                "mov dr0, {0}",
+                "mov dr1, {1}",
+                "mov dr2, {2}",
+                "mov dr3, {3}",
+                "mov dr7, {4}",
+                in(reg) dr0,
+                in(reg) dr1,
+                in(reg) dr2,
+                in(reg) dr3,
+                in(reg) dr7,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+pub static DEBUG_CONTEXT_MGR: HardwareDebugContextManager = HardwareDebugContextManager::new();
+
+/// Switches hardware debug register context to the target thread.
+pub fn win32_switch_thread_debug_context(prev_tid: u64, next_tid: u64) {
+    DEBUG_CONTEXT_MGR.switch_context(prev_tid, next_tid);
+}
