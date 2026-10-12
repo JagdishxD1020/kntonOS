@@ -162,3 +162,57 @@ pub fn win32_register_thread_vector_state(thread_id: u64, has_avx512: bool, has_
 pub fn win32_dispatch_lazy_vector_switch(prev_tid: u64, next_tid: u64) -> bool {
     LAZY_VECTOR_GOVERNOR.on_thread_switch(prev_tid, next_tid)
 }
+
+/// Frequency-aware scheduler avoiding CPU thermal downclocking on heavy AVX-512 / AMX workloads.
+pub struct Avx512FrequencyGovernor {
+    pub avx512_heavy_thread_count: AtomicU32,
+    pub frequency_penalty_active: AtomicBool,
+    pub isolated_core_mask: AtomicU64,
+}
+
+impl Avx512FrequencyGovernor {
+    pub const fn new() -> Self {
+        Self {
+            avx512_heavy_thread_count: AtomicU32::new(0),
+            frequency_penalty_active: AtomicBool::new(false),
+            isolated_core_mask: AtomicU64::new(0b1100), // Pin heavy SIMD to upper cores
+        }
+    }
+
+    /// Evaluates whether a thread should be scheduled on isolated AVX-512 power islands.
+    pub fn schedule_vector_thread(&self, thread_id: u64, is_heavy_simd: bool) -> u32 {
+        if is_heavy_simd {
+            let count = self.avx512_heavy_thread_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if count >= 1 {
+                self.frequency_penalty_active.store(true, Ordering::Release);
+            }
+            // Assign to dedicated high-TDP compute core 2 or 3 to prevent main thread frequency downclock
+            2 + ((thread_id % 2) as u32)
+        } else {
+            // Assign to fast latency-sensitive core 0 or 1
+            (thread_id % 2) as u32
+        }
+    }
+
+    /// Releases a completed vector thread from the thermal budget tracking.
+    pub fn on_thread_complete(&self, is_heavy_simd: bool) {
+        if is_heavy_simd {
+            let prev = self.avx512_heavy_thread_count.fetch_sub(1, Ordering::SeqCst);
+            if prev <= 1 {
+                self.frequency_penalty_active.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Returns whether AVX-512 thermal mitigation is active.
+    pub fn is_mitigation_active(&self) -> bool {
+        self.frequency_penalty_active.load(Ordering::Acquire)
+    }
+}
+
+pub static AVX512_FREQ_GOVERNOR: Avx512FrequencyGovernor = Avx512FrequencyGovernor::new();
+
+/// Schedules a gaming thread based on AVX-512 intensity to avoid core frequency droop.
+pub fn win32_schedule_avx512_thread(thread_id: u64, is_heavy_simd: bool) -> u32 {
+    AVX512_FREQ_GOVERNOR.schedule_vector_thread(thread_id, is_heavy_simd)
+}
