@@ -292,3 +292,77 @@ pub static DEBUG_CONTEXT_MGR: HardwareDebugContextManager = HardwareDebugContext
 pub fn win32_switch_thread_debug_context(prev_tid: u64, next_tid: u64) {
     DEBUG_CONTEXT_MGR.switch_context(prev_tid, next_tid);
 }
+
+/// Anti-cheat memory hook guard protecting critical code sections and game state.
+pub struct AntiCheatMemoryHookGuard {
+    pub protected_regions: Spinlock<Vec<(usize, usize, &'static str)>>, // (base, len, name)
+    pub detected_tampering_count: AtomicU64,
+}
+
+impl AntiCheatMemoryHookGuard {
+    pub const fn new() -> Self {
+        Self {
+            protected_regions: Spinlock::new(Vec::new()),
+            detected_tampering_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers a critical code or game data region for watchpoint anti-cheat guarding.
+    pub fn protect_region(&self, base_addr: usize, len: usize, label: &'static str) {
+        let mut regions = self.protected_regions.lock();
+        regions.push((base_addr, len, label));
+    }
+
+    /// Verifies whether an unauthorized write attempt violated protected anti-cheat memory.
+    pub fn verify_unauthorized_write(&self, thread_id: u64, address: usize, size: usize) -> bool {
+        let regions = self.protected_regions.lock();
+        for &(base, len, label) in regions.iter() {
+            let reg_end = base.saturating_add(len);
+            let acc_end = address.saturating_add(size);
+            if address < reg_end && base < acc_end {
+                self.detected_tampering_count.fetch_add(1, Ordering::Relaxed);
+                crate::serial_write_str("[KNT-SECURITY] Anti-cheat trap: unauthorized memory modification detected on '");
+                crate::serial_write_str(label);
+                crate::serial_write_str("' by TID: ");
+                write_u64(thread_id);
+                crate::serial_write_str("\r\n");
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the total count of unauthorized tampering attempts caught.
+    pub fn tampering_violations(&self) -> u64 {
+        self.detected_tampering_count.load(Ordering::Acquire)
+    }
+}
+
+pub static ANTI_CHEAT_GUARD: AntiCheatMemoryHookGuard = AntiCheatMemoryHookGuard::new();
+
+/// Registers a memory region into the anti-cheat hardware watchpoint protection layer.
+pub fn win32_protect_anti_cheat_region(base_addr: usize, len: usize, label: &'static str) {
+    ANTI_CHEAT_GUARD.protect_region(base_addr, len, label);
+}
+
+/// Checks an unauthorized write attempt against registered anti-cheat memory regions.
+pub fn win32_check_anti_cheat_write_violation(thread_id: u64, address: usize, size: usize) -> bool {
+    ANTI_CHEAT_GUARD.verify_unauthorized_write(thread_id, address, size)
+}
+
+fn write_u64(mut val: u64) {
+    if val == 0 {
+        crate::serial_write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut len = 0;
+    while val > 0 {
+        buf[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        crate::serial_write_byte(buf[i]);
+    }
+}
