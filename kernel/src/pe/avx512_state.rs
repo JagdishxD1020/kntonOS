@@ -216,3 +216,80 @@ pub static AVX512_FREQ_GOVERNOR: Avx512FrequencyGovernor = Avx512FrequencyGovern
 pub fn win32_schedule_avx512_thread(thread_id: u64, is_heavy_simd: bool) -> u32 {
     AVX512_FREQ_GOVERNOR.schedule_vector_thread(thread_id, is_heavy_simd)
 }
+
+/// Computes a lightweight checksum over an extended state buffer to detect tampering.
+fn compute_state_checksum(buffer: &ExtendedVectorStateBuffer) -> u64 {
+    let mut hash = 0xCBF29CE484222325u64; // FNV-1a 64-bit basis
+    for &b in &buffer.legacy_fxsave[0..64] {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001B3);
+    }
+    hash ^= buffer.header.xstate_bv;
+    hash
+}
+
+/// Extended register state tampering detector and anti-cheat trap.
+pub struct ExtendedStateIntegrityGuard {
+    pub tampering_detected: AtomicU64,
+}
+
+impl ExtendedStateIntegrityGuard {
+    pub const fn new() -> Self {
+        Self {
+            tampering_detected: AtomicU64::new(0),
+        }
+    }
+
+    /// Seals a thread's vector state with an integrity tag prior to context switch.
+    pub fn seal_thread_state(&self, thread_id: u64) {
+        let mut states = THREAD_VECTOR_STATES.lock();
+        if let Some(desc) = states.get_mut(&thread_id) {
+            desc.checksum = compute_state_checksum(&desc.state_buffer);
+        }
+    }
+
+    /// Verifies thread vector state integrity on restore. Returns false if tampered.
+    pub fn verify_and_unseal(&self, thread_id: u64) -> bool {
+        let states = THREAD_VECTOR_STATES.lock();
+        if let Some(desc) = states.get(&thread_id) {
+            let actual = compute_state_checksum(&desc.state_buffer);
+            if desc.checksum != 0 && desc.checksum != actual {
+                self.tampering_detected.fetch_add(1, Ordering::Relaxed);
+                crate::serial_write_str("[KNT-SECURITY] Anti-cheat trap: vector register state tampering detected on TID: ");
+                write_u64_id(thread_id);
+                crate::serial_write_str("\r\n");
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub static INTEGRITY_GUARD: ExtendedStateIntegrityGuard = ExtendedStateIntegrityGuard::new();
+
+/// Seals a thread's vector state with an anti-cheat checksum.
+pub fn win32_seal_vector_state(thread_id: u64) {
+    INTEGRITY_GUARD.seal_thread_state(thread_id);
+}
+
+/// Verifies a thread's vector state against unauthorized tampering.
+pub fn win32_verify_vector_state(thread_id: u64) -> bool {
+    INTEGRITY_GUARD.verify_and_unseal(thread_id)
+}
+
+fn write_u64_id(mut val: u64) {
+    if val == 0 {
+        crate::serial_write_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut len = 0;
+    while val > 0 {
+        buf[len] = b'0' + (val % 10) as u8;
+        val /= 10;
+        len += 1;
+    }
+    for i in (0..len).rev() {
+        crate::serial_write_byte(buf[i]);
+    }
+}
