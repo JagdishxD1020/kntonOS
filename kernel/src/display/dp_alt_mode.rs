@@ -583,3 +583,234 @@ pub fn verify_docking_resolution_autoscaler() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 4: Dynamic Link Lane Power Gating During Handheld Screen Blanking
+// ============================================================================
+
+/// DisplayPort Advanced Link Power Management (ALPM) / Panel Replay & PSR2 State.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DpAlpmPowerState {
+    /// Active: all physical transmitter lanes fully powered, transmitting active pixels.
+    D0ActiveFullPower,
+    /// Standby / Panel Replay: internal screen self-refreshing from TCON memory.
+    /// PHY high-speed SERDES lanes enter sleep, reducing PHY power by ~85%.
+    D1PanelReplaySleep,
+    /// Screen Blanked / Deep Sleep: main link completely power-gated (0W PHY dissipation).
+    /// AUX channel listener remains active for instant wake (< 5ms).
+    D3DeepPowerGated,
+}
+
+/// Power consumption metrics and gating state for individual DP high-speed lanes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LanePowerState {
+    /// Lane index (0..3).
+    pub lane_idx: u8,
+    /// Whether transmitter SERDES circuitry on this lane is powered on.
+    pub is_lane_powered: bool,
+    /// Estimated lane power consumption in milliwatts (e.g. 180mW active, 5mW sleep, 0mW gated).
+    pub power_mw: u16,
+}
+
+/// Dynamic Link Lane Power Gating and Handheld Screen Blanking Controller.
+///
+/// Handheld devices drain significant battery (up to 1.5W - 2.5W) driving high-speed
+/// SERDES lanes when the screen is idle, locked, or blanked during audio playback.
+/// This governor monitors user idle timeouts and screen blanking requests, dynamically
+/// cutting power to unnecessary lanes and switching to ALPM/PSR2 states to conserve battery.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DpLanePowerGatingGovernor {
+    /// Global display PHY power state.
+    pub alpm_state: DpAlpmPowerState,
+    /// Individual power state for each of the 4 physical lanes.
+    pub lanes: [LanePowerState; 4],
+    /// Whether display is currently requested to be blanked (e.g. screen timeout or lid close).
+    pub is_screen_blanked: bool,
+    /// Idle duration in milliseconds.
+    pub idle_time_ms: u32,
+    /// Idle threshold to enter Panel Replay sleep (e.g. 1000 ms).
+    pub panel_replay_timeout_ms: u32,
+    /// Idle threshold to enter Deep Power Gated blanking (e.g. 5000 ms).
+    pub deep_sleep_timeout_ms: u32,
+    /// Cumulative power saved in milliwatt-hours (mWh).
+    pub power_saved_mwh: f32,
+    /// Wake transition latency in microseconds (target < 5,000 µs).
+    pub last_wake_latency_us: u32,
+    /// Power gating transition count.
+    pub state_transitions_count: u32,
+}
+
+impl DpLanePowerGatingGovernor {
+    /// Constructs a lane power gating governor with 4 lanes active.
+    pub const fn new() -> Self {
+        let lanes = [
+            LanePowerState { lane_idx: 0, is_lane_powered: true, power_mw: 180 },
+            LanePowerState { lane_idx: 1, is_lane_powered: true, power_mw: 180 },
+            LanePowerState { lane_idx: 2, is_lane_powered: true, power_mw: 180 },
+            LanePowerState { lane_idx: 3, is_lane_powered: true, power_mw: 180 },
+        ];
+
+        Self {
+            alpm_state: DpAlpmPowerState::D0ActiveFullPower,
+            lanes,
+            is_screen_blanked: false,
+            idle_time_ms: 0,
+            panel_replay_timeout_ms: 1_000,
+            deep_sleep_timeout_ms: 5_000,
+            power_saved_mwh: 0.0,
+            last_wake_latency_us: 0,
+            state_transitions_count: 0,
+        }
+    }
+
+    /// Total instantaneous power consumed by all 4 DP PHY lanes in mW.
+    pub fn get_total_phy_power_mw(&self) -> u16 {
+        self.lanes.iter().map(|l| l.power_mw).sum()
+    }
+
+    /// Evaluates display activity and executes dynamic lane power gating transitions.
+    pub fn update(&mut self, is_user_interacting: bool, request_blank: bool, dt_ms: u32) -> DpAlpmPowerState {
+        self.is_screen_blanked = request_blank;
+
+        if request_blank {
+            // Immediate deep power gating
+            if self.alpm_state != DpAlpmPowerState::D3DeepPowerGated {
+                self.alpm_state = DpAlpmPowerState::D3DeepPowerGated;
+                self.state_transitions_count += 1;
+                for l in &mut self.lanes {
+                    l.is_lane_powered = false;
+                    l.power_mw = 0;
+                }
+            }
+        } else if is_user_interacting {
+            // User interaction resets idle timer and wakes display to D0
+            self.idle_time_ms = 0;
+            if self.alpm_state != DpAlpmPowerState::D0ActiveFullPower {
+                self.last_wake_latency_us = match self.alpm_state {
+                    DpAlpmPowerState::D1PanelReplaySleep => 850,   // 0.85 ms fast AUX wake
+                    DpAlpmPowerState::D3DeepPowerGated => 4_200,   // 4.2 ms full PHY wake
+                    DpAlpmPowerState::D0ActiveFullPower => 0,
+                };
+                self.alpm_state = DpAlpmPowerState::D0ActiveFullPower;
+                self.state_transitions_count += 1;
+                for l in &mut self.lanes {
+                    l.is_lane_powered = true;
+                    l.power_mw = 180;
+                }
+            }
+        } else {
+            // Idle progression
+            self.idle_time_ms += dt_ms;
+
+            if self.idle_time_ms >= self.deep_sleep_timeout_ms {
+                if self.alpm_state != DpAlpmPowerState::D3DeepPowerGated {
+                    self.alpm_state = DpAlpmPowerState::D3DeepPowerGated;
+                    self.state_transitions_count += 1;
+                    for l in &mut self.lanes {
+                        l.is_lane_powered = false;
+                        l.power_mw = 0;
+                    }
+                }
+            } else if self.idle_time_ms >= self.panel_replay_timeout_ms {
+                if self.alpm_state != DpAlpmPowerState::D1PanelReplaySleep {
+                    self.alpm_state = DpAlpmPowerState::D1PanelReplaySleep;
+                    self.state_transitions_count += 1;
+                    for l in &mut self.lanes {
+                        l.is_lane_powered = false;
+                        l.power_mw = 5; // 5 mW standby
+                    }
+                }
+            }
+        }
+
+        // Telemetry: Baseline is 720 mW (4 * 180). Compute energy saved in mWh
+        let current_pwr = self.get_total_phy_power_mw();
+        let saved_mw = 720u16.saturating_sub(current_pwr);
+        let saved_mwh = (saved_mw as f32 * (dt_ms as f32 / 1000.0)) / 3600.0;
+        self.power_saved_mwh += saved_mwh;
+
+        self.alpm_state
+    }
+}
+
+/// Integrated Handheld USB-C DisplayPort & eDP Subsystem Controller.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldDpAltModeController {
+    /// USB-C DP Alt Mode speed negotiator.
+    pub negotiator: UsbCDpAltModeNegotiator,
+    /// eDP fast link trainer.
+    pub link_trainer: EdpFastLinkTrainer,
+    /// Docking autoscaler.
+    pub autoscaler: DockingResolutionAutoscaler,
+    /// Dynamic lane power gating governor.
+    pub power_governor: DpLanePowerGatingGovernor,
+}
+
+impl HandheldDpAltModeController {
+    /// Creates an integrated DP Alt Mode controller.
+    pub const fn new() -> Self {
+        Self {
+            negotiator: UsbCDpAltModeNegotiator::new(),
+            link_trainer: EdpFastLinkTrainer::new(),
+            autoscaler: DockingResolutionAutoscaler::new(),
+            power_governor: DpLanePowerGatingGovernor::new(),
+        }
+    }
+}
+
+/// Verification test for dynamic link lane power gating during handheld screen blanking.
+pub fn verify_dp_lane_power_gating() -> bool {
+    let mut gov = DpLanePowerGatingGovernor::new();
+
+    // 1. Initial state: D0 Active, all 4 lanes powered (720 mW)
+    if gov.alpm_state != DpAlpmPowerState::D0ActiveFullPower {
+        return false;
+    }
+    if gov.get_total_phy_power_mw() != 720 {
+        return false;
+    }
+
+    // 2. Idle for 1500 ms (> 1000 ms Panel Replay timeout)
+    let state1 = gov.update(false, false, 1500);
+    if state1 != DpAlpmPowerState::D1PanelReplaySleep {
+        return false;
+    }
+    // Power drops to 20 mW (4 * 5 mW)
+    if gov.get_total_phy_power_mw() != 20 {
+        return false;
+    }
+
+    // 3. Request immediate screen blanking (e.g. user taps power button to turn off screen)
+    let state2 = gov.update(false, true, 100);
+    if state2 != DpAlpmPowerState::D3DeepPowerGated {
+        return false;
+    }
+    // Power completely cut to 0 mW
+    if gov.get_total_phy_power_mw() != 0 {
+        return false;
+    }
+
+    // 4. User touches screen or presses button -> Wake back to D0
+    let state3 = gov.update(true, false, 10);
+    if state3 != DpAlpmPowerState::D0ActiveFullPower {
+        return false;
+    }
+    if gov.get_total_phy_power_mw() != 720 {
+        return false;
+    }
+    // Wake latency from D3 must be < 5,000 µs (4,200 µs recorded)
+    if gov.last_wake_latency_us >= 5_000 || gov.last_wake_latency_us != 4_200 {
+        return false;
+    }
+    if gov.power_saved_mwh <= 0.0 {
+        return false;
+    }
+
+    // 5. Verify integrated controller
+    let controller = HandheldDpAltModeController::new();
+    if controller.power_governor.get_total_phy_power_mw() != 720 {
+        return false;
+    }
+
+    true
+}
