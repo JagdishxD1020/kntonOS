@@ -280,6 +280,137 @@ impl GpuTlbEngine {
     }
 }
 
+// Error conditions encountered during sparse tile residency operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparseTileError {
+    PoolExhausted,
+    InvalidVirtualTile,
+    MappingFailed,
+}
+
+// Record tracking a resident physical tile allocated to a virtual texture region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidentTileRecord {
+    // Unique ID of owning sparse resource.
+    pub resource_id: u64,
+    // Virtual tile offset within the sparse resource.
+    pub virtual_tile_index: usize,
+    // Allocated physical tile pool slot.
+    pub physical_tile_index: u32,
+    // Timestamp frame counter when tile was last touched.
+    pub last_access_frame: u64,
+    // Residency priority level where higher values resist eviction.
+    pub priority: u32,
+}
+
+// Handheld sparse texture streaming governor mapping 64 KiB tiles on demand.
+#[derive(Debug, Clone)]
+pub struct HandheldSparseTextureGovernor {
+    // Maximum physical 64 KiB tiles permitted in active pool.
+    pub pool_capacity_tiles: usize,
+    // Active physical tile records currently mapped.
+    pub resident_tiles: Vec<ResidentTileRecord>,
+    // Next physical tile index allocated before pool wraps.
+    pub next_physical_tile: u32,
+    // Total on-demand tile streaming requests served.
+    pub total_tile_requests: u64,
+    // Total LRU tile evictions triggered under memory pressure.
+    pub total_evictions: u64,
+}
+
+impl HandheldSparseTextureGovernor {
+    // Creates a new handheld sparse texture streaming governor.
+    pub fn new(pool_capacity_tiles: usize) -> Self {
+        Self {
+            pool_capacity_tiles: if pool_capacity_tiles == 0 {
+                256
+            } else {
+                pool_capacity_tiles
+            },
+            resident_tiles: Vec::new(),
+            next_physical_tile: 0,
+            total_tile_requests: 0,
+            total_evictions: 0,
+        }
+    }
+
+    // Requests on-demand residency for a virtual tile, evicting LRU tiles if pool is full.
+    pub fn request_tile(
+        &mut self,
+        resource_id: u64,
+        virtual_tile: usize,
+        priority: u32,
+        frame_id: u64,
+        table: &mut SparseResourceMappingTable,
+    ) -> Result<u32, SparseTileError> {
+        self.total_tile_requests += 1;
+
+        // Check if tile is already resident.
+        for record in &mut self.resident_tiles {
+            if record.resource_id == resource_id && record.virtual_tile_index == virtual_tile {
+                record.last_access_frame = frame_id;
+                record.priority = priority;
+                return Ok(record.physical_tile_index);
+            }
+        }
+
+        // Allocate a new physical tile or evict LRU tile if pool is full.
+        let physical_tile = if self.resident_tiles.len() < self.pool_capacity_tiles {
+            let p = self.next_physical_tile;
+            self.next_physical_tile += 1;
+            p
+        } else {
+            let mut victim_idx = 0;
+            let mut lowest_prio = u32::MAX;
+            let mut oldest_frame = u64::MAX;
+
+            for (i, rec) in self.resident_tiles.iter().enumerate() {
+                if rec.priority < lowest_prio
+                    || (rec.priority == lowest_prio && rec.last_access_frame < oldest_frame)
+                {
+                    lowest_prio = rec.priority;
+                    oldest_frame = rec.last_access_frame;
+                    victim_idx = i;
+                }
+            }
+
+            let victim = self.resident_tiles.remove(victim_idx);
+            self.total_evictions += 1;
+
+            if table.resource_id == victim.resource_id
+                && victim.virtual_tile_index < table.total_virtual_tiles
+            {
+                table.virtual_to_physical[victim.virtual_tile_index] = None;
+            }
+
+            victim.physical_tile_index
+        };
+
+        self.resident_tiles.push(ResidentTileRecord {
+            resource_id,
+            virtual_tile_index: virtual_tile,
+            physical_tile_index: physical_tile,
+            last_access_frame: frame_id,
+            priority,
+        });
+
+        if virtual_tile < table.total_virtual_tiles {
+            table.virtual_to_physical[virtual_tile] = Some(physical_tile);
+        }
+
+        Ok(physical_tile)
+    }
+
+    // Returns percentage of physical tile pool currently committed in range 0 to 100.
+    pub fn pool_utilization_percentage(&self) -> u32 {
+        if self.pool_capacity_tiles == 0 {
+            0
+        } else {
+            ((self.resident_tiles.len() * 100) / self.pool_capacity_tiles) as u32
+        }
+    }
+}
+
 // Temporary stub for incremental commits.
 pub fn test_gpu_page_remapping_subsystem() -> bool {
     true
