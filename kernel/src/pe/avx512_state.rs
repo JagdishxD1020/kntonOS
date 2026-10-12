@@ -293,3 +293,82 @@ fn write_u64_id(mut val: u64) {
         crate::serial_write_byte(buf[i]);
     }
 }
+
+/// Self-test suite verifying AVX-512/AMX XSAVE state, lazy context switching, frequency governor, and anti-cheat trap.
+pub fn test_win32_avx512_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 AVX-512 & AMX Matrix State Lazy Governor self-test...\r\n");
+
+    let tid_scalar = 701;
+    let tid_avx = 702;
+    let tid_amx = 703;
+
+    // 1. Verify XCR0 extended feature mask
+    let xcr0 = unsafe { read_xcr0() };
+    if (xcr0 & XCR0_AVX512_MASK) != XCR0_AVX512_MASK || (xcr0 & XCR0_AMX_MASK) != XCR0_AMX_MASK {
+        crate::serial_write_str("[KNT-ERROR] XCR0 does not provide AVX-512 and AMX feature flags\r\n");
+        return false;
+    }
+
+    // 2. Register thread states: one scalar, one AVX-512, one AMX
+    if !win32_register_thread_vector_state(tid_scalar, false, false)
+        || !win32_register_thread_vector_state(tid_avx, true, false)
+        || !win32_register_thread_vector_state(tid_amx, false, true)
+    {
+        crate::serial_write_str("[KNT-ERROR] Failed to register thread vector states\r\n");
+        return false;
+    }
+
+    // 3. Test lazy context switch: scalar to scalar should skip save/restore
+    let tid_scalar2 = 704;
+    win32_register_thread_vector_state(tid_scalar2, false, false);
+    let switch_skipped = !win32_dispatch_lazy_vector_switch(tid_scalar, tid_scalar2);
+    if !switch_skipped {
+        crate::serial_write_str("[KNT-ERROR] Lazy context governor failed to skip non-SIMD switch\r\n");
+        return false;
+    }
+
+    // Switch from scalar to AVX-512 should require restore
+    let switch_simd = win32_dispatch_lazy_vector_switch(tid_scalar, tid_avx);
+    if !switch_simd {
+        crate::serial_write_str("[KNT-ERROR] SIMD context switch was unexpectedly skipped\r\n");
+        return false;
+    }
+
+    // 4. Test frequency-aware scheduler avoiding CPU downclocking
+    let core_scalar = win32_schedule_avx512_thread(tid_scalar, false);
+    if core_scalar >= 2 {
+        crate::serial_write_str("[KNT-ERROR] Scalar thread assigned to high-TDP compute island\r\n");
+        return false;
+    }
+
+    let core_avx = win32_schedule_avx512_thread(tid_avx, true);
+    if core_avx < 2 || !AVX512_FREQ_GOVERNOR.is_mitigation_active() {
+        crate::serial_write_str("[KNT-ERROR] Heavy AVX-512 thread not isolated or mitigation inactive\r\n");
+        return false;
+    }
+    AVX512_FREQ_GOVERNOR.on_thread_complete(true);
+
+    // 5. Test extended state integrity guard & anti-cheat trap
+    win32_seal_vector_state(tid_avx);
+    if !win32_verify_vector_state(tid_avx) {
+        crate::serial_write_str("[KNT-ERROR] Untampered vector state failed integrity check\r\n");
+        return false;
+    }
+
+    // Inject unauthorized vector register mutation
+    {
+        let mut states = THREAD_VECTOR_STATES.lock();
+        if let Some(desc) = states.get_mut(&tid_avx) {
+            desc.state_buffer.legacy_fxsave[10] ^= 0xFF; // Flip byte
+        }
+    }
+
+    let detected = !win32_verify_vector_state(tid_avx);
+    if !detected || INTEGRITY_GUARD.tampering_detected.load(Ordering::Acquire) == 0 {
+        crate::serial_write_str("[KNT-ERROR] Anti-cheat failed to detect vector register tampering\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-AVX512-PASS] Win32 AVX-512 / AMX matrix state lazy restore governor verified\r\n");
+    true
+}
