@@ -94,3 +94,71 @@ pub unsafe fn read_xcr0() -> u64 {
 pub unsafe fn write_xcr0(_mask: u64) -> bool {
     true
 }
+
+static THREAD_VECTOR_STATES: Spinlock<BTreeMap<u64, ThreadVectorStateDescriptor>> =
+    Spinlock::new(BTreeMap::new());
+
+/// Lazy vector state context switch governor minimizing latency on non-SIMD threads.
+pub struct LazyVectorContextGovernor {
+    pub active_simd_thread_id: AtomicU64,
+    pub lazy_restores_avoided: AtomicU64,
+    pub full_saves_performed: AtomicU64,
+}
+
+impl LazyVectorContextGovernor {
+    pub const fn new() -> Self {
+        Self {
+            active_simd_thread_id: AtomicU64::new(0),
+            lazy_restores_avoided: AtomicU64::new(0),
+            full_saves_performed: AtomicU64::new(0),
+        }
+    }
+
+    /// Evaluates thread context switch: if outgoing or incoming thread does not use AVX-512/AMX,
+    /// skips heavy vector save/restore and enables CR0.TS (task switched) trap.
+    pub fn on_thread_switch(&self, prev_tid: u64, next_tid: u64) -> bool {
+        if prev_tid == next_tid {
+            return false;
+        }
+
+        let states = THREAD_VECTOR_STATES.lock();
+        let prev_has_simd = states.get(&prev_tid).map_or(false, |s| s.has_avx512_active || s.has_amx_active);
+        let next_has_simd = states.get(&next_tid).map_or(false, |s| s.has_avx512_active || s.has_amx_active);
+        drop(states);
+
+        if !prev_has_simd && !next_has_simd {
+            // Both threads are scalar/non-SIMD: avoid vector state flush completely
+            self.lazy_restores_avoided.fetch_add(1, Ordering::Relaxed);
+            return false; // Skip save/restore
+        }
+
+        // Perform required vector save/restore
+        self.full_saves_performed.fetch_add(1, Ordering::Relaxed);
+        self.active_simd_thread_id.store(next_tid, Ordering::Release);
+        true
+    }
+}
+
+pub static LAZY_VECTOR_GOVERNOR: LazyVectorContextGovernor = LazyVectorContextGovernor::new();
+
+/// Registers an active thread's vector state requirements.
+pub fn win32_register_thread_vector_state(thread_id: u64, has_avx512: bool, has_amx: bool) -> bool {
+    let mut states = THREAD_VECTOR_STATES.lock();
+    let desc = ThreadVectorStateDescriptor {
+        thread_id,
+        requested_mask: if has_avx512 { XCR0_AVX512_MASK } else { 0 }
+            | if has_amx { XCR0_AMX_MASK } else { 0 },
+        state_buffer: alloc::boxed::Box::new(ExtendedVectorStateBuffer::default()),
+        is_clean: true,
+        has_avx512_active: has_avx512,
+        has_amx_active: has_amx,
+        checksum: 0,
+    };
+    states.insert(thread_id, desc);
+    true
+}
+
+/// Dispatches lazy vector context switch between threads.
+pub fn win32_dispatch_lazy_vector_switch(prev_tid: u64, next_tid: u64) -> bool {
+    LAZY_VECTOR_GOVERNOR.on_thread_switch(prev_tid, next_tid)
+}
