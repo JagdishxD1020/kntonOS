@@ -9,3 +9,6 @@ pub use wifi_gaming::*;
 
 pub mod wifi_mlo;
 pub use wifi_mlo::*;
+
+pub mod wifi_punctured;
+pub use wifi_punctured::*;
