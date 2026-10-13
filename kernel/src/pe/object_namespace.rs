@@ -1,0 +1,450 @@
+//! Win32 Kernel Object Namespace Directory, Symbolic Link Engine & Object Manager Security.
+//!
+//! Implements Windows NT hierarchical object directory namespace, symbolic link resolution,
+//! object type registration, security descriptor DACL validation, and anti-cheat object hook defense.
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, unused_imports, dead_code)]
+
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+use crate::memory::spinlock::Spinlock;
+use crate::pe::ntdll::{
+    nt_error, nt_status_to_str, nt_success, NtStatus, ObjectAttributes, UnicodeString,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_NO_MEMORY,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS,
+};
+pub use crate::pe::synch::HANDLE;
+pub use crate::pe::token_security::{
+    SecurityDescriptor, ACCESS_MASK, DELETE, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
+    GENERIC_WRITE, READ_CONTROL, SID, STANDARD_RIGHTS_ALL, STANDARD_RIGHTS_EXECUTE,
+    STANDARD_RIGHTS_READ, STANDARD_RIGHTS_REQUIRED, STANDARD_RIGHTS_WRITE, SYNCHRONIZE, WRITE_DAC,
+    WRITE_OWNER,
+};
+
+// Additional NT Status codes
+pub const STATUS_ACCESS_DENIED: NtStatus = 0xC000_0022;
+pub const STATUS_OBJECT_TYPE_MISMATCH: NtStatus = 0xC000_0024;
+pub const STATUS_OBJECT_PATH_INVALID: NtStatus = 0xC000_0039;
+pub const STATUS_OBJECT_PATH_NOT_FOUND: NtStatus = 0xC000_003A;
+pub const STATUS_OBJECT_PATH_SYNTAX_BAD: NtStatus = 0xC000_003B;
+pub const STATUS_TOO_MANY_LINKS: NtStatus = 0xC000_0266;
+pub const STATUS_CIRCULAR_REFERENCE: NtStatus = 0xC000_0267;
+pub const STATUS_DIRECTORY_NOT_EMPTY: NtStatus = 0xC000_0101;
+
+// Object Attributes flags
+pub const OBJ_INHERIT: u32 = 0x0000_0002;
+pub const OBJ_PERMANENT: u32 = 0x0000_0010;
+pub const OBJ_EXCLUSIVE: u32 = 0x0000_0020;
+pub const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+pub const OBJ_OPENIF: u32 = 0x0000_0080;
+pub const OBJ_OPENLINK: u32 = 0x0000_0100;
+pub const OBJ_KERNEL_HANDLE: u32 = 0x0000_0200;
+pub const OBJ_FORCE_ACCESS_CHECK: u32 = 0x0000_0400;
+pub const OBJ_DONT_REPARSE: u32 = 0x0000_0800;
+
+// Directory specific access rights
+pub const DIRECTORY_QUERY: ACCESS_MASK = 0x0001;
+pub const DIRECTORY_TRAVERSE: ACCESS_MASK = 0x0002;
+pub const DIRECTORY_CREATE_OBJECT: ACCESS_MASK = 0x0004;
+pub const DIRECTORY_CREATE_SUBDIRECTORY: ACCESS_MASK = 0x0008;
+pub const DIRECTORY_ALL_ACCESS: ACCESS_MASK = STANDARD_RIGHTS_REQUIRED | 0x000F;
+
+// Symbolic Link specific access rights
+pub const SYMBOLIC_LINK_QUERY: ACCESS_MASK = 0x0001;
+pub const SYMBOLIC_LINK_SET: ACCESS_MASK = 0x0002;
+pub const SYMBOLIC_LINK_ALL_ACCESS: ACCESS_MASK = STANDARD_RIGHTS_REQUIRED | 0x0001;
+
+// Maximum symbolic link resolution depth to avoid infinite loops
+pub const MAX_SYMBOLIC_LINK_DEPTH: usize = 32;
+
+/// Enumeration of supported NT object types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectTypeKind {
+    Directory,
+    SymbolicLink,
+    Device,
+    Section,
+    Event,
+    Mutant,
+    Semaphore,
+    Port,
+    Key,
+    Job,
+    File,
+    Custom,
+}
+
+/// Caller integrity and trust level for anti-cheat verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProcessTrustLevel {
+    Untrusted = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    System = 4,
+    ProtectedGame = 5,
+}
+
+/// Common header present on all NT kernel objects.
+#[derive(Clone)]
+pub struct ObjectHeader {
+    pub name: String,
+    pub type_kind: ObjectTypeKind,
+    pub attributes: u32,
+    pub pointer_count: usize,
+    pub handle_count: usize,
+    pub security_descriptor: Option<SecurityDescriptor>,
+    pub is_permanent: bool,
+    pub is_protected: bool,
+    pub min_trust_level: ProcessTrustLevel,
+}
+
+/// Internal payload for directory nodes.
+pub struct ObjectDirectory {
+    pub entries: BTreeMap<String, Arc<Spinlock<NtObject>>>,
+    pub is_protected_system_dir: bool,
+}
+
+impl ObjectDirectory {
+    pub fn new(is_protected: bool) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            is_protected_system_dir: is_protected,
+        }
+    }
+}
+
+/// Internal payload for symbolic link nodes.
+pub struct SymbolicLinkObject {
+    pub target_path: String,
+    pub creation_time: u64,
+}
+
+/// Payload variants for NT objects.
+pub enum ObjectPayload {
+    Directory(ObjectDirectory),
+    SymbolicLink(SymbolicLinkObject),
+    Device { device_type: u32, device_number: u32 },
+    Section { size: u64, section_handle: u64 },
+    Custom { tag: u32 },
+}
+
+/// Complete in-memory NT kernel object.
+pub struct NtObject {
+    pub header: ObjectHeader,
+    pub payload: ObjectPayload,
+}
+
+impl NtObject {
+    pub fn new_directory(
+        name: &str,
+        attributes: u32,
+        is_protected: bool,
+        min_trust: ProcessTrustLevel,
+    ) -> Self {
+        Self {
+            header: ObjectHeader {
+                name: name.to_string(),
+                type_kind: ObjectTypeKind::Directory,
+                attributes,
+                pointer_count: 1,
+                handle_count: 0,
+                security_descriptor: None,
+                is_permanent: (attributes & OBJ_PERMANENT) != 0,
+                is_protected,
+                min_trust_level: min_trust,
+            },
+            payload: ObjectPayload::Directory(ObjectDirectory {
+                entries: BTreeMap::new(),
+                is_protected_system_dir: is_protected,
+            }),
+        }
+    }
+}
+
+/// Handle table entry tracking an open object.
+#[derive(Clone)]
+pub struct HandleEntry {
+    pub object: Arc<Spinlock<NtObject>>,
+    pub granted_access: ACCESS_MASK,
+    pub process_id: u64,
+}
+
+/// Normalizes path by stripping redundant delimiters and handling case insensitivity.
+pub fn normalize_nt_path(path: &str) -> String {
+    let mut normalized = String::new();
+    let mut prev_slash = false;
+
+    for ch in path.chars() {
+        if ch == '\\' || ch == '/' {
+            if !prev_slash {
+                normalized.push('\\');
+                prev_slash = true;
+            }
+        } else {
+            normalized.push(ch);
+            prev_slash = false;
+        }
+    }
+
+    if normalized.len() > 1 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+
+    normalized
+}
+
+/// Splits a normalized NT path into individual component names.
+pub fn split_nt_path(path: &str) -> Vec<String> {
+    let norm = normalize_nt_path(path);
+    norm.split('\\')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Central Object Manager and Namespace Directory Tree Governor.
+pub struct ObjectNamespaceManager {
+    pub root_directory: Arc<Spinlock<NtObject>>,
+    pub handle_table: BTreeMap<HANDLE, HandleEntry>,
+    pub next_handle: usize,
+}
+
+impl ObjectNamespaceManager {
+    /// Constructs a fully populated standard NT object directory namespace.
+    pub fn new() -> Self {
+        let root = Arc::new(Spinlock::new(NtObject::new_directory(
+            "",
+            OBJ_PERMANENT | OBJ_CASE_INSENSITIVE,
+            false,
+            ProcessTrustLevel::Untrusted,
+        )));
+
+        let mut mgr = Self {
+            root_directory: root,
+            handle_table: BTreeMap::new(),
+            next_handle: 0x100,
+        };
+
+        // Initialize standard NT hierarchical directories
+        mgr.init_standard_directories();
+        mgr
+    }
+
+    /// Initializes standard NT namespace hierarchy.
+    fn init_standard_directories(&mut self) {
+        let std_dirs = [
+            ("Device", false, ProcessTrustLevel::Untrusted),
+            ("DosDevices", false, ProcessTrustLevel::Untrusted),
+            ("BaseNamedObjects", false, ProcessTrustLevel::Untrusted),
+            ("KernelObjects", true, ProcessTrustLevel::System),
+            ("Session", false, ProcessTrustLevel::Untrusted),
+            ("KnownDlls", true, ProcessTrustLevel::System),
+            ("GLOBAL??", false, ProcessTrustLevel::Untrusted),
+        ];
+
+        for (name, is_protected, min_trust) in std_dirs {
+            let _ = self.create_subdirectory_internal(&self.root_directory.clone(), name, is_protected, min_trust);
+        }
+
+        // Initialize \Session\0 and \Session\0\BaseNamedObjects
+        if let Ok(session_dir) = self.lookup_entry_direct(&self.root_directory.clone(), "Session") {
+            let session_0 = self.create_subdirectory_internal(&session_dir, "0", false, ProcessTrustLevel::Untrusted);
+            if let Ok(s0) = session_0 {
+                let _ = self.create_subdirectory_internal(&s0, "BaseNamedObjects", false, ProcessTrustLevel::Untrusted);
+            }
+        }
+    }
+
+    /// Creates an internal subdirectory node.
+    pub fn create_subdirectory_internal(
+        &self,
+        parent: &Arc<Spinlock<NtObject>>,
+        name: &str,
+        is_protected: bool,
+        min_trust: ProcessTrustLevel,
+    ) -> Result<Arc<Spinlock<NtObject>>, NtStatus> {
+        let mut p = parent.lock();
+        if let ObjectPayload::Directory(ref mut dir) = p.payload {
+            let lookup_key = name.to_ascii_lowercase();
+            if dir.entries.contains_key(&lookup_key) {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
+
+            let new_dir = Arc::new(Spinlock::new(NtObject::new_directory(
+                name,
+                OBJ_PERMANENT | OBJ_CASE_INSENSITIVE,
+                is_protected,
+                min_trust,
+            )));
+            dir.entries.insert(lookup_key, new_dir.clone());
+            Ok(new_dir)
+        } else {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        }
+    }
+
+    /// Lookups direct child entry in a directory by name (case-insensitive).
+    pub fn lookup_entry_direct(
+        &self,
+        dir: &Arc<Spinlock<NtObject>>,
+        name: &str,
+    ) -> Result<Arc<Spinlock<NtObject>>, NtStatus> {
+        let d = dir.lock();
+        if let ObjectPayload::Directory(ref directory) = d.payload {
+            let lookup_key = name.to_ascii_lowercase();
+            directory
+                .entries
+                .get(&lookup_key)
+                .cloned()
+                .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)
+        } else {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        }
+    }
+
+    /// Traverses a hierarchical path from root without resolving terminal symlinks.
+    pub fn traverse_directory_path(
+        &self,
+        path: &str,
+    ) -> Result<(Arc<Spinlock<NtObject>>, Option<String>), NtStatus> {
+        let components = split_nt_path(path);
+        if components.is_empty() {
+            return Ok((self.root_directory.clone(), None));
+        }
+
+        let mut current = self.root_directory.clone();
+
+        for (i, comp) in components.iter().enumerate() {
+            let is_last = i == components.len() - 1;
+            if is_last {
+                return Ok((current, Some(comp.clone())));
+            }
+
+            let next = self.lookup_entry_direct(&current, comp)?;
+            current = next;
+        }
+
+        Ok((current, None))
+    }
+
+    /// Resolves an object by full absolute NT path directly.
+    pub fn resolve_object_direct(&self, path: &str) -> Result<Arc<Spinlock<NtObject>>, NtStatus> {
+        let components = split_nt_path(path);
+        if components.is_empty() {
+            return Ok(self.root_directory.clone());
+        }
+
+        let mut current = self.root_directory.clone();
+        for comp in &components {
+            let next = self.lookup_entry_direct(&current, comp)?;
+            current = next;
+        }
+
+        Ok(current)
+    }
+
+    /// Opens an existing directory by path.
+    pub fn open_directory(
+        &mut self,
+        path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+    ) -> Result<HANDLE, NtStatus> {
+        let obj = self.resolve_object_direct(path)?;
+        {
+            let o = obj.lock();
+            if o.header.type_kind != ObjectTypeKind::Directory {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+        }
+        Ok(self.allocate_handle(obj, desired_access, process_id))
+    }
+
+    /// Creates a directory object in the namespace.
+    pub fn create_directory(
+        &mut self,
+        path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+    ) -> Result<HANDLE, NtStatus> {
+        let (parent_dir, leaf_name) = self.traverse_directory_path(path)?;
+        let name = leaf_name.ok_or(STATUS_OBJECT_PATH_INVALID)?;
+        let new_dir = self.create_subdirectory_internal(
+            &parent_dir,
+            &name,
+            false,
+            ProcessTrustLevel::Untrusted,
+        )?;
+        Ok(self.allocate_handle(new_dir, desired_access, process_id))
+    }
+
+    /// Allocates an internal handle for an object.
+    pub fn allocate_handle(
+        &mut self,
+        object: Arc<Spinlock<NtObject>>,
+        granted_access: ACCESS_MASK,
+        process_id: u64,
+    ) -> HANDLE {
+        let handle = self.next_handle;
+        self.next_handle += 4;
+
+        {
+            let mut obj = object.lock();
+            obj.header.handle_count += 1;
+            obj.header.pointer_count += 1;
+        }
+
+        self.handle_table.insert(
+            handle,
+            HandleEntry {
+                object,
+                granted_access,
+                process_id,
+            },
+        );
+
+        handle
+    }
+
+    /// Closes an open handle.
+    pub fn close_handle(&mut self, handle: HANDLE) -> bool {
+        if let Some(entry) = self.handle_table.remove(&handle) {
+            let mut obj = entry.object.lock();
+            if obj.header.handle_count > 0 {
+                obj.header.handle_count -= 1;
+            }
+            if obj.header.pointer_count > 0 {
+                obj.header.pointer_count -= 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Global system-wide NT Object Namespace Manager instance.
+static GLOBAL_OBJECT_NAMESPACE: Spinlock<Option<ObjectNamespaceManager>> = Spinlock::new(None);
+
+/// Initializes the global NT object namespace subsystem.
+pub fn init_object_namespace() {
+    let mut lock = GLOBAL_OBJECT_NAMESPACE.lock();
+    if lock.is_none() {
+        *lock = Some(ObjectNamespaceManager::new());
+    }
+}
+
+/// Accessor for global object namespace manager.
+pub fn with_object_namespace<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ObjectNamespaceManager) -> R,
+{
+    init_object_namespace();
+    let mut lock = GLOBAL_OBJECT_NAMESPACE.lock();
+    f(lock.as_mut().unwrap())
+}

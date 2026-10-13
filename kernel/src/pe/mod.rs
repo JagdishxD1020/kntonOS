@@ -40,6 +40,7 @@ pub mod guard_stack;
 pub mod etw_provider;
 pub mod debug_registers;
 pub mod avx512_state;
+pub mod object_namespace;
 
 pub use header::*;
 pub use ntdll::*;
@@ -79,6 +80,7 @@ pub use guard_stack::*;
 pub use etw_provider::*;
 pub use debug_registers::*;
 pub use avx512_state::*;
+pub use object_namespace::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
