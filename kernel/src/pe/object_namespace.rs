@@ -340,12 +340,141 @@ pub fn split_nt_path(path: &str) -> Vec<String> {
         .collect()
 }
 
+
+/// Types of anti-cheat namespace tampering violations detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiCheatViolationKind {
+    None,
+    RogueKnownDllInjection,
+    ProtectedDirectoryHook,
+    SymbolicLinkHijack,
+    UnauthorizedDaclModification,
+    RogueObjectCreation,
+}
+
+/// Diagnostic record capturing an anti-cheat tampering attempt.
+#[derive(Debug, Clone)]
+pub struct TamperViolationRecord {
+    pub timestamp: u64,
+    pub process_id: u64,
+    pub caller_trust_level: ProcessTrustLevel,
+    pub target_path: String,
+    pub violation_kind: AntiCheatViolationKind,
+}
+
+/// Anti-cheat namespace hook protection and rogue object injection defense governor.
+pub struct AntiCheatNamespaceGuard {
+    pub protected_prefixes: Vec<String>,
+    pub tamper_records: Vec<TamperViolationRecord>,
+    pub tamper_count: AtomicU32,
+    pub strict_enforcement: AtomicBool,
+}
+
+impl AntiCheatNamespaceGuard {
+    pub fn new() -> Self {
+        Self {
+            protected_prefixes: alloc::vec![
+                String::from("\\knowndlls"),
+                String::from("\\kernelobjects"),
+                String::from("\\device\\physicalmemory"),
+            ],
+            tamper_records: Vec::new(),
+            tamper_count: AtomicU32::new(0),
+            strict_enforcement: AtomicBool::new(true),
+        }
+    }
+
+    /// Evaluates whether an object creation or modification request in a namespace path violates anti-cheat policy.
+    pub fn verify_operation(
+        &mut self,
+        target_path: &str,
+        caller: &CallerSecurityContext,
+        is_symlink: bool,
+    ) -> Result<(), NtStatus> {
+        let norm_path = normalize_nt_path(target_path).to_ascii_lowercase();
+
+        // 1. Rogue KnownDlls injection defense: only System trust can add/alter \KnownDlls
+        if norm_path.starts_with("\\knowndlls") {
+            if caller.trust_level < ProcessTrustLevel::System {
+                self.record_violation(
+                    caller,
+                    target_path,
+                    AntiCheatViolationKind::RogueKnownDllInjection,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        // 2. KernelObjects directory protection
+        if norm_path.starts_with("\\kernelobjects") {
+            if caller.trust_level < ProcessTrustLevel::System {
+                self.record_violation(
+                    caller,
+                    target_path,
+                    AntiCheatViolationKind::ProtectedDirectoryHook,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        // 3. Symbolic link hijacking check in BaseNamedObjects or critical roots
+        if is_symlink {
+            if norm_path.starts_with("\\basenamedobjects\\anticheat")
+                || norm_path.starts_with("\\basenamedobjects\\system")
+            {
+                if caller.trust_level < ProcessTrustLevel::High {
+                    self.record_violation(
+                        caller,
+                        target_path,
+                        AntiCheatViolationKind::SymbolicLinkHijack,
+                    );
+                    return Err(STATUS_ACCESS_DENIED);
+                }
+            }
+        }
+
+        // 4. Untrusted process restriction on BaseNamedObjects protected game prefixes
+        if caller.trust_level == ProcessTrustLevel::Untrusted {
+            if norm_path.starts_with("\\basenamedobjects") {
+                // Untrusted caller attempted rogue injection
+                self.record_violation(
+                    caller,
+                    target_path,
+                    AntiCheatViolationKind::RogueObjectCreation,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Records an anti-cheat tampering violation event.
+    pub fn record_violation(
+        &mut self,
+        caller: &CallerSecurityContext,
+        target_path: &str,
+        kind: AntiCheatViolationKind,
+    ) {
+        self.tamper_count.fetch_add(1, Ordering::SeqCst);
+        let record = TamperViolationRecord {
+            timestamp: 0,
+            process_id: caller.process_id,
+            caller_trust_level: caller.trust_level,
+            target_path: target_path.to_string(),
+            violation_kind: kind,
+        };
+        self.tamper_records.push(record);
+    }
+}
+
 /// Central Object Manager and Namespace Directory Tree Governor.
 pub struct ObjectNamespaceManager {
     pub root_directory: Arc<Spinlock<NtObject>>,
     pub object_types: BTreeMap<String, Arc<ObjectType>>,
     pub handle_table: BTreeMap<HANDLE, HandleEntry>,
     pub next_handle: usize,
+    pub anti_cheat_guard: AntiCheatNamespaceGuard,
 }
 
 impl ObjectNamespaceManager {
@@ -363,6 +492,7 @@ let mut mgr = Self {
             object_types: BTreeMap::new(),
             handle_table: BTreeMap::new(),
             next_handle: 0x100,
+            anti_cheat_guard: AntiCheatNamespaceGuard::new(),
         };
 
         mgr.register_standard_types();
@@ -502,7 +632,35 @@ let mut mgr = Self {
     }
 
     /// Creates a directory object in the namespace.
+    pub fn create_directory_secure(
+        &mut self,
+        path: &str,
+        desired_access: ACCESS_MASK,
+        caller: &CallerSecurityContext,
+    ) -> Result<HANDLE, NtStatus> {
+        self.anti_cheat_guard.verify_operation(path, caller, false)?;
+        let (parent_dir, leaf_name) = self.traverse_directory_path(path)?;
+        let name = leaf_name.ok_or(STATUS_OBJECT_PATH_INVALID)?;
+        let new_dir = self.create_subdirectory_internal(
+            &parent_dir,
+            &name,
+            false,
+            caller.trust_level,
+        )?;
+        Ok(self.allocate_handle(new_dir, desired_access, caller.process_id))
+    }
+
     pub fn create_directory(
+        &mut self,
+        path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+    ) -> Result<HANDLE, NtStatus> {
+        let caller = CallerSecurityContext::new_system(process_id);
+        self.create_directory_secure(path, desired_access, &caller)
+    }
+
+    pub fn create_directory_old(
         &mut self,
         path: &str,
         desired_access: ACCESS_MASK,
@@ -521,7 +679,60 @@ let mut mgr = Self {
 
 
     /// Creates a symbolic link in the object namespace.
+    pub fn create_symbolic_link_secure(
+        &mut self,
+        link_path: &str,
+        target_path: &str,
+        desired_access: ACCESS_MASK,
+        caller: &CallerSecurityContext,
+        is_protected: bool,
+    ) -> Result<HANDLE, NtStatus> {
+        self.anti_cheat_guard.verify_operation(link_path, caller, true)?;
+        let (parent_dir, leaf_name) = self.traverse_directory_path(link_path)?;
+        let name = leaf_name.ok_or(STATUS_OBJECT_PATH_INVALID)?;
+
+        let mut p = parent_dir.lock();
+        if let ObjectPayload::Directory(ref mut dir) = p.payload {
+            let lookup_key = name.to_ascii_lowercase();
+            if dir.entries.contains_key(&lookup_key) {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
+
+            let link_obj = Arc::new(Spinlock::new(NtObject::new_symbolic_link(
+                &name,
+                target_path,
+                OBJ_CASE_INSENSITIVE,
+                is_protected,
+                caller.trust_level,
+            )));
+            dir.entries.insert(lookup_key, link_obj.clone());
+            drop(p);
+
+            Ok(self.allocate_handle(link_obj, desired_access, caller.process_id))
+        } else {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        }
+    }
+
     pub fn create_symbolic_link(
+        &mut self,
+        link_path: &str,
+        target_path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+        is_protected: bool,
+        min_trust: ProcessTrustLevel,
+    ) -> Result<HANDLE, NtStatus> {
+        let caller = CallerSecurityContext {
+            process_id,
+            client_sids: alloc::vec![SID::world_sid()],
+            trust_level: min_trust,
+            is_kernel: min_trust >= ProcessTrustLevel::System,
+        };
+        self.create_symbolic_link_secure(link_path, target_path, desired_access, &caller, is_protected)
+    }
+
+    pub fn create_symbolic_link_legacy(
         &mut self,
         link_path: &str,
         target_path: &str,
@@ -881,6 +1092,19 @@ let mut mgr = Self {
         let mut o = obj.lock();
         o.header.security_descriptor = Some(sd);
         Ok(())
+    }
+
+
+    /// Queries the total count of anti-cheat violations and the most recent record.
+    pub fn get_anti_cheat_stats(&self) -> (u32, Option<TamperViolationRecord>) {
+        let count = self.anti_cheat_guard.tamper_count.load(Ordering::SeqCst);
+        let last = self.anti_cheat_guard.tamper_records.last().cloned();
+        (count, last)
+    }
+
+    /// Returns true if any anti-cheat tampering violations were recorded.
+    pub fn is_namespace_tamper_detected(&self) -> bool {
+        self.anti_cheat_guard.tamper_count.load(Ordering::SeqCst) > 0
     }
 
     /// Closes an open handle.
