@@ -574,3 +574,192 @@ pub fn verify_hrtf_vector_panner() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 4: Handheld Headphone Crossfeed Downmixer & Doppler Shift Simulation
+// ============================================================================
+
+/// Handheld Headphone Crossfeed / Virtual Surround Downmixer with Doppler Shift Engine.
+///
+/// Handheld gaming over headphones often causes listener ear fatigue due to extreme
+/// stereo hard-panning (sound isolated strictly to one ear with zero acoustic leakage).
+/// Crossfeed injects a subtly delayed (~250 µs) and low-pass filtered copy of each channel
+/// into the opposite ear (Meier crossfeed model), creating natural out-of-head speaker imaging.
+///
+/// Furthermore, fast-moving game sound sources (e.g. racing cars, incoming projectiles,
+/// fly-bys) require real-time Doppler frequency pitch shifting:
+/// f' = f * (c / (c - v_radial)), bounded to prevent harsh pitching anomalies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldHeadphoneCrossfeedDopplerEngine {
+    /// Crossfeed blend level (0.0 = bypass, 0.3 = subtle natural, 0.6 = wide virtual surround).
+    pub crossfeed_amount: f32,
+    /// Crossfeed delay buffer for left-to-right spill (samples).
+    pub crossfeed_delay_l: [f32; 16],
+    /// Crossfeed delay buffer for right-to-left spill (samples).
+    pub crossfeed_delay_r: [f32; 16],
+    /// Crossfeed write index (0..16).
+    pub crossfeed_idx: usize,
+    /// Low-pass filtered state for crossfeed channel L.
+    pub crossfeed_lpf_state_l: f32,
+    /// Low-pass filtered state for crossfeed channel R.
+    pub crossfeed_lpf_state_r: f32,
+    /// Speed of sound in m/s (343.0 m/s).
+    pub speed_of_sound_mps: f32,
+    /// Current source velocity vector relative to listener (m/s).
+    pub source_velocity: SpatialVector3D,
+    /// Current calculated Doppler pitch shift scale factor (e.g. 1.0 = stationary, 1.15 = approaching, 0.88 = receding).
+    pub doppler_factor: f32,
+}
+
+impl HandheldHeadphoneCrossfeedDopplerEngine {
+    /// Constructs a headphone crossfeed and Doppler shift engine.
+    pub const fn new() -> Self {
+        Self {
+            crossfeed_amount: 0.35,
+            crossfeed_delay_l: [0.0f32; 16],
+            crossfeed_delay_r: [0.0f32; 16],
+            crossfeed_idx: 0,
+            crossfeed_lpf_state_l: 0.0,
+            crossfeed_lpf_state_r: 0.0,
+            speed_of_sound_mps: 343.0,
+            source_velocity: SpatialVector3D::new(0.0, 0.0, 0.0),
+            doppler_factor: 1.0,
+        }
+    }
+
+    /// Updates Doppler frequency pitch factor based on source position and relative velocity.
+    pub fn update_doppler(&mut self, source_pos: SpatialVector3D, source_vel: SpatialVector3D) -> f32 {
+        self.source_velocity = source_vel;
+        let dist = source_pos.distance();
+
+        if dist < 1e-3 {
+            self.doppler_factor = 1.0;
+            return 1.0;
+        }
+
+        // Radial velocity = dot(velocity, position_unit_vector)
+        // Positive radial velocity means moving AWAY from listener (receding -> lower pitch)
+        // Negative radial velocity means moving TOWARDS listener (approaching -> higher pitch)
+        let dir_x = source_pos.x / dist;
+        let dir_y = source_pos.y / dist;
+        let dir_z = source_pos.z / dist;
+
+        let v_radial = source_vel.x * dir_x + source_vel.y * dir_y + source_vel.z * dir_z;
+
+        // Doppler formula: f' / f = c / (c + v_radial)
+        // Clamp v_radial to avoid division by zero or supersonic shock singularity (-300 m/s to +300 m/s)
+        let clamped_v = if v_radial < -300.0 { -300.0 } else if v_radial > 300.0 { 300.0 } else { v_radial };
+        let factor = self.speed_of_sound_mps / (self.speed_of_sound_mps + clamped_v);
+
+        // Bound Doppler pitch factor between 0.5x (-1 octave) and 2.0x (+1 octave)
+        self.doppler_factor = if factor < 0.5 { 0.5 } else if factor > 2.0 { 2.0 } else { factor };
+        self.doppler_factor
+    }
+
+    /// Processes a stereo input pair (L, R) through the Meier headphone crossfeed network.
+    /// Injects cross-channel acoustic bleeding with ~250 µs (12 samples @ 48kHz) delay and 700 Hz low-pass filter.
+    pub fn process_crossfeed(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        // 1. Store into crossfeed delay lines (~12 sample delay)
+        let delay_taps = 12usize;
+        self.crossfeed_delay_l[self.crossfeed_idx] = in_l;
+        self.crossfeed_delay_r[self.crossfeed_idx] = in_r;
+
+        let read_idx = (self.crossfeed_idx + 16 - delay_taps) % 16;
+        let delayed_l = self.crossfeed_delay_l[read_idx];
+        let delayed_r = self.crossfeed_delay_r[read_idx];
+
+        self.crossfeed_idx = (self.crossfeed_idx + 1) % 16;
+
+        // 2. Simple single-pole low-pass filter (approx 700 Hz cutoff at 48 kHz: alpha ≈ 0.088)
+        let alpha = 0.088f32;
+        self.crossfeed_lpf_state_l += alpha * (delayed_l - self.crossfeed_lpf_state_l);
+        self.crossfeed_lpf_state_r += alpha * (delayed_r - self.crossfeed_lpf_state_r);
+
+        // 3. Cross-mix opposite channels
+        // Out_L = (1 - crossfeed/2) * In_L + crossfeed * LPF(Delayed_R)
+        // Out_R = (1 - crossfeed/2) * In_R + crossfeed * LPF(Delayed_L)
+        let direct_gain = 1.0 - (self.crossfeed_amount * 0.5);
+        let cross_gain = self.crossfeed_amount;
+
+        let out_l = direct_gain * in_l + cross_gain * self.crossfeed_lpf_state_r;
+        let out_r = direct_gain * in_r + cross_gain * self.crossfeed_lpf_state_l;
+
+        (out_l, out_r)
+    }
+}
+
+/// Integrated Handheld Spatial Audio & Resampling Engine Pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldSpatialAudioEngine {
+    /// Dynamic variable rate resampler.
+    pub resampler: DynamicVariableRateResampler,
+    /// Polyphase anti-aliasing filter bank.
+    pub fir_filter: SincPolyphaseFirFilterBank,
+    /// 3D HRTF vector panner.
+    pub panner: HrtfVectorPanner,
+    /// Headphone crossfeed & Doppler engine.
+    pub crossfeed_doppler: HandheldHeadphoneCrossfeedDopplerEngine,
+}
+
+impl HandheldSpatialAudioEngine {
+    /// Creates a complete spatial audio processing pipeline.
+    pub fn new() -> Self {
+        Self {
+            resampler: DynamicVariableRateResampler::new(AudioSampleRate::Rate44100Hz, AudioSampleRate::Rate48000Hz),
+            fir_filter: SincPolyphaseFirFilterBank::new(0.45, 6.0),
+            panner: HrtfVectorPanner::new(),
+            crossfeed_doppler: HandheldHeadphoneCrossfeedDopplerEngine::new(),
+        }
+    }
+}
+
+/// Verification test for handheld headphone crossfeed downmixer and Doppler shift simulation.
+pub fn verify_headphone_crossfeed_and_doppler() -> bool {
+    let mut engine = HandheldHeadphoneCrossfeedDopplerEngine::new();
+
+    // 1. Stationary source: Doppler factor = 1.0
+    let pos = SpatialVector3D::new(0.0, 0.0, 10.0);
+    let vel_zero = SpatialVector3D::new(0.0, 0.0, 0.0);
+    let d0 = engine.update_doppler(pos, vel_zero);
+    if (d0 - 1.0).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Approaching source at 50 m/s towards listener:
+    // f' = 343 / (343 - 50) = 343 / 293 ≈ 1.1706 (> 1.0 pitch up)
+    let vel_approach = SpatialVector3D::new(0.0, 0.0, -50.0);
+    let d_approach = engine.update_doppler(pos, vel_approach);
+    if d_approach <= 1.0 || d_approach < 1.15 || d_approach > 1.20 {
+        return false;
+    }
+
+    // 3. Receding source at 50 m/s away from listener:
+    // f' = 343 / (343 + 50) = 343 / 393 ≈ 0.8727 (< 1.0 pitch down)
+    let vel_recede = SpatialVector3D::new(0.0, 0.0, 50.0);
+    let d_recede = engine.update_doppler(pos, vel_recede);
+    if d_recede >= 1.0 || d_recede < 0.85 || d_recede > 0.90 {
+        return false;
+    }
+
+    // 4. Test headphone crossfeed with pure Left impulse (1.0, 0.0)
+    // Over 16 samples, right ear should receive crossfeed bleeding (> 0.0)
+    let mut right_bleeding_detected = false;
+    for i in 0..16 {
+        let (in_l, in_r) = if i == 0 { (1.0, 0.0) } else { (0.0, 0.0) };
+        let (_out_l, out_r) = engine.process_crossfeed(in_l, in_r);
+        if out_r > 0.001 {
+            right_bleeding_detected = true;
+        }
+    }
+    if !right_bleeding_detected {
+        return false;
+    }
+
+    // 5. Verify integrated pipeline initialization
+    let pipeline = HandheldSpatialAudioEngine::new();
+    if pipeline.resampler.input_rate_hz != 44100 || pipeline.resampler.output_rate_hz != 48000 {
+        return false;
+    }
+
+    true
+}
