@@ -502,7 +502,111 @@ impl SharedNullTileManager {
     }
 }
 
-// Temporary stub for incremental commits.
+// Comprehensive verification self-test suite for D3D12 sparse tile page remapping and TLB engine.
 pub fn test_gpu_page_remapping_subsystem() -> bool {
+    // 1. Verify D3D12 UpdateTileMappings and CopyTileMappings.
+    let mut table1 = SparseResourceMappingTable::new(1001, 16);
+    let ranges = [
+        TileMappingRange::normal(100, 4),
+        TileMappingRange::null(4),
+        TileMappingRange::reuse_single(200, 4),
+        TileMappingRange::normal(300, 4),
+    ];
+    let mapped = table1.update_tile_mappings(0, &ranges);
+    if mapped != 16 {
+        return false;
+    }
+
+    if table1.get_physical_tile(0) != Some(100)
+        || table1.get_physical_tile(3) != Some(103)
+        || table1.get_physical_tile(4).is_some()
+        || table1.get_physical_tile(8) != Some(200)
+        || table1.get_physical_tile(11) != Some(200)
+        || table1.get_physical_tile(12) != Some(300)
+    {
+        return false;
+    }
+
+    let mut table2 = SparseResourceMappingTable::new(1002, 8);
+    let copied = table2.copy_tile_mappings(0, &table1, 0, 4);
+    if copied != 4
+        || table2.get_physical_tile(0) != Some(100)
+        || table2.get_physical_tile(3) != Some(103)
+    {
+        return false;
+    }
+
+    // 2. Verify GPU virtual page table leaf invalidation and TLB flush engine.
+    let mut ptes = [GpuPteLeaf::default(); 16];
+    let mut i = 0;
+    while i < 8 {
+        ptes[i].valid = true;
+        ptes[i].is_null_tile = false;
+        ptes[i].physical_address = (i as u64) * 65536;
+        i += 1;
+    }
+
+    let mut tlb_engine = GpuTlbEngine::new();
+    let gen1 = tlb_engine.invalidate_page_range(&mut ptes, 2, 4);
+    if gen1 != 2 || tlb_engine.total_flushes != 1 || tlb_engine.total_invalidated_leaves != 4 {
+        return false;
+    }
+    if ptes[1].valid != true || ptes[2].valid != false || ptes[5].valid != false || ptes[6].valid != true {
+        return false;
+    }
+
+    let gen2 = tlb_engine.flush_global();
+    if gen2 != 3 || tlb_engine.total_flushes != 2 {
+        return false;
+    }
+
+    // 3. Verify handheld sparse texture streaming governor and LRU tile eviction.
+    let mut gov = HandheldSparseTextureGovernor::new(2);
+    let mut table3 = SparseResourceMappingTable::new(1003, 4);
+
+    let p0 = match gov.request_tile(1003, 0, 1, 10, &mut table3) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let p1 = match gov.request_tile(1003, 1, 1, 20, &mut table3) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if p0 != 0 || p1 != 1 || gov.pool_utilization_percentage() != 100 {
+        return false;
+    }
+
+    // Evicts tile 0 (oldest frame 10), reallocating physical tile 0 to virtual tile 2.
+    let p2 = match gov.request_tile(1003, 2, 1, 30, &mut table3) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if p2 != 0 || table3.get_physical_tile(0).is_some() || table3.get_physical_tile(2) != Some(0) {
+        return false;
+    }
+    if gov.total_evictions != 1 {
+        return false;
+    }
+
+    // 4. Verify shared null tile fallback and VRAM savings metric.
+    let mut null_mgr = SharedNullTileManager::new(0x2000_0000);
+    let mut null_ptes = [GpuPteLeaf::default(); 10];
+    let bound_count = null_mgr.bind_null_range(&mut null_ptes, 0, 10);
+    if bound_count != 10 || null_mgr.active_null_tiles() != 10 {
+        return false;
+    }
+    if null_ptes[0].physical_address != 0x2000_0000 || !null_ptes[0].is_null_tile || !null_ptes[0].valid {
+        return false;
+    }
+
+    let vram_saved = null_mgr.calculate_vram_saved_bytes();
+    if vram_saved != 589_824 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str(
+        "[KNT-D3D12-SPARSE-TILE-PASS] Direct3D 12 agility sparse tile page remapping verified\r\n",
+    );
     true
 }
