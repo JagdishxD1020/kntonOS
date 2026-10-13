@@ -1515,3 +1515,268 @@ pub fn test_d3d12_work_graphs_subsystem() -> bool {
     crate::serial_write_str("[KNT-GFX-WORK-GRAPHS-PASS] Direct3D 12 work graphs autonomous GPU execution engine verified\r\n");
     true
 }
+
+// Direct3D 12 Agility Work Graphs Tier 1.0 capability levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_WORK_GRAPHS_TIER {
+    NotSupported = 0,
+    Tier1_0 = 10,
+}
+
+// Work graph program configuration flags for autonomous GPU scheduling.
+pub const D3D12_WORK_GRAPH_FLAG_ENTRYPOINT: u32 = 1 << 0;
+pub const D3D12_WORK_GRAPH_FLAG_ALLOW_RECURSION: u32 = 1 << 1;
+pub const D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_ALLOCATION: u32 = 1 << 2;
+
+// Tier 1.0 work graph entrypoint specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkGraphTier1EntryPoint {
+    pub node_id: D3D12_NODE_ID,
+    pub flags: u32,
+    pub record_stride: u32,
+}
+
+impl WorkGraphTier1EntryPoint {
+    // Construct a new entrypoint specification.
+    pub fn new(node_id: D3D12_NODE_ID, flags: u32, record_stride: u32) -> Self {
+        Self {
+            node_id,
+            flags,
+            record_stride,
+        }
+    }
+}
+
+// Tier 1.0 work graph node classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkGraphTier1NodeType {
+    Broadcasting,
+    Coalescing,
+    Thread,
+}
+
+// Broadcasting launch overrides specifying dispatch grid dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BroadcastingNodeSpec {
+    pub dispatch_grid: [u32; 3],
+    pub max_dispatch_grid: [u32; 3],
+    pub threadgroup_size: [u32; 3],
+}
+
+// Coalescing launch overrides specifying record grouping threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CoalescingNodeSpec {
+    pub max_records_per_threadgroup: u32,
+    pub threadgroup_size: [u32; 3],
+}
+
+// Thread launch overrides specifying threadgroup dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadNodeSpec {
+    pub threadgroup_size: [u32; 3],
+}
+
+// Tier 1.0 work graph node specification.
+#[derive(Debug, Clone)]
+pub struct WorkGraphTier1NodeSpec {
+    pub node_id: D3D12_NODE_ID,
+    pub node_type: WorkGraphTier1NodeType,
+    pub shader_id: [u8; 32],
+    pub input_record_stride: u32,
+    pub input_record_alignment: u32,
+    pub output_record_stride: u32,
+    pub is_entry_point: bool,
+    pub broadcasting: Option<BroadcastingNodeSpec>,
+    pub coalescing: Option<CoalescingNodeSpec>,
+    pub thread: Option<ThreadNodeSpec>,
+    pub target_nodes: Vec<D3D12_NODE_ID>,
+}
+
+impl WorkGraphTier1NodeSpec {
+    // Construct a Tier 1.0 broadcasting node specification.
+    pub fn broadcaster(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        grid: [u32; 3],
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Broadcasting,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: Some(BroadcastingNodeSpec {
+                dispatch_grid: grid,
+                max_dispatch_grid: grid,
+                threadgroup_size: tg_size,
+            }),
+            coalescing: None,
+            thread: None,
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Construct a Tier 1.0 coalescing node specification.
+    pub fn coalescing(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        max_records: u32,
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Coalescing,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: None,
+            coalescing: Some(CoalescingNodeSpec {
+                max_records_per_threadgroup: max_records,
+                threadgroup_size: tg_size,
+            }),
+            thread: None,
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Construct a Tier 1.0 thread node specification.
+    pub fn thread(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Thread,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: None,
+            coalescing: None,
+            thread: Some(ThreadNodeSpec {
+                threadgroup_size: tg_size,
+            }),
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Connect a downstream child node target.
+    pub fn add_target(&mut self, target: D3D12_NODE_ID) -> Result<(), WorkGraphError> {
+        if self.target_nodes.len() >= MAX_OUTPUT_RECORD_TARGETS {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.target_nodes.push(target);
+        Ok(())
+    }
+
+    // Validate node configuration against Tier 1.0 rules.
+    pub fn validate(&self) -> Result<(), WorkGraphError> {
+        if self.input_record_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.input_record_stride as usize));
+        }
+        match self.node_type {
+            WorkGraphTier1NodeType::Broadcasting => {
+                let spec = self.broadcasting.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.dispatch_grid[0] == 0 || spec.dispatch_grid[1] == 0 || spec.dispatch_grid[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphTier1NodeType::Coalescing => {
+                let spec = self.coalescing.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.max_records_per_threadgroup == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphTier1NodeType::Thread => {
+                let spec = self.thread.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// Direct3D 12 Agility Work Graphs Tier 1.0 Program Descriptor.
+#[derive(Debug, Clone)]
+pub struct WorkGraphTier1ProgramDesc {
+    pub program_name: &'static str,
+    pub tier: D3D12_WORK_GRAPHS_TIER,
+    pub flags: u32,
+    pub max_recursion_depth: u32,
+    pub entrypoints: Vec<WorkGraphTier1EntryPoint>,
+    pub nodes: Vec<WorkGraphTier1NodeSpec>,
+}
+
+impl WorkGraphTier1ProgramDesc {
+    // Construct a new Tier 1.0 program descriptor.
+    pub fn new(program_name: &'static str, flags: u32, max_depth: u32) -> Self {
+        Self {
+            program_name,
+            tier: D3D12_WORK_GRAPHS_TIER::Tier1_0,
+            flags,
+            max_recursion_depth: max_depth.min(MAX_WORK_GRAPH_RECURSION_DEPTH),
+            entrypoints: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    // Register a node specification in the work graph program.
+    pub fn add_node(&mut self, node: WorkGraphTier1NodeSpec) -> Result<(), WorkGraphError> {
+        if self.nodes.len() >= MAX_WORK_GRAPH_NODES {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    // Register an entrypoint node for the work graph program.
+    pub fn add_entrypoint(&mut self, entry: WorkGraphTier1EntryPoint) -> Result<(), WorkGraphError> {
+        self.entrypoints.push(entry);
+        Ok(())
+    }
+
+    // Find node specification by node ID.
+    pub fn find_node(&self, id: D3D12_NODE_ID) -> Option<&WorkGraphTier1NodeSpec> {
+        self.nodes.iter().find(|n| n.node_id == id)
+    }
+
+    // Find node specification mutable reference by node ID.
+    pub fn find_node_mut(&mut self, id: D3D12_NODE_ID) -> Option<&mut WorkGraphTier1NodeSpec> {
+        self.nodes.iter_mut().find(|n| n.node_id == id)
+    }
+
+    // Return number of registered nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    // Return number of registered entrypoints.
+    pub fn entrypoint_count(&self) -> usize {
+        self.entrypoints.len()
+    }
+}
