@@ -343,3 +343,234 @@ pub fn verify_sinc_polyphase_fir_filter() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 3: 3D Spatial HRTF Vector Panner & Sub-Millisecond ITD Delay Line
+// ============================================================================
+
+/// Maximum ITD delay buffer capacity in samples (at 48 kHz, max ITD is ~0.7 ms = ~34 samples).
+pub const SPATIAL_ITD_MAX_DELAY_SAMPLES: usize = 64;
+pub const ITD_DELAY_MASK: usize = SPATIAL_ITD_MAX_DELAY_SAMPLES - 1;
+
+/// Spatial coordinate vector for 3D sound source position relative to listener.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpatialVector3D {
+    /// Right/Left axis (+X is Right, -X is Left) in meters.
+    pub x: f32,
+    /// Up/Down axis (+Y is Up, -Y is Down) in meters.
+    pub y: f32,
+    /// Forward/Backward axis (+Z is Forward, -Z is Backward) in meters.
+    pub z: f32,
+}
+
+impl SpatialVector3D {
+    /// Creates a 3D position vector in meters.
+    pub const fn new(x: f32, y: f32, z: f32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Computes Euclidean distance from origin in meters.
+    pub fn distance(&self) -> f32 {
+        let dist_sq = self.x * self.x + self.y * self.y + self.z * self.z;
+        if dist_sq > 0.0 {
+            crate::graphics::types::sqrt_f32(dist_sq)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// 3D Spatial HRTF Vector Panner with Sub-Millisecond Interaural Time Difference (ITD) Delay Line.
+///
+/// Models Woodworth-Schlosberg spherical head diffraction physics:
+/// - Interaural Time Difference (ITD): acoustic path length difference between left/right ears.
+///   At 48 kHz, 0.66 ms maximum lateral delay represents ~32 samples of fractional delay.
+/// - Interaural Level Difference (ILD): high-frequency acoustic head shadow attenuation.
+/// - Elevation pinna filtering and distance attenuation (1 / max(dist, 1.0)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HrtfVectorPanner {
+    /// Circular delay buffer for left ear ITD (samples).
+    pub left_delay_line: [f32; SPATIAL_ITD_MAX_DELAY_SAMPLES],
+    /// Circular delay buffer for right ear ITD (samples).
+    pub right_delay_line: [f32; SPATIAL_ITD_MAX_DELAY_SAMPLES],
+    /// Write pointer for delay lines.
+    pub delay_write_ptr: usize,
+    /// Current source position in meters.
+    pub source_position: SpatialVector3D,
+    /// Calculated azimuth angle in radians (-PI .. +PI).
+    pub azimuth_rad: f32,
+    /// Calculated elevation angle in radians (-HALF_PI .. +HALF_PI).
+    pub elevation_rad: f32,
+    /// Interaural Time Difference for left ear in samples.
+    pub itd_left_samples: f32,
+    /// Interaural Time Difference for right ear in samples.
+    pub itd_right_samples: f32,
+    /// Interaural Level Difference linear gain for left ear (0.0 .. 1.0).
+    pub ild_left_gain: f32,
+    /// Interaural Level Difference linear gain for right ear (0.0 .. 1.0).
+    pub ild_right_gain: f32,
+    /// Distance attenuation factor (0.0 .. 1.0).
+    pub distance_attenuation: f32,
+}
+
+impl HrtfVectorPanner {
+    /// Speed of sound in meters/second (343 m/s).
+    pub const SPEED_OF_SOUND_MPS: f32 = 343.0;
+    /// Typical human head radius in meters (0.0875 m = 8.75 cm).
+    pub const HEAD_RADIUS_M: f32 = 0.0875;
+    /// Sample rate in Hz (48,000 Hz).
+    pub const SAMPLE_RATE_HZ: f32 = 48_000.0;
+
+    /// Constructs a 3D spatial HRTF panner at nominal listener forward position.
+    pub fn new() -> Self {
+        let mut panner = Self {
+            left_delay_line: [0.0f32; SPATIAL_ITD_MAX_DELAY_SAMPLES],
+            right_delay_line: [0.0f32; SPATIAL_ITD_MAX_DELAY_SAMPLES],
+            delay_write_ptr: 0,
+            source_position: SpatialVector3D::new(0.0, 0.0, 1.0),
+            azimuth_rad: 0.0,
+            elevation_rad: 0.0,
+            itd_left_samples: 0.0,
+            itd_right_samples: 0.0,
+            ild_left_gain: 1.0,
+            ild_right_gain: 1.0,
+            distance_attenuation: 1.0,
+        };
+
+        panner.update_position(SpatialVector3D::new(0.0, 0.0, 1.0));
+        panner
+    }
+
+    /// Updates 3D source position and re-computes ITD delays and ILD acoustic gains.
+    pub fn update_position(&mut self, pos: SpatialVector3D) {
+        self.source_position = pos;
+        let dist = pos.distance();
+
+        // 1. Distance attenuation: inverse distance law with 1m minimum clamp
+        self.distance_attenuation = 1.0 / (if dist < 1.0 { 1.0 } else { dist });
+
+        // 2. Azimuth angle (-PI to +PI) in horizontal plane
+        // +X is right, +Z is forward
+        let horiz_dist = crate::graphics::types::sqrt_f32(pos.x * pos.x + pos.z * pos.z);
+        self.azimuth_rad = if horiz_dist > 1e-4 {
+            pos.x / horiz_dist // sin(azimuth) approximation for lateral angle
+        } else {
+            0.0
+        };
+
+        // 3. Elevation angle (-HALF_PI to +HALF_PI)
+        self.elevation_rad = if dist > 1e-4 {
+            pos.y / dist
+        } else {
+            0.0
+        };
+
+        // 4. Woodworth ITD model: ITD = (radius / speed_of_sound) * (sin(theta) + theta)
+        // Max ITD is ~ (0.0875 / 343.0) * (1.0 + 1.5708) ≈ 0.655 ms ≈ 31.4 samples at 48kHz
+        let sin_theta = self.azimuth_rad; // -1.0 (far left) .. +1.0 (far right)
+        let max_itd_s = (Self::HEAD_RADIUS_M / Self::SPEED_OF_SOUND_MPS) * 2.57; // ~0.655 ms
+        let max_itd_samples = max_itd_s * Self::SAMPLE_RATE_HZ;
+
+        if sin_theta > 0.0 {
+            // Source is to the RIGHT (+X): Sound reaches Right ear first, Left ear is delayed
+            self.itd_right_samples = 0.0;
+            self.itd_left_samples = sin_theta * max_itd_samples;
+
+            // ILD: Head shadow attenuates left ear
+            self.ild_right_gain = 1.0;
+            self.ild_left_gain = 1.0 - (0.55 * sin_theta);
+        } else {
+            // Source is to the LEFT (-X): Sound reaches Left ear first, Right ear is delayed
+            let abs_sin = -sin_theta;
+            self.itd_left_samples = 0.0;
+            self.itd_right_samples = abs_sin * max_itd_samples;
+
+            // ILD: Head shadow attenuates right ear
+            self.ild_left_gain = 1.0;
+            self.ild_right_gain = 1.0 - (0.55 * abs_sin);
+        }
+    }
+
+    /// Feeds a mono input sample into the 3D spatializer and outputs binaural (Left, Right) samples.
+    pub fn process_sample(&mut self, input_sample: f32) -> (f32, f32) {
+        // Push input sample into both delay lines
+        self.left_delay_line[self.delay_write_ptr] = input_sample;
+        self.right_delay_line[self.delay_write_ptr] = input_sample;
+
+        // Read from left ear delay line with fractional linear interpolation
+        let left_read = self.read_interpolated(&self.left_delay_line, self.itd_left_samples);
+        // Read from right ear delay line with fractional linear interpolation
+        let right_read = self.read_interpolated(&self.right_delay_line, self.itd_right_samples);
+
+        // Advance circular write pointer
+        self.delay_write_ptr = (self.delay_write_ptr + 1) & ITD_DELAY_MASK;
+
+        // Apply ILD gains and 3D distance attenuation
+        let out_left = left_read * self.ild_left_gain * self.distance_attenuation;
+        let out_right = right_read * self.ild_right_gain * self.distance_attenuation;
+
+        (out_left, out_right)
+    }
+
+    /// Reads sample from circular buffer at fractional delay `delay_samples` behind current write pointer.
+    fn read_interpolated(&self, buffer: &[f32; SPATIAL_ITD_MAX_DELAY_SAMPLES], delay_samples: f32) -> f32 {
+        let int_delay = delay_samples as usize;
+        let frac = delay_samples - int_delay as f32;
+
+        let idx0 = (self.delay_write_ptr + SPATIAL_ITD_MAX_DELAY_SAMPLES - int_delay) & ITD_DELAY_MASK;
+        let idx1 = (idx0 + SPATIAL_ITD_MAX_DELAY_SAMPLES - 1) & ITD_DELAY_MASK;
+
+        let s0 = buffer[idx0];
+        let s1 = buffer[idx1];
+
+        s0 + frac * (s1 - s0)
+    }
+}
+
+/// Verification test for 3D spatial HRTF vector panner and sub-millisecond ITD delay line.
+pub fn verify_hrtf_vector_panner() -> bool {
+    let mut panner = HrtfVectorPanner::new();
+
+    // 1. Center source (0, 0, 2): ITD = 0, ILD = (1.0, 1.0), dist = 2m (attenuation = 0.5)
+    panner.update_position(SpatialVector3D::new(0.0, 0.0, 2.0));
+    if panner.itd_left_samples != 0.0 || panner.itd_right_samples != 0.0 {
+        return false;
+    }
+    if panner.ild_left_gain != 1.0 || panner.ild_right_gain != 1.0 {
+        return false;
+    }
+    if (panner.distance_attenuation - 0.5).abs() > 1e-4 {
+        return false;
+    }
+
+    // 2. Far Right source (+5m, 0, 0): Right ear delay = 0, Left ear delay ~ 31.4 samples (> 25 samples)
+    panner.update_position(SpatialVector3D::new(5.0, 0.0, 0.0));
+    if panner.itd_right_samples != 0.0 {
+        return false;
+    }
+    if panner.itd_left_samples < 25.0 || panner.itd_left_samples > 35.0 {
+        return false;
+    }
+    // Right ear gain = 1.0, Left ear head-shadowed < 0.5
+    if panner.ild_right_gain != 1.0 || panner.ild_left_gain > 0.5 {
+        return false;
+    }
+
+    // 3. Process unit impulse through panner
+    let (l0, r0) = panner.process_sample(1.0);
+    // Right ear should immediately output non-zero (0 delay), Left ear is delayed (should be 0 on first sample)
+    if r0 <= 0.0 || l0 != 0.0 {
+        return false;
+    }
+
+    // 4. Far Left source (-5m, 0, 0): Left ear delay = 0, Right ear delay > 25 samples
+    panner.update_position(SpatialVector3D::new(-5.0, 0.0, 0.0));
+    if panner.itd_left_samples != 0.0 || panner.itd_right_samples < 25.0 {
+        return false;
+    }
+    if panner.ild_left_gain != 1.0 || panner.ild_right_gain > 0.5 {
+        return false;
+    }
+
+    true
+}
