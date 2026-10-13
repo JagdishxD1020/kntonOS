@@ -20,3 +20,6 @@ pub use panel_overdrive::*;
 
 pub mod dsc_vrr;
 pub use dsc_vrr::*;
+
+pub mod dp_alt_mode;
+pub use dp_alt_mode::*;

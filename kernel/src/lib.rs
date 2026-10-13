@@ -866,6 +866,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld display DSC compression and VRR fast-sync self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld USB-C DisplayPort Alternate Mode & eDP Hot-Plug Re-Clocking Governor (TASK-KNT-257)
+    if !display::test_dp_alt_mode_governor_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld USB-C DP Alt Mode and eDP hot-plug governor self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)
