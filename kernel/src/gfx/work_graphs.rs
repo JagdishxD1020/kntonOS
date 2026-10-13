@@ -2413,3 +2413,145 @@ impl WorkGraphStateValidator {
         deepest
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 Agility Work Graphs Tier 1.0 and autonomous allocator.
+pub fn test_work_graphs_tier1_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WORK-GRAPHS] Initializing Direct3D 12 Agility Work Graphs Tier 1.0 self-test...\r\n");
+
+    // 1. Verify Tier 1.0 program descriptors, nodes, and entrypoints.
+    let mut program = WorkGraphTier1ProgramDesc::new("AgilityAutonomousCullGraph", D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_ALLOCATION, 8);
+    let mut broadcaster = WorkGraphTier1NodeSpec::broadcaster("CullBroadcaster", 0, [1u8; 32], [4, 1, 1], [8, 8, 1], 16, 16);
+    let mut coalescer = WorkGraphTier1NodeSpec::coalescing("BatchCoalescer", 1, [2u8; 32], 4, [16, 1, 1], 16, 16);
+    let worker = WorkGraphTier1NodeSpec::thread("DrawWorker", 2, [3u8; 32], [32, 1, 1], 16, 0);
+
+    if broadcaster.add_target(coalescer.node_id).is_err() {
+        return false;
+    }
+    if coalescer.add_target(worker.node_id).is_err() {
+        return false;
+    }
+
+    if broadcaster.validate().is_err() || coalescer.validate().is_err() || worker.validate().is_err() {
+        return false;
+    }
+
+    let entry = WorkGraphTier1EntryPoint::new(broadcaster.node_id, D3D12_WORK_GRAPH_FLAG_ENTRYPOINT, 16);
+    if program.add_entrypoint(entry).is_err() {
+        return false;
+    }
+    if program.add_node(broadcaster).is_err() || program.add_node(coalescer).is_err() || program.add_node(worker).is_err() {
+        return false;
+    }
+
+    if program.node_count() != 3 || program.entrypoint_count() != 1 {
+        return false;
+    }
+
+    // 2. Verify hardware state validator, recursion depth limits, and cycle detector.
+    let validator = WorkGraphStateValidator::new(16);
+    if validator.validate_program(&program).is_err() {
+        return false;
+    }
+
+    // Verify rejection of cycles when recursion flag is omitted.
+    let mut cycle_prog = WorkGraphTier1ProgramDesc::new("CycleGraph", 0, 8);
+    let mut node_a = WorkGraphTier1NodeSpec::thread("NodeA", 10, [10u8; 32], [8, 1, 1], 16, 16);
+    let mut node_b = WorkGraphTier1NodeSpec::thread("NodeB", 11, [11u8; 32], [8, 1, 1], 16, 16);
+    let _ = node_a.add_target(node_b.node_id);
+    let _ = node_b.add_target(node_a.node_id);
+    let _ = cycle_prog.add_entrypoint(WorkGraphTier1EntryPoint::new(node_a.node_id, 0, 16));
+    let _ = cycle_prog.add_node(node_a);
+    let _ = cycle_prog.add_node(node_b);
+
+    if validator.validate_program(&cycle_prog).is_ok() {
+        return false;
+    }
+
+    // 3. Verify autonomous backing memory allocator and memory requirements.
+    let reqs = WorkGraphTier1MemoryRequirements::calculate(&program);
+    if reqs.min_backing_memory_size_in_bytes == 0 || (reqs.min_backing_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+        return false;
+    }
+
+    if AutonomousWorkGraphBackingAllocator::new(0x8001, reqs.min_backing_memory_size_in_bytes, &reqs).is_ok() {
+        return false;
+    }
+    if AutonomousWorkGraphBackingAllocator::new(0x8000, reqs.min_backing_memory_size_in_bytes - 1, &reqs).is_ok() {
+        return false;
+    }
+
+    let mut allocator = match AutonomousWorkGraphBackingAllocator::new(0x0000_8000_0000, reqs.min_backing_memory_size_in_bytes * 2, &reqs) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    for node in &program.nodes {
+        if allocator.create_node_pool(node, 16).is_err() {
+            return false;
+        }
+    }
+
+    // 4. Verify node shader record distributor, child dispatch rings, and backing store recycling.
+    let mut distributor = NodeShaderRecordDistributor::new(8);
+    for node in &program.nodes {
+        distributor.register_queue(node.node_id, 16);
+    }
+
+    let broadcaster_id = program.nodes[0].node_id;
+    let coalescer_id = program.nodes[1].node_id;
+
+    let payload_sample = [0x5au8; 16];
+    let allocated_va = match distributor.allocate_and_dispatch(broadcaster_id, broadcaster_id, &payload_sample, 0, &mut allocator) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+
+    if allocated_va == 0 || (allocated_va % 16) != 0 {
+        return false;
+    }
+
+    let popped = match distributor.pop_next_record(broadcaster_id) {
+        Some(r) => r,
+        None => return false,
+    };
+    if popped.record_va != allocated_va || popped.payload_bytes() != &payload_sample {
+        return false;
+    }
+
+    // Dispatch child record with incremented recursion depth.
+    let _child_va = match distributor.allocate_and_dispatch(broadcaster_id, coalescer_id, &payload_sample, 1, &mut allocator) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+
+    let child_popped = match distributor.pop_next_record(coalescer_id) {
+        Some(r) => r,
+        None => return false,
+    };
+    if child_popped.recursion_depth != 1 {
+        return false;
+    }
+
+    // Recycle records back to the allocator.
+    if distributor.recycle_record(&popped, &mut allocator).is_err() {
+        return false;
+    }
+    if distributor.recycle_record(&child_popped, &mut allocator).is_err() {
+        return false;
+    }
+
+    let bc_pool = allocator.find_node_pool_mut(broadcaster_id).unwrap();
+    if bc_pool.available_slots() != 16 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinels.
+    crate::serial_write_str("[KNT-GPU-WORKGRAPHS-PASS] Direct3D 12 work graphs and autonomous GPU shader execution engine verified\r\n");
+    crate::serial_write_str("[KNT-D3D12-WORK-GRAPHS-PASS] Direct3D 12 agility work graphs tier 1.0 verified\r\n");
+    true
+}
+
+// Forwarding alias for Direct3D 12 Agility Work Graphs self-test.
+pub fn test_agility_work_graphs_subsystem() -> bool {
+    test_work_graphs_tier1_subsystem()
+}

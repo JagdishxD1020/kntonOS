@@ -526,6 +526,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_gpu_page_remapping_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility GPU page remapping self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Work Graphs Tier 1.0 (TASK-KNT-261)
+    if !gfx::test_work_graphs_tier1_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility work graphs tier 1.0 self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
