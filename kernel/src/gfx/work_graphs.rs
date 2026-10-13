@@ -1780,3 +1780,228 @@ impl WorkGraphTier1ProgramDesc {
         self.entrypoints.len()
     }
 }
+
+// Tier 1.0 backing memory and scratch requirements for autonomous GPU work graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkGraphTier1MemoryRequirements {
+    pub min_backing_memory_size_in_bytes: u64,
+    pub max_backing_memory_size_in_bytes: u64,
+    pub scratch_memory_size_in_bytes: u64,
+    pub node_input_record_pool_size: u64,
+    pub max_in_flight_records: u32,
+}
+
+impl WorkGraphTier1MemoryRequirements {
+    // Calculate backing memory requirements from program node topology.
+    pub fn calculate(program: &WorkGraphTier1ProgramDesc) -> Self {
+        let base_overhead = 4096u64;
+        let mut total_pools = 0u64;
+        let mut max_records = 0u32;
+
+        for node in &program.nodes {
+            let slot_size = (node.input_record_stride as u64 + 15) & !15;
+            let node_pool = slot_size.max(32) * 64;
+            total_pools += (node_pool + 255) & !255;
+            max_records += 64;
+        }
+
+        let aligned_pools = (total_pools + 255) & !255;
+        let min_backing = (base_overhead + aligned_pools + 255) & !255;
+        let max_backing = min_backing * 2;
+        let scratch = (min_backing / 2 + 255) & !255;
+
+        Self {
+            min_backing_memory_size_in_bytes: min_backing,
+            max_backing_memory_size_in_bytes: max_backing,
+            scratch_memory_size_in_bytes: scratch,
+            node_input_record_pool_size: aligned_pools,
+            max_in_flight_records: max_records,
+        }
+    }
+}
+
+// Memory range representing a GPU virtual address allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackingMemoryRange {
+    pub gpu_va: u64,
+    pub size: u64,
+}
+
+// Autonomous GPU node input record pool managing dynamic record slots.
+#[derive(Debug, Clone)]
+pub struct NodeInputRecordPool {
+    pub node_id: D3D12_NODE_ID,
+    pub slot_size: usize,
+    pub capacity: usize,
+    pub base_va: u64,
+    pub allocated_mask: u64,
+    pub total_allocations: u64,
+    pub total_frees: u64,
+}
+
+impl NodeInputRecordPool {
+    // Construct a new node input record pool with 256-byte alignment.
+    pub fn new(node_id: D3D12_NODE_ID, slot_size: usize, capacity: usize, base_va: u64) -> Result<Self, WorkGraphError> {
+        if (base_va % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_va));
+        }
+        let cap = capacity.min(64).max(1);
+        let aligned_slot = (slot_size.max(16) + 15) & !15;
+        Ok(Self {
+            node_id,
+            slot_size: aligned_slot,
+            capacity: cap,
+            base_va,
+            allocated_mask: 0,
+            total_allocations: 0,
+            total_frees: 0,
+        })
+    }
+
+    // Allocate next available record slot from the pool.
+    pub fn allocate_slot(&mut self) -> Result<u64, WorkGraphError> {
+        for bit in 0..self.capacity {
+            let mask = 1u64 << bit;
+            if (self.allocated_mask & mask) == 0 {
+                self.allocated_mask |= mask;
+                self.total_allocations += 1;
+                return Ok(self.base_va + (bit * self.slot_size) as u64);
+            }
+        }
+        Err(WorkGraphError::RecordRingFull)
+    }
+
+    // Free a previously allocated record slot back to the pool.
+    pub fn free_slot(&mut self, gpu_va: u64) -> Result<(), WorkGraphError> {
+        if gpu_va < self.base_va {
+            return Err(WorkGraphError::InsufficientBackingMemory { required: self.base_va, provided: gpu_va });
+        }
+        let offset = (gpu_va - self.base_va) as usize;
+        if (offset % self.slot_size) != 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        let bit = offset / self.slot_size;
+        if bit >= self.capacity {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        let mask = 1u64 << bit;
+        if (self.allocated_mask & mask) == 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        self.allocated_mask &= !mask;
+        self.total_frees += 1;
+        Ok(())
+    }
+
+    // Return count of available free slots.
+    pub fn available_slots(&self) -> usize {
+        self.capacity - self.allocated_mask.count_ones() as usize
+    }
+
+    // Return count of currently in-use slots.
+    pub fn in_use_slots(&self) -> usize {
+        self.allocated_mask.count_ones() as usize
+    }
+
+    // Reset all slot allocations.
+    pub fn reset(&mut self) {
+        self.allocated_mask = 0;
+    }
+}
+
+// Autonomous GPU Backing Memory Allocator managing backing and scratch partitions.
+#[derive(Debug, Clone)]
+pub struct AutonomousWorkGraphBackingAllocator {
+    pub base_address: u64,
+    pub total_size: u64,
+    pub allocated_bytes: u64,
+    pub scratch_offset: u64,
+    pub scratch_size: u64,
+    pub record_pools: Vec<NodeInputRecordPool>,
+}
+
+impl AutonomousWorkGraphBackingAllocator {
+    // Allocate backing store partitions from physical GPU virtual address.
+    pub fn new(base_address: u64, total_size: u64, reqs: &WorkGraphTier1MemoryRequirements) -> Result<Self, WorkGraphError> {
+        if (base_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_address));
+        }
+        if total_size < reqs.min_backing_memory_size_in_bytes {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: reqs.min_backing_memory_size_in_bytes,
+                provided: total_size,
+            });
+        }
+
+        let scratch_sz = reqs.scratch_memory_size_in_bytes;
+        let scratch_off = (total_size.saturating_sub(scratch_sz)) & !255;
+
+        Ok(Self {
+            base_address,
+            total_size,
+            allocated_bytes: 4096,
+            scratch_offset: scratch_off,
+            scratch_size: scratch_sz,
+            record_pools: Vec::new(),
+        })
+    }
+
+    // Register a node input record pool within the backing store.
+    pub fn create_node_pool(&mut self, node: &WorkGraphTier1NodeSpec, capacity: usize) -> Result<&mut NodeInputRecordPool, WorkGraphError> {
+        let slot_size = ((node.input_record_stride as usize).max(16) + 15) & !15;
+        let pool_bytes = (slot_size * capacity.min(64) + 255) & !255;
+
+        if self.allocated_bytes + pool_bytes as u64 > self.scratch_offset {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: self.allocated_bytes + pool_bytes as u64,
+                provided: self.scratch_offset,
+            });
+        }
+
+        let pool_va = self.base_address + self.allocated_bytes;
+        self.allocated_bytes += pool_bytes as u64;
+
+        let pool = NodeInputRecordPool::new(node.node_id, slot_size, capacity, pool_va)?;
+        self.record_pools.push(pool);
+        let idx = self.record_pools.len() - 1;
+        Ok(&mut self.record_pools[idx])
+    }
+
+    // Locate node pool mutably by target node ID.
+    pub fn find_node_pool_mut(&mut self, node_id: D3D12_NODE_ID) -> Option<&mut NodeInputRecordPool> {
+        self.record_pools.iter_mut().find(|p| p.node_id == node_id)
+    }
+
+    // Query backing memory range.
+    pub fn backing_memory_range(&self) -> BackingMemoryRange {
+        BackingMemoryRange {
+            gpu_va: self.base_address,
+            size: self.scratch_offset,
+        }
+    }
+
+    // Query scratch memory range.
+    pub fn scratch_memory_range(&self) -> BackingMemoryRange {
+        BackingMemoryRange {
+            gpu_va: self.base_address + self.scratch_offset,
+            size: self.scratch_size,
+        }
+    }
+
+    // Query total allocated bytes.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    // Query remaining available bytes before scratch space.
+    pub fn available_bytes(&self) -> u64 {
+        self.scratch_offset.saturating_sub(self.allocated_bytes)
+    }
+
+    // Recycle all active node pool allocations.
+    pub fn recycle_all(&mut self) {
+        for pool in &mut self.record_pools {
+            pool.reset();
+        }
+    }
+}
