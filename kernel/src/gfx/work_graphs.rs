@@ -2251,3 +2251,165 @@ impl NodeShaderRecordDistributor {
         self.queues.iter().map(|q| q.len()).sum()
     }
 }
+
+// Validation error details for work graph compilation and hardware state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkGraphValidationError {
+    ExceededMaxRecursionDepth(u32),
+    InvalidRecordAlignment { stride: u32, alignment: u32 },
+    InvalidGridDimensions([u32; 3]),
+    CycleDetected(D3D12_NODE_ID),
+    MissingEntryPoint,
+    UnreachableNode(D3D12_NODE_ID),
+}
+
+// Hardware state validator checking recursion depth, record alignment, grids, and cycles.
+#[derive(Debug, Clone)]
+pub struct WorkGraphStateValidator {
+    pub max_recursion_limit: u32,
+    pub max_grid_limit: [u32; 3],
+}
+
+impl WorkGraphStateValidator {
+    // Construct state validator with maximum recursion threshold.
+    pub fn new(max_recursion_limit: u32) -> Self {
+        Self {
+            max_recursion_limit: max_recursion_limit.min(MAX_WORK_GRAPH_RECURSION_DEPTH),
+            max_grid_limit: [65535, 65535, 65535],
+        }
+    }
+
+    // Comprehensive validation of Tier 1.0 work graph program descriptor.
+    pub fn validate_program(&self, program: &WorkGraphTier1ProgramDesc) -> Result<(), WorkGraphValidationError> {
+        if program.entrypoints.is_empty() {
+            return Err(WorkGraphValidationError::MissingEntryPoint);
+        }
+        if program.max_recursion_depth > self.max_recursion_limit {
+            return Err(WorkGraphValidationError::ExceededMaxRecursionDepth(program.max_recursion_depth));
+        }
+
+        for entry in &program.entrypoints {
+            if program.find_node(entry.node_id).is_none() {
+                return Err(WorkGraphValidationError::UnreachableNode(entry.node_id));
+            }
+        }
+
+        for node in &program.nodes {
+            if node.input_record_alignment < 4 || (node.input_record_stride % node.input_record_alignment) != 0 {
+                return Err(WorkGraphValidationError::InvalidRecordAlignment {
+                    stride: node.input_record_stride,
+                    alignment: node.input_record_alignment,
+                });
+            }
+            if node.input_record_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+                return Err(WorkGraphValidationError::InvalidRecordAlignment {
+                    stride: node.input_record_stride,
+                    alignment: node.input_record_alignment,
+                });
+            }
+
+            if let Some(ref bc) = node.broadcasting {
+                if bc.dispatch_grid[0] == 0
+                    || bc.dispatch_grid[1] == 0
+                    || bc.dispatch_grid[2] == 0
+                    || bc.dispatch_grid[0] > self.max_grid_limit[0]
+                    || bc.dispatch_grid[1] > self.max_grid_limit[1]
+                    || bc.dispatch_grid[2] > self.max_grid_limit[2]
+                {
+                    return Err(WorkGraphValidationError::InvalidGridDimensions(bc.dispatch_grid));
+                }
+            }
+
+            for target in &node.target_nodes {
+                if program.find_node(*target).is_none() {
+                    return Err(WorkGraphValidationError::UnreachableNode(*target));
+                }
+            }
+        }
+
+        if (program.flags & D3D12_WORK_GRAPH_FLAG_ALLOW_RECURSION) == 0 {
+            if let Some(cycle_node) = self.detect_cycles(program) {
+                return Err(WorkGraphValidationError::CycleDetected(cycle_node));
+            }
+        }
+
+        let max_depth = self.max_graph_depth(program);
+        if max_depth > program.max_recursion_depth {
+            return Err(WorkGraphValidationError::ExceededMaxRecursionDepth(max_depth));
+        }
+
+        Ok(())
+    }
+
+    // Detect cycles in work graph DAG using depth-first search traversal.
+    pub fn detect_cycles(&self, program: &WorkGraphTier1ProgramDesc) -> Option<D3D12_NODE_ID> {
+        let mut visited = Vec::new();
+        let mut in_stack = Vec::new();
+
+        for entry in &program.entrypoints {
+            if self.dfs_cycle(entry.node_id, program, &mut visited, &mut in_stack) {
+                return in_stack.last().copied();
+            }
+        }
+        None
+    }
+
+    // Recursive DFS helper to discover back-edges in work graph.
+    fn dfs_cycle(
+        &self,
+        current: D3D12_NODE_ID,
+        program: &WorkGraphTier1ProgramDesc,
+        visited: &mut Vec<D3D12_NODE_ID>,
+        in_stack: &mut Vec<D3D12_NODE_ID>,
+    ) -> bool {
+        if in_stack.contains(&current) {
+            return true;
+        }
+        if visited.contains(&current) {
+            return false;
+        }
+
+        visited.push(current);
+        in_stack.push(current);
+
+        if let Some(node) = program.find_node(current) {
+            for target in &node.target_nodes {
+                if self.dfs_cycle(*target, program, visited, in_stack) {
+                    return true;
+                }
+            }
+        }
+
+        in_stack.pop();
+        false
+    }
+
+    // Calculate maximum traversal depth across all branches from entrypoints.
+    pub fn max_graph_depth(&self, program: &WorkGraphTier1ProgramDesc) -> u32 {
+        let mut max_depth = 0u32;
+        for entry in &program.entrypoints {
+            let depth = self.dfs_depth(entry.node_id, program, 1);
+            if depth > max_depth {
+                max_depth = depth;
+            }
+        }
+        max_depth
+    }
+
+    // Recursive DFS helper calculating branch depth.
+    fn dfs_depth(&self, current: D3D12_NODE_ID, program: &WorkGraphTier1ProgramDesc, current_depth: u32) -> u32 {
+        if current_depth > self.max_recursion_limit {
+            return current_depth;
+        }
+        let mut deepest = current_depth;
+        if let Some(node) = program.find_node(current) {
+            for target in &node.target_nodes {
+                let d = self.dfs_depth(*target, program, current_depth + 1);
+                if d > deepest {
+                    deepest = d;
+                }
+            }
+        }
+        deepest
+    }
+}
