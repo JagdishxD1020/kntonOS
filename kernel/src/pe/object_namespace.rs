@@ -1144,3 +1144,209 @@ where
     let mut lock = GLOBAL_OBJECT_NAMESPACE.lock();
     f(lock.as_mut().unwrap())
 }
+
+
+/// Public self-test suite validating Win32 Kernel Object Namespace Directory,
+/// Symbolic Link Engine, DACL Access Check & Anti-Cheat Object Hook Protection.
+pub fn test_win32_object_namespace_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Object Namespace self-test suite...\r\n");
+
+    let mut mgr = ObjectNamespaceManager::new();
+
+    // 1. Verify standard root directories initialization
+    let root_dirs = [
+        r"\Device",
+        r"\DosDevices",
+        r"\BaseNamedObjects",
+        r"\KernelObjects",
+        r"\Session",
+        r"\Session\0",
+        r"\Session\0\BaseNamedObjects",
+        r"\KnownDlls",
+        r"\GLOBAL??",
+    ];
+
+    for dir_path in root_dirs {
+        match mgr.resolve_object_direct(dir_path) {
+            Ok(obj) => {
+                let o = obj.lock();
+                if o.header.type_kind != ObjectTypeKind::Directory {
+                    crate::serial_write_str("[KNT-TEST-ERR] Node is not a directory: ");
+                    crate::serial_write_str(dir_path);
+                    crate::serial_write_str("\r\n");
+                    return false;
+                }
+            }
+            Err(_) => {
+                crate::serial_write_str("[KNT-TEST-ERR] Failed to resolve standard directory: ");
+                crate::serial_write_str(dir_path);
+                crate::serial_write_str("\r\n");
+                return false;
+            }
+        }
+    }
+
+    // 2. Verify symbolic link creation and recursive path resolution
+    let caller_sys = CallerSecurityContext::new_system(4);
+
+    // Create \Device\HarddiskVolume1\Windows
+    let _h_vol = match mgr.create_directory_secure(r"\Device\HarddiskVolume1", DIRECTORY_ALL_ACCESS, &caller_sys) {
+        Ok(h) => h,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to create \\Device\\HarddiskVolume1\r\n");
+            return false;
+        }
+    };
+    let _ = mgr.create_directory_secure(r"\Device\HarddiskVolume1\Windows", DIRECTORY_ALL_ACCESS, &caller_sys);
+
+    // Create \DosDevices\C: -> \Device\HarddiskVolume1
+    if let Err(_) = mgr.create_symbolic_link_secure(
+        r"\DosDevices\C:",
+        r"\Device\HarddiskVolume1",
+        SYMBOLIC_LINK_ALL_ACCESS,
+        &caller_sys,
+        false,
+    ) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to create \\DosDevices\\C: link\r\n");
+        return false;
+    }
+
+    // Resolve \DosDevices\C:\Windows
+    match mgr.resolve_path(r"\DosDevices\C:\Windows", true) {
+        Ok(obj) => {
+            let o = obj.lock();
+            if o.header.name != "Windows" {
+                crate::serial_write_str("[KNT-TEST-ERR] Symlink target resolution leaf mismatch\r\n");
+                return false;
+            }
+        }
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to resolve path through symbolic link\r\n");
+            return false;
+        }
+    }
+
+    // Resolve path string expansion
+    match mgr.resolve_path_to_target_string(r"\DosDevices\C:\Windows\System32") {
+        Ok(s) => {
+            if s != r"\Device\HarddiskVolume1\Windows\System32" {
+                crate::serial_write_str("[KNT-TEST-ERR] Canonical string mismatch: ");
+                crate::serial_write_str(&s);
+                crate::serial_write_str("\r\n");
+                return false;
+            }
+        }
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to resolve path string\r\n");
+            return false;
+        }
+    }
+
+    // 3. Verify circular symbolic link protection & loop detection
+    let _ = mgr.create_symbolic_link_secure(
+        r"\DosDevices\LoopA",
+        r"\DosDevices\LoopB",
+        SYMBOLIC_LINK_ALL_ACCESS,
+        &caller_sys,
+        false,
+    );
+    let _ = mgr.create_symbolic_link_secure(
+        r"\DosDevices\LoopB",
+        r"\DosDevices\LoopA",
+        SYMBOLIC_LINK_ALL_ACCESS,
+        &caller_sys,
+        false,
+    );
+
+    match mgr.resolve_path(r"\DosDevices\LoopA", true) {
+        Err(status) if status == STATUS_TOO_MANY_LINKS => {
+            // Expected cycle detection abort
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Circular symbolic link did not trigger STATUS_TOO_MANY_LINKS\r\n");
+            return false;
+        }
+    }
+
+    // 4. Verify DACL access check validation
+    let _ = mgr.create_directory_secure(
+        r"\BaseNamedObjects\SecureDir",
+        DIRECTORY_ALL_ACCESS,
+        &caller_sys,
+    );
+
+    let alice_sid = SID::users_sid();
+    let bob_sid = SID::new([0, 0, 0, 0, 0, 5], &[21, 9999]);
+
+    let mut dacl = crate::pe::token_security::ACL::new();
+    // Alice allowed read
+    dacl.add_allowed_ace(STANDARD_RIGHTS_READ | DIRECTORY_QUERY | DIRECTORY_TRAVERSE, alice_sid.clone());
+    // Bob denied write
+    dacl.add_denied_ace(DIRECTORY_CREATE_OBJECT, bob_sid.clone());
+
+    let mut sd = SecurityDescriptor::new();
+    sd.set_dacl(Some(dacl), false);
+
+    if let Err(_) = mgr.set_object_security_descriptor(r"\BaseNamedObjects\SecureDir", sd) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set security descriptor\r\n");
+        return false;
+    }
+
+    let obj_sec = mgr.resolve_object_direct(r"\BaseNamedObjects\SecureDir").unwrap();
+    let obj_locked = obj_sec.lock();
+
+    let caller_alice = CallerSecurityContext::new_user(201, alice_sid);
+    let caller_bob = CallerSecurityContext::new_user(202, bob_sid);
+
+    // Alice requests read -> Should succeed
+    if let Err(_) = mgr.validate_access(&obj_locked, &caller_alice, GENERIC_READ) {
+        crate::serial_write_str("[KNT-TEST-ERR] Alice GENERIC_READ denied unexpectedly\r\n");
+        return false;
+    }
+
+    // Bob requests write -> Should be denied
+    if let Ok(_) = mgr.validate_access(&obj_locked, &caller_bob, GENERIC_WRITE) {
+        crate::serial_write_str("[KNT-TEST-ERR] Bob GENERIC_WRITE allowed unexpectedly\r\n");
+        return false;
+    }
+
+    // Alice requests write -> Should be denied
+    if let Ok(_) = mgr.validate_access(&obj_locked, &caller_alice, GENERIC_WRITE) {
+        crate::serial_write_str("[KNT-TEST-ERR] Alice GENERIC_WRITE allowed without grant\r\n");
+        return false;
+    }
+    drop(obj_locked);
+
+    // 5. Verify Anti-Cheat namespace tampering defense
+    let untrusted_caller = CallerSecurityContext::new_untrusted(777);
+
+    // Attempt rogue DLL injection into \KnownDlls
+    let inject_res = mgr.create_symbolic_link_secure(
+        r"\KnownDlls\hack32.dll",
+        r"\Device\CheatDriver",
+        SYMBOLIC_LINK_ALL_ACCESS,
+        &untrusted_caller,
+        false,
+    );
+
+    if inject_res != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Rogue KnownDll injection was not blocked\r\n");
+        return false;
+    }
+
+    // Verify tamper stats recorded the attempt
+    let (tamper_count, last_record) = mgr.get_anti_cheat_stats();
+    if tamper_count == 0 || last_record.is_none() {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat tamper event was not recorded\r\n");
+        return false;
+    }
+
+    let rec = last_record.unwrap();
+    if rec.violation_kind != AntiCheatViolationKind::RogueKnownDllInjection {
+        crate::serial_write_str("[KNT-TEST-ERR] Tamper violation kind mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-OBJ-NAMESPACE-PASS] Win32 Kernel Object Namespace & Security Subsystem verified\r\n");
+    true
+}

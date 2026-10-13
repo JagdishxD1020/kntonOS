@@ -1180,6 +1180,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Kernel Object Namespace Directory, Symbolic Link Engine & Object Manager Security (TASK-KNT-259)
+    if !pe::test_win32_object_namespace_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Object Namespace Directory self-test failed!\r\n");
+    }
+
     // Verify Win32 Thread Context Switch & AVX-512 / AMX Matrix State Lazy Restore Governor (TASK-KNT-256)
     if !pe::test_win32_avx512_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 AVX-512 lazy state governor self-test failed!\r\n");
