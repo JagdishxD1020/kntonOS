@@ -164,6 +164,32 @@ impl NtObject {
             }),
         }
     }
+
+    pub fn new_symbolic_link(
+        name: &str,
+        target_path: &str,
+        attributes: u32,
+        is_protected: bool,
+        min_trust: ProcessTrustLevel,
+    ) -> Self {
+        Self {
+            header: ObjectHeader {
+                name: name.to_string(),
+                type_kind: ObjectTypeKind::SymbolicLink,
+                attributes,
+                pointer_count: 1,
+                handle_count: 0,
+                security_descriptor: None,
+                is_permanent: (attributes & OBJ_PERMANENT) != 0,
+                is_protected,
+                min_trust_level: min_trust,
+            },
+            payload: ObjectPayload::SymbolicLink(SymbolicLinkObject {
+                target_path: target_path.to_string(),
+                creation_time: 0,
+            }),
+        }
+    }
 }
 
 /// Handle table entry tracking an open object.
@@ -381,6 +407,233 @@ impl ObjectNamespaceManager {
             ProcessTrustLevel::Untrusted,
         )?;
         Ok(self.allocate_handle(new_dir, desired_access, process_id))
+    }
+
+
+    /// Creates a symbolic link in the object namespace.
+    pub fn create_symbolic_link(
+        &mut self,
+        link_path: &str,
+        target_path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+        is_protected: bool,
+        min_trust: ProcessTrustLevel,
+    ) -> Result<HANDLE, NtStatus> {
+        let (parent_dir, leaf_name) = self.traverse_directory_path(link_path)?;
+        let name = leaf_name.ok_or(STATUS_OBJECT_PATH_INVALID)?;
+
+        let mut p = parent_dir.lock();
+        if let ObjectPayload::Directory(ref mut dir) = p.payload {
+            let lookup_key = name.to_ascii_lowercase();
+            if dir.entries.contains_key(&lookup_key) {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
+
+            let link_obj = Arc::new(Spinlock::new(NtObject::new_symbolic_link(
+                &name,
+                target_path,
+                OBJ_CASE_INSENSITIVE,
+                is_protected,
+                min_trust,
+            )));
+            dir.entries.insert(lookup_key, link_obj.clone());
+            drop(p);
+
+            Ok(self.allocate_handle(link_obj, desired_access, process_id))
+        } else {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        }
+    }
+
+    /// Opens an existing symbolic link object without following the link.
+    pub fn open_symbolic_link(
+        &mut self,
+        link_path: &str,
+        desired_access: ACCESS_MASK,
+        process_id: u64,
+    ) -> Result<HANDLE, NtStatus> {
+        let obj = self.resolve_path(link_path, false)?;
+        {
+            let o = obj.lock();
+            if o.header.type_kind != ObjectTypeKind::SymbolicLink {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+        }
+        Ok(self.allocate_handle(obj, desired_access, process_id))
+    }
+
+    /// Queries the target string of a symbolic link by handle.
+    pub fn query_symbolic_link(&self, handle: HANDLE) -> Result<String, NtStatus> {
+        let entry = self.handle_table.get(&handle).ok_or(STATUS_INVALID_HANDLE)?;
+        let obj = entry.object.lock();
+        if let ObjectPayload::SymbolicLink(ref symlink) = obj.payload {
+            Ok(symlink.target_path.clone())
+        } else {
+            Err(STATUS_OBJECT_TYPE_MISMATCH)
+        }
+    }
+
+    /// Resolves an NT path completely, resolving intermediate and optional terminal symbolic links.
+    /// Incorporates cycle detection and aborts if depth exceeds MAX_SYMBOLIC_LINK_DEPTH.
+    pub fn resolve_path(
+        &self,
+        initial_path: &str,
+        follow_terminal_link: bool,
+    ) -> Result<Arc<Spinlock<NtObject>>, NtStatus> {
+        let mut current_path = normalize_nt_path(initial_path);
+        let mut depth: usize = 0;
+
+        loop {
+            let components = split_nt_path(&current_path);
+            if components.is_empty() {
+                return Ok(self.root_directory.clone());
+            }
+
+            let mut current = self.root_directory.clone();
+            let num_components = components.len();
+            let mut reparsed = false;
+
+            for (i, comp) in components.iter().enumerate() {
+                let is_last = i == num_components - 1;
+                let next = self.lookup_entry_direct(&current, comp)?;
+
+                let (is_symlink, target_path) = {
+                    let locked = next.lock();
+                    match locked.payload {
+                        ObjectPayload::SymbolicLink(ref sl) => (true, sl.target_path.clone()),
+                        _ => (false, String::new()),
+                    }
+                };
+
+                if is_symlink {
+                    if is_last && !follow_terminal_link {
+                        return Ok(next);
+                    }
+
+                    depth += 1;
+                    if depth > MAX_SYMBOLIC_LINK_DEPTH {
+                        return Err(STATUS_TOO_MANY_LINKS);
+                    }
+
+                    // Suffix components after this symbolic link
+                    let suffix = if !is_last {
+                        let mut s = String::new();
+                        for rem in &components[i + 1..] {
+                            s.push('\\');
+                            s.push_str(rem);
+                        }
+                        s
+                    } else {
+                        String::new()
+                    };
+
+                    let mut expanded = String::new();
+                    if target_path.starts_with('\\') {
+                        expanded.push_str(&target_path);
+                    } else {
+                        // Relative link: prepend directory path traversed so far
+                        expanded.push_str("\\");
+                        for prev in &components[0..i] {
+                            expanded.push_str(prev);
+                            expanded.push('\\');
+                        }
+                        expanded.push_str(&target_path);
+                    }
+
+                    expanded.push_str(&suffix);
+                    current_path = normalize_nt_path(&expanded);
+                    reparsed = true;
+                    break;
+                }
+
+                current = next;
+            }
+
+            if !reparsed {
+                return Ok(current);
+            }
+        }
+    }
+
+    /// Resolves an NT path and returns the final canonical path string.
+    pub fn resolve_path_to_target_string(&self, initial_path: &str) -> Result<String, NtStatus> {
+        let mut current_path = normalize_nt_path(initial_path);
+        let mut depth: usize = 0;
+
+        loop {
+            let components = split_nt_path(&current_path);
+            if components.is_empty() {
+                return Ok(String::from("\\"));
+            }
+
+            let mut current = self.root_directory.clone();
+            let num_components = components.len();
+            let mut reparsed = false;
+
+            for (i, comp) in components.iter().enumerate() {
+                let is_last = i == num_components - 1;
+                let next = match self.lookup_entry_direct(&current, comp) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // If path component not found, but we already resolved links so far, return current_path
+                        if depth > 0 {
+                            return Ok(current_path);
+                        }
+                        return Err(e);
+                    }
+                };
+
+                let (is_symlink, target_path) = {
+                    let locked = next.lock();
+                    match locked.payload {
+                        ObjectPayload::SymbolicLink(ref sl) => (true, sl.target_path.clone()),
+                        _ => (false, String::new()),
+                    }
+                };
+
+                if is_symlink {
+                    depth += 1;
+                    if depth > MAX_SYMBOLIC_LINK_DEPTH {
+                        return Err(STATUS_TOO_MANY_LINKS);
+                    }
+
+                    let suffix = if !is_last {
+                        let mut s = String::new();
+                        for rem in &components[i + 1..] {
+                            s.push('\\');
+                            s.push_str(rem);
+                        }
+                        s
+                    } else {
+                        String::new()
+                    };
+
+                    let mut expanded = String::new();
+                    if target_path.starts_with('\\') {
+                        expanded.push_str(&target_path);
+                    } else {
+                        expanded.push_str("\\");
+                        for prev in &components[0..i] {
+                            expanded.push_str(prev);
+                            expanded.push('\\');
+                        }
+                        expanded.push_str(&target_path);
+                    }
+
+                    expanded.push_str(&suffix);
+                    current_path = normalize_nt_path(&expanded);
+                    reparsed = true;
+                    break;
+                }
+
+                current = next;
+            }
+
+            if !reparsed {
+                return Ok(current_path);
+            }
+        }
     }
 
     /// Allocates an internal handle for an object.
