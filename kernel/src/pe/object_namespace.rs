@@ -89,6 +89,113 @@ pub enum ProcessTrustLevel {
     ProtectedGame = 5,
 }
 
+
+/// NT Generic Mapping structure defining translation from generic to specific access masks.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenericMapping {
+    pub GenericRead: ACCESS_MASK,
+    pub GenericWrite: ACCESS_MASK,
+    pub GenericExecute: ACCESS_MASK,
+    pub GenericAll: ACCESS_MASK,
+}
+
+impl GenericMapping {
+    pub fn new(read: ACCESS_MASK, write: ACCESS_MASK, exec: ACCESS_MASK, all: ACCESS_MASK) -> Self {
+        Self {
+            GenericRead: read,
+            GenericWrite: write,
+            GenericExecute: exec,
+            GenericAll: all,
+        }
+    }
+
+    /// Translates generic access rights (GENERIC_READ, etc.) to object-specific access rights.
+    pub fn map_mask(&self, mask: &mut ACCESS_MASK) {
+        if (*mask & GENERIC_READ) != 0 {
+            *mask &= !GENERIC_READ;
+            *mask |= self.GenericRead;
+        }
+        if (*mask & GENERIC_WRITE) != 0 {
+            *mask &= !GENERIC_WRITE;
+            *mask |= self.GenericWrite;
+        }
+        if (*mask & GENERIC_EXECUTE) != 0 {
+            *mask &= !GENERIC_EXECUTE;
+            *mask |= self.GenericExecute;
+        }
+        if (*mask & GENERIC_ALL) != 0 {
+            *mask &= !GENERIC_ALL;
+            *mask |= self.GenericAll;
+        }
+    }
+}
+
+/// Standard object type metadata registered in the object manager.
+pub struct ObjectType {
+    pub name: String,
+    pub type_kind: ObjectTypeKind,
+    pub generic_mapping: GenericMapping,
+    pub default_security_descriptor: Option<SecurityDescriptor>,
+    pub total_objects: AtomicU32,
+    pub total_handles: AtomicU32,
+}
+
+impl ObjectType {
+    pub fn new(name: &str, kind: ObjectTypeKind, mapping: GenericMapping) -> Self {
+        Self {
+            name: name.to_string(),
+            type_kind: kind,
+            generic_mapping: mapping,
+            default_security_descriptor: None,
+            total_objects: AtomicU32::new(0),
+            total_handles: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Caller security token credentials for DACL evaluation and audit checks.
+#[derive(Debug, Clone)]
+pub struct CallerSecurityContext {
+    pub process_id: u64,
+    pub client_sids: Vec<SID>,
+    pub trust_level: ProcessTrustLevel,
+    pub is_kernel: bool,
+}
+
+impl CallerSecurityContext {
+    pub fn new_user(pid: u64, user_sid: SID) -> Self {
+        Self {
+            process_id: pid,
+            client_sids: alloc::vec![user_sid, SID::world_sid()],
+            trust_level: ProcessTrustLevel::Medium,
+            is_kernel: false,
+        }
+    }
+
+    pub fn new_system(pid: u64) -> Self {
+        Self {
+            process_id: pid,
+            client_sids: alloc::vec![
+                SID::local_system_sid(),
+                SID::administrators_sid(),
+                SID::world_sid(),
+            ],
+            trust_level: ProcessTrustLevel::System,
+            is_kernel: true,
+        }
+    }
+
+    pub fn new_untrusted(pid: u64) -> Self {
+        Self {
+            process_id: pid,
+            client_sids: alloc::vec![SID::world_sid()],
+            trust_level: ProcessTrustLevel::Untrusted,
+            is_kernel: false,
+        }
+    }
+}
+
 /// Common header present on all NT kernel objects.
 #[derive(Clone)]
 pub struct ObjectHeader {
@@ -236,6 +343,7 @@ pub fn split_nt_path(path: &str) -> Vec<String> {
 /// Central Object Manager and Namespace Directory Tree Governor.
 pub struct ObjectNamespaceManager {
     pub root_directory: Arc<Spinlock<NtObject>>,
+    pub object_types: BTreeMap<String, Arc<ObjectType>>,
     pub handle_table: BTreeMap<HANDLE, HandleEntry>,
     pub next_handle: usize,
 }
@@ -250,12 +358,14 @@ impl ObjectNamespaceManager {
             ProcessTrustLevel::Untrusted,
         )));
 
-        let mut mgr = Self {
+let mut mgr = Self {
             root_directory: root,
+            object_types: BTreeMap::new(),
             handle_table: BTreeMap::new(),
             next_handle: 0x100,
         };
 
+        mgr.register_standard_types();
         // Initialize standard NT hierarchical directories
         mgr.init_standard_directories();
         mgr
@@ -662,6 +772,115 @@ impl ObjectNamespaceManager {
         );
 
         handle
+    }
+
+
+    /// Registers a standard object type with its generic mapping.
+    pub fn register_object_type(&mut self, obj_type: ObjectType) {
+        let key = obj_type.name.to_ascii_lowercase();
+        self.object_types.insert(key, Arc::new(obj_type));
+    }
+
+    /// Registers the default system object types.
+    fn register_standard_types(&mut self) {
+        // Directory generic mapping
+        self.register_object_type(ObjectType::new(
+            "Directory",
+            ObjectTypeKind::Directory,
+            GenericMapping::new(
+                STANDARD_RIGHTS_READ | DIRECTORY_QUERY | DIRECTORY_TRAVERSE,
+                STANDARD_RIGHTS_WRITE | DIRECTORY_CREATE_OBJECT | DIRECTORY_CREATE_SUBDIRECTORY,
+                STANDARD_RIGHTS_EXECUTE | DIRECTORY_TRAVERSE,
+                DIRECTORY_ALL_ACCESS,
+            ),
+        ));
+
+        // SymbolicLink generic mapping
+        self.register_object_type(ObjectType::new(
+            "SymbolicLink",
+            ObjectTypeKind::SymbolicLink,
+            GenericMapping::new(
+                STANDARD_RIGHTS_READ | SYMBOLIC_LINK_QUERY,
+                STANDARD_RIGHTS_WRITE | SYMBOLIC_LINK_SET,
+                STANDARD_RIGHTS_EXECUTE | SYMBOLIC_LINK_QUERY,
+                SYMBOLIC_LINK_ALL_ACCESS,
+            ),
+        ));
+
+        // Device, Section, Event
+        self.register_object_type(ObjectType::new(
+            "Device",
+            ObjectTypeKind::Device,
+            GenericMapping::new(STANDARD_RIGHTS_READ, STANDARD_RIGHTS_WRITE, STANDARD_RIGHTS_EXECUTE, STANDARD_RIGHTS_ALL),
+        ));
+
+        self.register_object_type(ObjectType::new(
+            "Section",
+            ObjectTypeKind::Section,
+            GenericMapping::new(0x0004, 0x0002, 0x0008, 0x000F | STANDARD_RIGHTS_REQUIRED),
+        ));
+    }
+
+    /// Retrieves the generic mapping for a given object type.
+    pub fn get_generic_mapping(&self, kind: ObjectTypeKind) -> GenericMapping {
+        match kind {
+            ObjectTypeKind::Directory => GenericMapping::new(
+                STANDARD_RIGHTS_READ | DIRECTORY_QUERY | DIRECTORY_TRAVERSE,
+                STANDARD_RIGHTS_WRITE | DIRECTORY_CREATE_OBJECT | DIRECTORY_CREATE_SUBDIRECTORY,
+                STANDARD_RIGHTS_EXECUTE | DIRECTORY_TRAVERSE,
+                DIRECTORY_ALL_ACCESS,
+            ),
+            ObjectTypeKind::SymbolicLink => GenericMapping::new(
+                STANDARD_RIGHTS_READ | SYMBOLIC_LINK_QUERY,
+                STANDARD_RIGHTS_WRITE | SYMBOLIC_LINK_SET,
+                STANDARD_RIGHTS_EXECUTE | SYMBOLIC_LINK_QUERY,
+                SYMBOLIC_LINK_ALL_ACCESS,
+            ),
+            _ => GenericMapping::new(
+                STANDARD_RIGHTS_READ,
+                STANDARD_RIGHTS_WRITE,
+                STANDARD_RIGHTS_EXECUTE,
+                STANDARD_RIGHTS_ALL,
+            ),
+        }
+    }
+
+    /// Evaluates requested access mask against object's DACL and caller's credentials.
+    pub fn validate_access(
+        &self,
+        object: &NtObject,
+        caller: &CallerSecurityContext,
+        requested_access: ACCESS_MASK,
+    ) -> Result<ACCESS_MASK, NtStatus> {
+        let mapping = self.get_generic_mapping(object.header.type_kind);
+        let mut mapped_access = requested_access;
+        mapping.map_mask(&mut mapped_access);
+
+        // Kernel or System callers automatically bypass DACL
+        if caller.is_kernel || caller.trust_level >= ProcessTrustLevel::System {
+            return Ok(mapped_access);
+        }
+
+        // If security descriptor is set, evaluate DACL
+        if let Some(ref sd) = object.header.security_descriptor {
+            if !sd.evaluate_access(&caller.client_sids, mapped_access) {
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        Ok(mapped_access)
+    }
+
+    /// Sets the security descriptor on an object identified by path.
+    pub fn set_object_security_descriptor(
+        &self,
+        path: &str,
+        sd: SecurityDescriptor,
+    ) -> Result<(), NtStatus> {
+        let obj = self.resolve_path(path, true)?;
+        let mut o = obj.lock();
+        o.header.security_descriptor = Some(sd);
+        Ok(())
     }
 
     /// Closes an open handle.
