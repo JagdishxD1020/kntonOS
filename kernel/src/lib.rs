@@ -1043,6 +1043,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld voice chat beamformer, noise gate and AEC self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Dynamic Variable Rate Audio Resampling & Sub-Millisecond Spatial Panning Engine (TASK-KNT-260)
+    if !audio::test_audio_spatial_resampler_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld audio dynamic resampler and spatial panner self-test failed!\r\n");
+    }
+
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
     if !crypto::test_crypto_rng_subsystem() {

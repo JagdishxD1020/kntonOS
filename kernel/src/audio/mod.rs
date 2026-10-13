@@ -18,6 +18,8 @@ pub mod winmm;
 pub mod openal;
 pub mod footstep_enhancer;
 pub mod voice_beamformer;
+pub mod spatial_resampler;
+pub use spatial_resampler::*;
 
 pub use occlusion::test_audio_occlusion_subsystem;
 pub use vad::test_audio_vad_subsystem;
