@@ -763,3 +763,36 @@ pub fn verify_headphone_crossfeed_and_doppler() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Dynamic Variable Rate Audio Resampling
+/// & Sub-Millisecond Spatial Panning Engine (TASK-KNT-260).
+pub fn test_audio_spatial_resampler_subsystem() -> bool {
+    crate::serial_write_str("[AUDIO-SPATIAL] Initiating Handheld Dynamic Audio Resampler & 3D Spatial Panner Verification...\r\n");
+
+    if !verify_dynamic_variable_rate_resampler() {
+        crate::serial_write_str("[AUDIO-SPATIAL-ERR] Dynamic variable rate resampler & clock drift test failed!\r\n");
+        return false;
+    }
+
+    if !verify_sinc_polyphase_fir_filter() {
+        crate::serial_write_str("[AUDIO-SPATIAL-ERR] Sinc polyphase FIR filter bank test failed!\r\n");
+        return false;
+    }
+
+    if !verify_hrtf_vector_panner() {
+        crate::serial_write_str("[AUDIO-SPATIAL-ERR] 3D spatial HRTF vector panner & ITD delay test failed!\r\n");
+        return false;
+    }
+
+    if !verify_headphone_crossfeed_and_doppler() {
+        crate::serial_write_str("[AUDIO-SPATIAL-ERR] Headphone crossfeed & Doppler shift test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-AUDIO-SPATIAL-PASS] Audio spatial resampler and 3D panner verified!\r\n");
+    true
+}
