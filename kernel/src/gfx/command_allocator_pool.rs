@@ -213,3 +213,166 @@ impl ThreadCommandAllocatorPool {
         sum_d + sum_c + sum_cp
     }
 }
+
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+// Maximum slots in atomic lock-free allocator freelist.
+pub const MAX_LOCK_FREE_SLOTS: usize = 64;
+
+// Atomic lock-free allocator freelist for zero-contention recycling across threads.
+pub struct AtomicAllocatorFreelist {
+    pub available_mask: AtomicU64,
+    pub slots: Vec<Option<CommandAllocatorInstance>>,
+    pub total_recycles: AtomicUsize,
+    pub total_acquisitions: AtomicUsize,
+}
+
+impl AtomicAllocatorFreelist {
+    // Construct empty atomic freelist.
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(MAX_LOCK_FREE_SLOTS);
+        for _ in 0..MAX_LOCK_FREE_SLOTS {
+            slots.push(None);
+        }
+        Self {
+            available_mask: AtomicU64::new(0),
+            slots,
+            total_recycles: AtomicUsize::new(0),
+            total_acquisitions: AtomicUsize::new(0),
+        }
+    }
+
+    // Push a completed allocator into the lock-free freelist.
+    pub fn push_allocator(&mut self, mut allocator: CommandAllocatorInstance) -> bool {
+        allocator.reset();
+        for i in 0..MAX_LOCK_FREE_SLOTS {
+            let mask = 1u64 << i;
+            let current = self.available_mask.load(Ordering::Acquire);
+            if (current & mask) == 0 {
+                self.slots[i] = Some(allocator);
+                self.available_mask.fetch_or(mask, Ordering::Release);
+                self.total_recycles.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    // Pop an allocator of matching command list type from freelist.
+    pub fn pop_allocator(&mut self, list_type: D3D12_COMMAND_LIST_TYPE) -> Option<CommandAllocatorInstance> {
+        let current = self.available_mask.load(Ordering::Acquire);
+        for i in 0..MAX_LOCK_FREE_SLOTS {
+            let mask = 1u64 << i;
+            if (current & mask) != 0 {
+                if let Some(ref alloc) = self.slots[i] {
+                    if alloc.list_type == list_type {
+                        self.available_mask.fetch_and(!mask, Ordering::Release);
+                        self.total_acquisitions.fetch_add(1, Ordering::Relaxed);
+                        return self.slots[i].take();
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Number of available allocators in the freelist.
+    pub fn available_count(&self) -> usize {
+        self.available_mask.load(Ordering::Relaxed).count_ones() as usize
+    }
+}
+
+// Thread-affine allocator manager coordinating per-thread pools and global lock-free recycling.
+pub struct ThreadAffineAllocatorManager {
+    pub thread_pools: Vec<ThreadCommandAllocatorPool>,
+    pub global_freelist: AtomicAllocatorFreelist,
+    pub base_virtual_address: u64,
+    pub next_thread_id: u32,
+    pub thread_affine_hits: usize,
+    pub global_freelist_hits: usize,
+    pub cold_allocations: usize,
+}
+
+impl ThreadAffineAllocatorManager {
+    // Construct thread-affine manager starting at given GPU virtual address.
+    pub fn new(base_va: u64) -> Self {
+        Self {
+            thread_pools: Vec::new(),
+            global_freelist: AtomicAllocatorFreelist::new(),
+            base_virtual_address: base_va,
+            next_thread_id: 1,
+            thread_affine_hits: 0,
+            global_freelist_hits: 0,
+            cold_allocations: 0,
+        }
+    }
+
+    // Register a thread and return its thread ID.
+    pub fn register_thread(&mut self) -> u32 {
+        let tid = self.next_thread_id;
+        self.next_thread_id += 1;
+        let pool_va = self.base_virtual_address + (tid as u64) * 0x1000_0000;
+        self.thread_pools.push(ThreadCommandAllocatorPool::new(tid, pool_va));
+        tid
+    }
+
+    // Obtain an allocator with thread-affinity priority, falling back to lock-free freelist.
+    pub fn acquire_allocator(
+        &mut self,
+        thread_id: u32,
+        list_type: D3D12_COMMAND_LIST_TYPE,
+        completed_fence: u64,
+    ) -> &mut CommandAllocatorInstance {
+        let pool_idx = match self.thread_pools.iter().position(|p| p.thread_id == thread_id) {
+            Some(idx) => idx,
+            None => {
+                let pool_va = self.base_virtual_address + (thread_id as u64) * 0x1000_0000;
+                self.thread_pools.push(ThreadCommandAllocatorPool::new(thread_id, pool_va));
+                self.thread_pools.len() - 1
+            }
+        };
+
+        let pool = &mut self.thread_pools[pool_idx];
+        let allocators = match list_type {
+            D3D12_COMMAND_LIST_TYPE::Direct | D3D12_COMMAND_LIST_TYPE::Bundle => &mut pool.direct_allocators,
+            D3D12_COMMAND_LIST_TYPE::Compute => &mut pool.compute_allocators,
+            D3D12_COMMAND_LIST_TYPE::Copy => &mut pool.copy_allocators,
+            _ => &mut pool.direct_allocators,
+        };
+
+        for i in 0..allocators.len() {
+            if allocators[i].is_ready_for_reset(completed_fence) {
+                allocators[i].reset();
+                allocators[i].lifecycle = AllocatorLifecycle::Recording;
+                self.thread_affine_hits += 1;
+                return &mut allocators[i];
+            }
+        }
+
+        if let Some(mut recycled) = self.global_freelist.pop_allocator(list_type) {
+            recycled.thread_id = thread_id;
+            recycled.lifecycle = AllocatorLifecycle::Recording;
+            allocators.push(recycled);
+            self.global_freelist_hits += 1;
+            let last = allocators.len() - 1;
+            return &mut allocators[last];
+        }
+
+        self.cold_allocations += 1;
+        let id = pool.next_allocator_id;
+        pool.next_allocator_id += 1;
+        let va = pool.next_virtual_address;
+        pool.next_virtual_address += COMMAND_ALLOCATOR_DEFAULT_PAGE_SIZE as u64;
+
+        let mut instance = CommandAllocatorInstance::new(id, thread_id, list_type, va);
+        instance.lifecycle = AllocatorLifecycle::Recording;
+        allocators.push(instance);
+        let last = allocators.len() - 1;
+        &mut allocators[last]
+    }
+
+    // Recycle allocator into the global lock-free freelist.
+    pub fn recycle_to_global_freelist(&mut self, allocator: CommandAllocatorInstance) -> bool {
+        self.global_freelist.push_allocator(allocator)
+    }
+}
