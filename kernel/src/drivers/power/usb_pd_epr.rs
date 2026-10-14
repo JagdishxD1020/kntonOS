@@ -246,3 +246,154 @@ pub fn verify_usb_pd_epr_contract_negotiation() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Real-Time Cable Impedance & Contact Resistance Tracking
+// ============================================================================
+
+/// Contact health diagnostic rating for USB Type-C receptacle and cable plug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableContactHealth {
+    /// Optimal contact resistance (< 120 mΩ); safe for maximum 5A EPR charging.
+    OptimalCleanContact,
+    /// Elevated contact resistance (120 mΩ .. 250 mΩ); moderate wear or dust, throttles current to 3A.
+    ElevatedResistanceWarning,
+    /// Severe oxidation / thermal degradation (> 250 mΩ); high risk of port melting, throttles to 1.5A / 5V.
+    OxidizedSevereContactFault,
+}
+
+/// Real-Time Cable Impedance and Contact Resistance Tracker.
+///
+/// Under 240W EPR (48V @ 5A), dirty, oxidized, or worn USB-C connector contacts
+/// dissipate extreme I^2 * R heat (e.g. 5A through a 300 mΩ contact burns 7.5W of heat
+/// inside the handheld charging port, melting plastics and scorching pins).
+/// This engine performs active Kelvin-style impedance probing:
+/// 1. Measures Vbus voltage droop between light load (0.5A) and heavy load (5.0A):
+///    R_cable = (V_light - V_heavy) / (I_heavy - I_light)
+/// 2. Tracks port thermal temperature sensor co-located on the USB-C PCB receptacle.
+/// 3. Automatically triggers contact oxidation warnings and scales down charge current.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CableImpedanceTracker {
+    /// Measured total round-trip cable and contact resistance in milliohms (mΩ).
+    pub measured_resistance_mohm: u32,
+    /// Baseline contact resistance when freshly mated in mΩ.
+    pub baseline_resistance_mohm: u32,
+    /// USB-C receptacle thermistor temperature in degrees Celsius (°C).
+    pub port_temperature_c: f32,
+    /// Contact health status.
+    pub contact_health: CableContactHealth,
+    /// Recommended maximum charging current in mA to prevent port overheating.
+    pub recommended_current_cap_ma: u32,
+    /// Total impedance measurement probes executed.
+    pub probes_executed: u32,
+    /// Thermal runaway warnings logged.
+    pub thermal_warnings_count: u32,
+}
+
+impl CableImpedanceTracker {
+    /// Optimal contact resistance threshold in milliohms (120 mΩ).
+    pub const RESISTANCE_OPTIMAL_MAX_MOHM: u32 = 120;
+    /// Elevated resistance warning threshold in milliohms (250 mΩ).
+    pub const RESISTANCE_ELEVATED_MAX_MOHM: u32 = 250;
+    /// Maximum safe USB-C receptacle temperature (°C).
+    pub const MAX_SAFE_PORT_TEMP_C: f32 = 65.0;
+
+    /// Constructs an impedance tracker with pristine default contact metrics.
+    pub const fn new() -> Self {
+        Self {
+            measured_resistance_mohm: 80, // Pristine 80 mΩ
+            baseline_resistance_mohm: 80,
+            port_temperature_c: 28.0,
+            contact_health: CableContactHealth::OptimalCleanContact,
+            recommended_current_cap_ma: 5_000,
+            probes_executed: 0,
+            thermal_warnings_count: 0,
+        }
+    }
+
+    /// Evaluates cable and contact impedance from delta-V and delta-I telemetry:
+    /// `v_light_mv` @ `i_light_ma` and `v_heavy_mv` @ `i_heavy_ma`.
+    pub fn probe_impedance(
+        &mut self,
+        v_light_mv: u32,
+        i_light_ma: u32,
+        v_heavy_mv: u32,
+        i_heavy_ma: u32,
+        port_temp_c: f32,
+    ) -> CableContactHealth {
+        self.probes_executed += 1;
+        self.port_temperature_c = port_temp_c;
+
+        if i_heavy_ma > i_light_ma && v_light_mv >= v_heavy_mv {
+            let delta_v_mv = v_light_mv - v_heavy_mv;
+            let delta_i_ma = i_heavy_ma - i_light_ma;
+
+            // R (mΩ) = (delta_v_mv * 1000) / delta_i_ma
+            let calculated_mohm = ((delta_v_mv as u64 * 1000) / (delta_i_ma as u64)) as u32;
+            self.measured_resistance_mohm = calculated_mohm;
+        }
+
+        // Assess contact health and port temperature
+        if self.port_temperature_c >= Self::MAX_SAFE_PORT_TEMP_C
+            || self.measured_resistance_mohm > Self::RESISTANCE_ELEVATED_MAX_MOHM
+        {
+            self.contact_health = CableContactHealth::OxidizedSevereContactFault;
+            self.recommended_current_cap_ma = 1_500; // Throttle to 1.5A safe limit
+            self.thermal_warnings_count += 1;
+        } else if self.measured_resistance_mohm > Self::RESISTANCE_OPTIMAL_MAX_MOHM {
+            self.contact_health = CableContactHealth::ElevatedResistanceWarning;
+            self.recommended_current_cap_ma = 3_000; // Throttle to 3.0A
+        } else {
+            self.contact_health = CableContactHealth::OptimalCleanContact;
+            self.recommended_current_cap_ma = 5_000; // Full 5.0A EPR capability
+        }
+
+        self.contact_health
+    }
+}
+
+/// Verification test for real-time cable impedance and contact resistance tracking.
+pub fn verify_cable_impedance_tracking() -> bool {
+    let mut tracker = CableImpedanceTracker::new();
+
+    // 1. Initial state: Optimal 80 mΩ, 5A cap
+    if tracker.contact_health != CableContactHealth::OptimalCleanContact {
+        return false;
+    }
+    if tracker.recommended_current_cap_ma != 5_000 {
+        return false;
+    }
+
+    // 2. Clean probe: Light load (48,000 mV @ 500 mA), Heavy load (47,595 mV @ 5000 mA)
+    // Delta V = 405 mV, Delta I = 4500 mA -> R = 405,000 / 4500 = 90 mΩ (< 120 mΩ optimal)
+    let health_clean = tracker.probe_impedance(48_000, 500, 47_595, 5_000, 35.0);
+    if health_clean != CableContactHealth::OptimalCleanContact {
+        return false;
+    }
+    if tracker.measured_resistance_mohm != 90 || tracker.recommended_current_cap_ma != 5_000 {
+        return false;
+    }
+
+    // 3. Elevated resistance test (worn cable): Delta V = 720 mV, Delta I = 4500 mA -> R = 160 mΩ
+    let health_elevated = tracker.probe_impedance(48_000, 500, 47_280, 5_000, 42.0);
+    if health_elevated != CableContactHealth::ElevatedResistanceWarning {
+        return false;
+    }
+    if tracker.measured_resistance_mohm != 160 || tracker.recommended_current_cap_ma != 3_000 {
+        return false;
+    }
+
+    // 4. Severe contact oxidation / thermal warning: Delta V = 1350 mV @ 4500 mA -> R = 300 mΩ or Temp = 68°C
+    let health_severe = tracker.probe_impedance(48_000, 500, 46_650, 5_000, 68.0);
+    if health_severe != CableContactHealth::OxidizedSevereContactFault {
+        return false;
+    }
+    if tracker.measured_resistance_mohm != 300 || tracker.recommended_current_cap_ma != 1_500 {
+        return false;
+    }
+    if tracker.thermal_warnings_count != 1 {
+        return false;
+    }
+
+    true
+}
