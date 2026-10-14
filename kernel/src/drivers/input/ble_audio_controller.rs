@@ -373,3 +373,153 @@ pub fn verify_dual_controller_multiplexer() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 3: Dynamic Polling Rate Governor (Adaptive 500Hz - 1000Hz Polling)
+// ============================================================================
+
+/// Dynamic controller USB / Bluetooth polling rate setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerPollingRateHz {
+    /// 500 Hz polling rate (2.0 ms interval, power-saving mode when hands/sticks are stationary).
+    Rate500Hz = 500,
+    /// 1000 Hz polling rate (1.0 ms interval, esports competitive high-velocity flick mode).
+    Rate1000Hz = 1000,
+}
+
+impl ControllerPollingRateHz {
+    /// Returns interval in microseconds (µs).
+    pub const fn interval_us(&self) -> u32 {
+        match self {
+            Self::Rate500Hz => 2000,
+            Self::Rate1000Hz => 1000,
+        }
+    }
+}
+
+/// Dynamic Polling Rate Governor.
+///
+/// Running Bluetooth / 2.4GHz controller radios at continuous 1000 Hz consumes significant
+/// RF battery power and increases CPU interrupt servicing overhead.
+/// This governor tracks input angular velocity across thumbsticks and triggers:
+/// 1. During fast stick flicks or rapid button presses (velocity > 8000 units/sec):
+///    Dynamically ramps polling rate to 1000 Hz (< 1.0ms latency).
+/// 2. During stationary stick holding, navigating menus, or slow movement:
+///    Drops polling rate to 500 Hz (2.0ms interval), saving up to 40% controller battery life.
+/// 3. Employs a 50ms holdoff decay timer to prevent rapid polling flapping.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicPollingRateGovernor {
+    /// Current operating polling rate.
+    pub current_rate: ControllerPollingRateHz,
+    /// Measured thumbstick movement velocity in units/second.
+    pub stick_velocity_units_per_s: u32,
+    /// Velocity threshold to trigger 1000 Hz polling (8,000 units/s).
+    pub high_rate_threshold: u32,
+    /// Holdoff timer in microseconds remaining before falling back to 500 Hz.
+    pub holdoff_remaining_us: u32,
+    /// Total polling rate escalations to 1000 Hz executed.
+    pub escalations_count: u32,
+}
+
+impl DynamicPollingRateGovernor {
+    /// Holdoff time (50,000 µs = 50 ms) to keep 1000 Hz active after motion stops.
+    pub const HOLDOFF_DECAY_US: u32 = 50_000;
+
+    /// Constructs a dynamic polling rate governor defaulting to 500 Hz.
+    pub const fn new() -> Self {
+        Self {
+            current_rate: ControllerPollingRateHz::Rate500Hz,
+            stick_velocity_units_per_s: 0,
+            high_rate_threshold: 8_000,
+            holdoff_remaining_us: 0,
+            escalations_count: 0,
+        }
+    }
+
+    /// Evaluates stick motion delta and elapsed time in microseconds, updating polling rate.
+    pub fn update_movement(
+        &mut self,
+        prev_x: i16,
+        prev_y: i16,
+        curr_x: i16,
+        curr_y: i16,
+        buttons_changed: bool,
+        dt_us: u32,
+    ) -> ControllerPollingRateHz {
+        if dt_us == 0 {
+            return self.current_rate;
+        }
+
+        let dx = (curr_x as i32 - prev_x as i32).abs();
+        let dy = (curr_y as i32 - prev_y as i32).abs();
+        let distance = dx + dy; // Manhattan distance approximation for fast integer velocity
+
+        // Velocity = (distance * 1,000,000) / dt_us
+        let velocity = ((distance as u64 * 1_000_000) / dt_us as u64) as u32;
+        self.stick_velocity_units_per_s = velocity;
+
+        if velocity >= self.high_rate_threshold || buttons_changed {
+            // Rapid flick or button tap: Escalate to 1000 Hz immediately
+            if self.current_rate != ControllerPollingRateHz::Rate1000Hz {
+                self.escalations_count += 1;
+            }
+            self.current_rate = ControllerPollingRateHz::Rate1000Hz;
+            self.holdoff_remaining_us = Self::HOLDOFF_DECAY_US;
+        } else {
+            // Inactivity or slow movement: Decay holdoff timer
+            if self.holdoff_remaining_us > 0 {
+                if self.holdoff_remaining_us <= dt_us {
+                    self.holdoff_remaining_us = 0;
+                    self.current_rate = ControllerPollingRateHz::Rate500Hz;
+                } else {
+                    self.holdoff_remaining_us -= dt_us;
+                }
+            } else {
+                self.current_rate = ControllerPollingRateHz::Rate500Hz;
+            }
+        }
+
+        self.current_rate
+    }
+}
+
+/// Verification test for dynamic polling rate governor.
+pub fn verify_dynamic_polling_rate_governor() -> bool {
+    let mut gov = DynamicPollingRateGovernor::new();
+
+    // 1. Initial state: 500 Hz
+    if gov.current_rate != ControllerPollingRateHz::Rate500Hz {
+        return false;
+    }
+
+    // 2. Slow stick movement: from 0,0 to 10,10 over 10,000 µs (10ms)
+    // Distance = 20, velocity = (20 * 1,000,000) / 10,000 = 2,000 units/s (< 8,000 threshold)
+    let r1 = gov.update_movement(0, 0, 10, 10, false, 10_000);
+    if r1 != ControllerPollingRateHz::Rate500Hz || gov.current_rate != ControllerPollingRateHz::Rate500Hz {
+        return false;
+    }
+
+    // 3. Fast flick: from 10,10 to 1000,1000 over 10,000 µs (10ms)
+    // Distance = 1980, velocity = (1980 * 1,000,000) / 10,000 = 198,000 units/s (> 8,000 threshold)
+    let r2 = gov.update_movement(10, 10, 1000, 1000, false, 10_000);
+    if r2 != ControllerPollingRateHz::Rate1000Hz || gov.current_rate != ControllerPollingRateHz::Rate1000Hz {
+        return false;
+    }
+    if gov.escalations_count != 1 || gov.holdoff_remaining_us != DynamicPollingRateGovernor::HOLDOFF_DECAY_US {
+        return false;
+    }
+
+    // 4. Motion stops, advance by 20,000 µs (20ms): Holdoff decay active, stays at 1000 Hz
+    let r3 = gov.update_movement(1000, 1000, 1000, 1000, false, 20_000);
+    if r3 != ControllerPollingRateHz::Rate1000Hz {
+        return false;
+    }
+
+    // 5. Advance another 35,000 µs (35ms > remaining 30ms holdoff): Drops back to 500 Hz
+    let r4 = gov.update_movement(1000, 1000, 1000, 1000, false, 35_000);
+    if r4 != ControllerPollingRateHz::Rate500Hz || gov.current_rate != ControllerPollingRateHz::Rate500Hz {
+        return false;
+    }
+
+    true
+}
