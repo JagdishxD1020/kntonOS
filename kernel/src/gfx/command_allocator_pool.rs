@@ -376,3 +376,152 @@ impl ThreadAffineAllocatorManager {
         self.global_freelist.push_allocator(allocator)
     }
 }
+
+// Command list batch submitted to hardware execution queues.
+#[derive(Debug, Clone)]
+pub struct CommandListBatch {
+    pub list_id: u32,
+    pub allocator_id: u32,
+    pub command_count: usize,
+    pub recorded_bytes: usize,
+}
+
+impl CommandListBatch {
+    // Construct a new command list batch.
+    pub fn new(list_id: u32, allocator_id: u32, command_count: usize, recorded_bytes: usize) -> Self {
+        Self {
+            list_id,
+            allocator_id,
+            command_count,
+            recorded_bytes,
+        }
+    }
+}
+
+// Hardware command queue maintaining monotonic timeline fence and pending wait-points.
+#[derive(Debug, Clone)]
+pub struct HardwareCommandQueue {
+    pub queue_type: D3D12_COMMAND_LIST_TYPE,
+    pub timeline_fence_value: u64,
+    pub completed_fence_value: u64,
+    pub pending_waits: Vec<(u32, u64)>,
+    pub submitted_batches: Vec<CommandListBatch>,
+}
+
+impl HardwareCommandQueue {
+    // Construct new hardware queue.
+    pub fn new(queue_type: D3D12_COMMAND_LIST_TYPE) -> Self {
+        Self {
+            queue_type,
+            timeline_fence_value: 0,
+            completed_fence_value: 0,
+            pending_waits: Vec::new(),
+            submitted_batches: Vec::new(),
+        }
+    }
+
+    // Insert GPU wait condition on an external timeline fence.
+    pub fn wait_fence(&mut self, fence_id: u32, target_value: u64) {
+        self.pending_waits.push((fence_id, target_value));
+    }
+
+    // Advance GPU completed fence value up to specified value.
+    pub fn advance_progress(&mut self, completed_value: u64) {
+        if completed_value > self.completed_fence_value {
+            self.completed_fence_value = completed_value;
+        }
+    }
+}
+
+// Sub-microsecond multi-queue submission engine coordinating Direct, Compute, and Copy queues.
+pub struct SubMicrosecondMultiQueueEngine {
+    pub direct_queue: HardwareCommandQueue,
+    pub compute_queue: HardwareCommandQueue,
+    pub copy_queue: HardwareCommandQueue,
+    pub timeline_fence_id: u32,
+    pub total_submissions: u64,
+    pub total_sync_points: u64,
+}
+
+impl SubMicrosecondMultiQueueEngine {
+    // Construct new multi-queue submission engine.
+    pub fn new() -> Self {
+        Self {
+            direct_queue: HardwareCommandQueue::new(D3D12_COMMAND_LIST_TYPE::Direct),
+            compute_queue: HardwareCommandQueue::new(D3D12_COMMAND_LIST_TYPE::Compute),
+            copy_queue: HardwareCommandQueue::new(D3D12_COMMAND_LIST_TYPE::Copy),
+            timeline_fence_id: 1,
+            total_submissions: 0,
+            total_sync_points: 0,
+        }
+    }
+
+    // Retrieve mutable reference to targeted queue.
+    fn get_queue_mut(&mut self, queue_type: D3D12_COMMAND_LIST_TYPE) -> &mut HardwareCommandQueue {
+        match queue_type {
+            D3D12_COMMAND_LIST_TYPE::Direct | D3D12_COMMAND_LIST_TYPE::Bundle => &mut self.direct_queue,
+            D3D12_COMMAND_LIST_TYPE::Compute => &mut self.compute_queue,
+            D3D12_COMMAND_LIST_TYPE::Copy => &mut self.copy_queue,
+            _ => &mut self.direct_queue,
+        }
+    }
+
+    // Retrieve shared reference to targeted queue.
+    fn get_queue(&self, queue_type: D3D12_COMMAND_LIST_TYPE) -> &HardwareCommandQueue {
+        match queue_type {
+            D3D12_COMMAND_LIST_TYPE::Direct | D3D12_COMMAND_LIST_TYPE::Bundle => &self.direct_queue,
+            D3D12_COMMAND_LIST_TYPE::Compute => &self.compute_queue,
+            D3D12_COMMAND_LIST_TYPE::Copy => &self.copy_queue,
+            _ => &self.direct_queue,
+        }
+    }
+
+    // Execute command lists batch on the target queue, returning new timeline fence value.
+    pub fn execute_command_lists(
+        &mut self,
+        queue_type: D3D12_COMMAND_LIST_TYPE,
+        batches: &[CommandListBatch],
+    ) -> u64 {
+        let queue = self.get_queue_mut(queue_type);
+        queue.timeline_fence_value += 1;
+        let signal_val = queue.timeline_fence_value;
+        for batch in batches {
+            queue.submitted_batches.push(batch.clone());
+        }
+        self.total_submissions += 1;
+        signal_val
+    }
+
+    // Enqueue cross-queue wait on target queue until source queue fence completes.
+    pub fn cross_queue_sync(
+        &mut self,
+        waiting_queue: D3D12_COMMAND_LIST_TYPE,
+        signaling_queue: D3D12_COMMAND_LIST_TYPE,
+    ) {
+        let signal_fence = self.get_queue(signaling_queue).timeline_fence_value;
+        let fence_id = self.timeline_fence_id;
+        let queue = self.get_queue_mut(waiting_queue);
+        queue.wait_fence(fence_id, signal_fence);
+        self.total_sync_points += 1;
+    }
+
+    // Advance completion progress on the targeted queue.
+    pub fn advance_queue_progress(&mut self, queue_type: D3D12_COMMAND_LIST_TYPE, completed_val: u64) {
+        self.get_queue_mut(queue_type).advance_progress(completed_val);
+    }
+
+    // Check if target queue timeline fence has completed specified value.
+    pub fn is_fence_completed(&self, queue_type: D3D12_COMMAND_LIST_TYPE, target_val: u64) -> bool {
+        self.get_queue(queue_type).completed_fence_value >= target_val
+    }
+
+    // Retrieve current timeline fence value for queue.
+    pub fn timeline_value(&self, queue_type: D3D12_COMMAND_LIST_TYPE) -> u64 {
+        self.get_queue(queue_type).timeline_fence_value
+    }
+
+    // Retrieve current completed fence value for queue.
+    pub fn completed_value(&self, queue_type: D3D12_COMMAND_LIST_TYPE) -> u64 {
+        self.get_queue(queue_type).completed_fence_value
+    }
+}
