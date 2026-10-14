@@ -238,10 +238,149 @@ impl ThreadApcContext {
     }
 }
 
+
+pub use crate::pe::object_namespace::ProcessTrustLevel;
+
+/// Violations detected by the anti-cheat APC injection governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiCheatApcViolationKind {
+    None,
+    CrossProcessInjection,
+    UnbackedCodePageInjection,
+    UnauthorizedThreadDetour,
+    SuspiciousPayloadTarget,
+}
+
+/// Audit event capturing an anti-cheat APC injection attempt.
+#[derive(Debug, Clone)]
+pub struct ApcTamperViolationRecord {
+    pub timestamp: u64,
+    pub caller_pid: u64,
+    pub target_pid: u64,
+    pub target_tid: u64,
+    pub apc_routine: usize,
+    pub caller_trust_level: ProcessTrustLevel,
+    pub violation_kind: AntiCheatApcViolationKind,
+}
+
+/// Address range descriptor for signed/backed executable PE modules.
+#[derive(Debug, Clone)]
+pub struct LoadedModuleRange {
+    pub name: String,
+    pub base_address: usize,
+    pub size: usize,
+    pub is_system_backed: bool,
+}
+
+/// Anti-cheat APC injection and thread hijacking defense governor.
+pub struct AntiCheatApcGovernor {
+    pub backed_modules: Vec<LoadedModuleRange>,
+    pub tamper_records: Vec<ApcTamperViolationRecord>,
+    pub tamper_count: AtomicU32,
+    pub strict_enforcement: AtomicBool,
+}
+
+impl AntiCheatApcGovernor {
+    pub fn new() -> Self {
+        let mut gov = Self {
+            backed_modules: Vec::new(),
+            tamper_records: Vec::new(),
+            tamper_count: AtomicU32::new(0),
+            strict_enforcement: AtomicBool::new(true),
+        };
+
+        // Pre-register standard system module code regions (e.g. ntdll.dll, kernel32.dll, kntmain.exe)
+        gov.register_backed_module("ntdll.dll", 0x00007FFF_8000_0000, 0x0020_0000);
+        gov.register_backed_module("kernel32.dll", 0x00007FFF_8040_0000, 0x0018_0000);
+        gov.register_backed_module("init.exe", 0x00000000_0040_0000, 0x0010_0000);
+        gov
+    }
+
+    /// Registers a validated PE module virtual address range backed by file system storage.
+    pub fn register_backed_module(&mut self, name: &str, base: usize, size: usize) {
+        self.backed_modules.push(LoadedModuleRange {
+            name: name.to_string(),
+            base_address: base,
+            size,
+            is_system_backed: true,
+        });
+    }
+
+    /// Checks if a code address resides within a verified file-backed executable module section.
+    pub fn is_address_module_backed(&self, addr: usize) -> bool {
+        self.backed_modules.iter().any(|m| {
+            addr >= m.base_address && addr < (m.base_address + m.size)
+        })
+    }
+
+    /// Validates an incoming APC queue request against anti-cheat injection policies.
+    pub fn verify_apc_request(
+        &mut self,
+        caller_pid: u64,
+        caller_trust: ProcessTrustLevel,
+        target_pid: u64,
+        target_tid: u64,
+        apc_routine: usize,
+    ) -> Result<(), NtStatus> {
+        // 1. Cross-process APC injection protection
+        if caller_pid != target_pid {
+            if caller_trust < ProcessTrustLevel::System {
+                self.record_violation(
+                    caller_pid,
+                    target_pid,
+                    target_tid,
+                    apc_routine,
+                    caller_trust,
+                    AntiCheatApcViolationKind::CrossProcessInjection,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        // 2. Unbacked code page execution detection (heap/stack/unbacked RWX memory injection)
+        if !self.is_address_module_backed(apc_routine) {
+            self.record_violation(
+                caller_pid,
+                target_pid,
+                target_tid,
+                apc_routine,
+                caller_trust,
+                AntiCheatApcViolationKind::UnbackedCodePageInjection,
+            );
+            return Err(STATUS_ACCESS_DENIED);
+        }
+
+        Ok(())
+    }
+
+    /// Records an anti-cheat tampering violation event.
+    pub fn record_violation(
+        &mut self,
+        caller_pid: u64,
+        target_pid: u64,
+        target_tid: u64,
+        apc_routine: usize,
+        caller_trust: ProcessTrustLevel,
+        kind: AntiCheatApcViolationKind,
+    ) {
+        self.tamper_count.fetch_add(1, Ordering::SeqCst);
+        self.tamper_records.push(ApcTamperViolationRecord {
+            timestamp: 0,
+            caller_pid,
+            target_pid,
+            target_tid,
+            apc_routine,
+            caller_trust_level: caller_trust,
+            violation_kind: kind,
+        });
+    }
+}
+
 /// Global system-wide Asynchronous Procedure Call governor.
 pub struct GlobalApcManager {
     pub threads: BTreeMap<u64, ThreadApcContext>,
     pub next_apc_id: AtomicU64,
+    pub anti_cheat_gov: AntiCheatApcGovernor,
 }
 
 impl GlobalApcManager {
@@ -249,6 +388,7 @@ impl GlobalApcManager {
         Self {
             threads: BTreeMap::new(),
             next_apc_id: AtomicU64::new(1),
+            anti_cheat_gov: AntiCheatApcGovernor::new(),
         }
     }
 
@@ -485,6 +625,43 @@ impl GlobalApcManager {
             Ok(_) => 1,
             Err(_) => 0,
         }
+    }
+
+
+    /// Queues a User-mode APC with anti-cheat origin and code-backing validation.
+    pub fn queue_user_apc_secure(
+        &mut self,
+        caller_pid: u64,
+        caller_trust: ProcessTrustLevel,
+        target_tid: u64,
+        apc_routine: usize,
+        context: usize,
+        arg1: usize,
+        arg2: usize,
+    ) -> Result<u64, NtStatus> {
+        let target_pid = self
+            .threads
+            .get(&target_tid)
+            .map(|t| t.process_id)
+            .ok_or(STATUS_INVALID_HANDLE)?;
+
+        // Validate via anti-cheat governor
+        self.anti_cheat_gov.verify_apc_request(
+            caller_pid,
+            caller_trust,
+            target_pid,
+            target_tid,
+            apc_routine,
+        )?;
+
+        self.queue_user_apc(target_tid, target_pid, apc_routine, context, arg1, arg2)
+    }
+
+    /// Queries total count of anti-cheat APC injection violations and the last recorded event.
+    pub fn get_anti_cheat_apc_stats(&self) -> (u32, Option<ApcTamperViolationRecord>) {
+        let count = self.anti_cheat_gov.tamper_count.load(Ordering::SeqCst);
+        let last = self.anti_cheat_gov.tamper_records.last().cloned();
+        (count, last)
     }
 
     /// Pops the next pending Kernel-mode APC for a thread.
