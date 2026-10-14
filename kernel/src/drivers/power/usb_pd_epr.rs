@@ -397,3 +397,161 @@ pub fn verify_cable_impedance_tracking() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 3: Dynamic Peak Gaming Boost Charging Governor
+// ============================================================================
+
+/// Operating power state for handheld APU and battery fast-charge power splitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamingBoostPowerState {
+    /// Pure Battery Power: AC charger disconnected.
+    BatteryDischargeOnly,
+    /// Balanced Charging: Charger provides power for APU and full battery charging.
+    BalancedCharging,
+    /// Peak Gaming Boost: APU draw exceeds sustained rating; battery charge rate throttled to 0W (pass-through).
+    PeakGamingPassThrough,
+    /// Battery Assist Boost: APU demand exceeds charger contract capacity; battery assists charger simultaneously.
+    HybridBatteryAssist,
+}
+
+/// Dynamic Peak Gaming Boost Charging Governor.
+///
+/// Handheld gaming APUs frequently spike from 15W sustained TDP to 35W-55W transient burst TDP.
+/// Under high load, concurrent fast charging can push the total handheld thermal dissipation
+/// past the chassis cooling limit (causing uncomfortably hot palm grips > 43°C or fan noise).
+/// This governor dynamically balances:
+/// P_charger = P_apu_draw + P_battery_charge
+///
+/// 1. Prioritizes APU gaming performance to prevent frame-rate drops.
+/// 2. Scales down battery charge current during heavy GPU/CPU scenes.
+/// 3. Enables "Hybrid Battery Assist" if APU power exceeds the negotiated USB-PD contract.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeakGamingBoostGovernor {
+    /// Total charger power delivery budget in Watts (from USB-PD contract, e.g. 65W, 100W, 140W, 240W).
+    pub charger_budget_w: u16,
+    /// Instantaneous APU package electrical power in Watts.
+    pub apu_power_draw_w: u16,
+    /// Handheld chassis palm grip temperature in °C.
+    pub grip_temp_c: f32,
+    /// Allocated battery charging power in Watts.
+    pub allocated_battery_charge_w: u16,
+    /// Battery discharge assist power in Watts (0 if not assisting).
+    pub battery_assist_draw_w: u16,
+    /// Active boost power mode.
+    pub power_state: GamingBoostPowerState,
+    /// Maximum allowable palm grip temperature (42.0°C).
+    pub max_grip_temp_c: f32,
+}
+
+impl PeakGamingBoostGovernor {
+    /// Constructs a peak gaming boost governor with a default 100W charger budget.
+    pub const fn new() -> Self {
+        Self {
+            charger_budget_w: 100,
+            apu_power_draw_w: 25,
+            grip_temp_c: 32.0,
+            allocated_battery_charge_w: 60,
+            battery_assist_draw_w: 0,
+            power_state: GamingBoostPowerState::BalancedCharging,
+            max_grip_temp_c: 42.0,
+        }
+    }
+
+    /// Evaluates and balances power sharing between APU and battery fast charge.
+    pub fn arbitrate_power(
+        &mut self,
+        charger_w: u16,
+        apu_w: u16,
+        grip_c: f32,
+        battery_target_w: u16,
+    ) -> GamingBoostPowerState {
+        self.charger_budget_w = charger_w;
+        self.apu_power_draw_w = apu_w;
+        self.grip_temp_c = grip_c;
+
+        if charger_w == 0 {
+            // Disconnected
+            self.allocated_battery_charge_w = 0;
+            self.battery_assist_draw_w = apu_w;
+            self.power_state = GamingBoostPowerState::BatteryDischargeOnly;
+            return self.power_state;
+        }
+
+        if apu_w > charger_w {
+            // APU demands more than charger can physically deliver (e.g. 120W burst on 100W charger)
+            // Enter Hybrid Battery Assist: Battery provides the difference
+            self.allocated_battery_charge_w = 0;
+            self.battery_assist_draw_w = apu_w - charger_w;
+            self.power_state = GamingBoostPowerState::HybridBatteryAssist;
+        } else {
+            // Charger has surplus capacity above APU draw
+            self.battery_assist_draw_w = 0;
+            let surplus_w = charger_w - apu_w;
+
+            // Thermal throttle: if palm grip temperature approaches or exceeds 42.0°C, throttle battery charge
+            let thermal_derating = if grip_c >= self.max_grip_temp_c {
+                0.0f32 // Complete thermal charge cutoff to cool down chassis
+            } else if grip_c >= 38.0 {
+                // Progressive linear derating from 38°C to 42°C
+                (self.max_grip_temp_c - grip_c) / (self.max_grip_temp_c - 38.0)
+            } else {
+                1.0f32
+            };
+
+            let allowable_charge_w = (surplus_w.min(battery_target_w) as f32 * thermal_derating) as u16;
+            self.allocated_battery_charge_w = allowable_charge_w;
+
+            if allowable_charge_w == 0 {
+                self.power_state = GamingBoostPowerState::PeakGamingPassThrough;
+            } else {
+                self.power_state = GamingBoostPowerState::BalancedCharging;
+            }
+        }
+
+        self.power_state
+    }
+}
+
+/// Verification test for dynamic peak gaming boost charging governor.
+pub fn verify_peak_gaming_boost_governor() -> bool {
+    let mut governor = PeakGamingBoostGovernor::new();
+
+    // 1. Balanced charging: 100W charger, 25W APU draw, cool grip (32°C), target 65W battery charge
+    let s1 = governor.arbitrate_power(100, 25, 32.0, 65);
+    if s1 != GamingBoostPowerState::BalancedCharging {
+        return false;
+    }
+    if governor.allocated_battery_charge_w != 65 || governor.battery_assist_draw_w != 0 {
+        return false;
+    }
+
+    // 2. High gaming load: 60W APU draw, 100W charger, surplus = 40W
+    let s2 = governor.arbitrate_power(100, 60, 35.0, 65);
+    if s2 != GamingBoostPowerState::BalancedCharging {
+        return false;
+    }
+    if governor.allocated_battery_charge_w != 40 || governor.battery_assist_draw_w != 0 {
+        return false;
+    }
+
+    // 3. Thermal throttling: Grip temp hits 42.5°C (> 42.0°C limit) -> Charge cut to 0W (Pass-Through mode)
+    let s3 = governor.arbitrate_power(100, 35, 42.5, 65);
+    if s3 != GamingBoostPowerState::PeakGamingPassThrough {
+        return false;
+    }
+    if governor.allocated_battery_charge_w != 0 {
+        return false;
+    }
+
+    // 4. Hybrid Battery Assist: Heavy 120W burst on a 100W charger -> Battery assists with 20W
+    let s4 = governor.arbitrate_power(100, 120, 38.0, 65);
+    if s4 != GamingBoostPowerState::HybridBatteryAssist {
+        return false;
+    }
+    if governor.battery_assist_draw_w != 20 || governor.allocated_battery_charge_w != 0 {
+        return false;
+    }
+
+    true
+}
