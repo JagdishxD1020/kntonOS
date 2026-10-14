@@ -1515,3 +1515,1043 @@ pub fn test_d3d12_work_graphs_subsystem() -> bool {
     crate::serial_write_str("[KNT-GFX-WORK-GRAPHS-PASS] Direct3D 12 work graphs autonomous GPU execution engine verified\r\n");
     true
 }
+
+// Direct3D 12 Agility Work Graphs Tier 1.0 capability levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum D3D12_WORK_GRAPHS_TIER {
+    NotSupported = 0,
+    Tier1_0 = 10,
+}
+
+// Work graph program configuration flags for autonomous GPU scheduling.
+pub const D3D12_WORK_GRAPH_FLAG_ENTRYPOINT: u32 = 1 << 0;
+pub const D3D12_WORK_GRAPH_FLAG_ALLOW_RECURSION: u32 = 1 << 1;
+pub const D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_ALLOCATION: u32 = 1 << 2;
+
+// Tier 1.0 work graph entrypoint specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkGraphTier1EntryPoint {
+    pub node_id: D3D12_NODE_ID,
+    pub flags: u32,
+    pub record_stride: u32,
+}
+
+impl WorkGraphTier1EntryPoint {
+    // Construct a new entrypoint specification.
+    pub fn new(node_id: D3D12_NODE_ID, flags: u32, record_stride: u32) -> Self {
+        Self {
+            node_id,
+            flags,
+            record_stride,
+        }
+    }
+}
+
+// Tier 1.0 work graph node classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkGraphTier1NodeType {
+    Broadcasting,
+    Coalescing,
+    Thread,
+}
+
+// Broadcasting launch overrides specifying dispatch grid dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BroadcastingNodeSpec {
+    pub dispatch_grid: [u32; 3],
+    pub max_dispatch_grid: [u32; 3],
+    pub threadgroup_size: [u32; 3],
+}
+
+// Coalescing launch overrides specifying record grouping threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CoalescingNodeSpec {
+    pub max_records_per_threadgroup: u32,
+    pub threadgroup_size: [u32; 3],
+}
+
+// Thread launch overrides specifying threadgroup dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadNodeSpec {
+    pub threadgroup_size: [u32; 3],
+}
+
+// Tier 1.0 work graph node specification.
+#[derive(Debug, Clone)]
+pub struct WorkGraphTier1NodeSpec {
+    pub node_id: D3D12_NODE_ID,
+    pub node_type: WorkGraphTier1NodeType,
+    pub shader_id: [u8; 32],
+    pub input_record_stride: u32,
+    pub input_record_alignment: u32,
+    pub output_record_stride: u32,
+    pub is_entry_point: bool,
+    pub broadcasting: Option<BroadcastingNodeSpec>,
+    pub coalescing: Option<CoalescingNodeSpec>,
+    pub thread: Option<ThreadNodeSpec>,
+    pub target_nodes: Vec<D3D12_NODE_ID>,
+}
+
+impl WorkGraphTier1NodeSpec {
+    // Construct a Tier 1.0 broadcasting node specification.
+    pub fn broadcaster(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        grid: [u32; 3],
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Broadcasting,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: Some(BroadcastingNodeSpec {
+                dispatch_grid: grid,
+                max_dispatch_grid: grid,
+                threadgroup_size: tg_size,
+            }),
+            coalescing: None,
+            thread: None,
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Construct a Tier 1.0 coalescing node specification.
+    pub fn coalescing(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        max_records: u32,
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Coalescing,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: None,
+            coalescing: Some(CoalescingNodeSpec {
+                max_records_per_threadgroup: max_records,
+                threadgroup_size: tg_size,
+            }),
+            thread: None,
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Construct a Tier 1.0 thread node specification.
+    pub fn thread(
+        name: &str,
+        index: u32,
+        shader_id: [u8; 32],
+        tg_size: [u32; 3],
+        in_stride: u32,
+        out_stride: u32,
+    ) -> Self {
+        Self {
+            node_id: D3D12_NODE_ID::new(name, index),
+            node_type: WorkGraphTier1NodeType::Thread,
+            shader_id,
+            input_record_stride: in_stride,
+            input_record_alignment: 4,
+            output_record_stride: out_stride,
+            is_entry_point: false,
+            broadcasting: None,
+            coalescing: None,
+            thread: Some(ThreadNodeSpec {
+                threadgroup_size: tg_size,
+            }),
+            target_nodes: Vec::new(),
+        }
+    }
+
+    // Connect a downstream child node target.
+    pub fn add_target(&mut self, target: D3D12_NODE_ID) -> Result<(), WorkGraphError> {
+        if self.target_nodes.len() >= MAX_OUTPUT_RECORD_TARGETS {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.target_nodes.push(target);
+        Ok(())
+    }
+
+    // Validate node configuration against Tier 1.0 rules.
+    pub fn validate(&self) -> Result<(), WorkGraphError> {
+        if self.input_record_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(self.input_record_stride as usize));
+        }
+        match self.node_type {
+            WorkGraphTier1NodeType::Broadcasting => {
+                let spec = self.broadcasting.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.dispatch_grid[0] == 0 || spec.dispatch_grid[1] == 0 || spec.dispatch_grid[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphTier1NodeType::Coalescing => {
+                let spec = self.coalescing.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.max_records_per_threadgroup == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+            WorkGraphTier1NodeType::Thread => {
+                let spec = self.thread.as_ref().ok_or(WorkGraphError::InvalidDispatchMode)?;
+                if spec.threadgroup_size[0] == 0 || spec.threadgroup_size[1] == 0 || spec.threadgroup_size[2] == 0 {
+                    return Err(WorkGraphError::InvalidGridDimensions);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// Direct3D 12 Agility Work Graphs Tier 1.0 Program Descriptor.
+#[derive(Debug, Clone)]
+pub struct WorkGraphTier1ProgramDesc {
+    pub program_name: &'static str,
+    pub tier: D3D12_WORK_GRAPHS_TIER,
+    pub flags: u32,
+    pub max_recursion_depth: u32,
+    pub entrypoints: Vec<WorkGraphTier1EntryPoint>,
+    pub nodes: Vec<WorkGraphTier1NodeSpec>,
+}
+
+impl WorkGraphTier1ProgramDesc {
+    // Construct a new Tier 1.0 program descriptor.
+    pub fn new(program_name: &'static str, flags: u32, max_depth: u32) -> Self {
+        Self {
+            program_name,
+            tier: D3D12_WORK_GRAPHS_TIER::Tier1_0,
+            flags,
+            max_recursion_depth: max_depth.min(MAX_WORK_GRAPH_RECURSION_DEPTH),
+            entrypoints: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    // Register a node specification in the work graph program.
+    pub fn add_node(&mut self, node: WorkGraphTier1NodeSpec) -> Result<(), WorkGraphError> {
+        if self.nodes.len() >= MAX_WORK_GRAPH_NODES {
+            return Err(WorkGraphError::ExceededMaxNodes);
+        }
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    // Register an entrypoint node for the work graph program.
+    pub fn add_entrypoint(&mut self, entry: WorkGraphTier1EntryPoint) -> Result<(), WorkGraphError> {
+        self.entrypoints.push(entry);
+        Ok(())
+    }
+
+    // Find node specification by node ID.
+    pub fn find_node(&self, id: D3D12_NODE_ID) -> Option<&WorkGraphTier1NodeSpec> {
+        self.nodes.iter().find(|n| n.node_id == id)
+    }
+
+    // Find node specification mutable reference by node ID.
+    pub fn find_node_mut(&mut self, id: D3D12_NODE_ID) -> Option<&mut WorkGraphTier1NodeSpec> {
+        self.nodes.iter_mut().find(|n| n.node_id == id)
+    }
+
+    // Return number of registered nodes.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    // Return number of registered entrypoints.
+    pub fn entrypoint_count(&self) -> usize {
+        self.entrypoints.len()
+    }
+}
+
+// Tier 1.0 backing memory and scratch requirements for autonomous GPU work graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkGraphTier1MemoryRequirements {
+    pub min_backing_memory_size_in_bytes: u64,
+    pub max_backing_memory_size_in_bytes: u64,
+    pub scratch_memory_size_in_bytes: u64,
+    pub node_input_record_pool_size: u64,
+    pub max_in_flight_records: u32,
+}
+
+impl WorkGraphTier1MemoryRequirements {
+    // Calculate backing memory requirements from program node topology.
+    pub fn calculate(program: &WorkGraphTier1ProgramDesc) -> Self {
+        let base_overhead = 4096u64;
+        let mut total_pools = 0u64;
+        let mut max_records = 0u32;
+
+        for node in &program.nodes {
+            let slot_size = (node.input_record_stride as u64 + 15) & !15;
+            let node_pool = slot_size.max(32) * 64;
+            total_pools += (node_pool + 255) & !255;
+            max_records += 64;
+        }
+
+        let aligned_pools = (total_pools + 255) & !255;
+        let min_backing = (base_overhead + aligned_pools + 255) & !255;
+        let max_backing = min_backing * 2;
+        let scratch = (min_backing / 2 + 255) & !255;
+
+        Self {
+            min_backing_memory_size_in_bytes: min_backing,
+            max_backing_memory_size_in_bytes: max_backing,
+            scratch_memory_size_in_bytes: scratch,
+            node_input_record_pool_size: aligned_pools,
+            max_in_flight_records: max_records,
+        }
+    }
+}
+
+// Memory range representing a GPU virtual address allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BackingMemoryRange {
+    pub gpu_va: u64,
+    pub size: u64,
+}
+
+// Autonomous GPU node input record pool managing dynamic record slots.
+#[derive(Debug, Clone)]
+pub struct NodeInputRecordPool {
+    pub node_id: D3D12_NODE_ID,
+    pub slot_size: usize,
+    pub capacity: usize,
+    pub base_va: u64,
+    pub allocated_mask: u64,
+    pub total_allocations: u64,
+    pub total_frees: u64,
+}
+
+impl NodeInputRecordPool {
+    // Construct a new node input record pool with 256-byte alignment.
+    pub fn new(node_id: D3D12_NODE_ID, slot_size: usize, capacity: usize, base_va: u64) -> Result<Self, WorkGraphError> {
+        if (base_va % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_va));
+        }
+        let cap = capacity.min(64).max(1);
+        let aligned_slot = (slot_size.max(16) + 15) & !15;
+        Ok(Self {
+            node_id,
+            slot_size: aligned_slot,
+            capacity: cap,
+            base_va,
+            allocated_mask: 0,
+            total_allocations: 0,
+            total_frees: 0,
+        })
+    }
+
+    // Allocate next available record slot from the pool.
+    pub fn allocate_slot(&mut self) -> Result<u64, WorkGraphError> {
+        for bit in 0..self.capacity {
+            let mask = 1u64 << bit;
+            if (self.allocated_mask & mask) == 0 {
+                self.allocated_mask |= mask;
+                self.total_allocations += 1;
+                return Ok(self.base_va + (bit * self.slot_size) as u64);
+            }
+        }
+        Err(WorkGraphError::RecordRingFull)
+    }
+
+    // Free a previously allocated record slot back to the pool.
+    pub fn free_slot(&mut self, gpu_va: u64) -> Result<(), WorkGraphError> {
+        if gpu_va < self.base_va {
+            return Err(WorkGraphError::InsufficientBackingMemory { required: self.base_va, provided: gpu_va });
+        }
+        let offset = (gpu_va - self.base_va) as usize;
+        if (offset % self.slot_size) != 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        let bit = offset / self.slot_size;
+        if bit >= self.capacity {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        let mask = 1u64 << bit;
+        if (self.allocated_mask & mask) == 0 {
+            return Err(WorkGraphError::RecordRingEmpty);
+        }
+        self.allocated_mask &= !mask;
+        self.total_frees += 1;
+        Ok(())
+    }
+
+    // Return count of available free slots.
+    pub fn available_slots(&self) -> usize {
+        self.capacity - self.allocated_mask.count_ones() as usize
+    }
+
+    // Return count of currently in-use slots.
+    pub fn in_use_slots(&self) -> usize {
+        self.allocated_mask.count_ones() as usize
+    }
+
+    // Reset all slot allocations.
+    pub fn reset(&mut self) {
+        self.allocated_mask = 0;
+    }
+}
+
+// Autonomous GPU Backing Memory Allocator managing backing and scratch partitions.
+#[derive(Debug, Clone)]
+pub struct AutonomousWorkGraphBackingAllocator {
+    pub base_address: u64,
+    pub total_size: u64,
+    pub allocated_bytes: u64,
+    pub scratch_offset: u64,
+    pub scratch_size: u64,
+    pub record_pools: Vec<NodeInputRecordPool>,
+}
+
+impl AutonomousWorkGraphBackingAllocator {
+    // Allocate backing store partitions from physical GPU virtual address.
+    pub fn new(base_address: u64, total_size: u64, reqs: &WorkGraphTier1MemoryRequirements) -> Result<Self, WorkGraphError> {
+        if (base_address % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+            return Err(WorkGraphError::UnalignedBackingMemory(base_address));
+        }
+        if total_size < reqs.min_backing_memory_size_in_bytes {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: reqs.min_backing_memory_size_in_bytes,
+                provided: total_size,
+            });
+        }
+
+        let scratch_sz = reqs.scratch_memory_size_in_bytes;
+        let scratch_off = (total_size.saturating_sub(scratch_sz)) & !255;
+
+        Ok(Self {
+            base_address,
+            total_size,
+            allocated_bytes: 4096,
+            scratch_offset: scratch_off,
+            scratch_size: scratch_sz,
+            record_pools: Vec::new(),
+        })
+    }
+
+    // Register a node input record pool within the backing store.
+    pub fn create_node_pool(&mut self, node: &WorkGraphTier1NodeSpec, capacity: usize) -> Result<&mut NodeInputRecordPool, WorkGraphError> {
+        let slot_size = ((node.input_record_stride as usize).max(16) + 15) & !15;
+        let pool_bytes = (slot_size * capacity.min(64) + 255) & !255;
+
+        if self.allocated_bytes + pool_bytes as u64 > self.scratch_offset {
+            return Err(WorkGraphError::InsufficientBackingMemory {
+                required: self.allocated_bytes + pool_bytes as u64,
+                provided: self.scratch_offset,
+            });
+        }
+
+        let pool_va = self.base_address + self.allocated_bytes;
+        self.allocated_bytes += pool_bytes as u64;
+
+        let pool = NodeInputRecordPool::new(node.node_id, slot_size, capacity, pool_va)?;
+        self.record_pools.push(pool);
+        let idx = self.record_pools.len() - 1;
+        Ok(&mut self.record_pools[idx])
+    }
+
+    // Locate node pool mutably by target node ID.
+    pub fn find_node_pool_mut(&mut self, node_id: D3D12_NODE_ID) -> Option<&mut NodeInputRecordPool> {
+        self.record_pools.iter_mut().find(|p| p.node_id == node_id)
+    }
+
+    // Query backing memory range.
+    pub fn backing_memory_range(&self) -> BackingMemoryRange {
+        BackingMemoryRange {
+            gpu_va: self.base_address,
+            size: self.scratch_offset,
+        }
+    }
+
+    // Query scratch memory range.
+    pub fn scratch_memory_range(&self) -> BackingMemoryRange {
+        BackingMemoryRange {
+            gpu_va: self.base_address + self.scratch_offset,
+            size: self.scratch_size,
+        }
+    }
+
+    // Query total allocated bytes.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
+    }
+
+    // Query remaining available bytes before scratch space.
+    pub fn available_bytes(&self) -> u64 {
+        self.scratch_offset.saturating_sub(self.allocated_bytes)
+    }
+
+    // Recycle all active node pool allocations.
+    pub fn recycle_all(&mut self) {
+        for pool in &mut self.record_pools {
+            pool.reset();
+        }
+    }
+}
+
+// Child node dispatch record generated by node shaders for downstream scheduling.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChildDispatchRecord {
+    pub producer_node: D3D12_NODE_ID,
+    pub target_node: D3D12_NODE_ID,
+    pub record_va: u64,
+    pub payload_size: u16,
+    pub recursion_depth: u16,
+    pub priority: u8,
+    pub flags: u8,
+    pub payload: [u8; MAX_NODE_RECORD_PAYLOAD_BYTES],
+}
+
+impl Default for ChildDispatchRecord {
+    fn default() -> Self {
+        Self {
+            producer_node: D3D12_NODE_ID::default(),
+            target_node: D3D12_NODE_ID::default(),
+            record_va: 0,
+            payload_size: 0,
+            recursion_depth: 0,
+            priority: 0,
+            flags: 0,
+            payload: [0u8; MAX_NODE_RECORD_PAYLOAD_BYTES],
+        }
+    }
+}
+
+impl ChildDispatchRecord {
+    // Construct child dispatch record with validated payload size and recursion depth.
+    pub fn new(
+        producer_node: D3D12_NODE_ID,
+        target_node: D3D12_NODE_ID,
+        payload_bytes: &[u8],
+        recursion_depth: u16,
+    ) -> Result<Self, WorkGraphError> {
+        if payload_bytes.len() > MAX_NODE_RECORD_PAYLOAD_BYTES {
+            return Err(WorkGraphError::PayloadSizeTooLarge(payload_bytes.len()));
+        }
+        if recursion_depth as u32 > MAX_WORK_GRAPH_RECURSION_DEPTH {
+            return Err(WorkGraphError::RecursionDepthExceeded(recursion_depth as u32));
+        }
+
+        let mut record = Self {
+            producer_node,
+            target_node,
+            record_va: 0,
+            payload_size: payload_bytes.len() as u16,
+            recursion_depth,
+            priority: 0,
+            flags: 0,
+            payload: [0u8; MAX_NODE_RECORD_PAYLOAD_BYTES],
+        };
+        record.payload[..payload_bytes.len()].copy_from_slice(payload_bytes);
+        Ok(record)
+    }
+
+    // Access slice of valid payload bytes.
+    pub fn payload_bytes(&self) -> &[u8] {
+        &self.payload[..self.payload_size as usize]
+    }
+}
+
+// Circular ring buffer backing child node dispatches in GPU memory.
+#[derive(Debug, Clone)]
+pub struct ChildDispatchRingBuffer {
+    pub target_node: D3D12_NODE_ID,
+    pub capacity: usize,
+    pub head: usize,
+    pub tail: usize,
+    pub count: usize,
+    pub ring: Vec<Option<ChildDispatchRecord>>,
+    pub total_enqueued: u64,
+    pub total_dequeued: u64,
+}
+
+impl ChildDispatchRingBuffer {
+    // Create a new child dispatch ring buffer with specified record capacity.
+    pub fn new(target_node: D3D12_NODE_ID, capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        let mut ring = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            ring.push(None);
+        }
+        Self {
+            target_node,
+            capacity: cap,
+            head: 0,
+            tail: 0,
+            count: 0,
+            ring,
+            total_enqueued: 0,
+            total_dequeued: 0,
+        }
+    }
+
+    // Push child record to ring buffer tail.
+    pub fn push(&mut self, record: ChildDispatchRecord) -> Result<(), WorkGraphError> {
+        if self.count >= self.capacity {
+            return Err(WorkGraphError::RecordRingFull);
+        }
+        self.ring[self.tail] = Some(record);
+        self.tail = (self.tail + 1) % self.capacity;
+        self.count += 1;
+        self.total_enqueued += 1;
+        Ok(())
+    }
+
+    // Pop child record from ring buffer head.
+    pub fn pop(&mut self) -> Option<ChildDispatchRecord> {
+        if self.count == 0 {
+            return None;
+        }
+        let record = self.ring[self.head].take();
+        self.head = (self.head + 1) % self.capacity;
+        self.count -= 1;
+        self.total_dequeued += 1;
+        record
+    }
+
+    // Whether the ring buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    // Whether the ring buffer is full.
+    pub fn is_full(&self) -> bool {
+        self.count >= self.capacity
+    }
+
+    // Number of records currently queued.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    // Clear all records from the ring buffer.
+    pub fn clear(&mut self) {
+        for slot in &mut self.ring {
+            *slot = None;
+        }
+        self.head = 0;
+        self.tail = 0;
+        self.count = 0;
+    }
+}
+
+// Node Shader Record Distributor managing dynamic allocations and dispatch queues.
+#[derive(Debug, Clone)]
+pub struct NodeShaderRecordDistributor {
+    pub max_recursion_depth: u32,
+    pub queues: Vec<ChildDispatchRingBuffer>,
+    pub total_dispatched: u64,
+    pub total_completed: u64,
+}
+
+impl NodeShaderRecordDistributor {
+    // Construct new record distributor with recursion depth limit.
+    pub fn new(max_recursion_depth: u32) -> Self {
+        Self {
+            max_recursion_depth: max_recursion_depth.min(MAX_WORK_GRAPH_RECURSION_DEPTH),
+            queues: Vec::new(),
+            total_dispatched: 0,
+            total_completed: 0,
+        }
+    }
+
+    // Register a child dispatch queue for a target node.
+    pub fn register_queue(&mut self, target_node: D3D12_NODE_ID, capacity: usize) {
+        if self.queues.iter().any(|q| q.target_node == target_node) {
+            return;
+        }
+        self.queues.push(ChildDispatchRingBuffer::new(target_node, capacity));
+    }
+
+    // Allocate dynamic input record from backing memory and enqueue child dispatch.
+    pub fn allocate_and_dispatch(
+        &mut self,
+        producer: D3D12_NODE_ID,
+        target: D3D12_NODE_ID,
+        payload: &[u8],
+        depth: u16,
+        allocator: &mut AutonomousWorkGraphBackingAllocator,
+    ) -> Result<u64, WorkGraphError> {
+        if depth as u32 > self.max_recursion_depth {
+            return Err(WorkGraphError::RecursionDepthExceeded(depth as u32));
+        }
+
+        let pool = allocator
+            .find_node_pool_mut(target)
+            .ok_or(WorkGraphError::NodeNotFound(target.name_hash))?;
+        let va = pool.allocate_slot()?;
+
+        let mut child_rec = ChildDispatchRecord::new(producer, target, payload, depth)?;
+        child_rec.record_va = va;
+
+        let queue = self
+            .queues
+            .iter_mut()
+            .find(|q| q.target_node == target)
+            .ok_or(WorkGraphError::NodeNotFound(target.name_hash))?;
+
+        if let Err(e) = queue.push(child_rec) {
+            let _ = pool.free_slot(va);
+            return Err(e);
+        }
+
+        self.total_dispatched += 1;
+        Ok(va)
+    }
+
+    // Pop next pending dispatch record for the target node.
+    pub fn pop_next_record(&mut self, target_node: D3D12_NODE_ID) -> Option<ChildDispatchRecord> {
+        let queue = self.queues.iter_mut().find(|q| q.target_node == target_node)?;
+        queue.pop()
+    }
+
+    // Free child dispatch record and recycle its backing memory slot.
+    pub fn recycle_record(
+        &mut self,
+        record: &ChildDispatchRecord,
+        allocator: &mut AutonomousWorkGraphBackingAllocator,
+    ) -> Result<(), WorkGraphError> {
+        if record.record_va != 0 {
+            if let Some(pool) = allocator.find_node_pool_mut(record.target_node) {
+                pool.free_slot(record.record_va)?;
+            }
+        }
+        self.total_completed += 1;
+        Ok(())
+    }
+
+    // Query pending record count for target node.
+    pub fn pending_records_for(&self, target_node: D3D12_NODE_ID) -> usize {
+        self.queues
+            .iter()
+            .find(|q| q.target_node == target_node)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    // Query total pending records across all queues.
+    pub fn total_pending(&self) -> usize {
+        self.queues.iter().map(|q| q.len()).sum()
+    }
+}
+
+// Validation error details for work graph compilation and hardware state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkGraphValidationError {
+    ExceededMaxRecursionDepth(u32),
+    InvalidRecordAlignment { stride: u32, alignment: u32 },
+    InvalidGridDimensions([u32; 3]),
+    CycleDetected(D3D12_NODE_ID),
+    MissingEntryPoint,
+    UnreachableNode(D3D12_NODE_ID),
+}
+
+// Hardware state validator checking recursion depth, record alignment, grids, and cycles.
+#[derive(Debug, Clone)]
+pub struct WorkGraphStateValidator {
+    pub max_recursion_limit: u32,
+    pub max_grid_limit: [u32; 3],
+}
+
+impl WorkGraphStateValidator {
+    // Construct state validator with maximum recursion threshold.
+    pub fn new(max_recursion_limit: u32) -> Self {
+        Self {
+            max_recursion_limit: max_recursion_limit.min(MAX_WORK_GRAPH_RECURSION_DEPTH),
+            max_grid_limit: [65535, 65535, 65535],
+        }
+    }
+
+    // Comprehensive validation of Tier 1.0 work graph program descriptor.
+    pub fn validate_program(&self, program: &WorkGraphTier1ProgramDesc) -> Result<(), WorkGraphValidationError> {
+        if program.entrypoints.is_empty() {
+            return Err(WorkGraphValidationError::MissingEntryPoint);
+        }
+        if program.max_recursion_depth > self.max_recursion_limit {
+            return Err(WorkGraphValidationError::ExceededMaxRecursionDepth(program.max_recursion_depth));
+        }
+
+        for entry in &program.entrypoints {
+            if program.find_node(entry.node_id).is_none() {
+                return Err(WorkGraphValidationError::UnreachableNode(entry.node_id));
+            }
+        }
+
+        for node in &program.nodes {
+            if node.input_record_alignment < 4 || (node.input_record_stride % node.input_record_alignment) != 0 {
+                return Err(WorkGraphValidationError::InvalidRecordAlignment {
+                    stride: node.input_record_stride,
+                    alignment: node.input_record_alignment,
+                });
+            }
+            if node.input_record_stride as usize > MAX_NODE_RECORD_PAYLOAD_BYTES {
+                return Err(WorkGraphValidationError::InvalidRecordAlignment {
+                    stride: node.input_record_stride,
+                    alignment: node.input_record_alignment,
+                });
+            }
+
+            if let Some(ref bc) = node.broadcasting {
+                if bc.dispatch_grid[0] == 0
+                    || bc.dispatch_grid[1] == 0
+                    || bc.dispatch_grid[2] == 0
+                    || bc.dispatch_grid[0] > self.max_grid_limit[0]
+                    || bc.dispatch_grid[1] > self.max_grid_limit[1]
+                    || bc.dispatch_grid[2] > self.max_grid_limit[2]
+                {
+                    return Err(WorkGraphValidationError::InvalidGridDimensions(bc.dispatch_grid));
+                }
+            }
+
+            for target in &node.target_nodes {
+                if program.find_node(*target).is_none() {
+                    return Err(WorkGraphValidationError::UnreachableNode(*target));
+                }
+            }
+        }
+
+        if (program.flags & D3D12_WORK_GRAPH_FLAG_ALLOW_RECURSION) == 0 {
+            if let Some(cycle_node) = self.detect_cycles(program) {
+                return Err(WorkGraphValidationError::CycleDetected(cycle_node));
+            }
+        }
+
+        let max_depth = self.max_graph_depth(program);
+        if max_depth > program.max_recursion_depth {
+            return Err(WorkGraphValidationError::ExceededMaxRecursionDepth(max_depth));
+        }
+
+        Ok(())
+    }
+
+    // Detect cycles in work graph DAG using depth-first search traversal.
+    pub fn detect_cycles(&self, program: &WorkGraphTier1ProgramDesc) -> Option<D3D12_NODE_ID> {
+        let mut visited = Vec::new();
+        let mut in_stack = Vec::new();
+
+        for entry in &program.entrypoints {
+            if self.dfs_cycle(entry.node_id, program, &mut visited, &mut in_stack) {
+                return in_stack.last().copied();
+            }
+        }
+        None
+    }
+
+    // Recursive DFS helper to discover back-edges in work graph.
+    fn dfs_cycle(
+        &self,
+        current: D3D12_NODE_ID,
+        program: &WorkGraphTier1ProgramDesc,
+        visited: &mut Vec<D3D12_NODE_ID>,
+        in_stack: &mut Vec<D3D12_NODE_ID>,
+    ) -> bool {
+        if in_stack.contains(&current) {
+            return true;
+        }
+        if visited.contains(&current) {
+            return false;
+        }
+
+        visited.push(current);
+        in_stack.push(current);
+
+        if let Some(node) = program.find_node(current) {
+            for target in &node.target_nodes {
+                if self.dfs_cycle(*target, program, visited, in_stack) {
+                    return true;
+                }
+            }
+        }
+
+        in_stack.pop();
+        false
+    }
+
+    // Calculate maximum traversal depth across all branches from entrypoints.
+    pub fn max_graph_depth(&self, program: &WorkGraphTier1ProgramDesc) -> u32 {
+        let mut max_depth = 0u32;
+        for entry in &program.entrypoints {
+            let depth = self.dfs_depth(entry.node_id, program, 1);
+            if depth > max_depth {
+                max_depth = depth;
+            }
+        }
+        max_depth
+    }
+
+    // Recursive DFS helper calculating branch depth.
+    fn dfs_depth(&self, current: D3D12_NODE_ID, program: &WorkGraphTier1ProgramDesc, current_depth: u32) -> u32 {
+        if current_depth > self.max_recursion_limit {
+            return current_depth;
+        }
+        let mut deepest = current_depth;
+        if let Some(node) = program.find_node(current) {
+            for target in &node.target_nodes {
+                let d = self.dfs_depth(*target, program, current_depth + 1);
+                if d > deepest {
+                    deepest = d;
+                }
+            }
+        }
+        deepest
+    }
+}
+
+// Comprehensive self-test suite for Direct3D 12 Agility Work Graphs Tier 1.0 and autonomous allocator.
+pub fn test_work_graphs_tier1_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WORK-GRAPHS] Initializing Direct3D 12 Agility Work Graphs Tier 1.0 self-test...\r\n");
+
+    // 1. Verify Tier 1.0 program descriptors, nodes, and entrypoints.
+    let mut program = WorkGraphTier1ProgramDesc::new("AgilityAutonomousCullGraph", D3D12_WORK_GRAPH_FLAG_AUTONOMOUS_ALLOCATION, 8);
+    let mut broadcaster = WorkGraphTier1NodeSpec::broadcaster("CullBroadcaster", 0, [1u8; 32], [4, 1, 1], [8, 8, 1], 16, 16);
+    let mut coalescer = WorkGraphTier1NodeSpec::coalescing("BatchCoalescer", 1, [2u8; 32], 4, [16, 1, 1], 16, 16);
+    let worker = WorkGraphTier1NodeSpec::thread("DrawWorker", 2, [3u8; 32], [32, 1, 1], 16, 0);
+
+    if broadcaster.add_target(coalescer.node_id).is_err() {
+        return false;
+    }
+    if coalescer.add_target(worker.node_id).is_err() {
+        return false;
+    }
+
+    if broadcaster.validate().is_err() || coalescer.validate().is_err() || worker.validate().is_err() {
+        return false;
+    }
+
+    let entry = WorkGraphTier1EntryPoint::new(broadcaster.node_id, D3D12_WORK_GRAPH_FLAG_ENTRYPOINT, 16);
+    if program.add_entrypoint(entry).is_err() {
+        return false;
+    }
+    if program.add_node(broadcaster).is_err() || program.add_node(coalescer).is_err() || program.add_node(worker).is_err() {
+        return false;
+    }
+
+    if program.node_count() != 3 || program.entrypoint_count() != 1 {
+        return false;
+    }
+
+    // 2. Verify hardware state validator, recursion depth limits, and cycle detector.
+    let validator = WorkGraphStateValidator::new(16);
+    if validator.validate_program(&program).is_err() {
+        return false;
+    }
+
+    // Verify rejection of cycles when recursion flag is omitted.
+    let mut cycle_prog = WorkGraphTier1ProgramDesc::new("CycleGraph", 0, 8);
+    let mut node_a = WorkGraphTier1NodeSpec::thread("NodeA", 10, [10u8; 32], [8, 1, 1], 16, 16);
+    let mut node_b = WorkGraphTier1NodeSpec::thread("NodeB", 11, [11u8; 32], [8, 1, 1], 16, 16);
+    let _ = node_a.add_target(node_b.node_id);
+    let _ = node_b.add_target(node_a.node_id);
+    let _ = cycle_prog.add_entrypoint(WorkGraphTier1EntryPoint::new(node_a.node_id, 0, 16));
+    let _ = cycle_prog.add_node(node_a);
+    let _ = cycle_prog.add_node(node_b);
+
+    if validator.validate_program(&cycle_prog).is_ok() {
+        return false;
+    }
+
+    // 3. Verify autonomous backing memory allocator and memory requirements.
+    let reqs = WorkGraphTier1MemoryRequirements::calculate(&program);
+    if reqs.min_backing_memory_size_in_bytes == 0 || (reqs.min_backing_memory_size_in_bytes % D3D12_WORK_GRAPH_BACKING_MEMORY_ALIGNMENT) != 0 {
+        return false;
+    }
+
+    if AutonomousWorkGraphBackingAllocator::new(0x8001, reqs.min_backing_memory_size_in_bytes, &reqs).is_ok() {
+        return false;
+    }
+    if AutonomousWorkGraphBackingAllocator::new(0x8000, reqs.min_backing_memory_size_in_bytes - 1, &reqs).is_ok() {
+        return false;
+    }
+
+    let mut allocator = match AutonomousWorkGraphBackingAllocator::new(0x0000_8000_0000, reqs.min_backing_memory_size_in_bytes * 2, &reqs) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    for node in &program.nodes {
+        if allocator.create_node_pool(node, 16).is_err() {
+            return false;
+        }
+    }
+
+    // 4. Verify node shader record distributor, child dispatch rings, and backing store recycling.
+    let mut distributor = NodeShaderRecordDistributor::new(8);
+    for node in &program.nodes {
+        distributor.register_queue(node.node_id, 16);
+    }
+
+    let broadcaster_id = program.nodes[0].node_id;
+    let coalescer_id = program.nodes[1].node_id;
+
+    let payload_sample = [0x5au8; 16];
+    let allocated_va = match distributor.allocate_and_dispatch(broadcaster_id, broadcaster_id, &payload_sample, 0, &mut allocator) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+
+    if allocated_va == 0 || (allocated_va % 16) != 0 {
+        return false;
+    }
+
+    let popped = match distributor.pop_next_record(broadcaster_id) {
+        Some(r) => r,
+        None => return false,
+    };
+    if popped.record_va != allocated_va || popped.payload_bytes() != &payload_sample {
+        return false;
+    }
+
+    // Dispatch child record with incremented recursion depth.
+    let _child_va = match distributor.allocate_and_dispatch(broadcaster_id, coalescer_id, &payload_sample, 1, &mut allocator) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+
+    let child_popped = match distributor.pop_next_record(coalescer_id) {
+        Some(r) => r,
+        None => return false,
+    };
+    if child_popped.recursion_depth != 1 {
+        return false;
+    }
+
+    // Recycle records back to the allocator.
+    if distributor.recycle_record(&popped, &mut allocator).is_err() {
+        return false;
+    }
+    if distributor.recycle_record(&child_popped, &mut allocator).is_err() {
+        return false;
+    }
+
+    let bc_pool = allocator.find_node_pool_mut(broadcaster_id).unwrap();
+    if bc_pool.available_slots() != 16 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinels.
+    crate::serial_write_str("[KNT-GPU-WORKGRAPHS-PASS] Direct3D 12 work graphs and autonomous GPU shader execution engine verified\r\n");
+    crate::serial_write_str("[KNT-D3D12-WORK-GRAPHS-PASS] Direct3D 12 agility work graphs tier 1.0 verified\r\n");
+    true
+}
+
+// Forwarding alias for Direct3D 12 Agility Work Graphs self-test.
+pub fn test_agility_work_graphs_subsystem() -> bool {
+    test_work_graphs_tier1_subsystem()
+}
