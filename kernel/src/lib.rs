@@ -922,6 +922,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld dual-battery hot-swap power balancer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld USB-PD 3.1 Extended Power Range (EPR 240W) Fast Charge & Real-Time Impedance Tracker (TASK-KNT-262)
+    if !drivers::power::test_power_usb_pd_epr_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld USB-PD 3.1 EPR 240W and impedance tracker self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Fan & Thermal Governor Service (TASK-KNT-160)
     if !drivers::power::test_thermal_governor_subsystem() {
         serial_write_str("[KNT-PANIC] Handheld thermal governor and dynamic fan curve engine self-test failed!\r\n");

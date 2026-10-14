@@ -766,3 +766,36 @@ pub fn verify_hardware_epr_protection() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld USB-PD 3.1 Extended Power Range
+/// (EPR 240W) Fast Charge & Real-Time Impedance Tracker (TASK-KNT-262).
+pub fn test_power_usb_pd_epr_subsystem() -> bool {
+    crate::serial_write_str("[USB-PD-EPR] Initiating Handheld USB-PD 3.1 EPR 240W & Impedance Tracker Verification...\r\n");
+
+    if !verify_usb_pd_epr_contract_negotiation() {
+        crate::serial_write_str("[USB-PD-EPR-ERR] USB-PD 3.1 EPR contract negotiation and AVS stepping test failed!\r\n");
+        return false;
+    }
+
+    if !verify_cable_impedance_tracking() {
+        crate::serial_write_str("[USB-PD-EPR-ERR] Cable impedance and contact oxidation tracking test failed!\r\n");
+        return false;
+    }
+
+    if !verify_peak_gaming_boost_governor() {
+        crate::serial_write_str("[USB-PD-EPR-ERR] Dynamic peak gaming boost charging governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_hardware_epr_protection() {
+        crate::serial_write_str("[USB-PD-EPR-ERR] Hardware OVP/OCP/OTP emergency protection test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-USB-PD-EPR-PASS] USB-PD 3.1 EPR 240W and impedance tracker verified!\r\n");
+    true
+}
