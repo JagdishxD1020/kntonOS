@@ -525,3 +525,115 @@ impl SubMicrosecondMultiQueueEngine {
         self.get_queue(queue_type).completed_fence_value
     }
 }
+
+// Configuration for allocator memory watermark threshold governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorWatermarkConfig {
+    pub high_watermark_bytes: usize,
+    pub low_watermark_bytes: usize,
+    pub max_retained_arenas_per_allocator: usize,
+    pub trim_on_frame_end: bool,
+}
+
+impl Default for AllocatorWatermarkConfig {
+    fn default() -> Self {
+        Self {
+            high_watermark_bytes: 16 * 1024 * 1024,
+            low_watermark_bytes: 4 * 1024 * 1024,
+            max_retained_arenas_per_allocator: 1,
+            trim_on_frame_end: true,
+        }
+    }
+}
+
+// Memory tracking metrics for allocator page arena reclamation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AllocatorMemoryStats {
+    pub total_committed_bytes: usize,
+    pub total_allocated_bytes: usize,
+    pub total_trimmed_bytes: usize,
+    pub total_reclaimed_arenas: usize,
+    pub trim_cycles_performed: usize,
+}
+
+// Memory watermark governor reclaiming surplus page arenas on memory overflow.
+pub struct AllocatorWatermarkGovernor {
+    pub config: AllocatorWatermarkConfig,
+    pub stats: AllocatorMemoryStats,
+}
+
+impl AllocatorWatermarkGovernor {
+    // Construct new memory watermark governor.
+    pub fn new(config: AllocatorWatermarkConfig) -> Self {
+        Self {
+            config,
+            stats: AllocatorMemoryStats::default(),
+        }
+    }
+
+    // Evaluate memory consumption and trim idle page arenas if above high watermark.
+    pub fn check_and_trim(&mut self, manager: &mut ThreadAffineAllocatorManager) -> usize {
+        let mut total_committed = 0usize;
+        for pool in &manager.thread_pools {
+            total_committed += pool.total_committed_memory();
+        }
+
+        self.stats.total_committed_bytes = total_committed;
+        if total_committed <= self.config.high_watermark_bytes && !self.config.trim_on_frame_end {
+            return 0;
+        }
+
+        self.trim_excess_arenas(manager)
+    }
+
+    // Force trimming of surplus page arenas across all thread pools and global freelist.
+    pub fn force_trim_all(&mut self, manager: &mut ThreadAffineAllocatorManager) -> usize {
+        self.trim_excess_arenas(manager)
+    }
+
+    // Internal helper executing arena trimming on ready allocators.
+    fn trim_excess_arenas(&mut self, manager: &mut ThreadAffineAllocatorManager) -> usize {
+        let max_arenas = self.config.max_retained_arenas_per_allocator.max(1);
+        let mut trimmed_bytes = 0usize;
+        let mut reclaimed_arenas = 0usize;
+
+        for pool in &mut manager.thread_pools {
+            let all_allocators = [
+                &mut pool.direct_allocators,
+                &mut pool.compute_allocators,
+                &mut pool.copy_allocators,
+            ];
+
+            for alloc_list in all_allocators {
+                for alloc in alloc_list.iter_mut() {
+                    if alloc.lifecycle == AllocatorLifecycle::Ready && alloc.page_arenas.len() > max_arenas {
+                        let surplus = alloc.page_arenas.split_off(max_arenas);
+                        for arena in surplus {
+                            trimmed_bytes += arena.capacity_bytes;
+                            alloc.total_committed_bytes = alloc.total_committed_bytes.saturating_sub(arena.capacity_bytes);
+                            reclaimed_arenas += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        for slot in &mut manager.global_freelist.slots {
+            if let Some(ref mut alloc) = slot {
+                if alloc.page_arenas.len() > max_arenas {
+                    let surplus = alloc.page_arenas.split_off(max_arenas);
+                    for arena in surplus {
+                        trimmed_bytes += arena.capacity_bytes;
+                        alloc.total_committed_bytes = alloc.total_committed_bytes.saturating_sub(arena.capacity_bytes);
+                        reclaimed_arenas += 1;
+                    }
+                }
+            }
+        }
+
+        self.stats.total_trimmed_bytes += trimmed_bytes;
+        self.stats.total_reclaimed_arenas += reclaimed_arenas;
+        self.stats.trim_cycles_performed += 1;
+        trimmed_bytes
+    }
+}
