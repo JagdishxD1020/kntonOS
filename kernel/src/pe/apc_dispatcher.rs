@@ -716,3 +716,159 @@ where
     let mut lock = GLOBAL_APC_MANAGER.lock();
     f(lock.as_mut().unwrap())
 }
+
+static KERNEL_APC_INVOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn sample_kernel_apc_routine(_apc_id: u64, context: &mut usize, arg1: &mut usize, _arg2: &mut usize) {
+    *context = context.wrapping_add(42);
+    *arg1 = arg1.wrapping_add(100);
+    KERNEL_APC_INVOCATION_COUNT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Public self-test suite validating Win32 Kernel & User-Mode APC Dispatching,
+/// Alertable Wait States (SleepEx), Trap Frame Redirection & Anti-Cheat Injection Defense.
+pub fn test_win32_apc_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 APC Dispatcher self-test suite...\r\n");
+
+    let mut mgr = GlobalApcManager::new();
+
+    // 1. Verify Kernel Special APC delivery
+    mgr.register_thread(100, 10);
+    let mut kernel_apc = KAPC::new_kernel(
+        100,
+        10,
+        true,
+        Some(sample_kernel_apc_routine),
+        None,
+        1000,
+    );
+    kernel_apc.system_argument1 = 500;
+
+    let initial_count = KERNEL_APC_INVOCATION_COUNT.load(Ordering::SeqCst);
+    if let Err(_) = mgr.queue_apc(kernel_apc) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to queue special kernel APC\r\n");
+        return false;
+    }
+
+    if KERNEL_APC_INVOCATION_COUNT.load(Ordering::SeqCst) != initial_count + 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Special kernel APC was not immediately executed\r\n");
+        return false;
+    }
+
+    // 2. Verify User alertable wait state delivery
+    mgr.register_thread(101, 10);
+
+    // Initial sleep without APC should return 0 (timeout)
+    if mgr.sleep_ex(101, 10, true) != 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] SleepEx returned alerted without pending APC\r\n");
+        return false;
+    }
+
+    // Queue backed user APC and enter alertable sleep
+    let backed_ntdll_code = 0x00007FFF_8000_1500;
+    if let Err(_) = mgr.queue_user_apc(101, 10, backed_ntdll_code, 777, 0, 0) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to queue user APC\r\n");
+        return false;
+    }
+
+    if mgr.sleep_ex(101, 100, true) != WAIT_IO_COMPLETION {
+        crate::serial_write_str("[KNT-TEST-ERR] SleepEx did not return WAIT_IO_COMPLETION on pending APC\r\n");
+        return false;
+    }
+
+    // 3. Verify Multi-APC FIFO queueing
+    mgr.register_thread(102, 10);
+    let _ = mgr.queue_user_apc(102, 10, backed_ntdll_code, 10, 0, 0);
+    let _ = mgr.queue_user_apc(102, 10, backed_ntdll_code, 20, 0, 0);
+    let _ = mgr.queue_user_apc(102, 10, backed_ntdll_code, 30, 0, 0);
+
+    let apc1 = mgr.pop_user_apc(102).map(|a| a.normal_context);
+    let apc2 = mgr.pop_user_apc(102).map(|a| a.normal_context);
+    let apc3 = mgr.pop_user_apc(102).map(|a| a.normal_context);
+
+    if apc1 != Some(10) || apc2 != Some(20) || apc3 != Some(30) {
+        crate::serial_write_str("[KNT-TEST-ERR] Multi-APC FIFO ordering violated\r\n");
+        return false;
+    }
+
+    // 4. Verify User trap frame redirection to KiUserApcDispatcher
+    let target_callback = 0x00007FFF_8000_2500;
+    let target_context = 0xCAFE_BABE_usize;
+    let _ = mgr.queue_user_apc(102, 10, target_callback, target_context, 0x111, 0x222);
+
+    let mut trap_frame = UserTrapFrame {
+        rip: 0x0040_1050,
+        rsp: 0x00007FFF_FFFF_0000,
+        rcx: 0,
+        rdx: 0,
+        r8: 0,
+        r9: 0,
+        ..Default::default()
+    };
+
+    match mgr.prepare_user_apc_dispatch(102, &mut trap_frame) {
+        Ok(true) => {
+            if trap_frame.rip != KI_USER_APC_DISPATCHER_ADDRESS {
+                crate::serial_write_str("[KNT-TEST-ERR] Trap frame RIP not redirected to KiUserApcDispatcher\r\n");
+                return false;
+            }
+            if trap_frame.rcx != target_callback as u64 {
+                crate::serial_write_str("[KNT-TEST-ERR] Trap frame RCX does not hold target callback routine\r\n");
+                return false;
+            }
+            if trap_frame.rdx != target_context as u64 {
+                crate::serial_write_str("[KNT-TEST-ERR] Trap frame RDX does not hold APC context parameter\r\n");
+                return false;
+            }
+            if trap_frame.rsp >= 0x00007FFF_FFFF_0000 {
+                crate::serial_write_str("[KNT-TEST-ERR] Trap frame RSP was not adjusted for user stack frame\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] prepare_user_apc_dispatch failed\r\n");
+            return false;
+        }
+    }
+
+    // 5. Verify Anti-Cheat rogue APC injection rejection
+    // Case A: Untrusted external process attempting cross-process APC injection
+    let cross_proc_res = mgr.queue_user_apc_secure(
+        999,
+        ProcessTrustLevel::Untrusted,
+        100,
+        backed_ntdll_code,
+        0,
+        0,
+        0,
+    );
+    if cross_proc_res != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Cross-process untrusted APC injection was not blocked\r\n");
+        return false;
+    }
+
+    // Case B: Unbacked shellcode memory injection
+    let unbacked_heap_code = 0x00000200_1234_0000;
+    let unbacked_res = mgr.queue_user_apc_secure(
+        10,
+        ProcessTrustLevel::Medium,
+        100,
+        unbacked_heap_code,
+        0,
+        0,
+        0,
+    );
+    if unbacked_res != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unbacked code page APC injection was not blocked\r\n");
+        return false;
+    }
+
+    let (tamper_count, last_record) = mgr.get_anti_cheat_apc_stats();
+    if tamper_count != 2 || last_record.is_none() {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat APC tamper events not recorded correctly\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-APC-PASS] Win32 Kernel & User-Mode APC Dispatcher & Alertable Wait Engine verified\r\n");
+    true
+}

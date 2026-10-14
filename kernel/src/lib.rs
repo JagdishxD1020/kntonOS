@@ -1194,6 +1194,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Kernel & User-Mode APCs, Alertable Waits & QueueUserAPC Engine (TASK-KNT-263)
+    if !pe::test_win32_apc_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 APC subsystem self-test failed!\r\n");
+    }
+
     // Verify Win32 Kernel Object Namespace Directory, Symbolic Link Engine & Object Manager Security (TASK-KNT-259)
     if !pe::test_win32_object_namespace_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Object Namespace Directory self-test failed!\r\n");
