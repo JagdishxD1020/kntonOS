@@ -812,6 +812,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld touchpad smoothing and anti-jitter self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Ultra-Low-Latency Bluetooth 5.4 LE Audio & Dual-Controller Low-Jitter Input Multiplexer (TASK-KNT-264)
+    if !drivers::input::test_ble_audio_controller_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld BLE 5.4 LE Audio and dual-controller input multiplexer self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone RGB Lighting Controller & Aura Sync Engine
     if !drivers::led::test_rgb_lighting_subsystem() {
         serial_write_str("[KNT-PANIC] RGB lighting and Aura Sync subsystem self-test failed!\r\n");

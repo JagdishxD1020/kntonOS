@@ -706,3 +706,36 @@ pub fn verify_controller_failover_retention() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Ultra-Low-Latency Bluetooth 5.4
+/// LE Audio & Dual-Controller Low-Jitter Input Multiplexer (TASK-KNT-264).
+pub fn test_ble_audio_controller_subsystem() -> bool {
+    crate::serial_write_str("[BLE-AUDIO-INPUT] Initiating Bluetooth 5.4 LE Audio & Dual-Controller Subsystem Verification...\r\n");
+
+    if !verify_ble_audio_lc3_framing() {
+        crate::serial_write_str("[BLE-AUDIO-INPUT-ERR] LE Audio LC3 codec framing test failed!\r\n");
+        return false;
+    }
+
+    if !verify_dual_controller_multiplexer() {
+        crate::serial_write_str("[BLE-AUDIO-INPUT-ERR] Dual-controller input multiplexer test failed!\r\n");
+        return false;
+    }
+
+    if !verify_dynamic_polling_rate_governor() {
+        crate::serial_write_str("[BLE-AUDIO-INPUT-ERR] Dynamic polling rate governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_controller_failover_retention() {
+        crate::serial_write_str("[BLE-AUDIO-INPUT-ERR] Controller connection failover & state retention test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-INPUT-BLE-AUDIO-PASS] Bluetooth 5.4 LE Audio & Dual-Controller multiplexer verified!\r\n");
+    true
+}
