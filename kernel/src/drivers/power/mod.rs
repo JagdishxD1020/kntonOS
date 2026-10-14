@@ -12,6 +12,8 @@ pub mod bypass_charging;
 pub mod coulomb_counter;
 pub mod cooling_pump;
 pub mod dual_battery;
+pub mod usb_pd_epr;
+pub use usb_pd_epr::*;
 
 pub use battery_balance::*;
 pub use coulomb_counter::*;
