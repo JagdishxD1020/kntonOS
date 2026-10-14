@@ -27,6 +27,46 @@ pub use crate::pe::synch::HANDLE;
 pub use crate::pe::wait::WAIT_IO_COMPLETION;
 pub const STATUS_USER_APC: NtStatus = 0x0000_00C0;
 
+/// Canonical virtual address of NTDLL KiUserApcDispatcher trampoline.
+pub const KI_USER_APC_DISPATCHER_ADDRESS: u64 = 0x00007FFF_8100_1000;
+
+/// User-mode execution trap frame captured upon kernel transition.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UserTrapFrame {
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+/// Context saved onto the user stack during APC trampoline setup.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ApcSavedContext {
+    pub original_rip: u64,
+    pub original_rsp: u64,
+    pub original_rcx: u64,
+    pub original_rdx: u64,
+    pub apc_routine: u64,
+    pub apc_context: u64,
+}
+
+
 /// Processor execution mode for an Asynchronous Procedure Call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KProcessorMode {
@@ -343,6 +383,107 @@ impl GlobalApcManager {
             STATUS_USER_APC
         } else {
             STATUS_SUCCESS
+        }
+    }
+
+
+    /// Modifies user trap frame to execute KiUserApcDispatcher trampoline upon return to user mode.
+    /// Passes normal routine in RCX, context in RDX, arg1 in R8, arg2 in R9 according to MS x64 ABI.
+    pub fn prepare_user_apc_dispatch(
+        &mut self,
+        thread_id: u64,
+        trap_frame: &mut UserTrapFrame,
+    ) -> Result<bool, NtStatus> {
+        let apc = match self.pop_user_apc(thread_id) {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+
+        let normal_fn = apc.normal_routine.ok_or(STATUS_UNSUCCESSFUL)?;
+
+        // Adjust user stack for 32-byte shadow space + saved context alignment
+        let _original_rip = trap_frame.rip;
+        let original_rsp = trap_frame.rsp;
+        let new_rsp = (original_rsp.saturating_sub(0x40)) & !0x0F;
+
+        // Configure register arguments for KiUserApcDispatcher:
+        // RCX: Target APC callback routine pointer
+        // RDX: APC Context parameter (dwData)
+        // R8:  SystemArgument1
+        // R9:  SystemArgument2
+        trap_frame.rcx = normal_fn as u64;
+        trap_frame.rdx = apc.normal_context as u64;
+        trap_frame.r8 = apc.system_argument1 as u64;
+        trap_frame.r9 = apc.system_argument2 as u64;
+        trap_frame.rsp = new_rsp;
+        trap_frame.rip = KI_USER_APC_DISPATCHER_ADDRESS;
+
+        Ok(true)
+    }
+
+    /// Queues a User-mode APC to target thread by handle/TID.
+    pub fn queue_user_apc(
+        &mut self,
+        thread_id: u64,
+        process_id: u64,
+        apc_routine: usize,
+        context: usize,
+        arg1: usize,
+        arg2: usize,
+    ) -> Result<u64, NtStatus> {
+        if apc_routine == 0 {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+
+        let apc = KAPC::new_user(
+            thread_id,
+            process_id,
+            apc_routine,
+            context,
+            arg1,
+            arg2,
+        );
+
+        self.queue_apc(apc)
+    }
+
+    /// NT system call NtQueueApcThread.
+    pub fn nt_queue_apc_thread(
+        &mut self,
+        thread_id: u64,
+        apc_routine: usize,
+        arg1: usize,
+        arg2: usize,
+        arg3: usize,
+    ) -> NtStatus {
+        let proc_id = self
+            .threads
+            .get(&thread_id)
+            .map(|t| t.process_id)
+            .unwrap_or(0);
+
+        match self.queue_user_apc(thread_id, proc_id, apc_routine, arg1, arg2, arg3) {
+            Ok(_) => STATUS_SUCCESS,
+            Err(e) => e,
+        }
+    }
+
+    /// Win32 QueueUserAPC wrapper.
+    pub fn win32_queue_user_apc(
+        &mut self,
+        pfn_apc: usize,
+        thread_id: u64,
+        dw_data: usize,
+    ) -> u32 {
+        let proc_id = self
+            .threads
+            .get(&thread_id)
+            .map(|t| t.process_id)
+            .unwrap_or(0);
+
+        match self.queue_user_apc(thread_id, proc_id, pfn_apc, dw_data, 0, 0) {
+            Ok(_) => 1,
+            Err(_) => 0,
         }
     }
 
