@@ -178,6 +178,7 @@ pub struct ThreadApcContext {
     pub apc_state: KApcState,
     pub saved_apc_state: Option<KApcState>,
     pub alertable: bool,
+    pub wait_interrupted: bool,
     pub kernel_apc_disable: u32,
     pub special_apc_disable: u32,
 }
@@ -190,6 +191,7 @@ impl ThreadApcContext {
             apc_state: KApcState::new(process_id),
             saved_apc_state: None,
             alertable: false,
+            wait_interrupted: false,
             kernel_apc_disable: 0,
             special_apc_disable: 0,
         }
@@ -239,8 +241,109 @@ impl GlobalApcManager {
             }
         }
 
+        // If User-mode APC is queued to a thread in alertable wait state, wake it up immediately
+        if apc.apc_mode == KProcessorMode::UserMode && thread.alertable {
+            thread.alertable = false;
+            thread.wait_interrupted = true;
+        }
+
         thread.apc_state.push_apc(apc);
         Ok(apc_id)
+    }
+
+
+    /// Puts a thread into an alertable wait state.
+    /// Returns true if a User-mode APC is already pending and immediately alerts the thread.
+    pub fn enter_alertable_wait(&mut self, thread_id: u64) -> bool {
+        let thread = match self.threads.get_mut(&thread_id) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        if thread.apc_state.user_apc_pending {
+            thread.alertable = false;
+            thread.wait_interrupted = true;
+            true
+        } else {
+            thread.alertable = true;
+            thread.wait_interrupted = false;
+            false
+        }
+    }
+
+    /// Exits an alertable wait state, clearing flags.
+    pub fn exit_alertable_wait(&mut self, thread_id: u64) {
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            thread.alertable = false;
+            thread.wait_interrupted = false;
+        }
+    }
+
+    /// Checks if a thread's wait was interrupted by a queued User APC.
+    pub fn check_and_clear_interrupted(&mut self, thread_id: u64) -> bool {
+        if let Some(thread) = self.threads.get_mut(&thread_id) {
+            let was_interrupted = thread.wait_interrupted;
+            thread.wait_interrupted = false;
+            was_interrupted
+        } else {
+            false
+        }
+    }
+
+    /// Emulates Win32 SleepEx with alertable user APC dispatch.
+    pub fn sleep_ex(&mut self, thread_id: u64, _milliseconds: u32, alertable: bool) -> u32 {
+        if !alertable {
+            return 0;
+        }
+
+        // Check if thread can enter alertable state or is already pending
+        if self.enter_alertable_wait(thread_id) {
+            return WAIT_IO_COMPLETION;
+        }
+
+        // In synchronous kernel environment, check if wait was interrupted by an APC
+        if self.check_and_clear_interrupted(thread_id) || self.is_user_apc_pending(thread_id) {
+            self.exit_alertable_wait(thread_id);
+            WAIT_IO_COMPLETION
+        } else {
+            self.exit_alertable_wait(thread_id);
+            0
+        }
+    }
+
+    /// Emulates Win32 WaitForSingleObjectEx with alertable user APC dispatch.
+    pub fn wait_for_single_object_ex(
+        &mut self,
+        thread_id: u64,
+        _handle: u64,
+        _milliseconds: u32,
+        alertable: bool,
+    ) -> u32 {
+        if !alertable {
+            return 0; // WAIT_OBJECT_0
+        }
+
+        if self.enter_alertable_wait(thread_id) {
+            return WAIT_IO_COMPLETION;
+        }
+
+        if self.check_and_clear_interrupted(thread_id) || self.is_user_apc_pending(thread_id) {
+            self.exit_alertable_wait(thread_id);
+            WAIT_IO_COMPLETION
+        } else {
+            self.exit_alertable_wait(thread_id);
+            0 // WAIT_OBJECT_0
+        }
+    }
+
+    /// NT system call NtDelayExecution supporting alertable APC delivery.
+    pub fn nt_delay_execution(&mut self, thread_id: u64, alertable: bool) -> NtStatus {
+        let res = self.sleep_ex(thread_id, 0, alertable);
+        if res == WAIT_IO_COMPLETION {
+            STATUS_USER_APC
+        } else {
+            STATUS_SUCCESS
+        }
     }
 
     /// Pops the next pending Kernel-mode APC for a thread.
