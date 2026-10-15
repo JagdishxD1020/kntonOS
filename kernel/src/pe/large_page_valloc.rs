@@ -781,3 +781,184 @@ where
     let mut lock = GLOBAL_LARGE_PAGE_MANAGER.lock();
     f(lock.as_mut().unwrap())
 }
+
+/// Public self-test suite validating Win32 Large Page (2MB/1GB) Allocations,
+/// VirtualAlloc2 Extended Attributes Engine, NUMA Binding, 4KB Fallback & Anti-Cheat W^X Protection.
+pub fn test_win32_large_page_valloc_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Large Page VirtualAlloc2 self-test suite...\r\n");
+
+    let mut mgr = LargePageMemoryManager::new();
+
+    // 1. Verify 2MB huge page allocation & strict 2MB alignment constraints
+    let size_2mb = PAGE_SIZE_2MB;
+    let base_addr = match mgr.allocate_virtual_memory_ex(
+        0,
+        0,
+        size_2mb,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        PAGE_READWRITE,
+        &[],
+    ) {
+        Ok(addr) => addr,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to allocate 2MB large page\r\n");
+            return false;
+        }
+    };
+
+    if (base_addr & (PAGE_SIZE_2MB - 1)) != 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Large page base address is not 2MB-aligned\r\n");
+        return false;
+    }
+
+    if let Err(_) = mgr.commit_large_page_physical_backing(base_addr) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to commit 2MB physical backing\r\n");
+        return false;
+    }
+
+    let alloc1 = mgr.find_allocation(base_addr).unwrap();
+    if alloc1.granularity != PageGranularity::Huge2MB || alloc1.physical_frames.len() != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Allocation granularity mismatch\r\n");
+        return false;
+    }
+
+    // Unaligned base address check with MEM_LARGE_PAGES must fail with STATUS_INVALID_PARAMETER
+    let unaligned_base = base_addr + 0x1000;
+    if mgr.allocate_virtual_memory_ex(
+        0,
+        unaligned_base,
+        size_2mb,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        PAGE_READWRITE,
+        &[],
+    ) != Err(STATUS_INVALID_PARAMETER) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unaligned large page address did not return STATUS_INVALID_PARAMETER\r\n");
+        return false;
+    }
+
+    // 2. Verify NUMA node binding via MEM_EXTENDED_PARAMETER_NUMA_NODE
+    let numa_param = [MEM_EXTENDED_PARAMETER::numa_node(1)];
+    let numa_base = match mgr.allocate_virtual_memory_ex(
+        0,
+        0,
+        size_2mb,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        PAGE_READWRITE,
+        &numa_param,
+    ) {
+        Ok(addr) => addr,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to allocate large page on NUMA node 1\r\n");
+            return false;
+        }
+    };
+
+    if let Err(_) = mgr.commit_large_page_physical_backing(numa_base) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to commit physical frames for NUMA node 1\r\n");
+        return false;
+    }
+
+    let alloc_numa = mgr.find_allocation(numa_base).unwrap();
+    if alloc_numa.numa_node != 1 || alloc_numa.physical_frames.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] NUMA node binding mismatch\r\n");
+        return false;
+    }
+    // Verify physical address is within NUMA node 1 memory base (>= 0x2000_0000)
+    if alloc_numa.physical_frames[0] < 0x2000_0000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Physical frame not allocated from NUMA node 1 pool\r\n");
+        return false;
+    }
+
+    // 3. Verify Fallback policy: graceful downgrade to 4KB demand paging upon large frame exhaustion
+    // Drain NUMA node 0 2MB pool to simulate exhaustion
+    if let Some(pool0) = mgr.numa_pools.get_mut(&0) {
+        pool0.free_2mb_frames.clear();
+    }
+
+    let fallback_base = match mgr.allocate_virtual_memory_ex(
+        0,
+        0,
+        size_2mb,
+        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
+        PAGE_READWRITE,
+        &[],
+    ) {
+        Ok(addr) => addr,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to allocate virtual range for fallback test\r\n");
+            return false;
+        }
+    };
+
+    if let Err(_) = mgr.commit_large_page_physical_backing(fallback_base) {
+        crate::serial_write_str("[KNT-TEST-ERR] Fallback commit to 4KB demand paging failed\r\n");
+        return false;
+    }
+
+    let alloc_fb = mgr.find_allocation(fallback_base).unwrap();
+    if !alloc_fb.is_downgraded_to_4kb || alloc_fb.granularity != PageGranularity::Standard4KB {
+        crate::serial_write_str("[KNT-TEST-ERR] Allocation was not flagged as downgraded to 4KB\r\n");
+        return false;
+    }
+
+    if alloc_fb.physical_frames.len() != (size_2mb / PAGE_SIZE_4KB) {
+        crate::serial_write_str("[KNT-TEST-ERR] 4KB frame count mismatch on downgrade\r\n");
+        return false;
+    }
+
+    if mgr.get_downgrade_count() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Downgrade statistics count not incremented\r\n");
+        return false;
+    }
+
+    // 4. Verify Anti-Cheat W^X enforcement (PAGE_EXECUTE_READWRITE blocked)
+    let untrusted_rwx_res = mgr.allocate_virtual_memory_secure(
+        1337,
+        ProcessTrustLevel::Untrusted,
+        0,
+        0,
+        size_2mb,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE,
+        &[],
+    );
+
+    if untrusted_rwx_res != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Untrusted PAGE_EXECUTE_READWRITE allocation was not blocked\r\n");
+        return false;
+    }
+
+    let (tamper_count, last_tamper) = mgr.get_anti_cheat_memory_stats();
+    if tamper_count == 0 || last_tamper.is_none() {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat W^X violation was not recorded\r\n");
+        return false;
+    }
+
+    if last_tamper.unwrap().violation_kind != AntiCheatMemoryViolationKind::RwxAllocationAttempt {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat violation kind mismatch\r\n");
+        return false;
+    }
+
+    // 5. Verify Page Table Walk Integrity Verification
+    match mgr.verify_page_table_walk_integrity(base_addr) {
+        Ok(true) => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Valid page table walk failed verification\r\n");
+            return false;
+        }
+    }
+
+    // Simulate stealth write-protection stripping (tampering with PTE)
+    if let Some(entry) = mgr.page_table_entries.get_mut(&base_addr) {
+        entry.raw_entry |= PTE_WRITABLE; // Corrupt hardware flag
+        entry.raw_entry &= !PTE_NO_EXECUTE; // Make writable + executable (W^X breach)
+    }
+
+    if mgr.verify_page_table_walk_integrity(base_addr) != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Stealth page table modification was not trapped\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-LARGE-PAGE-PASS] Win32 Large Page Allocations & VirtualAlloc2 Engine verified\r\n");
+    true
+}

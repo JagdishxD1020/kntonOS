@@ -1212,6 +1212,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
+    if !pe::test_win32_large_page_valloc_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Large Page VirtualAlloc2 self-test failed!\r\n");
+    }
+
     // Verify Win32 Kernel & User-Mode APCs, Alertable Waits & QueueUserAPC Engine (TASK-KNT-263)
     if !pe::test_win32_apc_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 APC subsystem self-test failed!\r\n");
