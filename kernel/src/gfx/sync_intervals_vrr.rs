@@ -325,3 +325,116 @@ impl LatencyQueueDepthGovernor {
         self.max_allowed_frame_latency
     }
 }
+
+// Present-to-display latency histogram with 7 duration distribution buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyHistogram {
+    pub under_4ms: u32,
+    pub b_4_to_8ms: u32,
+    pub b_8_to_12ms: u32,
+    pub b_12_to_16ms: u32,
+    pub b_16_to_24ms: u32,
+    pub b_24_to_33ms: u32,
+    pub over_33ms: u32,
+}
+
+impl LatencyHistogram {
+    // Record present-to-display latency sample into corresponding histogram bucket.
+    pub fn record_latency(&mut self, latency_ns: u64) {
+        if latency_ns < 4_000_000 {
+            self.under_4ms += 1;
+        } else if latency_ns < 8_000_000 {
+            self.b_4_to_8ms += 1;
+        } else if latency_ns < 12_000_000 {
+            self.b_8_to_12ms += 1;
+        } else if latency_ns < 16_000_000 {
+            self.b_12_to_16ms += 1;
+        } else if latency_ns < 24_000_000 {
+            self.b_16_to_24ms += 1;
+        } else if latency_ns < 33_333_333 {
+            self.b_24_to_33ms += 1;
+        } else {
+            self.over_33ms += 1;
+        }
+    }
+}
+
+// Presentation telemetry engine tracking dropped frames, latency histograms, and stutter index.
+pub struct FramePresentationTelemetry {
+    pub total_frames_presented: u64,
+    pub total_frames_dropped: u64,
+    pub latency_histogram: LatencyHistogram,
+    pub recent_frame_intervals_ns: [u64; 16],
+    pub recent_index: usize,
+    pub recent_count: usize,
+    pub last_display_time_ns: u64,
+    pub stutter_frames_count: u64,
+}
+
+impl FramePresentationTelemetry {
+    // Construct new presentation telemetry tracker.
+    pub fn new() -> Self {
+        Self {
+            total_frames_presented: 0,
+            total_frames_dropped: 0,
+            latency_histogram: LatencyHistogram::default(),
+            recent_frame_intervals_ns: [16_666_666; 16],
+            recent_index: 0,
+            recent_count: 0,
+            last_display_time_ns: 0,
+            stutter_frames_count: 0,
+        }
+    }
+
+    // Record frame presentation event, updating latency distribution and stutter tracking.
+    pub fn record_presentation(&mut self, present_time_ns: u64, display_time_ns: u64, was_dropped: bool) {
+        if was_dropped {
+            self.total_frames_dropped += 1;
+            return;
+        }
+
+        self.total_frames_presented += 1;
+        let latency_ns = display_time_ns.saturating_sub(present_time_ns);
+        self.latency_histogram.record_latency(latency_ns);
+
+        if self.last_display_time_ns > 0 && display_time_ns > self.last_display_time_ns {
+            let interval = display_time_ns - self.last_display_time_ns;
+            self.recent_frame_intervals_ns[self.recent_index] = interval;
+            self.recent_index = (self.recent_index + 1) % 16;
+            if self.recent_count < 16 {
+                self.recent_count += 1;
+            }
+
+            let mut sum = 0u64;
+            for i in 0..self.recent_count {
+                sum += self.recent_frame_intervals_ns[i];
+            }
+            let avg_interval = sum / (self.recent_count as u64);
+
+            if interval > (avg_interval * 120) / 100 || interval < (avg_interval * 80) / 100 {
+                self.stutter_frames_count += 1;
+            }
+        }
+
+        self.last_display_time_ns = display_time_ns;
+    }
+
+    // Calculate stutter index percentage across all presented frames.
+    pub fn stutter_index_percent(&self) -> u32 {
+        if self.total_frames_presented == 0 {
+            0
+        } else {
+            ((self.stutter_frames_count * 100) / self.total_frames_presented) as u32
+        }
+    }
+
+    // Return total dropped frames.
+    pub fn dropped_frames_count(&self) -> u64 {
+        self.total_frames_dropped
+    }
+
+    // Return total successfully presented frames.
+    pub fn presented_frames_count(&self) -> u64 {
+        self.total_frames_presented
+    }
+}
