@@ -122,6 +122,88 @@ impl PageGranularity {
     }
 }
 
+
+pub const PTE_PRESENT: u64 = 1 << 0;
+pub const PTE_WRITABLE: u64 = 1 << 1;
+pub const PTE_USER: u64 = 1 << 2;
+pub const PTE_WRITE_THROUGH: u64 = 1 << 3;
+pub const PTE_CACHE_DISABLE: u64 = 1 << 4;
+pub const PTE_ACCESSED: u64 = 1 << 5;
+pub const PTE_DIRTY: u64 = 1 << 6;
+pub const PTE_HUGE_PAGE: u64 = 1 << 7;
+pub const PTE_GLOBAL: u64 = 1 << 8;
+pub const PTE_NO_EXECUTE: u64 = 1 << 63;
+
+/// Page table entry representation for 2MB (PML2) or 1GB (PML3) mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargePageTableEntry {
+    pub virt_addr: usize,
+    pub phys_addr: usize,
+    pub raw_entry: u64,
+    pub level: u8, // 2 = PML2 (2MB), 3 = PML3 (1GB), 1 = PML1 (4KB)
+}
+
+impl LargePageTableEntry {
+    pub fn is_huge(&self) -> bool {
+        (self.raw_entry & PTE_HUGE_PAGE) != 0
+    }
+
+    pub fn is_writable(&self) -> bool {
+        (self.raw_entry & PTE_WRITABLE) != 0
+    }
+
+    pub fn is_executable(&self) -> bool {
+        (self.raw_entry & PTE_NO_EXECUTE) == 0
+    }
+}
+
+/// Physical memory pool per NUMA node tracking available contiguous frames.
+#[derive(Debug, Clone)]
+pub struct NumaNodePool {
+    pub node_id: u32,
+    pub base_phys: usize,
+    pub free_2mb_frames: Vec<usize>,
+    pub free_1gb_frames: Vec<usize>,
+}
+
+impl NumaNodePool {
+    pub fn new(node_id: u32, base_phys: usize, num_2mb: usize, num_1gb: usize) -> Self {
+        let mut free_2mb = Vec::with_capacity(num_2mb);
+        for i in 0..num_2mb {
+            free_2mb.push(base_phys + i * PAGE_SIZE_2MB);
+        }
+
+        let mut free_1gb = Vec::with_capacity(num_1gb);
+        let base_1gb = base_phys + num_2mb * PAGE_SIZE_2MB;
+        for i in 0..num_1gb {
+            free_1gb.push(base_1gb + i * PAGE_SIZE_1GB);
+        }
+
+        Self {
+            node_id,
+            base_phys,
+            free_2mb_frames: free_2mb,
+            free_1gb_frames: free_1gb,
+        }
+    }
+
+    pub fn allocate_2mb_frame(&mut self) -> Option<usize> {
+        self.free_2mb_frames.pop()
+    }
+
+    pub fn allocate_1gb_frame(&mut self) -> Option<usize> {
+        self.free_1gb_frames.pop()
+    }
+
+    pub fn free_2mb_frame(&mut self, frame: usize) {
+        self.free_2mb_frames.push(frame);
+    }
+
+    pub fn free_1gb_frame(&mut self, frame: usize) {
+        self.free_1gb_frames.push(frame);
+    }
+}
+
 /// Descriptor tracking a large page virtual memory allocation.
 #[derive(Debug, Clone)]
 pub struct LargePageAllocation {
@@ -138,17 +220,26 @@ pub struct LargePageAllocation {
 /// Central Large Page & VirtualAlloc2 Memory Manager Governor.
 pub struct LargePageMemoryManager {
     pub allocations: Vec<LargePageAllocation>,
+    pub numa_pools: BTreeMap<u32, NumaNodePool>,
+    pub page_table_entries: BTreeMap<usize, LargePageTableEntry>,
     pub next_virt_address: usize,
     pub default_numa_node: u32,
 }
 
 impl LargePageMemoryManager {
     pub fn new() -> Self {
-        Self {
+        let mut mgr = Self {
             allocations: Vec::new(),
+            numa_pools: BTreeMap::new(),
+            page_table_entries: BTreeMap::new(),
             next_virt_address: 0x0000_0002_0000_0000, // 8 GiB base, 2MB-aligned
             default_numa_node: 0,
-        }
+        };
+
+        // Initialize NUMA nodes: Node 0 (e.g. 64x 2MB frames, 4x 1GB frames), Node 1 (same)
+        mgr.numa_pools.insert(0, NumaNodePool::new(0, 0x1000_0000, 64, 4));
+        mgr.numa_pools.insert(1, NumaNodePool::new(1, 0x2000_0000, 64, 4));
+        mgr
     }
 
     /// Aligns an address upward to a given alignment (must be a power of two).
@@ -238,6 +329,109 @@ impl LargePageMemoryManager {
 
         self.allocations.push(record);
         Ok(target_base)
+    }
+
+
+    /// Converts Win32 page protection constant to x86-64 page table entry attributes.
+    pub fn protection_to_pte_flags(protect: u32) -> u64 {
+        let flags = PTE_PRESENT | PTE_USER;
+
+        match protect & 0xFF {
+            PAGE_NOACCESS => 0,
+            PAGE_READONLY => flags | PTE_NO_EXECUTE,
+            PAGE_READWRITE => flags | PTE_WRITABLE | PTE_NO_EXECUTE,
+            PAGE_EXECUTE => flags,
+            PAGE_EXECUTE_READ => flags,
+            PAGE_EXECUTE_READWRITE => flags | PTE_WRITABLE,
+            _ => flags | PTE_WRITABLE | PTE_NO_EXECUTE,
+        }
+    }
+
+    /// Backs an allocation with physical memory frames from the designated NUMA node and maps PML2/PML3 entries.
+    pub fn commit_large_page_physical_backing(
+        &mut self,
+        base_address: usize,
+    ) -> Result<(), NtStatus> {
+        let alloc_idx = self
+            .allocations
+            .iter()
+            .position(|a| a.base_address == base_address)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+
+        let (granularity, size, numa_node, protect) = {
+            let a = &self.allocations[alloc_idx];
+            (a.granularity, a.size, a.numa_node, a.protect)
+        };
+
+        let chunk_size = granularity.size_in_bytes();
+        let num_chunks = size / chunk_size;
+        let mut allocated_phys = Vec::with_capacity(num_chunks);
+
+        let pte_flags = Self::protection_to_pte_flags(protect);
+
+        {
+            let pool = self
+                .numa_pools
+                .get_mut(&numa_node)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+
+            for _ in 0..num_chunks {
+                let phys_frame = match granularity {
+                    PageGranularity::Huge2MB => pool.allocate_2mb_frame(),
+                    PageGranularity::Gigantic1GB => pool.allocate_1gb_frame(),
+                    PageGranularity::Standard4KB => pool.allocate_2mb_frame(), // handled via fallback
+                };
+
+                let frame = match phys_frame {
+                    Some(f) => f,
+                    None => {
+                        // Rollback on out-of-memory
+                        for f in allocated_phys {
+                            if granularity == PageGranularity::Gigantic1GB {
+                                pool.free_1gb_frame(f);
+                            } else {
+                                pool.free_2mb_frame(f);
+                            }
+                        }
+                        return Err(STATUS_NO_MEMORY);
+                    }
+                };
+
+                allocated_phys.push(frame);
+            }
+        }
+
+        // Map into page table entries at PML2 or PML3 level with PTE_HUGE_PAGE flag
+        let level = match granularity {
+            PageGranularity::Huge2MB => 2,
+            PageGranularity::Gigantic1GB => 3,
+            PageGranularity::Standard4KB => 1,
+        };
+
+        for (i, &phys) in allocated_phys.iter().enumerate() {
+            let virt = base_address + i * chunk_size;
+            let raw_entry = (phys as u64 & 0x000F_FFFF_FFFF_F000)
+                | pte_flags
+                | if granularity != PageGranularity::Standard4KB {
+                    PTE_HUGE_PAGE
+                } else {
+                    0
+                };
+
+            self.page_table_entries.insert(
+                virt,
+                LargePageTableEntry {
+                    virt_addr: virt,
+                    phys_addr: phys,
+                    raw_entry,
+                    level,
+                },
+            );
+        }
+
+        self.allocations[alloc_idx].physical_frames = allocated_phys;
+        self.allocations[alloc_idx].state |= MEM_COMMIT;
+        Ok(())
     }
 
     /// Finds an existing allocation record by base address.
