@@ -236,6 +236,96 @@ impl NumaNodePool {
     }
 }
 
+
+/// Types of anti-cheat memory protection violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiCheatMemoryViolationKind {
+    None,
+    RwxAllocationAttempt,
+    UnauthorizedPageTransition,
+    PageTableIntegrityMismatch,
+    StealthWriteProtectionStrip,
+}
+
+/// Audit event recording an unauthorized memory allocation or page table tampering attempt.
+#[derive(Debug, Clone)]
+pub struct MemoryTamperRecord {
+    pub timestamp: u64,
+    pub process_id: u64,
+    pub base_address: usize,
+    pub size: usize,
+    pub requested_protect: u32,
+    pub caller_trust_level: ProcessTrustLevel,
+    pub violation_kind: AntiCheatMemoryViolationKind,
+}
+
+/// Anti-cheat memory governor enforcing W^X policies and page table walk verification.
+pub struct AntiCheatMemoryGovernor {
+    pub tamper_records: Vec<MemoryTamperRecord>,
+    pub tamper_count: AtomicU32,
+    pub wx_enforcement_strict: AtomicBool,
+}
+
+impl AntiCheatMemoryGovernor {
+    pub fn new() -> Self {
+        Self {
+            tamper_records: Vec::new(),
+            tamper_count: AtomicU32::new(0),
+            wx_enforcement_strict: AtomicBool::new(true),
+        }
+    }
+
+    /// Validates page protection request against W^X security rules.
+    pub fn verify_page_protection(
+        &mut self,
+        caller_pid: u64,
+        caller_trust: ProcessTrustLevel,
+        base_address: usize,
+        size: usize,
+        protect: u32,
+    ) -> Result<(), NtStatus> {
+        // Enforce W^X: PAGE_EXECUTE_READWRITE is forbidden for non-System callers
+        let is_rwx = (protect & 0xFF) == PAGE_EXECUTE_READWRITE;
+        if is_rwx && self.wx_enforcement_strict.load(Ordering::SeqCst) {
+            if caller_trust < ProcessTrustLevel::System {
+                self.record_violation(
+                    caller_pid,
+                    base_address,
+                    size,
+                    protect,
+                    caller_trust,
+                    AntiCheatMemoryViolationKind::RwxAllocationAttempt,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Records an anti-cheat memory violation event.
+    pub fn record_violation(
+        &mut self,
+        caller_pid: u64,
+        base_address: usize,
+        size: usize,
+        requested_protect: u32,
+        caller_trust: ProcessTrustLevel,
+        kind: AntiCheatMemoryViolationKind,
+    ) {
+        self.tamper_count.fetch_add(1, Ordering::SeqCst);
+        self.tamper_records.push(MemoryTamperRecord {
+            timestamp: 0,
+            process_id: caller_pid,
+            base_address,
+            size,
+            requested_protect,
+            caller_trust_level: caller_trust,
+            violation_kind: kind,
+        });
+    }
+}
+
 /// Descriptor tracking a large page virtual memory allocation.
 #[derive(Debug, Clone)]
 pub struct LargePageAllocation {
@@ -255,6 +345,7 @@ pub struct LargePageMemoryManager {
     pub numa_pools: BTreeMap<u32, NumaNodePool>,
     pub fallback_pool: Fallback4KbPool,
     pub page_table_entries: BTreeMap<usize, LargePageTableEntry>,
+    pub anti_cheat_gov: AntiCheatMemoryGovernor,
     pub fallback_policy: u32,
     pub downgrade_count: AtomicU32,
     pub next_virt_address: usize,
@@ -268,6 +359,7 @@ impl LargePageMemoryManager {
             numa_pools: BTreeMap::new(),
             fallback_pool: Fallback4KbPool::new(0x3000_0000, 16384), // 64 MiB of 4KB frames
             page_table_entries: BTreeMap::new(),
+            anti_cheat_gov: AntiCheatMemoryGovernor::new(),
             fallback_policy: LARGE_PAGE_FALLBACK_DEFAULT,
             downgrade_count: AtomicU32::new(0),
             next_virt_address: 0x0000_0002_0000_0000, // 8 GiB base, 2MB-aligned
@@ -546,6 +638,116 @@ impl LargePageMemoryManager {
     /// Returns the total count of large page allocations downgraded to 4KB.
     pub fn get_downgrade_count(&self) -> u32 {
         self.downgrade_count.load(Ordering::SeqCst)
+    }
+
+
+    /// Allocates virtual memory enforcing anti-cheat W^X policies and origin checks.
+    pub fn allocate_virtual_memory_secure(
+        &mut self,
+        caller_pid: u64,
+        caller_trust: ProcessTrustLevel,
+        process_handle: HANDLE,
+        base_address: usize,
+        size: usize,
+        allocation_type: u32,
+        page_protection: u32,
+        extended_params: &[MEM_EXTENDED_PARAMETER],
+    ) -> Result<usize, NtStatus> {
+        // Enforce anti-cheat W^X page protection
+        self.anti_cheat_gov.verify_page_protection(
+            caller_pid,
+            caller_trust,
+            base_address,
+            size,
+            page_protection,
+        )?;
+
+        self.allocate_virtual_memory_ex(
+            process_handle,
+            base_address,
+            size,
+            allocation_type,
+            page_protection,
+            extended_params,
+        )
+    }
+
+    /// Performs an integrity walk of page table entries for an allocated range,
+    /// verifying physical backing frames and hardware protection flags against kernel descriptors.
+    pub fn verify_page_table_walk_integrity(&mut self, base_address: usize) -> Result<bool, NtStatus> {
+        let alloc = self
+            .find_allocation(base_address)
+            .cloned()
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+
+        let chunk_size = alloc.granularity.size_in_bytes();
+        let num_chunks = alloc.size / chunk_size;
+
+        for i in 0..num_chunks {
+            let virt = base_address + i * chunk_size;
+            let pte = self.page_table_entries.get(&virt).ok_or(STATUS_UNSUCCESSFUL)?;
+
+            // 1. PTE must be present
+            if (pte.raw_entry & PTE_PRESENT) == 0 {
+                self.anti_cheat_gov.record_violation(
+                    0,
+                    virt,
+                    chunk_size,
+                    alloc.protect,
+                    ProcessTrustLevel::System,
+                    AntiCheatMemoryViolationKind::PageTableIntegrityMismatch,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+
+            // 2. Huge page flag verification
+            if alloc.granularity != PageGranularity::Standard4KB && !pte.is_huge() {
+                self.anti_cheat_gov.record_violation(
+                    0,
+                    virt,
+                    chunk_size,
+                    alloc.protect,
+                    ProcessTrustLevel::System,
+                    AntiCheatMemoryViolationKind::PageTableIntegrityMismatch,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+
+            // 3. W^X check on hardware PTE: cannot be simultaneously writable and executable
+            if pte.is_writable() && pte.is_executable() {
+                self.anti_cheat_gov.record_violation(
+                    0,
+                    virt,
+                    chunk_size,
+                    alloc.protect,
+                    ProcessTrustLevel::System,
+                    AntiCheatMemoryViolationKind::StealthWriteProtectionStrip,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+
+            // 4. Physical frame address consistency check
+            if i < alloc.physical_frames.len() && alloc.physical_frames[i] != pte.phys_addr {
+                self.anti_cheat_gov.record_violation(
+                    0,
+                    virt,
+                    chunk_size,
+                    alloc.protect,
+                    ProcessTrustLevel::System,
+                    AntiCheatMemoryViolationKind::PageTableIntegrityMismatch,
+                );
+                return Err(STATUS_ACCESS_DENIED);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Queries total anti-cheat memory violation statistics.
+    pub fn get_anti_cheat_memory_stats(&self) -> (u32, Option<MemoryTamperRecord>) {
+        let count = self.anti_cheat_gov.tamper_count.load(Ordering::SeqCst);
+        let last = self.anti_cheat_gov.tamper_records.last().cloned();
+        (count, last)
     }
 
     /// Finds an existing allocation record by base address.
