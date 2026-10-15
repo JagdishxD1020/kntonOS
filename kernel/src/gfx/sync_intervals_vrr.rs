@@ -438,3 +438,93 @@ impl FramePresentationTelemetry {
         self.total_frames_presented
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 sync intervals, VRR frame pacing, and telemetry.
+pub fn test_sync_intervals_vrr_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SYNC-VRR] Initializing Direct3D 12 enhanced sync intervals & VRR frame pacing self-test...\r\n");
+
+    // 1. Verify IDXGISwapChain::Present with enhanced sync intervals and tearing flags.
+    let mut swapchain = VrrEnhancedSwapChain::new(2, true);
+    let r1 = swapchain.present(0, DXGI_PRESENT_ALLOW_TEARING, 1_000_000_000);
+    if r1 != DxgiPresentResult::TearingAllowed || swapchain.total_tearing_presents != 1 {
+        return false;
+    }
+
+    let r2 = swapchain.present(1, 0, 1_016_666_666);
+    if r2 != DxgiPresentResult::Success {
+        return false;
+    }
+
+    // Attempt present with DO_NOT_WAIT on backbuffer whose GPU fence has not signaled.
+    let r3 = swapchain.present(0, DXGI_PRESENT_DO_NOT_WAIT, 1_017_000_000);
+    if r3 != DxgiPresentResult::WasStillDrawing || swapchain.total_still_drawing_drops != 1 {
+        return false;
+    }
+
+    swapchain.advance_gpu_fence(swapchain.current_gpu_fence);
+    let r4 = swapchain.present(0, DXGI_PRESENT_DO_NOT_WAIT, 1_018_000_000);
+    if r4 != DxgiPresentResult::Success && r4 != DxgiPresentResult::TearingAllowed {
+        return false;
+    }
+
+    // 2. Verify Handheld VRR frame pacing governor and dynamic frame deadline prediction.
+    let mut vrr_gov = HandheldVrrFramePacingGovernor::new(40, 120, 60);
+    for _ in 0..8 {
+        vrr_gov.record_frame_rendered(16_666_666);
+    }
+    let deadline = vrr_gov.estimate_next_frame_deadline(2_000_000_000);
+    if deadline != 2_016_666_666 {
+        return false;
+    }
+
+    vrr_gov.notify_present(2_000_000_000);
+    let sleep_ns = vrr_gov.compute_micro_sleep_ns(2_005_000_000, 5_000_000);
+    if sleep_ns != 6_666_666 || vrr_gov.total_pacing_sleeps != 1 {
+        return false;
+    }
+
+    // 3. Verify latency-reduction queue depth governor with dynamic 1-frame throttling.
+    let mut latency_gov = LatencyQueueDepthGovernor::new(3);
+    if latency_gov.current_max_latency() != 3 {
+        return false;
+    }
+
+    // Simulate GPU-bound workload (CPU 8ms, GPU 24ms).
+    latency_gov.record_frame_metrics(8_000_000, 24_000_000);
+    latency_gov.record_frame_metrics(8_000_000, 24_000_000);
+    if latency_gov.current_max_latency() != 1 || !latency_gov.should_wait_for_previous_frame(1) {
+        return false;
+    }
+
+    // Simulate transition back to CPU-bound workload (CPU 24ms, GPU 8ms).
+    for _ in 0..6 {
+        latency_gov.record_frame_metrics(24_000_000, 8_000_000);
+    }
+    if latency_gov.current_max_latency() != 3 {
+        return false;
+    }
+
+    // 4. Verify frame presentation telemetry, dropped frames, and stutter index.
+    let mut telemetry = FramePresentationTelemetry::new();
+    telemetry.record_presentation(3_000_000_000, 3_005_000_000, true);
+    if telemetry.dropped_frames_count() != 1 || telemetry.presented_frames_count() != 0 {
+        return false;
+    }
+
+    telemetry.record_presentation(3_000_000_000, 3_006_000_000, false);
+    telemetry.record_presentation(3_016_666_666, 3_022_666_666, false);
+    telemetry.record_presentation(3_033_333_333, 3_043_333_333, false);
+    if telemetry.presented_frames_count() != 3 || telemetry.latency_histogram.b_4_to_8ms != 2 || telemetry.latency_histogram.b_8_to_12ms != 1 {
+        return false;
+    }
+
+    // Inject a stutter frame with significant duration deviation.
+    telemetry.record_presentation(3_050_000_000, 3_085_000_000, false);
+    if telemetry.stutter_index_percent() == 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-SYNC-VRR-PASS] Direct3D 12 agility enhanced sync intervals & VRR frame pacing verified\r\n");
+    true
+}
