@@ -233,3 +233,95 @@ impl HandheldVrrFramePacingGovernor {
         self.last_present_time_ns = present_time_ns;
     }
 }
+
+// Bottleneck classification determining whether workload is CPU or GPU bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottleneckClassification {
+    CpuBound,
+    GpuBound,
+    Balanced,
+}
+
+// Latency reduction governor throttling swapchain queue depth to 1 frame when GPU bound.
+pub struct LatencyQueueDepthGovernor {
+    pub max_allowed_frame_latency: u32,
+    pub default_max_latency: u32,
+    pub cpu_frame_times_ns: [u64; 8],
+    pub gpu_frame_times_ns: [u64; 8],
+    pub history_index: usize,
+    pub history_count: usize,
+    pub gpu_bound_consecutive_frames: u32,
+    pub cpu_bound_consecutive_frames: u32,
+    pub total_throttle_events: u64,
+    pub total_unthrottle_events: u64,
+}
+
+impl LatencyQueueDepthGovernor {
+    // Construct latency governor with specified default maximum queue depth.
+    pub fn new(default_max_latency: u32) -> Self {
+        let def = default_max_latency.max(1);
+        Self {
+            max_allowed_frame_latency: def,
+            default_max_latency: def,
+            cpu_frame_times_ns: [16_666_666; 8],
+            gpu_frame_times_ns: [16_666_666; 8],
+            history_index: 0,
+            history_count: 0,
+            gpu_bound_consecutive_frames: 0,
+            cpu_bound_consecutive_frames: 0,
+            total_throttle_events: 0,
+            total_unthrottle_events: 0,
+        }
+    }
+
+    // Record per-frame CPU and GPU execution metrics and evaluate bottleneck.
+    pub fn record_frame_metrics(&mut self, cpu_duration_ns: u64, gpu_duration_ns: u64) -> BottleneckClassification {
+        self.cpu_frame_times_ns[self.history_index] = cpu_duration_ns;
+        self.gpu_frame_times_ns[self.history_index] = gpu_duration_ns;
+        self.history_index = (self.history_index + 1) % 8;
+        if self.history_count < 8 {
+            self.history_count += 1;
+        }
+
+        let mut sum_cpu = 0u64;
+        let mut sum_gpu = 0u64;
+        for i in 0..self.history_count {
+            sum_cpu += self.cpu_frame_times_ns[i];
+            sum_gpu += self.gpu_frame_times_ns[i];
+        }
+        let avg_cpu = sum_cpu / (self.history_count as u64);
+        let avg_gpu = sum_gpu / (self.history_count as u64);
+
+        if avg_gpu > (avg_cpu * 115) / 100 {
+            self.gpu_bound_consecutive_frames += 1;
+            self.cpu_bound_consecutive_frames = 0;
+            if self.gpu_bound_consecutive_frames >= 2 && self.max_allowed_frame_latency > 1 {
+                self.max_allowed_frame_latency = 1;
+                self.total_throttle_events += 1;
+            }
+            BottleneckClassification::GpuBound
+        } else if avg_cpu > (avg_gpu * 115) / 100 {
+            self.cpu_bound_consecutive_frames += 1;
+            self.gpu_bound_consecutive_frames = 0;
+            if self.cpu_bound_consecutive_frames >= 3 && self.max_allowed_frame_latency < self.default_max_latency {
+                self.max_allowed_frame_latency = self.default_max_latency;
+                self.total_unthrottle_events += 1;
+            }
+            BottleneckClassification::CpuBound
+        } else {
+            self.gpu_bound_consecutive_frames = 0;
+            self.cpu_bound_consecutive_frames = 0;
+            BottleneckClassification::Balanced
+        }
+    }
+
+    // Whether CPU must stall until prior in-flight frame completes on GPU.
+    pub fn should_wait_for_previous_frame(&self, in_flight_frames_count: u32) -> bool {
+        in_flight_frames_count >= self.max_allowed_frame_latency
+    }
+
+    // Current effective maximum frame latency.
+    pub fn current_max_latency(&self) -> u32 {
+        self.max_allowed_frame_latency
+    }
+}
