@@ -125,3 +125,111 @@ impl VrrEnhancedSwapChain {
         self.current_buffer_index
     }
 }
+
+// VRR display timing profile for handheld displays (e.g., 40 Hz - 120 Hz).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrrDisplayProfile {
+    pub min_refresh_hz: u32,
+    pub max_refresh_hz: u32,
+    pub min_frame_time_ns: u64,
+    pub max_frame_time_ns: u64,
+    pub vrr_active: bool,
+}
+
+impl VrrDisplayProfile {
+    // Construct display profile with verified refresh rate bounds.
+    pub fn new(min_hz: u32, max_hz: u32) -> Self {
+        let min_r = min_hz.max(20);
+        let max_r = max_hz.max(min_r);
+        let min_ft = 1_000_000_000u64 / (max_r as u64);
+        let max_ft = 1_000_000_000u64 / (min_r as u64);
+        Self {
+            min_refresh_hz: min_r,
+            max_refresh_hz: max_r,
+            min_frame_time_ns: min_ft,
+            max_frame_time_ns: max_ft,
+            vrr_active: true,
+        }
+    }
+}
+
+// Handheld VRR tear-free frame pacing governor regulating frame deadlines and micro-sleeps.
+pub struct HandheldVrrFramePacingGovernor {
+    pub profile: VrrDisplayProfile,
+    pub history_durations_ns: [u64; 8],
+    pub history_index: usize,
+    pub history_count: usize,
+    pub estimated_frame_time_ns: u64,
+    pub target_frame_rate_hz: u32,
+    pub last_present_time_ns: u64,
+    pub total_pacing_sleeps: u64,
+    pub accumulated_sleep_ns: u64,
+}
+
+impl HandheldVrrFramePacingGovernor {
+    // Construct frame pacing governor with target frame rate and display profile.
+    pub fn new(min_hz: u32, max_hz: u32, target_hz: u32) -> Self {
+        let profile = VrrDisplayProfile::new(min_hz, max_hz);
+        let default_target_ft = 1_000_000_000u64 / (target_hz.max(min_hz).min(max_hz) as u64);
+        Self {
+            profile,
+            history_durations_ns: [default_target_ft; 8],
+            history_index: 0,
+            history_count: 0,
+            estimated_frame_time_ns: default_target_ft,
+            target_frame_rate_hz: target_hz,
+            last_present_time_ns: 0,
+            total_pacing_sleeps: 0,
+            accumulated_sleep_ns: 0,
+        }
+    }
+
+    // Record rendered frame duration into exponential moving average.
+    pub fn record_frame_rendered(&mut self, render_duration_ns: u64) {
+        self.history_durations_ns[self.history_index] = render_duration_ns;
+        self.history_index = (self.history_index + 1) % 8;
+        if self.history_count < 8 {
+            self.history_count += 1;
+        }
+
+        let mut sum = 0u64;
+        for i in 0..self.history_count {
+            sum += self.history_durations_ns[i];
+        }
+        self.estimated_frame_time_ns = sum / (self.history_count as u64);
+    }
+
+    // Estimate next presentation deadline based on target frame rate and VRR envelope.
+    pub fn estimate_next_frame_deadline(&self, frame_start_ns: u64) -> u64 {
+        let target_interval = 1_000_000_000u64 / (self.target_frame_rate_hz as u64);
+        let clamped_interval = target_interval
+            .max(self.profile.min_frame_time_ns)
+            .min(self.profile.max_frame_time_ns);
+        frame_start_ns + clamped_interval
+    }
+
+    // Compute micro-sleep duration to align command submission with scanout window.
+    pub fn compute_micro_sleep_ns(&mut self, current_time_ns: u64, predicted_render_ns: u64) -> u64 {
+        if self.last_present_time_ns == 0 {
+            self.last_present_time_ns = current_time_ns;
+            return 0;
+        }
+
+        let target_interval = 1_000_000_000u64 / (self.target_frame_rate_hz as u64);
+        let target_deadline = self.last_present_time_ns + target_interval;
+
+        if target_deadline > current_time_ns + predicted_render_ns {
+            let sleep_needed = target_deadline - (current_time_ns + predicted_render_ns);
+            self.total_pacing_sleeps += 1;
+            self.accumulated_sleep_ns += sleep_needed;
+            sleep_needed
+        } else {
+            0
+        }
+    }
+
+    // Update last presentation timestamp.
+    pub fn notify_present(&mut self, present_time_ns: u64) {
+        self.last_present_time_ns = present_time_ns;
+    }
+}
