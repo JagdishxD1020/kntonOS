@@ -740,3 +740,36 @@ pub fn verify_decompression_throughput_and_cpu_fallback() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld DirectStorage 1.2 GPU Decompression Ring
+/// & NVMe Namespace Multiplexer (TASK-KNT-267).
+pub fn test_directstorage_decomp_subsystem() -> bool {
+    crate::serial_write_str("[STORAGE-DIRECTSTORAGE] Initiating DirectStorage 1.2 GPU Decompression & NVMe Multiplexer Verification...\r\n");
+
+    if !verify_directstorage_gpu_decomp_queue() {
+        crate::serial_write_str("[STORAGE-DIRECTSTORAGE-ERR] DirectStorage GPU decomp queue & GDeflate chunker test failed!\r\n");
+        return false;
+    }
+
+    if !verify_nvme_multi_namespace_arbitration() {
+        crate::serial_write_str("[STORAGE-DIRECTSTORAGE-ERR] NVMe multi-namespace priority arbiter test failed!\r\n");
+        return false;
+    }
+
+    if !verify_directstorage_pcie_dma_mapping() {
+        crate::serial_write_str("[STORAGE-DIRECTSTORAGE-ERR] Zero-copy PCIe DMA mapping to GPU staging test failed!\r\n");
+        return false;
+    }
+
+    if !verify_decompression_throughput_and_cpu_fallback() {
+        crate::serial_write_str("[STORAGE-DIRECTSTORAGE-ERR] Decompression throughput benchmark & CPU fallback test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-STORAGE-DIRECTSTORAGE-PASS] DirectStorage 1.2 GPU decompression and NVMe multiplexer verified!\r\n");
+    true
+}
