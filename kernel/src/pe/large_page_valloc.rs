@@ -157,6 +157,38 @@ impl LargePageTableEntry {
     }
 }
 
+
+pub const LARGE_PAGE_FALLBACK_DEFAULT: u32 = 0x0001;
+pub const LARGE_PAGE_STRICT_ALLOCATION: u32 = 0x0002;
+
+/// Standard 4KB fallback frame allocator pool.
+#[derive(Debug, Clone)]
+pub struct Fallback4KbPool {
+    pub base_phys: usize,
+    pub next_free_idx: usize,
+    pub total_frames: usize,
+}
+
+impl Fallback4KbPool {
+    pub fn new(base_phys: usize, total_frames: usize) -> Self {
+        Self {
+            base_phys,
+            next_free_idx: 0,
+            total_frames,
+        }
+    }
+
+    pub fn allocate_frame(&mut self) -> Option<usize> {
+        if self.next_free_idx < self.total_frames {
+            let addr = self.base_phys + self.next_free_idx * PAGE_SIZE_4KB;
+            self.next_free_idx += 1;
+            Some(addr)
+        } else {
+            None
+        }
+    }
+}
+
 /// Physical memory pool per NUMA node tracking available contiguous frames.
 #[derive(Debug, Clone)]
 pub struct NumaNodePool {
@@ -221,7 +253,10 @@ pub struct LargePageAllocation {
 pub struct LargePageMemoryManager {
     pub allocations: Vec<LargePageAllocation>,
     pub numa_pools: BTreeMap<u32, NumaNodePool>,
+    pub fallback_pool: Fallback4KbPool,
     pub page_table_entries: BTreeMap<usize, LargePageTableEntry>,
+    pub fallback_policy: u32,
+    pub downgrade_count: AtomicU32,
     pub next_virt_address: usize,
     pub default_numa_node: u32,
 }
@@ -231,7 +266,10 @@ impl LargePageMemoryManager {
         let mut mgr = Self {
             allocations: Vec::new(),
             numa_pools: BTreeMap::new(),
+            fallback_pool: Fallback4KbPool::new(0x3000_0000, 16384), // 64 MiB of 4KB frames
             page_table_entries: BTreeMap::new(),
+            fallback_policy: LARGE_PAGE_FALLBACK_DEFAULT,
+            downgrade_count: AtomicU32::new(0),
             next_virt_address: 0x0000_0002_0000_0000, // 8 GiB base, 2MB-aligned
             default_numa_node: 0,
         };
@@ -369,6 +407,29 @@ impl LargePageMemoryManager {
 
         let pte_flags = Self::protection_to_pte_flags(protect);
 
+        // Check if contiguous large frames are available in the requested NUMA pool
+        let has_sufficient_large_frames = {
+            let pool = self
+                .numa_pools
+                .get(&numa_node)
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+
+            match granularity {
+                PageGranularity::Huge2MB => pool.free_2mb_frames.len() >= num_chunks,
+                PageGranularity::Gigantic1GB => pool.free_1gb_frames.len() >= num_chunks,
+                PageGranularity::Standard4KB => true,
+            }
+        };
+
+        if !has_sufficient_large_frames {
+            // If fallback policy allows, gracefully downgrade to 4KB demand paging frames
+            if (self.fallback_policy & LARGE_PAGE_FALLBACK_DEFAULT) != 0 {
+                return self.downgrade_allocation_to_4kb(alloc_idx);
+            } else {
+                return Err(STATUS_NO_MEMORY);
+            }
+        }
+
         {
             let pool = self
                 .numa_pools
@@ -379,13 +440,12 @@ impl LargePageMemoryManager {
                 let phys_frame = match granularity {
                     PageGranularity::Huge2MB => pool.allocate_2mb_frame(),
                     PageGranularity::Gigantic1GB => pool.allocate_1gb_frame(),
-                    PageGranularity::Standard4KB => pool.allocate_2mb_frame(), // handled via fallback
+                    PageGranularity::Standard4KB => None,
                 };
 
                 let frame = match phys_frame {
                     Some(f) => f,
                     None => {
-                        // Rollback on out-of-memory
                         for f in allocated_phys {
                             if granularity == PageGranularity::Gigantic1GB {
                                 pool.free_1gb_frame(f);
@@ -432,6 +492,60 @@ impl LargePageMemoryManager {
         self.allocations[alloc_idx].physical_frames = allocated_phys;
         self.allocations[alloc_idx].state |= MEM_COMMIT;
         Ok(())
+    }
+
+
+    /// Gracefully downgrades an allocation from 2MB/1GB huge pages to standard 4KB demand paging.
+    pub fn downgrade_allocation_to_4kb(&mut self, alloc_idx: usize) -> Result<(), NtStatus> {
+        let (base_address, size, protect) = {
+            let a = &self.allocations[alloc_idx];
+            (a.base_address, a.size, a.protect)
+        };
+
+        let num_4kb_pages = size / PAGE_SIZE_4KB;
+        let mut allocated_4kb = Vec::with_capacity(num_4kb_pages);
+
+        for _ in 0..num_4kb_pages {
+            let frame = self.fallback_pool.allocate_frame().ok_or(STATUS_NO_MEMORY)?;
+            allocated_4kb.push(frame);
+        }
+
+        let pte_flags = Self::protection_to_pte_flags(protect);
+
+        // Map each 4KB frame at PML1 (level = 1, without HUGE_PAGE flag)
+        for (i, &phys) in allocated_4kb.iter().enumerate() {
+            let virt = base_address + i * PAGE_SIZE_4KB;
+            let raw_entry = (phys as u64 & 0x000F_FFFF_FFFF_F000) | pte_flags;
+
+            self.page_table_entries.insert(
+                virt,
+                LargePageTableEntry {
+                    virt_addr: virt,
+                    phys_addr: phys,
+                    raw_entry,
+                    level: 1,
+                },
+            );
+        }
+
+        self.downgrade_count.fetch_add(1, Ordering::SeqCst);
+        let a = &mut self.allocations[alloc_idx];
+        a.granularity = PageGranularity::Standard4KB;
+        a.is_downgraded_to_4kb = true;
+        a.physical_frames = allocated_4kb;
+        a.state |= MEM_COMMIT;
+
+        Ok(())
+    }
+
+    /// Sets the fallback policy (e.g. LARGE_PAGE_FALLBACK_DEFAULT or LARGE_PAGE_STRICT_ALLOCATION).
+    pub fn set_fallback_policy(&mut self, policy: u32) {
+        self.fallback_policy = policy;
+    }
+
+    /// Returns the total count of large page allocations downgraded to 4KB.
+    pub fn get_downgrade_count(&self) -> u32 {
+        self.downgrade_count.load(Ordering::SeqCst)
     }
 
     /// Finds an existing allocation record by base address.
