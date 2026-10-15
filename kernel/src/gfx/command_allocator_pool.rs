@@ -637,3 +637,128 @@ impl AllocatorWatermarkGovernor {
         trimmed_bytes
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 command allocator pool, multi-queue engine, and watermark governor.
+pub fn test_command_allocator_pool_subsystem() -> bool {
+    crate::serial_write_str("[KNT-ALLOCATOR-POOL] Initializing Direct3D 12 command allocator pool self-test...\r\n");
+
+    // 1. Verify per-thread allocator acquisition and page arena expansion.
+    let mut manager = ThreadAffineAllocatorManager::new(0x0000_6000_0000);
+    let t1 = manager.register_thread();
+    let t2 = manager.register_thread();
+
+    let id1: u32;
+    {
+        let alloc_direct = manager.acquire_allocator(t1, D3D12_COMMAND_LIST_TYPE::Direct, 0);
+        if alloc_direct.page_arenas.len() != 1 || alloc_direct.total_committed_bytes != COMMAND_ALLOCATOR_DEFAULT_PAGE_SIZE {
+            return false;
+        }
+
+        let va1 = alloc_direct.allocate_command_memory(1024, 256, 0x0000_6100_0000);
+        if va1 == 0 || (va1 % 256) != 0 {
+            return false;
+        }
+
+        // Force page arena expansion by requesting memory larger than remaining first arena capacity.
+        let _va_large = alloc_direct.allocate_command_memory(COMMAND_ALLOCATOR_DEFAULT_PAGE_SIZE, 256, 0x0000_6200_0000);
+        if alloc_direct.page_arenas.len() != 2 {
+            return false;
+        }
+
+        alloc_direct.mark_pending_gpu(10);
+        id1 = alloc_direct.allocator_id;
+    }
+
+    // 2. Verify thread-affine allocator recycling and lock-free global freelist.
+    {
+        let alloc_direct2 = manager.acquire_allocator(t1, D3D12_COMMAND_LIST_TYPE::Direct, 0);
+        if alloc_direct2.allocator_id == id1 {
+            return false;
+        }
+    }
+
+    {
+        let alloc_recycled = manager.acquire_allocator(t1, D3D12_COMMAND_LIST_TYPE::Direct, 10);
+        if alloc_recycled.lifecycle != AllocatorLifecycle::Recording || manager.thread_affine_hits < 1 {
+            return false;
+        }
+    }
+
+    let global_alloc = CommandAllocatorInstance::new(99, 0, D3D12_COMMAND_LIST_TYPE::Compute, 0x0000_6300_0000);
+    if !manager.recycle_to_global_freelist(global_alloc) {
+        return false;
+    }
+    if manager.global_freelist.available_count() != 1 {
+        return false;
+    }
+
+    {
+        let alloc_t2 = manager.acquire_allocator(t2, D3D12_COMMAND_LIST_TYPE::Compute, 0);
+        if alloc_t2.allocator_id != 99 || manager.global_freelist_hits < 1 {
+            return false;
+        }
+    }
+
+    // 3. Verify sub-microsecond multi-queue submission and timeline fence synchronization.
+    let mut mq_engine = SubMicrosecondMultiQueueEngine::new();
+    let b_copy = CommandListBatch::new(1, 10, 4, 1024);
+    let b_compute = CommandListBatch::new(2, 11, 8, 2048);
+    let b_direct = CommandListBatch::new(3, 12, 16, 4096);
+
+    let f_copy = mq_engine.execute_command_lists(D3D12_COMMAND_LIST_TYPE::Copy, &[b_copy]);
+    mq_engine.cross_queue_sync(D3D12_COMMAND_LIST_TYPE::Compute, D3D12_COMMAND_LIST_TYPE::Copy);
+
+    let f_compute = mq_engine.execute_command_lists(D3D12_COMMAND_LIST_TYPE::Compute, &[b_compute]);
+    mq_engine.cross_queue_sync(D3D12_COMMAND_LIST_TYPE::Direct, D3D12_COMMAND_LIST_TYPE::Compute);
+
+    let f_direct = mq_engine.execute_command_lists(D3D12_COMMAND_LIST_TYPE::Direct, &[b_direct]);
+
+    if f_copy != 1 || f_compute != 1 || f_direct != 1 {
+        return false;
+    }
+    if mq_engine.total_submissions != 3 || mq_engine.total_sync_points != 2 {
+        return false;
+    }
+
+    if mq_engine.is_fence_completed(D3D12_COMMAND_LIST_TYPE::Direct, 1) {
+        return false;
+    }
+    mq_engine.advance_queue_progress(D3D12_COMMAND_LIST_TYPE::Copy, 1);
+    mq_engine.advance_queue_progress(D3D12_COMMAND_LIST_TYPE::Compute, 1);
+    mq_engine.advance_queue_progress(D3D12_COMMAND_LIST_TYPE::Direct, 1);
+
+    if !mq_engine.is_fence_completed(D3D12_COMMAND_LIST_TYPE::Direct, 1) {
+        return false;
+    }
+
+    // 4. Verify memory watermark governor and surplus page arena trimming.
+    for pool in &mut manager.thread_pools {
+        for alloc in &mut pool.direct_allocators {
+            alloc.lifecycle = AllocatorLifecycle::Ready;
+        }
+    }
+
+    let wm_config = AllocatorWatermarkConfig {
+        high_watermark_bytes: 64 * 1024,
+        low_watermark_bytes: 64 * 1024,
+        max_retained_arenas_per_allocator: 1,
+        trim_on_frame_end: true,
+    };
+    let mut governor = AllocatorWatermarkGovernor::new(wm_config);
+    let trimmed = governor.force_trim_all(&mut manager);
+    if trimmed == 0 || governor.stats.total_reclaimed_arenas == 0 {
+        return false;
+    }
+
+    for pool in &manager.thread_pools {
+        for alloc in &pool.direct_allocators {
+            if alloc.page_arenas.len() > 1 {
+                return false;
+            }
+        }
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-ALLOCATOR-POOL-PASS] Direct3D 12 agility command allocator pool and submission engine verified\r\n");
+    true
+}
