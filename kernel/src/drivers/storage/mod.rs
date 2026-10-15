@@ -10,6 +10,8 @@ pub mod sdcard;
 pub mod sdhci;
 pub mod nvme_hmb;
 pub mod sd_express;
+pub mod directstorage_decomp;
+pub use directstorage_decomp::*;
 
 pub use uring::*;
 pub use nvme_hmb::*;
