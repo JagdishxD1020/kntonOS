@@ -445,3 +445,141 @@ pub fn verify_nvme_multi_namespace_arbitration() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 3: Zero-Copy PCIe DMA Mapping Directly to Direct3D 12 GPU Staging
+// ============================================================================
+
+/// Physical Memory Range Descriptor for NVMe Physical Region Page (PRP) lists.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicalDmaRange {
+    /// Host or GPU PCIe physical address (aligned to 4KB).
+    pub physical_base: u64,
+    /// Byte length of contiguous physical region.
+    pub length_bytes: u32,
+}
+
+/// Zero-Copy PCIe DMA Buffer Mapper between NVMe and Direct3D 12 GPU Memory.
+///
+/// Traditional I/O paths read data from NVMe into CPU host page cache RAM,
+/// and then perform a second copy over PCIe to GPU VRAM.
+/// DirectStorage 1.2 Zero-Copy Peer-to-Peer / Unified Memory DMA:
+/// 1. Maps Direct3D 12 GPU staging buffer physical addresses directly into NVMe PRP1/PRP2 entries.
+/// 2. NVMe controller writes compressed blocks directly across PCIe into GPU staging memory without CPU round-trips.
+/// 3. Validates 4KB page alignment and 64-bit physical address ranges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DirectStoragePcieDmaMapper {
+    /// Active mapped GPU physical buffer address.
+    pub gpu_staging_phys_addr: u64,
+    /// Total buffer size in bytes.
+    pub total_buffer_bytes: u32,
+    /// Number of 4KB physical pages spanned.
+    pub page_count: u32,
+    /// PRP1 base pointer (NVMe submission parameter).
+    pub nvme_prp1: u64,
+    /// PRP2 pointer (points to PRP List if > 2 pages, or 2nd page if exactly 2 pages).
+    pub nvme_prp2: u64,
+    /// Total zero-copy DMA transfers completed.
+    pub zero_copy_transfers_count: u64,
+    /// Total bytes transferred via zero-copy DMA.
+    pub total_zero_copy_bytes: u64,
+}
+
+impl DirectStoragePcieDmaMapper {
+    /// 4KB page alignment mask (4096 bytes).
+    pub const PAGE_SIZE_BYTES: u64 = 4096;
+    pub const PAGE_MASK: u64 = 4095;
+
+    /// Constructs a zero-copy DMA mapper.
+    pub const fn new() -> Self {
+        Self {
+            gpu_staging_phys_addr: 0,
+            total_buffer_bytes: 0,
+            page_count: 0,
+            nvme_prp1: 0,
+            nvme_prp2: 0,
+            zero_copy_transfers_count: 0,
+            total_zero_copy_bytes: 0,
+        }
+    }
+
+    /// Maps a GPU staging buffer into NVMe PRP1 and PRP2 structures.
+    pub fn map_gpu_staging_buffer(
+        &mut self,
+        gpu_phys_addr: u64,
+        size_bytes: u32,
+        prp_list_storage_phys: u64,
+    ) -> Result<(u64, u64), &'static str> {
+        // Enforce 4KB alignment on physical base address
+        if (gpu_phys_addr & Self::PAGE_MASK) != 0 {
+            return Err("GPU physical address must be 4KB page aligned");
+        }
+        if size_bytes == 0 {
+            return Err("Buffer size cannot be zero");
+        }
+
+        let pages = ((size_bytes as u64 + Self::PAGE_SIZE_BYTES - 1) / Self::PAGE_SIZE_BYTES) as u32;
+
+        self.gpu_staging_phys_addr = gpu_phys_addr;
+        self.total_buffer_bytes = size_bytes;
+        self.page_count = pages;
+
+        // NVMe PRP architecture:
+        // PRP1 points to first 4KB memory page.
+        self.nvme_prp1 = gpu_phys_addr;
+
+        // PRP2 points to second page if exactly 2 pages, or PRP List pointer if > 2 pages.
+        if pages == 1 {
+            self.nvme_prp2 = 0;
+        } else if pages == 2 {
+            self.nvme_prp2 = gpu_phys_addr + Self::PAGE_SIZE_BYTES;
+        } else {
+            // Points to physical PRP list buffer
+            self.nvme_prp2 = prp_list_storage_phys;
+        }
+
+        self.zero_copy_transfers_count += 1;
+        self.total_zero_copy_bytes += size_bytes as u64;
+
+        Ok((self.nvme_prp1, self.nvme_prp2))
+    }
+}
+
+/// Verification test for zero-copy PCIe DMA mapping to GPU staging buffers.
+pub fn verify_directstorage_pcie_dma_mapping() -> bool {
+    let mut mapper = DirectStoragePcieDmaMapper::new();
+
+    // 1. Initial state
+    if mapper.page_count != 0 || mapper.nvme_prp1 != 0 {
+        return false;
+    }
+
+    // 2. Misaligned address (0x10000001) should fail
+    if mapper.map_gpu_staging_buffer(0x10000001, 8192, 0).is_ok() {
+        return false;
+    }
+
+    // 3. Map 8KB buffer (exactly 2 pages) at 0x20000000
+    let (prp1, prp2) = mapper
+        .map_gpu_staging_buffer(0x20000000, 8192, 0)
+        .expect("Map 8KB failed");
+    if prp1 != 0x20000000 || prp2 != 0x20001000 || mapper.page_count != 2 {
+        return false;
+    }
+    if mapper.zero_copy_transfers_count != 1 || mapper.total_zero_copy_bytes != 8192 {
+        return false;
+    }
+
+    // 4. Map 64KB GDeflate chunk (16 pages) at 0x30000000 with PRP list at 0x10000
+    let (prp1_large, prp2_large) = mapper
+        .map_gpu_staging_buffer(0x30000000, 65536, 0x10000)
+        .expect("Map 64KB failed");
+    if prp1_large != 0x30000000 || prp2_large != 0x10000 || mapper.page_count != 16 {
+        return false;
+    }
+    if mapper.zero_copy_transfers_count != 2 || mapper.total_zero_copy_bytes != (8192 + 65536) {
+        return false;
+    }
+
+    true
+}
