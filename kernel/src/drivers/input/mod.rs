@@ -29,6 +29,8 @@ pub mod radial_macro;
 pub mod haptic_synth;
 pub mod touchpad_jitter;
 pub mod ble_audio_controller;
+pub mod motion_aiming;
+pub use motion_aiming::*;
 pub use ble_audio_controller::*;
 pub use controller_profile::*;
 pub use input_pacer::*;
