@@ -2,9 +2,11 @@
 
 pub mod usb4;
 pub mod egpu_manager;
+pub mod pcie_health;
 
 pub use usb4::*;
 pub use egpu_manager::*;
+pub use pcie_health::*;
 
 /// Verification self-test suite for Handheld PC USB4/Thunderbolt 4 Dynamic PCIe Tunneling & eGPU Governor.
 pub fn test_usb4_egpu_governor_subsystem() -> bool {
