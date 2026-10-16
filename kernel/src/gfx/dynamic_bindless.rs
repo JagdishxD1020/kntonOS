@@ -522,3 +522,115 @@ impl HandheldVramPressureGovernor {
         ((self.allocated_bytes * 100) / self.budget_bytes) as u32
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 dynamic resources, bindless indexing, and feedback evaluator.
+pub fn test_dynamic_bindless_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DYNAMIC-BINDLESS] Initializing Direct3D 12 dynamic bindless engine self-test...\r\n");
+
+    // 1. Verify bindless descriptor table allocation, reading, writing, and recycling.
+    let mut table = BindlessDescriptorHeapTable::new();
+    let idx0 = match table.allocate_index() {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+    let idx1 = match table.allocate_index() {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+    let idx2 = match table.allocate_index() {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+
+    let tex_desc = DynamicResourceDescriptor::texture_2d(0x0000_7000_0000, 1024 * 1024 * 4, 28, 8);
+    let buf_desc = DynamicResourceDescriptor::buffer(0x0000_7100_0000, 65536, 16, true);
+
+    if table.write_descriptor(idx0, tex_desc).is_err() || table.write_descriptor(idx1, buf_desc).is_err() {
+        return false;
+    }
+
+    if table.read_descriptor(idx0) != Some(&tex_desc) || table.read_descriptor(idx1) != Some(&buf_desc) {
+        return false;
+    }
+    if table.read_descriptor(2_000_000).is_some() {
+        return false;
+    }
+
+    if table.free_descriptor(idx1).is_err() || table.read_descriptor(idx1).map_or(false, |d| d.is_valid) {
+        return false;
+    }
+
+    // 2. Verify GPU-driven Sampler Feedback Minification and LOD clamping map evaluation.
+    let mut feedback_map = FeedbackMinMipMap::new();
+    for y in 0..FEEDBACK_TILE_GRID_SIZE {
+        for x in 0..FEEDBACK_TILE_GRID_SIZE {
+            let mip = 1 + ((x + y) % 3) as u8;
+            feedback_map.record_tile_sample(x, y, mip);
+        }
+    }
+
+    let mut lod_eval = SamplerFeedbackLodEvaluator::new();
+    let evaluated_clamp = lod_eval.evaluate_feedback_map(&feedback_map, 8);
+    if evaluated_clamp != 1 || lod_eval.calculate_unreferenced_vram_percent(8) != 75 {
+        return false;
+    }
+
+    // 3. Verify non-blocking lock-free descriptor ring queue and timeline fence updates.
+    let mut ring_queue = LockFreeDescriptorRingQueue::new(64);
+    let updated_tex = DynamicResourceDescriptor::texture_2d(0x0000_7200_0000, 512 * 512 * 4, 28, 6);
+    if ring_queue.enqueue_update(idx0, updated_tex, 5).is_err() {
+        return false;
+    }
+    if ring_queue.enqueue_update(idx2, buf_desc, 10).is_err() {
+        return false;
+    }
+
+    let f1 = ring_queue.flush_completed_updates(4, &mut table);
+    if f1 != 0 || ring_queue.pending_count() != 2 {
+        return false;
+    }
+
+    let f2 = ring_queue.flush_completed_updates(5, &mut table);
+    if f2 != 1 || ring_queue.pending_count() != 1 || table.read_descriptor(idx0) != Some(&updated_tex) {
+        return false;
+    }
+
+    let f3 = ring_queue.flush_completed_updates(10, &mut table);
+    if f3 != 1 || !ring_queue.is_empty() || table.read_descriptor(idx2) != Some(&buf_desc) {
+        return false;
+    }
+
+    // 4. Verify handheld VRAM memory pressure governor and dynamic mip clamping.
+    let mut vram_gov = HandheldVramPressureGovernor::new(4 * 1024 * 1024 * 1024);
+    let level = vram_gov.update_memory_usage(3_850_000_000);
+    if level != VramMemoryPressureLevel::Critical && level != VramMemoryPressureLevel::Saturation {
+        return false;
+    }
+
+    let clamped = vram_gov.apply_pressure_throttling(&mut table);
+    if clamped == 0 {
+        return false;
+    }
+    if let Some(desc) = table.read_descriptor(idx0) {
+        if desc.most_detailed_mip == 0 || desc.min_lod_clamp == 0 {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    vram_gov.update_memory_usage(1_500_000_000);
+    let restored = vram_gov.restore_unconstrained(&mut table);
+    if restored == 0 {
+        return false;
+    }
+    if let Some(desc) = table.read_descriptor(idx0) {
+        if desc.most_detailed_mip != 0 || desc.min_lod_clamp != 0 {
+            return false;
+        }
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-DYNAMIC-BINDLESS-PASS] Direct3D 12 agility dynamic resources & bindless feedback verified\r\n");
+    true
+}
