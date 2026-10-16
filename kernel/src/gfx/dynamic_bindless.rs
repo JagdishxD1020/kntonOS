@@ -413,3 +413,112 @@ impl LockFreeDescriptorRingQueue {
         self.count == 0
     }
 }
+
+// Handheld VRAM memory pressure state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VramMemoryPressureLevel {
+    Normal,
+    Elevated,
+    Critical,
+    Saturation,
+}
+
+// Handheld memory pressure governor dynamically clamping texture mip-residency.
+pub struct HandheldVramPressureGovernor {
+    pub budget_bytes: u64,
+    pub allocated_bytes: u64,
+    pub current_pressure: VramMemoryPressureLevel,
+    pub active_mip_clamp: u8,
+    pub total_clamped_textures: usize,
+    pub estimated_vram_saved_bytes: u64,
+}
+
+impl HandheldVramPressureGovernor {
+    // Construct new VRAM memory pressure governor.
+    pub fn new(budget_bytes: u64) -> Self {
+        Self {
+            budget_bytes: budget_bytes.max(1024 * 1024),
+            allocated_bytes: 0,
+            current_pressure: VramMemoryPressureLevel::Normal,
+            active_mip_clamp: 0,
+            total_clamped_textures: 0,
+            estimated_vram_saved_bytes: 0,
+        }
+    }
+
+    // Update allocated VRAM metrics and evaluate pressure classification.
+    pub fn update_memory_usage(&mut self, allocated_bytes: u64) -> VramMemoryPressureLevel {
+        self.allocated_bytes = allocated_bytes;
+        let pct = (allocated_bytes * 100) / self.budget_bytes;
+
+        if pct >= 95 {
+            self.current_pressure = VramMemoryPressureLevel::Saturation;
+            self.active_mip_clamp = 2;
+        } else if pct >= 85 {
+            self.current_pressure = VramMemoryPressureLevel::Critical;
+            self.active_mip_clamp = 1;
+        } else if pct >= 75 {
+            self.current_pressure = VramMemoryPressureLevel::Elevated;
+            self.active_mip_clamp = 0;
+        } else {
+            self.current_pressure = VramMemoryPressureLevel::Normal;
+            self.active_mip_clamp = 0;
+        }
+
+        self.current_pressure
+    }
+
+    // Apply mip-level residency clamp across bindless texture descriptors under memory pressure.
+    pub fn apply_pressure_throttling(&mut self, table: &mut BindlessDescriptorHeapTable) -> usize {
+        if self.active_mip_clamp == 0 {
+            return 0;
+        }
+
+        let mut clamped = 0usize;
+        let clamp_target = self.active_mip_clamp;
+
+        for chunk_opt in &mut table.chunks {
+            if let Some(ref mut chunk) = chunk_opt {
+                for desc in chunk.iter_mut() {
+                    if desc.is_valid && matches!(desc.view_type, AgilityDescriptorViewType::Texture2D | AgilityDescriptorViewType::Texture2DArray | AgilityDescriptorViewType::Texture3D) {
+                        if desc.num_mips > clamp_target {
+                            desc.most_detailed_mip = desc.most_detailed_mip.max(clamp_target);
+                            desc.min_lod_clamp = desc.min_lod_clamp.max(clamp_target);
+                            clamped += 1;
+                            let saved_ratio = if clamp_target == 1 { 75 } else { 93 };
+                            self.estimated_vram_saved_bytes += (desc.size_or_stride as u64 * saved_ratio) / 100;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.total_clamped_textures += clamped;
+        clamped
+    }
+
+    // Restore unconstrained mip-level residency when pressure subsides.
+    pub fn restore_unconstrained(&mut self, table: &mut BindlessDescriptorHeapTable) -> usize {
+        let mut restored = 0usize;
+
+        for chunk_opt in &mut table.chunks {
+            if let Some(ref mut chunk) = chunk_opt {
+                for desc in chunk.iter_mut() {
+                    if desc.is_valid && (desc.most_detailed_mip > 0 || desc.min_lod_clamp > 0) {
+                        desc.most_detailed_mip = 0;
+                        desc.min_lod_clamp = 0;
+                        restored += 1;
+                    }
+                }
+            }
+        }
+
+        self.active_mip_clamp = 0;
+        restored
+    }
+
+    // Return current VRAM utilization percentage.
+    pub fn vram_utilization_percent(&self) -> u32 {
+        ((self.allocated_bytes * 100) / self.budget_bytes) as u32
+    }
+}
