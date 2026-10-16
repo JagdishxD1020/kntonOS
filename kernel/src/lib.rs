@@ -538,6 +538,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_sync_intervals_vrr_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility sync intervals & VRR frame pacing self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Dynamic Resources & Bindless Engine (TASK-KNT-271)
+    if !gfx::test_dynamic_bindless_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility dynamic resources & bindless engine self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
