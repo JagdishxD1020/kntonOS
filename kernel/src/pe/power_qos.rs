@@ -84,6 +84,7 @@ pub struct THREAD_POWER_THROTTLING_STATE {
 pub struct ProcessPowerPolicy {
     pub process_id: u64,
     pub throttling_state: PROCESS_POWER_THROTTLING_STATE,
+    pub is_foreground: bool,
     pub execution_speed_throttled: bool,
     pub ignore_timer_resolution: bool,
 }
@@ -97,10 +98,60 @@ impl ProcessPowerPolicy {
                 ControlMask: 0,
                 StateMask: 0,
             },
+            is_foreground: true,
             execution_speed_throttled: false,
             ignore_timer_resolution: false,
         }
     }
+}
+
+
+pub const P_CORE_AFFINITY_MASK: u64 = 0b0011; // Cores 0 and 1
+pub const E_CORE_AFFINITY_MASK: u64 = 0b1100; // Cores 2 and 3
+pub const ALL_CORES_AFFINITY_MASK: u64 = 0b1111; // Cores 0..3
+
+/// Functional role of a thread within a gaming runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamingThreadRole {
+    RenderMain,
+    PhysicsSim,
+    AudioRealtime,
+    InputProcessing,
+    WorkerTask,
+    TelemetryWorker,
+    UpdateDownloader,
+    BackgroundIdle,
+}
+
+impl GamingThreadRole {
+    pub fn is_latency_critical(&self) -> bool {
+        matches!(self, Self::AudioRealtime | Self::InputProcessing)
+    }
+
+    pub fn is_foreground_performance(&self) -> bool {
+        matches!(self, Self::RenderMain | Self::PhysicsSim | Self::AudioRealtime | Self::InputProcessing)
+    }
+
+    pub fn is_background_throttled(&self) -> bool {
+        matches!(self, Self::TelemetryWorker | Self::UpdateDownloader | Self::BackgroundIdle)
+    }
+}
+
+/// Architectural CPU core class in heterogenous processors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuCoreClass {
+    PerformanceCore,
+    EfficiencyCore,
+}
+
+/// Computed scheduling placement and frequency profile for a thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadSchedulingProfile {
+    pub core_affinity_mask: u64,
+    pub primary_core_class: CpuCoreClass,
+    pub target_freq_mhz: u32,
+    pub qos_level: QosExecutionLevel,
+    pub is_immune_to_throttling: bool,
 }
 
 /// Thread-level QoS and power governance descriptor.
@@ -109,6 +160,7 @@ pub struct ThreadPowerPolicy {
     pub thread_id: u64,
     pub process_id: u64,
     pub throttling_state: THREAD_POWER_THROTTLING_STATE,
+    pub role: GamingThreadRole,
     pub execution_speed_throttled: bool,
 }
 
@@ -122,6 +174,7 @@ impl ThreadPowerPolicy {
                 ControlMask: 0,
                 StateMask: 0,
             },
+            role: GamingThreadRole::WorkerTask,
             execution_speed_throttled: false,
         }
     }
@@ -294,6 +347,98 @@ impl PowerQosManager {
         match self.determine_thread_qos_level(thread_id) {
             QosExecutionLevel::EcoQoS => ECO_QOS_MAX_FREQ_MHZ,
             QosExecutionLevel::HighQoS => HIGH_QOS_MAX_FREQ_MHZ,
+        }
+    }
+
+
+    /// Sets the gaming runtime functional role for a thread.
+    pub fn set_thread_role(&mut self, thread_id: u64, process_id: u64, role: GamingThreadRole) {
+        let policy = self
+            .thread_policies
+            .entry(thread_id)
+            .or_insert_with(|| ThreadPowerPolicy::new(thread_id, process_id));
+        policy.role = role;
+
+        // Automatically assign EcoQoS if thread role is background throttled
+        if role.is_background_throttled() {
+            policy.execution_speed_throttled = true;
+            policy.throttling_state.ControlMask |= THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+            policy.throttling_state.StateMask |= THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        }
+    }
+
+    /// Updates process foreground / background window state.
+    pub fn set_process_foreground_state(&mut self, process_id: u64, is_foreground: bool) {
+        let policy = self
+            .process_policies
+            .entry(process_id)
+            .or_insert_with(|| ProcessPowerPolicy::new(process_id));
+        policy.is_foreground = is_foreground;
+
+        // If moved to background, enable power throttling unless explicitly exempted
+        if !is_foreground {
+            policy.execution_speed_throttled = true;
+            policy.ignore_timer_resolution = true;
+        } else {
+            policy.execution_speed_throttled = false;
+            policy.ignore_timer_resolution = false;
+        }
+    }
+
+    /// Evaluates core affinity and scheduling placement for a thread based on role and QoS.
+    pub fn route_thread_scheduling(&self, thread_id: u64) -> ThreadSchedulingProfile {
+        let (role, proc_id) = if let Some(tp) = self.thread_policies.get(&thread_id) {
+            (tp.role, tp.process_id)
+        } else {
+            (GamingThreadRole::WorkerTask, 0)
+        };
+
+        let is_proc_fg = self
+            .process_policies
+            .get(&proc_id)
+            .map(|p| p.is_foreground)
+            .unwrap_or(true);
+
+        // Latency-critical threads (Audio, Input) always get dedicated P-Core affinity and top frequency
+        if role.is_latency_critical() {
+            return ThreadSchedulingProfile {
+                core_affinity_mask: P_CORE_AFFINITY_MASK,
+                primary_core_class: CpuCoreClass::PerformanceCore,
+                target_freq_mhz: HIGH_QOS_MAX_FREQ_MHZ,
+                qos_level: QosExecutionLevel::HighQoS,
+                is_immune_to_throttling: true,
+            };
+        }
+
+        // Background / telemetry threads or background processes routed to E-Cores
+        if role.is_background_throttled() || !is_proc_fg {
+            return ThreadSchedulingProfile {
+                core_affinity_mask: E_CORE_AFFINITY_MASK,
+                primary_core_class: CpuCoreClass::EfficiencyCore,
+                target_freq_mhz: ECO_QOS_MAX_FREQ_MHZ,
+                qos_level: QosExecutionLevel::EcoQoS,
+                is_immune_to_throttling: false,
+            };
+        }
+
+        // Foreground Game Render & Physics threads routed to P-Cores
+        if role.is_foreground_performance() {
+            ThreadSchedulingProfile {
+                core_affinity_mask: P_CORE_AFFINITY_MASK,
+                primary_core_class: CpuCoreClass::PerformanceCore,
+                target_freq_mhz: HIGH_QOS_MAX_FREQ_MHZ,
+                qos_level: QosExecutionLevel::HighQoS,
+                is_immune_to_throttling: false,
+            }
+        } else {
+            // General worker tasks run across all cores with balanced QoS
+            ThreadSchedulingProfile {
+                core_affinity_mask: ALL_CORES_AFFINITY_MASK,
+                primary_core_class: CpuCoreClass::PerformanceCore,
+                target_freq_mhz: 3200,
+                qos_level: QosExecutionLevel::HighQoS,
+                is_immune_to_throttling: false,
+            }
         }
     }
 
