@@ -180,10 +180,69 @@ impl ThreadPowerPolicy {
     }
 }
 
+
+/// Operating thermal zones based on SoC junction temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalPressureZone {
+    Nominal,           // < 75 C
+    Elevated,          // 75 C - 85 C
+    Critical,          // 85 C - 95 C
+    ThermalSaturation, // > 95 C (TJMax throttle zone)
+}
+
+impl ThermalPressureZone {
+    pub fn from_temperature(temp_celsius: u32) -> Self {
+        if temp_celsius > 95 {
+            ThermalPressureZone::ThermalSaturation
+        } else if temp_celsius >= 85 {
+            ThermalPressureZone::Critical
+        } else if temp_celsius >= 75 {
+            ThermalPressureZone::Elevated
+        } else {
+            ThermalPressureZone::Nominal
+        }
+    }
+}
+
+/// Dynamic thermal governor tracking temperature and enforcing prioritized degradation.
+#[derive(Debug)]
+pub struct ThermalGovernorState {
+    pub current_temperature_celsius: u32,
+    pub current_zone: ThermalPressureZone,
+    pub throttling_events_count: AtomicU32,
+    pub audio_input_preserved_count: AtomicU32,
+    pub render_throttled_count: AtomicU32,
+    pub background_quenched_count: AtomicU32,
+}
+
+impl ThermalGovernorState {
+    pub fn new() -> Self {
+        Self {
+            current_temperature_celsius: 45,
+            current_zone: ThermalPressureZone::Nominal,
+            throttling_events_count: AtomicU32::new(0),
+            audio_input_preserved_count: AtomicU32::new(0),
+            render_throttled_count: AtomicU32::new(0),
+            background_quenched_count: AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_temperature(&mut self, temp_celsius: u32) -> ThermalPressureZone {
+        self.current_temperature_celsius = temp_celsius;
+        let new_zone = ThermalPressureZone::from_temperature(temp_celsius);
+        if new_zone != self.current_zone && new_zone != ThermalPressureZone::Nominal {
+            self.throttling_events_count.fetch_add(1, Ordering::SeqCst);
+        }
+        self.current_zone = new_zone;
+        new_zone
+    }
+}
+
 /// Central Power & Thermal Throttling Quality-of-Service Governor.
 pub struct PowerQosManager {
     pub process_policies: BTreeMap<u64, ProcessPowerPolicy>,
     pub thread_policies: BTreeMap<u64, ThreadPowerPolicy>,
+    pub thermal_state: ThermalGovernorState,
 }
 
 impl PowerQosManager {
@@ -191,6 +250,7 @@ impl PowerQosManager {
         Self {
             process_policies: BTreeMap::new(),
             thread_policies: BTreeMap::new(),
+            thermal_state: ThermalGovernorState::new(),
         }
     }
 
@@ -440,6 +500,72 @@ impl PowerQosManager {
                 is_immune_to_throttling: false,
             }
         }
+    }
+
+
+    /// Updates SoC thermal temperature reading and triggers dynamic degradation evaluation.
+    pub fn update_soc_temperature(&mut self, temp_celsius: u32) -> ThermalPressureZone {
+        self.thermal_state.set_temperature(temp_celsius)
+    }
+
+    /// Evaluates effective thread scheduling profile under active thermal pressure constraints.
+    /// Under thermal saturation (>95°C), strictly preserves Audio/Input stability while degrading render/background.
+    pub fn route_thread_thermal_scheduling(&self, thread_id: u64) -> ThreadSchedulingProfile {
+        let mut profile = self.route_thread_scheduling(thread_id);
+        let zone = self.thermal_state.current_zone;
+
+        match zone {
+            ThermalPressureZone::Nominal => profile,
+            ThermalPressureZone::Elevated => {
+                // Background threads throttled further down
+                if !profile.is_immune_to_throttling && profile.primary_core_class == CpuCoreClass::EfficiencyCore {
+                    profile.target_freq_mhz = 1200;
+                    self.thermal_state.background_quenched_count.fetch_add(1, Ordering::SeqCst);
+                }
+                profile
+            }
+            ThermalPressureZone::Critical => {
+                if !profile.is_immune_to_throttling {
+                    if profile.primary_core_class == CpuCoreClass::EfficiencyCore {
+                        profile.target_freq_mhz = 1000;
+                        self.thermal_state.background_quenched_count.fetch_add(1, Ordering::SeqCst);
+                    } else if profile.target_freq_mhz > 3600 {
+                        profile.target_freq_mhz = 3600;
+                        self.thermal_state.render_throttled_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                profile
+            }
+            ThermalPressureZone::ThermalSaturation => {
+                // > 95°C Thermal Saturation (Emergency Handheld / Laptop Protection)
+                if profile.is_immune_to_throttling {
+                    // Audio and Input are strictly protected against frequency degradation and remain on P-Cores
+                    self.thermal_state.audio_input_preserved_count.fetch_add(1, Ordering::SeqCst);
+                    profile.target_freq_mhz = HIGH_QOS_MAX_FREQ_MHZ;
+                    profile.core_affinity_mask = P_CORE_AFFINITY_MASK;
+                } else if profile.primary_core_class == CpuCoreClass::PerformanceCore {
+                    // Render and physics scaled down to 2800 MHz to shed thermal load
+                    profile.target_freq_mhz = 2800;
+                    self.thermal_state.render_throttled_count.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    // All background tasks quenched to 800 MHz and restricted to E-Cores
+                    profile.target_freq_mhz = 800;
+                    profile.core_affinity_mask = E_CORE_AFFINITY_MASK;
+                    self.thermal_state.background_quenched_count.fetch_add(1, Ordering::SeqCst);
+                }
+                profile
+            }
+        }
+    }
+
+    /// Queries thermal governor statistics: (current_zone, audio_preserved, render_throttled, background_quenched).
+    pub fn get_thermal_governor_stats(&self) -> (ThermalPressureZone, u32, u32, u32) {
+        (
+            self.thermal_state.current_zone,
+            self.thermal_state.audio_input_preserved_count.load(Ordering::SeqCst),
+            self.thermal_state.render_throttled_count.load(Ordering::SeqCst),
+            self.thermal_state.background_quenched_count.load(Ordering::SeqCst),
+        )
     }
 
     /// Win32 SetProcessInformation dispatch wrapper for ProcessPowerThrottling.
