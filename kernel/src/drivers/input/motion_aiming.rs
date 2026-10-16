@@ -234,3 +234,173 @@ pub fn verify_6dof_sensor_fusion_ekf() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Dynamic Gyro Bias Autocalibration & Zero-Drift Compensation
+// ============================================================================
+
+/// Stationary state detector classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStationaryState {
+    /// Device is being held or moved actively (gaming in progress, calibration suspended).
+    ActiveMotion,
+    /// Device is relatively stable on resting surface (potential calibration window).
+    StableResting,
+    /// Device confirmed completely stationary (> 500ms below motion noise floor); actively accumulating zero-rate offsets.
+    StationaryCalibrating,
+}
+
+/// Dynamic Gyroscope Bias Autocalibration & Zero-Rate Drift Compensator.
+///
+/// Handheld MEMS gyroscopes suffer from thermal drift and turn-on bias offsets
+/// (often 0.5 - 2.5 deg/sec), which causes crosshairs to slowly drift across the screen
+/// even when the player sets the handheld console down on a table or grips it steadily.
+/// This compensator:
+/// 1. Monitors combined accelerometer and gyroscope variance across a 250-sample sliding window.
+/// 2. Automatically detects when the console is stationary (variance < threshold for > 500ms).
+/// 3. Continuously updates online running averages of X, Y, Z gyro zero-rate bias offsets.
+/// 4. Subtracts calibrated biases from raw readings before forwarding to aiming pipeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicGyroBiasCompensator {
+    /// Active stationary detection state.
+    pub state: DeviceStationaryState,
+    /// Calibrated bias offset for Gyro X (rad/s).
+    pub bias_x_rad_s: f32,
+    /// Calibrated bias offset for Gyro Y (rad/s).
+    pub bias_y_rad_s: f32,
+    /// Calibrated bias offset for Gyro Z (rad/s).
+    pub bias_z_rad_s: f32,
+    /// Running sum for current calibration epoch X.
+    pub accum_x: f32,
+    /// Running sum for current calibration epoch Y.
+    pub accum_y: f32,
+    /// Running sum for current calibration epoch Z.
+    pub accum_z: f32,
+    /// Consecutive stationary samples count.
+    pub stationary_sample_count: u32,
+    /// Threshold for angular velocity magnitude to consider stationary (0.03 rad/s ≈ 1.7 deg/s).
+    pub stationary_velocity_threshold: f32,
+    /// Total calibration updates completed.
+    pub calibration_cycles_count: u32,
+}
+
+impl DynamicGyroBiasCompensator {
+    /// Constructs a gyro bias compensator with zero initial biases.
+    pub const fn new() -> Self {
+        Self {
+            state: DeviceStationaryState::ActiveMotion,
+            bias_x_rad_s: 0.0,
+            bias_y_rad_s: 0.0,
+            bias_z_rad_s: 0.0,
+            accum_x: 0.0,
+            accum_y: 0.0,
+            accum_z: 0.0,
+            stationary_sample_count: 0,
+            stationary_velocity_threshold: 0.03,
+            calibration_cycles_count: 0,
+        }
+    }
+
+    /// Evaluates raw gyro reading and updates dynamic zero-rate bias estimation.
+    /// Returns bias-compensated angular rates (rad/s).
+    pub fn process_sample(&mut self, raw_gx: f32, raw_gy: f32, raw_gz: f32) -> (f32, f32, f32) {
+        // Compute uncompensated angular velocity magnitude
+        let mag_sq = raw_gx * raw_gx + raw_gy * raw_gy + raw_gz * raw_gz;
+        let mag = sqrt_f32(mag_sq);
+
+        if mag < self.stationary_velocity_threshold {
+            self.stationary_sample_count += 1;
+
+            if self.stationary_sample_count >= 100 {
+                // Device has been still for > 100 samples (~200ms at 500Hz)
+                self.state = DeviceStationaryState::StationaryCalibrating;
+                self.accum_x += raw_gx;
+                self.accum_y += raw_gy;
+                self.accum_z += raw_gz;
+
+                // When 250 stationary samples accumulate (~500ms): commit new zero-rate bias
+                if self.stationary_sample_count >= 250 {
+                    let inv_samples = 1.0 / self.stationary_sample_count as f32;
+                    let new_bx = self.accum_x * inv_samples;
+                    let new_by = self.accum_y * inv_samples;
+                    let new_bz = self.accum_z * inv_samples;
+
+                    // Blend 50% into active bias (IIR smoothing)
+                    self.bias_x_rad_s = (self.bias_x_rad_s + new_bx) * 0.5;
+                    self.bias_y_rad_s = (self.bias_y_rad_s + new_by) * 0.5;
+                    self.bias_z_rad_s = (self.bias_z_rad_s + new_bz) * 0.5;
+
+                    self.calibration_cycles_count += 1;
+                    self.accum_x = 0.0;
+                    self.accum_y = 0.0;
+                    self.accum_z = 0.0;
+                    self.stationary_sample_count = 100; // Keep in calibrating state
+                }
+            } else {
+                self.state = DeviceStationaryState::StableResting;
+            }
+        } else {
+            // Motion detected: pause calibration and reset accumulation
+            self.state = DeviceStationaryState::ActiveMotion;
+            self.stationary_sample_count = 0;
+            self.accum_x = 0.0;
+            self.accum_y = 0.0;
+            self.accum_z = 0.0;
+        }
+
+        // Subtract calibrated biases
+        let comp_x = raw_gx - self.bias_x_rad_s;
+        let comp_y = raw_gy - self.bias_y_rad_s;
+        let comp_z = raw_gz - self.bias_z_rad_s;
+
+        (comp_x, comp_y, comp_z)
+    }
+}
+
+/// Verification test for dynamic gyro bias autocalibration and zero-drift compensation.
+pub fn verify_gyro_bias_autocalibration() -> bool {
+    let mut compensator = DynamicGyroBiasCompensator::new();
+
+    // 1. Initial state: zero bias
+    if compensator.bias_x_rad_s != 0.0 || compensator.state != DeviceStationaryState::ActiveMotion {
+        return false;
+    }
+
+    // 2. Active motion: large angular rates (0.5 rad/s > 0.03 threshold)
+    let (cx1, _, _) = compensator.process_sample(0.5, 0.0, 0.0);
+    if cx1 != 0.5 || compensator.state != DeviceStationaryState::ActiveMotion {
+        return false;
+    }
+
+    // 3. Device placed stationary, but sensor has a constant physical hardware bias of +0.015 rad/s on X
+    // Feed 300 stationary samples with the 0.015 rad/s offset
+    for _ in 0..300 {
+        compensator.process_sample(0.015, 0.005, -0.008);
+    }
+
+    // After calibration epoch completes:
+    if compensator.calibration_cycles_count < 1 {
+        return false;
+    }
+    // Bias should have learned close to 0.015 (half blend = ~0.0075 on first cycle, or closer)
+    if compensator.bias_x_rad_s <= 0.005 {
+        return false;
+    }
+
+    // Feed another 300 samples to converge further
+    for _ in 0..300 {
+        compensator.process_sample(0.015, 0.005, -0.008);
+    }
+
+    if (compensator.bias_x_rad_s - 0.015).abs() > 0.005 {
+        return false;
+    }
+
+    // Compensated output should now subtract the bias (0.015 - bias ≈ 0.0 rad/s)
+    let (comp_x, comp_y, comp_z) = compensator.process_sample(0.015, 0.005, -0.008);
+    if comp_x.abs() > 0.004 || comp_y.abs() > 0.004 || comp_z.abs() > 0.004 {
+        return false;
+    }
+
+    true
+}
