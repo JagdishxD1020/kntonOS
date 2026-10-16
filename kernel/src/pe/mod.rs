@@ -44,6 +44,7 @@ pub mod object_namespace;
 pub mod apc_dispatcher;
 pub mod large_page_valloc;
 pub mod power_qos;
+pub mod working_set;
 
 pub use header::*;
 pub use ntdll::*;
