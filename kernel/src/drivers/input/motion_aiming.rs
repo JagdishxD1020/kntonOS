@@ -556,3 +556,196 @@ pub fn verify_motion_aiming_curve_generator() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 4: Handheld Physical Gesture Recognition (Flick-Turn & Tilt-to-Lean)
+// ============================================================================
+
+/// Recognized handheld physical motion gesture event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldMotionGesture {
+    /// No gesture active (nominal neutral handheld gaming).
+    None,
+    /// Quick-Flick 180-degree turn gesture: Player snaps handheld horizontally to instantly pivot character 180°.
+    QuickFlick180TurnRight,
+    QuickFlick180TurnLeft,
+    /// Tilt-to-Lean Left gesture: Handheld tilted roll angle > 15° to peek around corners.
+    TiltToLeanLeft,
+    /// Tilt-to-Lean Right gesture: Handheld tilted roll angle > 15° to peek around corners.
+    TiltToLeanRight,
+}
+
+/// Handheld Physical Gesture Recognition Engine.
+///
+/// Recognizes intuitive physical console maneuvers in competitive games:
+/// 1. Quick-Flick 180° Turn: Detects sharp, explosive yaw acceleration (> 6.0 rad/s / > 350 deg/s)
+///    lasting between 40ms and 180ms, triggering an instant 180-degree turn in first-person shooters.
+/// 2. Tilt-to-Lean: Tracks roll inclination from the gravity vector; tilts beyond ±15°
+///    activate virtual lean-around-corner buttons (e.g. Q/E keys or tactical shoulder lean).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldMotionGestureRecognizer {
+    /// Last detected gesture.
+    pub current_gesture: HandheldMotionGesture,
+    /// Quick-flick angular rate threshold in rad/s (6.0 rad/s ≈ 344 deg/s).
+    pub flick_yaw_threshold_rad_s: f32,
+    /// Minimum duration of flick spike in microseconds (40,000 µs = 40 ms).
+    pub flick_min_duration_us: u32,
+    /// Maximum duration of flick spike in microseconds (180,000 µs = 180 ms).
+    pub flick_max_duration_us: u32,
+    /// Elapsed flick duration in microseconds.
+    pub flick_timer_us: u32,
+    /// Peak flick angular speed recorded during current impulse.
+    pub peak_flick_speed_rad_s: f32,
+    /// Tilt angle threshold in degrees for lean detection (15.0°).
+    pub lean_tilt_threshold_deg: f32,
+    /// Holdoff timer in microseconds after a flick turn before allowing another (300,000 µs = 300 ms).
+    pub flick_cooldown_us: u32,
+    /// Total 180-degree flick turns recognized.
+    pub flick_turns_count: u32,
+    /// Total lean gestures recognized.
+    pub lean_gestures_count: u32,
+}
+
+impl HandheldMotionGestureRecognizer {
+    /// Constructs a handheld gesture recognizer.
+    pub const fn new() -> Self {
+        Self {
+            current_gesture: HandheldMotionGesture::None,
+            flick_yaw_threshold_rad_s: 6.0,
+            flick_min_duration_us: 40_000,
+            flick_max_duration_us: 180_000,
+            flick_timer_us: 0,
+            peak_flick_speed_rad_s: 0.0,
+            lean_tilt_threshold_deg: 15.0,
+            flick_cooldown_us: 0,
+            flick_turns_count: 0,
+            lean_gestures_count: 0,
+        }
+    }
+
+    /// Evaluates motion telemetry and returns any recognized gesture event.
+    pub fn update_gestures(
+        &mut self,
+        gyro_yaw: f32,
+        roll_deg: f32,
+        dt_us: u32,
+    ) -> HandheldMotionGesture {
+        // Decrement cooldown timer
+        if self.flick_cooldown_us > 0 {
+            self.flick_cooldown_us = self.flick_cooldown_us.saturating_sub(dt_us);
+        }
+
+        let yaw_abs = gyro_yaw.abs();
+
+        // 1. Evaluate Quick-Flick 180 Turn gesture
+        if self.flick_cooldown_us == 0 && yaw_abs >= self.flick_yaw_threshold_rad_s {
+            self.flick_timer_us += dt_us;
+            if yaw_abs > self.peak_flick_speed_rad_s {
+                self.peak_flick_speed_rad_s = yaw_abs;
+            }
+
+            if self.flick_timer_us >= self.flick_min_duration_us
+                && self.flick_timer_us <= self.flick_max_duration_us
+            {
+                // Trigger 180 flick turn!
+                self.flick_turns_count += 1;
+                self.flick_cooldown_us = 300_000; // 300ms cooldown to prevent double-flicking
+                self.flick_timer_us = 0;
+                self.peak_flick_speed_rad_s = 0.0;
+
+                self.current_gesture = if gyro_yaw > 0.0 {
+                    HandheldMotionGesture::QuickFlick180TurnRight
+                } else {
+                    HandheldMotionGesture::QuickFlick180TurnLeft
+                };
+                return self.current_gesture;
+            }
+        } else {
+            self.flick_timer_us = 0;
+            self.peak_flick_speed_rad_s = 0.0;
+        }
+
+        // 2. Evaluate Tilt-to-Lean gesture
+        if roll_deg <= -self.lean_tilt_threshold_deg {
+            self.current_gesture = HandheldMotionGesture::TiltToLeanLeft;
+            self.lean_gestures_count += 1;
+        } else if roll_deg >= self.lean_tilt_threshold_deg {
+            self.current_gesture = HandheldMotionGesture::TiltToLeanRight;
+            self.lean_gestures_count += 1;
+        } else {
+            self.current_gesture = HandheldMotionGesture::None;
+        }
+
+        self.current_gesture
+    }
+}
+
+/// Integrated Handheld Motion Aiming & Sensor Fusion Subsystem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandheldMotionAimingSubsystem {
+    /// 6-DoF sensor fusion EKF.
+    pub ekf: MotionSensorFusionEkf,
+    /// Gyroscope bias autocalibrator.
+    pub compensator: DynamicGyroBiasCompensator,
+    /// Precision aiming curve generator.
+    pub curve_generator: MotionAimingCurveGenerator,
+    /// Physical gesture recognizer.
+    pub gesture_recognizer: HandheldMotionGestureRecognizer,
+}
+
+impl HandheldMotionAimingSubsystem {
+    /// Constructs the integrated motion aiming subsystem.
+    pub const fn new() -> Self {
+        Self {
+            ekf: MotionSensorFusionEkf::new(0.04),
+            compensator: DynamicGyroBiasCompensator::new(),
+            curve_generator: MotionAimingCurveGenerator::new(MotionAimingResponseCurve::PrecisionSniper),
+            gesture_recognizer: HandheldMotionGestureRecognizer::new(),
+        }
+    }
+}
+
+/// Verification test for handheld physical gesture recognition.
+pub fn verify_motion_gesture_recognition() -> bool {
+    let mut recognizer = HandheldMotionGestureRecognizer::new();
+
+    // 1. Initial state: None
+    if recognizer.current_gesture != HandheldMotionGesture::None {
+        return false;
+    }
+
+    // 2. Tilt-to-Lean Left: Roll = -20.0° (< -15° threshold)
+    let g1 = recognizer.update_gestures(0.0, -20.0, 10_000);
+    if g1 != HandheldMotionGesture::TiltToLeanLeft || recognizer.current_gesture != HandheldMotionGesture::TiltToLeanLeft {
+        return false;
+    }
+
+    // 3. Return to neutral
+    let g2 = recognizer.update_gestures(0.0, 0.0, 10_000);
+    if g2 != HandheldMotionGesture::None {
+        return false;
+    }
+
+    // 4. Quick-flick right 180° turn: Feed 7.0 rad/s yaw for 50,000 µs (50ms in 10ms steps)
+    let mut flick_triggered = false;
+    for _ in 0..5 {
+        let g = recognizer.update_gestures(7.0, 0.0, 10_000);
+        if g == HandheldMotionGesture::QuickFlick180TurnRight {
+            flick_triggered = true;
+        }
+    }
+    if !flick_triggered || recognizer.flick_turns_count != 1 {
+        return false;
+    }
+    if recognizer.flick_cooldown_us == 0 {
+        return false;
+    }
+
+    // 5. Verify integrated subsystem instantiation
+    let subsystem = HandheldMotionAimingSubsystem::new();
+    if subsystem.ekf.orientation.w != 1.0 {
+        return false;
+    }
+
+    true
+}
