@@ -58,6 +58,7 @@ pub mod pso_cache;
 pub mod depth_bias_conservative;
 pub mod gpu_page_remapping;
 pub mod command_allocator_pool;
+pub mod sync_intervals_vrr;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -116,6 +117,7 @@ pub use pso_cache::*;
 pub use depth_bias_conservative::*;
 pub use gpu_page_remapping::*;
 pub use command_allocator_pool::*;
+pub use sync_intervals_vrr::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
