@@ -43,6 +43,7 @@ pub mod avx512_state;
 pub mod object_namespace;
 pub mod apc_dispatcher;
 pub mod large_page_valloc;
+pub mod power_qos;
 
 pub use header::*;
 pub use ntdll::*;
@@ -85,6 +86,7 @@ pub use avx512_state::*;
 pub use object_namespace::*;
 pub use apc_dispatcher::*;
 pub use large_page_valloc::*;
+pub use power_qos::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
