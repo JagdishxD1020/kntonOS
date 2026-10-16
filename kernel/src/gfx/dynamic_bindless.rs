@@ -314,3 +314,102 @@ impl SamplerFeedbackLodEvaluator {
         }
     }
 }
+
+// Staged descriptor update paired with GPU timeline fence synchronization value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingDescriptorUpdate {
+    pub index: u32,
+    pub descriptor: DynamicResourceDescriptor,
+    pub timeline_fence_value: u64,
+}
+
+// Circular ring queue providing non-blocking asynchronous descriptor table updates.
+pub struct LockFreeDescriptorRingQueue {
+    pub ring: Vec<Option<PendingDescriptorUpdate>>,
+    pub capacity: usize,
+    pub head: usize,
+    pub tail: usize,
+    pub count: usize,
+    pub total_enqueued: u64,
+    pub total_flushed: u64,
+}
+
+impl LockFreeDescriptorRingQueue {
+    // Construct new descriptor update ring queue.
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(16);
+        let mut ring = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            ring.push(None);
+        }
+        Self {
+            ring,
+            capacity: cap,
+            head: 0,
+            tail: 0,
+            count: 0,
+            total_enqueued: 0,
+            total_flushed: 0,
+        }
+    }
+
+    // Enqueue a descriptor update with associated timeline fence value.
+    pub fn enqueue_update(
+        &mut self,
+        index: u32,
+        descriptor: DynamicResourceDescriptor,
+        timeline_fence: u64,
+    ) -> Result<(), BindlessTableError> {
+        if self.count >= self.capacity {
+            return Err(BindlessTableError::TableFull);
+        }
+
+        self.ring[self.tail] = Some(PendingDescriptorUpdate {
+            index,
+            descriptor,
+            timeline_fence_value: timeline_fence,
+        });
+        self.tail = (self.tail + 1) % self.capacity;
+        self.count += 1;
+        self.total_enqueued += 1;
+        Ok(())
+    }
+
+    // Flush and apply all pending descriptor updates that have signaled on GPU fence.
+    pub fn flush_completed_updates(
+        &mut self,
+        completed_fence: u64,
+        table: &mut BindlessDescriptorHeapTable,
+    ) -> usize {
+        let mut flushed = 0usize;
+
+        while self.count > 0 {
+            if let Some(update) = self.ring[self.head] {
+                if update.timeline_fence_value <= completed_fence {
+                    let _ = table.write_descriptor(update.index, update.descriptor);
+                    self.ring[self.head] = None;
+                    self.head = (self.head + 1) % self.capacity;
+                    self.count -= 1;
+                    flushed += 1;
+                    self.total_flushed += 1;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        flushed
+    }
+
+    // Number of pending staged updates.
+    pub fn pending_count(&self) -> usize {
+        self.count
+    }
+
+    // Whether queue contains no pending updates.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
