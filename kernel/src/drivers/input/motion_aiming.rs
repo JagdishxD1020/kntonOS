@@ -404,3 +404,155 @@ pub fn verify_gyro_bias_autocalibration() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 3: Motion-Assisted Precision Aiming Curve Generator
+// ============================================================================
+
+/// Aiming curve response mode for gyro-assisted crosshair tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionAimingResponseCurve {
+    /// Linear: 1:1 direct angular velocity to mouse/crosshair delta mapping.
+    LinearDirect,
+    /// Precision Sniper: Low angular speeds dampened for micro-adjustments, high speeds amplified for flicks.
+    PrecisionSniper,
+    /// Exponential Acceleration: Curve steepens with angular speed for high dynamic range.
+    ExponentialDynamic,
+}
+
+/// Motion-Assisted Precision Aiming Curve Generator.
+///
+/// Converts raw IMU angular rates (rad/s or deg/s) into high-resolution virtual mouse/analog stick
+/// displacement vectors (dx, dy) for competitive handheld gaming:
+/// 1. Deadzone thresholding: suppresses involuntary physiological hand tremors (< 0.05 rad/s).
+/// 2. Non-linear power curve: fine micro-aiming for sniper headshots, high sensitivity for fast tracking.
+/// 3. Acceleration smoothing via Exponential Moving Average (EMA) to prevent crosshair jitter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionAimingCurveGenerator {
+    /// Selected response curve mode.
+    pub curve_mode: MotionAimingResponseCurve,
+    /// Deadzone threshold in rad/s (below this, output is zero).
+    pub tremor_deadzone_rad_s: f32,
+    /// Base sensitivity scale factor (e.g. 1200.0 counts per rad/s).
+    pub sensitivity_scale: f32,
+    /// Acceleration multiplier factor (e.g. 1.5).
+    pub acceleration_factor: f32,
+    /// Filtered smooth output delta X.
+    pub smooth_dx: f32,
+    /// Filtered smooth output delta Y.
+    pub smooth_dy: f32,
+    /// Smoothing smoothing weight alpha (0.0 .. 1.0, e.g. 0.35).
+    pub smoothing_alpha: f32,
+    /// Total aiming sample frames generated.
+    pub frames_generated: u64,
+}
+
+impl MotionAimingCurveGenerator {
+    /// Constructs a precision aiming curve generator.
+    pub const fn new(curve: MotionAimingResponseCurve) -> Self {
+        Self {
+            curve_mode: curve,
+            tremor_deadzone_rad_s: 0.05, // 0.05 rad/s ≈ 2.86 deg/s
+            sensitivity_scale: 1200.0,
+            acceleration_factor: 1.5,
+            smooth_dx: 0.0,
+            smooth_dy: 0.0,
+            smoothing_alpha: 0.35,
+            frames_generated: 0,
+        }
+    }
+
+    /// Evaluates angular velocity inputs (gyro_pitch, gyro_yaw) and generates smoothed (dx, dy) crosshair deltas.
+    pub fn process_aiming_velocity(&mut self, gyro_pitch: f32, gyro_yaw: f32, dt_s: f32) -> (f32, f32) {
+        self.frames_generated += 1;
+
+        // Apply tremor deadzone
+        let pitch_active = if gyro_pitch.abs() < self.tremor_deadzone_rad_s {
+            0.0
+        } else {
+            let sign = if gyro_pitch > 0.0 { 1.0 } else { -1.0 };
+            sign * (gyro_pitch.abs() - self.tremor_deadzone_rad_s)
+        };
+
+        let yaw_active = if gyro_yaw.abs() < self.tremor_deadzone_rad_s {
+            0.0
+        } else {
+            let sign = if gyro_yaw > 0.0 { 1.0 } else { -1.0 };
+            sign * (gyro_yaw.abs() - self.tremor_deadzone_rad_s)
+        };
+
+        let speed = sqrt_f32(pitch_active * pitch_active + yaw_active * yaw_active);
+
+        // Apply response curve gain
+        let curve_gain = match self.curve_mode {
+            MotionAimingResponseCurve::LinearDirect => 1.0,
+            MotionAimingResponseCurve::PrecisionSniper => {
+                // If speed is slow (< 0.5 rad/s), dampen by 0.6x; if speed is fast (> 1.5 rad/s), boost by 1.8x
+                if speed < 0.5 {
+                    0.6
+                } else if speed > 1.5 {
+                    1.8
+                } else {
+                    1.0
+                }
+            }
+            MotionAimingResponseCurve::ExponentialDynamic => {
+                // 1.0 + acceleration_factor * speed
+                1.0 + (self.acceleration_factor * speed).min(3.0)
+            }
+        };
+
+        let raw_dx = yaw_active * self.sensitivity_scale * curve_gain * dt_s;
+        let raw_dy = -pitch_active * self.sensitivity_scale * curve_gain * dt_s; // Invert pitch for standard FPS look
+
+        // Apply exponential moving average (EMA) smoothing: Smooth = Alpha * Raw + (1 - Alpha) * Smooth
+        self.smooth_dx = self.smoothing_alpha * raw_dx + (1.0 - self.smoothing_alpha) * self.smooth_dx;
+        self.smooth_dy = self.smoothing_alpha * raw_dy + (1.0 - self.smoothing_alpha) * self.smooth_dy;
+
+        (self.smooth_dx, self.smooth_dy)
+    }
+}
+
+/// Verification test for motion-assisted precision aiming curve generator.
+pub fn verify_motion_aiming_curve_generator() -> bool {
+    let mut gen = MotionAimingCurveGenerator::new(MotionAimingResponseCurve::PrecisionSniper);
+
+    // 1. Initial state
+    if gen.curve_mode != MotionAimingResponseCurve::PrecisionSniper {
+        return false;
+    }
+
+    // 2. Tremor deadzone test: Small micro-jitter of 0.03 rad/s (< 0.05 deadzone) -> output strictly 0.0
+    let (dx_tremor, dy_tremor) = gen.process_aiming_velocity(0.03, 0.03, 0.002);
+    if dx_tremor != 0.0 || dy_tremor != 0.0 {
+        return false;
+    }
+
+    // 3. Precision sniper slow tracking: 0.3 rad/s yaw (> 0.05, but < 0.5 rad/s) -> 0.6x dampening
+    let mut steady_dx = 0.0f32;
+    for _ in 0..20 {
+        let (dx, _) = gen.process_aiming_velocity(0.0, 0.3, 0.002);
+        steady_dx = dx;
+    }
+    // Active speed = 0.3 - 0.05 = 0.25 rad/s
+    // Raw dx = 0.25 * 1200 * 0.6 * 0.002 = 0.36
+    // Converged steady_dx should be within [0.30 .. 0.42]
+    if steady_dx < 0.30 || steady_dx > 0.42 {
+        return false;
+    }
+
+    // 4. Fast snap flick: 2.5 rad/s yaw (> 1.5 rad/s) -> 1.8x acceleration boost
+    let mut flick_dx = 0.0f32;
+    for _ in 0..20 {
+        let (dx, _) = gen.process_aiming_velocity(0.0, 2.5, 0.002);
+        flick_dx = dx;
+    }
+    // Active speed = 2.5 - 0.05 = 2.45 rad/s
+    // Raw dx = 2.45 * 1200 * 1.8 * 0.002 = 10.584
+    // Flick output must be substantially higher (> 8.0)
+    if flick_dx < 8.0 {
+        return false;
+    }
+
+    true
+}
