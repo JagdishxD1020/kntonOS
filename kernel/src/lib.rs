@@ -742,6 +742,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld gyro-to-mouse translator self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Sensor Fusion IMU 6-DoF Zero-Drift Kalman Filter & Motion-Assisted Aiming Engine (TASK-KNT-269)
+    if !drivers::input::test_motion_aiming_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld sensor fusion IMU 6-DoF Kalman filter and motion aiming self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Capacitive Touch Controller & Multi-Finger Gesture Engine
     if !drivers::input::test_touch_and_gesture_subsystem() {
         serial_write_str("[KNT-PANIC] Touch and gesture subsystem self-test failed!\r\n");

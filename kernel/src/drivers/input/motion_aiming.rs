@@ -276,6 +276,8 @@ pub struct DynamicGyroBiasCompensator {
     pub accum_y: f32,
     /// Running sum for current calibration epoch Z.
     pub accum_z: f32,
+    /// Number of samples accumulated in current calibration epoch.
+    pub accum_count: u32,
     /// Consecutive stationary samples count.
     pub stationary_sample_count: u32,
     /// Threshold for angular velocity magnitude to consider stationary (0.03 rad/s ≈ 1.7 deg/s).
@@ -295,6 +297,7 @@ impl DynamicGyroBiasCompensator {
             accum_x: 0.0,
             accum_y: 0.0,
             accum_z: 0.0,
+            accum_count: 0,
             stationary_sample_count: 0,
             stationary_velocity_threshold: 0.03,
             calibration_cycles_count: 0,
@@ -317,24 +320,37 @@ impl DynamicGyroBiasCompensator {
                 self.accum_x += raw_gx;
                 self.accum_y += raw_gy;
                 self.accum_z += raw_gz;
+                self.accum_count += 1;
 
-                // When 250 stationary samples accumulate (~500ms): commit new zero-rate bias
-                if self.stationary_sample_count >= 250 {
-                    let inv_samples = 1.0 / self.stationary_sample_count as f32;
-                    let new_bx = self.accum_x * inv_samples;
-                    let new_by = self.accum_y * inv_samples;
-                    let new_bz = self.accum_z * inv_samples;
+                // When 150 stationary samples accumulate (~300ms of calibrating): commit new zero-rate bias
+                if self.accum_count >= 150 {
+                    let inv_count = 1.0 / self.accum_count as f32;
+                    let new_bx = self.accum_x * inv_count;
+                    let new_by = self.accum_y * inv_count;
+                    let new_bz = self.accum_z * inv_count;
 
-                    // Blend 50% into active bias (IIR smoothing)
-                    self.bias_x_rad_s = (self.bias_x_rad_s + new_bx) * 0.5;
-                    self.bias_y_rad_s = (self.bias_y_rad_s + new_by) * 0.5;
-                    self.bias_z_rad_s = (self.bias_z_rad_s + new_bz) * 0.5;
+                    // Blend into active bias (100% on first calibration cycle, 50% IIR thereafter)
+                    self.bias_x_rad_s = if self.calibration_cycles_count == 0 {
+                        new_bx
+                    } else {
+                        (self.bias_x_rad_s + new_bx) * 0.5
+                    };
+                    self.bias_y_rad_s = if self.calibration_cycles_count == 0 {
+                        new_by
+                    } else {
+                        (self.bias_y_rad_s + new_by) * 0.5
+                    };
+                    self.bias_z_rad_s = if self.calibration_cycles_count == 0 {
+                        new_bz
+                    } else {
+                        (self.bias_z_rad_s + new_bz) * 0.5
+                    };
 
                     self.calibration_cycles_count += 1;
                     self.accum_x = 0.0;
                     self.accum_y = 0.0;
                     self.accum_z = 0.0;
-                    self.stationary_sample_count = 100; // Keep in calibrating state
+                    self.accum_count = 0;
                 }
             } else {
                 self.state = DeviceStationaryState::StableResting;
@@ -346,6 +362,7 @@ impl DynamicGyroBiasCompensator {
             self.accum_x = 0.0;
             self.accum_y = 0.0;
             self.accum_z = 0.0;
+            self.accum_count = 0;
         }
 
         // Subtract calibrated biases
@@ -747,5 +764,38 @@ pub fn verify_motion_gesture_recognition() -> bool {
         return false;
     }
 
+    true
+}
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Sensor Fusion IMU 6-DoF Zero-Drift
+/// Kalman Filter & Motion-Assisted Aiming Engine (TASK-KNT-269).
+pub fn test_motion_aiming_subsystem() -> bool {
+    crate::serial_write_str("[INPUT-MOTION-AIM] Initiating IMU 6-DoF Sensor Fusion & Motion Aiming Verification...\r\n");
+
+    if !verify_6dof_sensor_fusion_ekf() {
+        crate::serial_write_str("[INPUT-MOTION-AIM-ERR] 6-DoF sensor fusion EKF test failed!\r\n");
+        return false;
+    }
+
+    if !verify_gyro_bias_autocalibration() {
+        crate::serial_write_str("[INPUT-MOTION-AIM-ERR] Dynamic gyro bias autocalibration test failed!\r\n");
+        return false;
+    }
+
+    if !verify_motion_aiming_curve_generator() {
+        crate::serial_write_str("[INPUT-MOTION-AIM-ERR] Motion aiming curve generator test failed!\r\n");
+        return false;
+    }
+
+    if !verify_motion_gesture_recognition() {
+        crate::serial_write_str("[INPUT-MOTION-AIM-ERR] Physical gesture recognition test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-INPUT-MOTION-AIM-PASS] Sensor fusion IMU 6-DoF Kalman filter and motion aiming verified!\r\n");
     true
 }
