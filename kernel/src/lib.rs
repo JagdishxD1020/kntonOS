@@ -1217,6 +1217,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Win32 debugging and exception instrumentation self-test failed!\r\n");
     }
 
+    // Verify Win32 Process & Thread Power / Thermal QoS Policy Engine (TASK-KNT-270)
+    if !pe::test_win32_power_qos_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Power & Thermal QoS self-test failed!\r\n");
+    }
+
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Large Page VirtualAlloc2 self-test failed!\r\n");

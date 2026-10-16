@@ -370,13 +370,11 @@ impl PowerQosManager {
         thread_id: u64,
         requested_100ns: u32,
     ) -> TimerResolutionPolicy {
-        let mut ignore_timer = false;
-
-        if let Some(t) = self.thread_policies.get(&thread_id) {
-            if let Some(p) = self.process_policies.get(&t.process_id) {
-                ignore_timer = p.ignore_timer_resolution;
-            }
-        }
+        let qos = self.determine_thread_qos_level(thread_id);
+        let ignore_timer = match qos {
+            QosExecutionLevel::EcoQoS => true,
+            QosExecutionLevel::HighQoS => false,
+        };
 
         if ignore_timer {
             // EcoQoS timer coalescing active: enforce standard or relaxed tick rate
@@ -631,4 +629,148 @@ where
     init_power_qos_manager();
     let mut lock = GLOBAL_POWER_QOS_MANAGER.lock();
     f(lock.as_mut().unwrap())
+}
+
+/// Public self-test suite validating Win32 Process & Thread Power Throttling API,
+/// QoS Execution Levels (EcoQoS/HighQoS), Gaming Core Affinity & Thermal Saturation Prioritization.
+pub fn test_win32_power_qos_subsystem() -> bool {
+    crate::serial_write_str("[KNT-TEST] Initializing Win32 Power & Thermal QoS self-test suite...\r\n");
+
+    let mut mgr = PowerQosManager::new();
+
+    // 1. Verify Win32 Power Throttling API Configuration
+    let proc_state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    };
+
+    if mgr.win32_set_process_information(500, ProcessPowerThrottling, proc_state) == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set process power throttling state\r\n");
+        return false;
+    }
+
+    let read_state = match mgr.get_process_power_throttling(500) {
+        Ok(s) => s,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Failed to get process power throttling state\r\n");
+            return false;
+        }
+    };
+
+    if read_state.StateMask != proc_state.StateMask {
+        crate::serial_write_str("[KNT-TEST-ERR] Process power throttling state mask mismatch\r\n");
+        return false;
+    }
+
+    // Thread 1001 overrides process throttling (HighQoS)
+    let thread_state = THREAD_POWER_THROTTLING_STATE {
+        Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    if mgr.win32_set_thread_information(1001, 500, ThreadPowerThrottling, thread_state) == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set thread power throttling state\r\n");
+        return false;
+    }
+
+    // Thread 1002 inherits process EcoQoS
+    let _ = mgr.win32_set_thread_information(
+        1002,
+        500,
+        ThreadPowerThrottling,
+        THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: 0,
+            StateMask: 0,
+        },
+    );
+
+    if mgr.determine_thread_qos_level(1001) != QosExecutionLevel::HighQoS {
+        crate::serial_write_str("[KNT-TEST-ERR] Thread 1001 did not override process EcoQoS\r\n");
+        return false;
+    }
+
+    if mgr.determine_thread_qos_level(1002) != QosExecutionLevel::EcoQoS {
+        crate::serial_write_str("[KNT-TEST-ERR] Thread 1002 did not inherit process EcoQoS\r\n");
+        return false;
+    }
+
+    // 2. Verify Core Affinity & Heterogeneous Scheduler Routing
+    mgr.set_thread_role(2001, 500, GamingThreadRole::RenderMain);
+    mgr.set_thread_role(2002, 500, GamingThreadRole::AudioRealtime);
+    mgr.set_thread_role(2003, 500, GamingThreadRole::TelemetryWorker);
+
+    let route_render = mgr.route_thread_scheduling(2001);
+    let route_audio = mgr.route_thread_scheduling(2002);
+    let route_telem = mgr.route_thread_scheduling(2003);
+
+    // RenderMain on P-Cores with HighQoS
+    if route_render.core_affinity_mask != P_CORE_AFFINITY_MASK || route_render.qos_level != QosExecutionLevel::HighQoS {
+        crate::serial_write_str("[KNT-TEST-ERR] Render thread not routed to P-Cores with HighQoS\r\n");
+        return false;
+    }
+
+    // AudioRealtime on P-Cores with throttling immunity
+    if !route_audio.is_immune_to_throttling || route_audio.core_affinity_mask != P_CORE_AFFINITY_MASK {
+        crate::serial_write_str("[KNT-TEST-ERR] Audio thread not flagged as immune to throttling\r\n");
+        return false;
+    }
+
+    // TelemetryWorker on E-Cores with EcoQoS
+    if route_telem.core_affinity_mask != E_CORE_AFFINITY_MASK || route_telem.qos_level != QosExecutionLevel::EcoQoS {
+        crate::serial_write_str("[KNT-TEST-ERR] Telemetry worker not throttled to E-Cores\r\n");
+        return false;
+    }
+
+    // 3. Verify Background Timer Resolution Throttling & Coalescing
+    let eco_timer = mgr.calculate_effective_timer_resolution(1002, 1000);
+    if !eco_timer.timer_coalescing_active || eco_timer.effective_resolution_100ns < TIMER_RESOLUTION_DEFAULT_100NS {
+        crate::serial_write_str("[KNT-TEST-ERR] EcoQoS timer was not coalesced to default power-saving resolution\r\n");
+        return false;
+    }
+
+    let high_timer = mgr.calculate_effective_timer_resolution(1001, 5000);
+    if high_timer.timer_coalescing_active || high_timer.effective_resolution_100ns != 5000 {
+        crate::serial_write_str("[KNT-TEST-ERR] HighQoS high-precision timer was unexpectedly coalesced\r\n");
+        return false;
+    }
+
+    // 4. Verify Thermal Saturation (>95°C) Dynamic Degradation Policy
+    let zone = mgr.update_soc_temperature(98);
+    if zone != ThermalPressureZone::ThermalSaturation {
+        crate::serial_write_str("[KNT-TEST-ERR] 98°C reading did not enter ThermalSaturation zone\r\n");
+        return false;
+    }
+
+    let thermal_audio = mgr.route_thread_thermal_scheduling(2002);
+    let thermal_render = mgr.route_thread_thermal_scheduling(2001);
+    let thermal_telem = mgr.route_thread_thermal_scheduling(2003);
+
+    // Audio MUST be preserved at top speed on P-Cores
+    if thermal_audio.target_freq_mhz != HIGH_QOS_MAX_FREQ_MHZ || thermal_audio.core_affinity_mask != P_CORE_AFFINITY_MASK {
+        crate::serial_write_str("[KNT-TEST-ERR] Audio thread was improperly degraded under thermal saturation\r\n");
+        return false;
+    }
+
+    // Render scaled down from 4800 to 2800 MHz
+    if thermal_render.target_freq_mhz > 3000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Render thread frequency was not throttled under saturation\r\n");
+        return false;
+    }
+
+    // Telemetry quenched to 800 MHz on E-Cores
+    if thermal_telem.target_freq_mhz > 1000 || thermal_telem.core_affinity_mask != E_CORE_AFFINITY_MASK {
+        crate::serial_write_str("[KNT-TEST-ERR] Background worker not deeply quenched under saturation\r\n");
+        return false;
+    }
+
+    let (_, audio_cnt, render_cnt, telem_cnt) = mgr.get_thermal_governor_stats();
+    if audio_cnt == 0 || render_cnt == 0 || telem_cnt == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Thermal governor event counters not updated\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-POWER-QOS-PASS] Win32 Process & Thread Power/Thermal QoS Engine verified\r\n");
+    true
 }
