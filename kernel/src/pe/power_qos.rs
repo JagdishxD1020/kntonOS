@@ -48,6 +48,28 @@ pub struct PROCESS_POWER_THROTTLING_STATE {
     pub StateMask: u32,
 }
 
+pub const TIMER_RESOLUTION_DEFAULT_100NS: u32 = 156250; // 15.625 ms standard tick
+pub const TIMER_RESOLUTION_HIGH_PRECISION_100NS: u32 = 5000; // 0.5 ms precision
+pub const TIMER_RESOLUTION_COALESCED_ECO_100NS: u32 = 300000; // 30.0 ms coalesced tick
+
+pub const HIGH_QOS_MAX_FREQ_MHZ: u32 = 4800;
+pub const ECO_QOS_MAX_FREQ_MHZ: u32 = 1600;
+
+/// Quality-of-Service execution efficiency tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosExecutionLevel {
+    EcoQoS,
+    HighQoS,
+}
+
+/// Dynamic timer resolution and coalescing configuration for a process or thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerResolutionPolicy {
+    pub requested_resolution_100ns: u32,
+    pub effective_resolution_100ns: u32,
+    pub timer_coalescing_active: bool,
+}
+
 /// Thread power throttling configuration state matching Win32 THREAD_POWER_THROTTLING_STATE.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -205,6 +227,74 @@ impl PowerQosManager {
             .ok_or(STATUS_INVALID_HANDLE)?;
 
         Ok(policy.throttling_state)
+    }
+
+
+    /// Determines the effective QoS execution level (EcoQoS vs HighQoS) for a thread.
+    /// Thread-level policy overrides process-level policy.
+    pub fn determine_thread_qos_level(&self, thread_id: u64) -> QosExecutionLevel {
+        if let Some(thread_policy) = self.thread_policies.get(&thread_id) {
+            if thread_policy.execution_speed_throttled {
+                return QosExecutionLevel::EcoQoS;
+            }
+            // If thread specifically configured as not throttled
+            if (thread_policy.throttling_state.ControlMask & THREAD_POWER_THROTTLING_EXECUTION_SPEED) != 0 {
+                return QosExecutionLevel::HighQoS;
+            }
+            // Check parent process policy
+            if let Some(proc_policy) = self.process_policies.get(&thread_policy.process_id) {
+                if proc_policy.execution_speed_throttled {
+                    return QosExecutionLevel::EcoQoS;
+                }
+            }
+        }
+        QosExecutionLevel::HighQoS
+    }
+
+    /// Calculates the effective timer resolution according to PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION.
+    pub fn calculate_effective_timer_resolution(
+        &self,
+        thread_id: u64,
+        requested_100ns: u32,
+    ) -> TimerResolutionPolicy {
+        let mut ignore_timer = false;
+
+        if let Some(t) = self.thread_policies.get(&thread_id) {
+            if let Some(p) = self.process_policies.get(&t.process_id) {
+                ignore_timer = p.ignore_timer_resolution;
+            }
+        }
+
+        if ignore_timer {
+            // EcoQoS timer coalescing active: enforce standard or relaxed tick rate
+            let effective = if requested_100ns < TIMER_RESOLUTION_DEFAULT_100NS {
+                TIMER_RESOLUTION_DEFAULT_100NS
+            } else {
+                requested_100ns
+            };
+
+            TimerResolutionPolicy {
+                requested_resolution_100ns: requested_100ns,
+                effective_resolution_100ns: effective,
+                timer_coalescing_active: true,
+            }
+        } else {
+            // HighQoS: respect high-precision timer down to 0.5 ms
+            let effective = requested_100ns.max(TIMER_RESOLUTION_HIGH_PRECISION_100NS);
+            TimerResolutionPolicy {
+                requested_resolution_100ns: requested_100ns,
+                effective_resolution_100ns: effective,
+                timer_coalescing_active: false,
+            }
+        }
+    }
+
+    /// Evaluates CPU maximum frequency cap based on active QoS level.
+    pub fn get_effective_frequency_cap(&self, thread_id: u64) -> u32 {
+        match self.determine_thread_qos_level(thread_id) {
+            QosExecutionLevel::EcoQoS => ECO_QOS_MAX_FREQ_MHZ,
+            QosExecutionLevel::HighQoS => HIGH_QOS_MAX_FREQ_MHZ,
+        }
     }
 
     /// Win32 SetProcessInformation dispatch wrapper for ProcessPowerThrottling.
