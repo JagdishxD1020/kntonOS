@@ -209,3 +209,108 @@ impl BindlessDescriptorHeapTable {
         self.allocated_count
     }
 }
+
+// Tile dimension for 16x16 sampler feedback map.
+pub const FEEDBACK_TILE_GRID_SIZE: usize = 16;
+// Sentinel indicating unaccessed texture region (0xFF).
+pub const FEEDBACK_UNACCESSED_MIP: u8 = 0xFF;
+
+// GPU Sampler Feedback Minification Map storing finest sampled mip per tile.
+#[derive(Debug, Clone)]
+pub struct FeedbackMinMipMap {
+    pub tiles: [u8; FEEDBACK_TILE_GRID_SIZE * FEEDBACK_TILE_GRID_SIZE],
+}
+
+impl FeedbackMinMipMap {
+    // Construct new feedback map with all tiles marked unaccessed.
+    pub fn new() -> Self {
+        Self {
+            tiles: [FEEDBACK_UNACCESSED_MIP; FEEDBACK_TILE_GRID_SIZE * FEEDBACK_TILE_GRID_SIZE],
+        }
+    }
+
+    // Record sampled mip level into feedback tile, taking minimum accessed level.
+    pub fn record_tile_sample(&mut self, tile_x: usize, tile_y: usize, sampled_mip: u8) {
+        if tile_x < FEEDBACK_TILE_GRID_SIZE && tile_y < FEEDBACK_TILE_GRID_SIZE {
+            let idx = tile_y * FEEDBACK_TILE_GRID_SIZE + tile_x;
+            if self.tiles[idx] == FEEDBACK_UNACCESSED_MIP || sampled_mip < self.tiles[idx] {
+                self.tiles[idx] = sampled_mip;
+            }
+        }
+    }
+
+    // Read recorded feedback value at tile coordinates.
+    pub fn get_tile(&self, tile_x: usize, tile_y: usize) -> u8 {
+        if tile_x < FEEDBACK_TILE_GRID_SIZE && tile_y < FEEDBACK_TILE_GRID_SIZE {
+            self.tiles[tile_y * FEEDBACK_TILE_GRID_SIZE + tile_x]
+        } else {
+            FEEDBACK_UNACCESSED_MIP
+        }
+    }
+
+    // Clear all tile feedback values to unaccessed.
+    pub fn clear(&mut self) {
+        for t in &mut self.tiles {
+            *t = FEEDBACK_UNACCESSED_MIP;
+        }
+    }
+}
+
+// Sampler feedback evaluator computing minimum LOD clamp and unreferenced VRAM savings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SamplerFeedbackLodEvaluator {
+    pub min_sampled_mip: u8,
+    pub max_sampled_mip: u8,
+    pub unaccessed_tiles_count: usize,
+    pub evaluated_lod_clamp: u8,
+}
+
+impl SamplerFeedbackLodEvaluator {
+    // Construct new evaluator.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Evaluate feedback map and determine minimum LOD clamp for texture descriptor.
+    pub fn evaluate_feedback_map(&mut self, feedback_map: &FeedbackMinMipMap, total_mips: u8) -> u8 {
+        let mut min_mip = FEEDBACK_UNACCESSED_MIP;
+        let mut max_mip = 0u8;
+        let mut unaccessed = 0usize;
+
+        for &tile in &feedback_map.tiles {
+            if tile == FEEDBACK_UNACCESSED_MIP {
+                unaccessed += 1;
+            } else {
+                if tile < min_mip {
+                    min_mip = tile;
+                }
+                if tile > max_mip {
+                    max_mip = tile;
+                }
+            }
+        }
+
+        self.unaccessed_tiles_count = unaccessed;
+        self.min_sampled_mip = min_mip;
+        self.max_sampled_mip = max_mip;
+
+        if min_mip == FEEDBACK_UNACCESSED_MIP {
+            self.evaluated_lod_clamp = total_mips.saturating_sub(1);
+        } else {
+            self.evaluated_lod_clamp = min_mip;
+        }
+
+        self.evaluated_lod_clamp
+    }
+
+    // Compute approximate VRAM percentage saved by purging unreferenced fine mip-levels.
+    pub fn calculate_unreferenced_vram_percent(&self, _total_mips: u8) -> u32 {
+        match self.evaluated_lod_clamp {
+            0 => 0,
+            1 => 75,
+            2 => 93,
+            3 => 98,
+            _ => 99,
+        }
+    }
+}
