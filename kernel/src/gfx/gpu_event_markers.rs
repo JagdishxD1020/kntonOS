@@ -300,3 +300,182 @@ impl CommandListMarkerRecorder {
         self.event_count = 0;
     }
 }
+
+// Maximum number of timestamp queries simultaneously managed in a query heap.
+pub const MAX_TIMESTAMP_QUERIES: usize = 512;
+
+// Standard D3D12 query type for high-precision timeline timestamps.
+pub const D3D12_QUERY_TYPE_TIMESTAMP: u32 = 2;
+
+// Fixed-capacity GPU timestamp query heap conforming to D3D12 specifications.
+pub struct D3d12TimestampQueryHeap {
+    timestamps: [u64; MAX_TIMESTAMP_QUERIES],
+    allocated_bitmap: [u64; MAX_TIMESTAMP_QUERIES / 64],
+    capacity: usize,
+    active_count: usize,
+}
+
+impl D3d12TimestampQueryHeap {
+    // Initializes an empty timestamp query heap.
+    pub const fn new() -> Self {
+        Self {
+            timestamps: [0; MAX_TIMESTAMP_QUERIES],
+            allocated_bitmap: [0; MAX_TIMESTAMP_QUERIES / 64],
+            capacity: MAX_TIMESTAMP_QUERIES,
+            active_count: 0,
+        }
+    }
+
+    // Allocates a discrete query slot for timestamp recording.
+    pub fn allocate_query(&mut self) -> Result<u32, MarkerError> {
+        for word_idx in 0..self.allocated_bitmap.len() {
+            let word = self.allocated_bitmap[word_idx];
+            if word != u64::MAX {
+                let bit_idx = word.trailing_ones() as usize;
+                let query_idx = word_idx * 64 + bit_idx;
+                if query_idx < self.capacity {
+                    self.allocated_bitmap[word_idx] |= 1 << bit_idx;
+                    self.timestamps[query_idx] = 0;
+                    self.active_count += 1;
+                    return Ok(query_idx as u32);
+                }
+            }
+        }
+        Err(MarkerError::QueryHeapExhausted)
+    }
+
+    // Releases a previously allocated query slot back to the heap.
+    pub fn free_query(&mut self, query_idx: u32) -> Result<(), MarkerError> {
+        let idx = query_idx as usize;
+        if idx >= self.capacity {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        if (self.allocated_bitmap[word_idx] & (1 << bit_idx)) == 0 {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        self.allocated_bitmap[word_idx] &= !(1 << bit_idx);
+        self.timestamps[idx] = 0;
+        self.active_count -= 1;
+        Ok(())
+    }
+
+    // Simulates or records a hardware GPU timestamp into the specified slot.
+    pub fn record_timestamp(&mut self, query_idx: u32, gpu_tick: u64) -> Result<(), MarkerError> {
+        let idx = query_idx as usize;
+        if idx >= self.capacity {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        if (self.allocated_bitmap[word_idx] & (1 << bit_idx)) == 0 {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        self.timestamps[idx] = gpu_tick;
+        Ok(())
+    }
+
+    // Reads the captured timestamp for the query slot.
+    pub fn read_timestamp(&self, query_idx: u32) -> Result<u64, MarkerError> {
+        let idx = query_idx as usize;
+        if idx >= self.capacity {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        Ok(self.timestamps[idx])
+    }
+
+    // Resolves a range of query timestamps into a destination readback buffer.
+    pub fn resolve_query_data(
+        &self,
+        start_idx: u32,
+        count: u32,
+        destination: &mut [u64],
+    ) -> Result<(), MarkerError> {
+        let start = start_idx as usize;
+        let n = count as usize;
+        if start + n > self.capacity || destination.len() < n {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        destination[..n].copy_from_slice(&self.timestamps[start..start + n]);
+        Ok(())
+    }
+
+    // Returns the total count of currently allocated queries in the heap.
+    #[inline]
+    pub fn active_count(&self) -> usize {
+        self.active_count
+    }
+}
+
+// Calibrates GPU timeline clock counters against CPU RDTSC cycles for synchronized profiling.
+pub struct GpuCpuTimestampCalibrator {
+    gpu_frequency_hz: u64,
+    cpu_frequency_hz: u64,
+    base_gpu_timestamp: u64,
+    base_cpu_rdtsc: u64,
+}
+
+impl GpuCpuTimestampCalibrator {
+    // Initializes the timestamp calibrator with hardware clock frequencies.
+    pub const fn new(gpu_frequency_hz: u64, cpu_frequency_hz: u64) -> Self {
+        Self {
+            gpu_frequency_hz,
+            cpu_frequency_hz,
+            base_gpu_timestamp: 0,
+            base_cpu_rdtsc: 0,
+        }
+    }
+
+    // Synchronizes the baseline timeline correlation points between GPU and CPU.
+    pub fn calibrate(&mut self, gpu_timestamp: u64, cpu_rdtsc: u64) {
+        self.base_gpu_timestamp = gpu_timestamp;
+        self.base_cpu_rdtsc = cpu_rdtsc;
+    }
+
+    // Converts raw GPU clock ticks to nanoseconds based on GPU clock frequency.
+    pub fn gpu_ticks_to_nanoseconds(&self, ticks: u64) -> u64 {
+        if self.gpu_frequency_hz == 0 {
+            return 0;
+        }
+        ((ticks as u128 * 1_000_000_000) / self.gpu_frequency_hz as u128) as u64
+    }
+
+    // Converts GPU tick delta into equivalent CPU RDTSC cycle delta.
+    pub fn gpu_delta_to_cpu_cycles(&self, gpu_delta_ticks: u64) -> u64 {
+        if self.gpu_frequency_hz == 0 {
+            return 0;
+        }
+        ((gpu_delta_ticks as u128 * self.cpu_frequency_hz as u128)
+            / self.gpu_frequency_hz as u128) as u64
+    }
+
+    // Projects a GPU timeline timestamp to CPU RDTSC domain using baseline calibration.
+    pub fn correlate_gpu_timestamp_to_cpu_rdtsc(&self, gpu_timestamp: u64) -> u64 {
+        if gpu_timestamp >= self.base_gpu_timestamp {
+            let delta = gpu_timestamp - self.base_gpu_timestamp;
+            self.base_cpu_rdtsc.saturating_add(self.gpu_delta_to_cpu_cycles(delta))
+        } else {
+            let delta = self.base_gpu_timestamp - gpu_timestamp;
+            self.base_cpu_rdtsc.saturating_sub(self.gpu_delta_to_cpu_cycles(delta))
+        }
+    }
+
+    // Projects a CPU RDTSC tick value back to the GPU timestamp domain.
+    pub fn correlate_cpu_rdtsc_to_gpu_timestamp(&self, cpu_rdtsc: u64) -> u64 {
+        if self.cpu_frequency_hz == 0 {
+            return 0;
+        }
+        if cpu_rdtsc >= self.base_cpu_rdtsc {
+            let delta = cpu_rdtsc - self.base_cpu_rdtsc;
+            let gpu_delta = ((delta as u128 * self.gpu_frequency_hz as u128)
+                / self.cpu_frequency_hz as u128) as u64;
+            self.base_gpu_timestamp.saturating_add(gpu_delta)
+        } else {
+            let delta = self.base_cpu_rdtsc - cpu_rdtsc;
+            let gpu_delta = ((delta as u128 * self.gpu_frequency_hz as u128)
+                / self.cpu_frequency_hz as u128) as u64;
+            self.base_gpu_timestamp.saturating_sub(gpu_delta)
+        }
+    }
+}
