@@ -1234,6 +1234,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_power_qos_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Power & Thermal QoS self-test failed!\r\n");
     }
+    // Verify Win32 Working Set Trimming, Watch & Fault Clustering Engine (TASK-KNT-273)
+    if !pe::test_win32_working_set_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Working Set subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {

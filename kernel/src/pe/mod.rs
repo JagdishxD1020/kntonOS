@@ -88,6 +88,7 @@ pub use object_namespace::*;
 pub use apc_dispatcher::*;
 pub use large_page_valloc::*;
 pub use power_qos::*;
+pub use working_set::*;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;

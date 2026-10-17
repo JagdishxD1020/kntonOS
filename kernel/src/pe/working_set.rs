@@ -628,6 +628,177 @@ impl AntiCheatWorkingSetScanner {
 
 pub static ANTI_CHEAT_WS_SCANNER: AntiCheatWorkingSetScanner = AntiCheatWorkingSetScanner::new();
 
+/// Comprehensive self-test for Win32 Working Set Subsystem.
+pub fn test_win32_working_set_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-WORKING-SET] Initializing Win32 Working Set Subsystem self-test...\r\n");
+
+    let test_pid = 7788;
+    let h_proc = test_pid as HANDLE;
+
+    // 1. Test Working Set Quotas & Configuration
+    let min_ws = 128 * 1024;
+    let max_ws = 4 * 1024 * 1024;
+    let flags = QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE;
+
+    if !win32_set_process_working_set_size_ex(h_proc, min_ws, max_ws, flags) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_set_process_working_set_size_ex failed\r\n");
+        return false;
+    }
+
+    let mut query_min = 0;
+    let mut query_max = 0;
+    let mut query_flags = 0;
+    if !win32_get_process_working_set_size_ex(h_proc, &mut query_min, &mut query_max, &mut query_flags) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_get_process_working_set_size_ex failed\r\n");
+        return false;
+    }
+
+    if query_min != min_ws || query_max != max_ws || query_flags != flags {
+        crate::serial_write_str("[KNT-TEST-ERR] Working set limits mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test Page Fault Clustering (64KB pre-faulting on executable code fault)
+    let code_base = 0x0040_1000;
+    let fault_res = FAULT_CLUSTERING_ENGINE.handle_page_fault(
+        &WORKING_SET_GOVERNOR,
+        test_pid,
+        code_base,
+        false,
+        true,
+        PAGE_EXECUTE_READ,
+    );
+
+    match fault_res {
+        Ok(count) => {
+            if count != CLUSTER_PAGE_COUNT {
+                crate::serial_write_str("[KNT-TEST-ERR] Fault clustering did not commit 16 pages\r\n");
+                return false;
+            }
+        }
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] handle_page_fault returned error\r\n");
+            return false;
+        }
+    }
+
+    let stats = FAULT_CLUSTERING_ENGINE.get_stats();
+    if stats.clustered_faults != 1 || stats.prefaulted_pages != CLUSTER_PAGE_COUNT {
+        crate::serial_write_str("[KNT-TEST-ERR] Fault clustering stats mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Working Set Watch & QueryWorkingSetEx API
+    let mut info_buf = [
+        PSAPI_WORKING_SET_EX_INFORMATION {
+            VirtualAddress: code_base,
+            VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK::default(),
+        },
+        PSAPI_WORKING_SET_EX_INFORMATION {
+            VirtualAddress: code_base + 0x2000,
+            VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK::default(),
+        },
+        PSAPI_WORKING_SET_EX_INFORMATION {
+            VirtualAddress: 0x07F0_0000, // Non-resident address
+            VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK::default(),
+        },
+    ];
+
+    let query_ok = win32_query_working_set_ex(
+        h_proc,
+        info_buf.as_mut_ptr(),
+        (info_buf.len() * core::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+    );
+
+    if !query_ok {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_query_working_set_ex failed\r\n");
+        return false;
+    }
+
+    if !info_buf[0].VirtualAttributes.is_valid()
+        || info_buf[0].VirtualAttributes.get_protection() != PAGE_EXECUTE_READ
+    {
+        crate::serial_write_str("[KNT-TEST-ERR] Page 0 residency or protection mismatch\r\n");
+        return false;
+    }
+
+    if !info_buf[1].VirtualAttributes.is_valid() {
+        crate::serial_write_str("[KNT-TEST-ERR] Clustered page 1 is not valid\r\n");
+        return false;
+    }
+
+    if info_buf[2].VirtualAttributes.is_valid() {
+        crate::serial_write_str("[KNT-TEST-ERR] Unmapped page reported as valid\r\n");
+        return false;
+    }
+
+    // 4. Test Anti-Cheat Working Set Scanner (Hidden page and hooked page detection)
+    let actual_mappings = [
+        (code_base, PAGE_EXECUTE_READ),                   // Legitimate
+        (code_base + 0x1000, PAGE_EXECUTE_READWRITE),     // Hooked (expected RX, actual RWX)
+        (0x0600_0000, PAGE_EXECUTE_READ),                 // Hidden page: mapped in page table but missing in WS!
+    ];
+
+    let scan_report = ANTI_CHEAT_WS_SCANNER.scan_process_working_set(
+        &WORKING_SET_GOVERNOR,
+        test_pid,
+        &actual_mappings,
+    );
+
+    if scan_report.total_scanned_pages != 3 || scan_report.legitimate_pages != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat scanner page counts mismatch\r\n");
+        return false;
+    }
+
+    let mut found_hook = false;
+    let mut found_hidden = false;
+    for viol in &scan_report.violations {
+        match viol {
+            AntiCheatMemoryViolation::WorkingSetHookDetected { virtual_address, .. } => {
+                if *virtual_address == code_base + 0x1000 {
+                    found_hook = true;
+                }
+            }
+            AntiCheatMemoryViolation::HiddenPageDetected { virtual_address, .. } => {
+                if *virtual_address == 0x0600_0000 {
+                    found_hidden = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !found_hook || !found_hidden {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat scanner failed to detect hook or hidden page\r\n");
+        return false;
+    }
+
+    // 5. Test EmptyWorkingSet (Trimming)
+    if !win32_empty_working_set(h_proc) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_empty_working_set failed\r\n");
+        return false;
+    }
+
+    let mut post_trim_info = [PSAPI_WORKING_SET_EX_INFORMATION {
+        VirtualAddress: code_base,
+        VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK::default(),
+    }];
+
+    let _ = win32_query_working_set_ex(
+        h_proc,
+        post_trim_info.as_mut_ptr(),
+        core::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>() as u32,
+    );
+
+    if post_trim_info[0].VirtualAttributes.is_valid() {
+        crate::serial_write_str("[KNT-TEST-ERR] Page still valid after EmptyWorkingSet\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-WORKING-SET-PASS] Win32 Working Set Subsystem verified\r\n");
+    true
+}
+
 /// Emulates Win32 GetProcessWorkingSetSizeEx API.
 pub fn win32_get_process_working_set_size_ex(
     h_process: HANDLE,
