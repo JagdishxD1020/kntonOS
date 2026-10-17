@@ -528,6 +528,106 @@ impl FaultClusteringEngine {
 
 pub static FAULT_CLUSTERING_ENGINE: FaultClusteringEngine = FaultClusteringEngine::new();
 
+/// Anti-cheat memory violation classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AntiCheatMemoryViolation {
+    HiddenPageDetected {
+        virtual_address: usize,
+        protection: u32,
+    },
+    WorkingSetHookDetected {
+        virtual_address: usize,
+        expected_protect: u32,
+        actual_protect: u32,
+    },
+    UnauthorizedExecutableMapping {
+        virtual_address: usize,
+    },
+}
+
+/// Anti-cheat working set scanner report.
+#[derive(Debug, Clone, Default)]
+pub struct WorkingSetScanReport {
+    pub total_scanned_pages: usize,
+    pub legitimate_pages: usize,
+    pub violations: Vec<AntiCheatMemoryViolation>,
+}
+
+/// Anti-Cheat Working Set Scanner.
+pub struct AntiCheatWorkingSetScanner {
+    pub detection_enabled: AtomicBool,
+}
+
+impl AntiCheatWorkingSetScanner {
+    pub const fn new() -> Self {
+        Self {
+            detection_enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Scan a process's mapped memory pages against its registered working set.
+    /// Detects pages mapped in hardware page tables or virtual regions that are missing
+    /// from the working set descriptor (hidden pages/stealth hooks) or executable permission tampers.
+    pub fn scan_process_working_set(
+        &self,
+        governor: &WorkingSetGovernor,
+        pid: u32,
+        actual_mapped_pages: &[(usize, u32)], // (VirtualAddress, Protection)
+    ) -> WorkingSetScanReport {
+        let mut report = WorkingSetScanReport::default();
+        if !self.detection_enabled.load(Ordering::Acquire) {
+            return report;
+        }
+
+        governor.ensure_working_set(pid);
+        let map = governor.sets.lock();
+        let ws = match map.get(&pid) {
+            Some(w) => w,
+            None => return report,
+        };
+
+        for &(va, prot) in actual_mapped_pages {
+            report.total_scanned_pages += 1;
+            let aligned_va = va & !(PAGE_SIZE - 1);
+
+            match ws.resident_pages.get(&aligned_va) {
+                Some(entry) => {
+                    // Check if protection was tampered with (e.g. RW converted to RWX or RX)
+                    let is_entry_exec = (entry.protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+                    let is_actual_exec = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+
+                    if !is_entry_exec && is_actual_exec {
+                        report.violations.push(AntiCheatMemoryViolation::WorkingSetHookDetected {
+                            virtual_address: aligned_va,
+                            expected_protect: entry.protection,
+                            actual_protect: prot,
+                        });
+                    } else if entry.protection != prot {
+                        report.violations.push(AntiCheatMemoryViolation::WorkingSetHookDetected {
+                            virtual_address: aligned_va,
+                            expected_protect: entry.protection,
+                            actual_protect: prot,
+                        });
+                    } else {
+                        report.legitimate_pages += 1;
+                    }
+                }
+                None => {
+                    // Page is present in hardware page tables but completely absent from working set descriptor!
+                    report.violations.push(AntiCheatMemoryViolation::HiddenPageDetected {
+                        virtual_address: aligned_va,
+                        protection: prot,
+                    });
+                }
+            }
+        }
+
+        report
+    }
+}
+
+pub static ANTI_CHEAT_WS_SCANNER: AntiCheatWorkingSetScanner = AntiCheatWorkingSetScanner::new();
+
 /// Emulates Win32 GetProcessWorkingSetSizeEx API.
 pub fn win32_get_process_working_set_size_ex(
     h_process: HANDLE,
