@@ -656,3 +656,122 @@ impl InstrumentationRingBuffer {
         self.total_recorded_passes
     }
 }
+
+// Primary pipeline execution stage identified as the hardware throughput bottleneck.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BottleneckStage {
+    // Bottlenecked on vertex shader processing, primitive assembly, or tessellation.
+    VertexBound,
+    // Bottlenecked on pixel shading rate, rasterizer fill rate, or blending overdraw.
+    PixelBound,
+    // Bottlenecked on VRAM bus throughput, texture sampling cache misses, or copy transfers.
+    MemoryBandwidthBound,
+    // Bottlenecked on compute shader execution waves or shared memory access.
+    ComputeBound,
+    // Workload is balanced across pipeline stages without a single dominating bottleneck.
+    Balanced,
+}
+
+// Telemetry output describing the diagnosed hardware bottleneck for a draw pass or frame.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BottleneckAnalysisResult {
+    pub stage: BottleneckStage,
+    pub confidence_percent: u32,
+    pub bandwidth_mbps: u64,
+    pub vertex_pixel_ratio_percent: u32,
+}
+
+// Frame bottleneck analyzer classifying execution constraints across vertex, pixel, and memory stages.
+pub struct FrameBottleneckAnalyzer {
+    bandwidth_saturation_mbps: u64,
+}
+
+impl FrameBottleneckAnalyzer {
+    // Creates a new bottleneck analyzer with target handheld VRAM bandwidth ceiling.
+    pub const fn new(bandwidth_saturation_mbps: u64) -> Self {
+        Self {
+            bandwidth_saturation_mbps,
+        }
+    }
+
+    // Default analyzer configured for standard handheld unified memory architectures (e.g. 120 GB/s).
+    pub const fn default_handheld() -> Self {
+        Self::new(120_000)
+    }
+
+    // Evaluates execution metrics for a discrete draw pass and classifies the primary bottleneck.
+    pub fn analyze_pass(&self, metrics: &DrawPassMetrics) -> BottleneckAnalysisResult {
+        if !metrics.completed || metrics.duration_nanoseconds == 0 {
+            return BottleneckAnalysisResult {
+                stage: BottleneckStage::Balanced,
+                confidence_percent: 100,
+                bandwidth_mbps: 0,
+                vertex_pixel_ratio_percent: 100,
+            };
+        }
+
+        let total_bytes = metrics.vram_read_bytes.saturating_add(metrics.vram_write_bytes);
+        // Calculate bandwidth in MB/s: (total_bytes * 1000) / duration_nanoseconds.
+        let bandwidth_mbps = (total_bytes as u128 * 1_000 / metrics.duration_nanoseconds as u128) as u64;
+
+        // 1. Check for memory bandwidth saturation constraint.
+        if bandwidth_mbps >= (self.bandwidth_saturation_mbps * 85) / 100 {
+            let ratio = if self.bandwidth_saturation_mbps > 0 {
+                ((bandwidth_mbps * 100) / self.bandwidth_saturation_mbps) as u32
+            } else {
+                100
+            };
+            return BottleneckAnalysisResult {
+                stage: BottleneckStage::MemoryBandwidthBound,
+                confidence_percent: ratio.min(100),
+                bandwidth_mbps,
+                vertex_pixel_ratio_percent: 0,
+            };
+        }
+
+        // 2. Compute workload classification for compute-only dispatches.
+        if metrics.dispatch_count > 0 && metrics.draw_call_count == 0 {
+            return BottleneckAnalysisResult {
+                stage: BottleneckStage::ComputeBound,
+                confidence_percent: 90,
+                bandwidth_mbps,
+                vertex_pixel_ratio_percent: 0,
+            };
+        }
+
+        // 3. Evaluate vertex-bound vs pixel-bound ratios.
+        let v_invoc = metrics.vertex_invocations;
+        let p_invoc = metrics.pixel_invocations;
+
+        let ratio_percent = if p_invoc > 0 {
+            ((v_invoc as u128 * 100) / p_invoc as u128) as u32
+        } else if v_invoc > 0 {
+            10_000
+        } else {
+            100
+        };
+
+        if ratio_percent >= 150 {
+            BottleneckAnalysisResult {
+                stage: BottleneckStage::VertexBound,
+                confidence_percent: ratio_percent.min(100),
+                bandwidth_mbps,
+                vertex_pixel_ratio_percent: ratio_percent,
+            }
+        } else if ratio_percent <= 30 {
+            BottleneckAnalysisResult {
+                stage: BottleneckStage::PixelBound,
+                confidence_percent: (100 - ratio_percent).min(100),
+                bandwidth_mbps,
+                vertex_pixel_ratio_percent: ratio_percent,
+            }
+        } else {
+            BottleneckAnalysisResult {
+                stage: BottleneckStage::Balanced,
+                confidence_percent: 80,
+                bandwidth_mbps,
+                vertex_pixel_ratio_percent: ratio_percent,
+            }
+        }
+    }
+}
