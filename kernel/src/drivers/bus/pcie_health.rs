@@ -330,3 +330,289 @@ pub fn verify_pcie5_link_status_and_aer() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Dynamic Link Retraining & Signal Degradation Down-Throttling
+// ============================================================================
+
+/// LTSSM (Link Training and Status State Machine) dynamic retuning state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrainingState {
+    /// Normal operation at negotiated parameters.
+    StableOperational,
+    /// Degradation thresholds breached; preparing LTSSM directive.
+    DegradationDetected,
+    /// Hardware link retraining currently executing in PHY LTSSM.
+    RetrainingInProgress,
+    /// Operating in down-throttled fallback configuration (reduced speed or width).
+    FallbackEngaged,
+    /// Error-free recovery window satisfied; probing restoration of higher link rate.
+    ProbeRecovery,
+}
+
+/// Fallback policy strategy for degraded links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackStrategy {
+    /// Down-train transmission speed (e.g. Gen5 32 GT/s -> Gen4 16 GT/s) to overcome high-frequency channel loss.
+    SpeedFallback,
+    /// Down-configure lane count (e.g. x4 -> x2) to isolate damaged or excessively noisy differential pairs.
+    LaneWidthFallback,
+    /// Aggressive combined step (Gen5 x4 -> Gen4 x2).
+    CombinedFallback,
+}
+
+/// Controller for automated PCIe link health recovery and dynamic retraining.
+#[derive(Debug, Clone)]
+pub struct DynamicLinkRetuningController {
+    /// Active generation of the link.
+    pub current_gen: PcieGeneration,
+    /// Active lane width of the link.
+    pub current_width: PcieLinkWidth,
+    /// Target generation commanded to the hardware root port / endpoint.
+    pub target_gen: PcieGeneration,
+    /// Target width commanded to the hardware root port / endpoint.
+    pub target_width: PcieLinkWidth,
+    /// Current retuning state.
+    pub state: RetrainingState,
+    /// Total count of fallback events triggered.
+    pub fallback_events_count: u32,
+    /// Total count of successful link retrain sequences.
+    pub successful_retrain_count: u32,
+    /// Consecutive clean cycles without error.
+    pub stability_ticks: u32,
+    /// Threshold ticks required before allowing probe recovery upward (e.g. 50 ticks).
+    pub recovery_threshold_ticks: u32,
+    /// Human-readable descriptor for last retrain decision.
+    pub last_retrain_reason: &'static str,
+}
+
+impl DynamicLinkRetuningController {
+    pub const fn new(initial_gen: PcieGeneration, initial_width: PcieLinkWidth) -> Self {
+        Self {
+            current_gen: initial_gen,
+            current_width: initial_width,
+            target_gen: initial_gen,
+            target_width: initial_width,
+            state: RetrainingState::StableOperational,
+            fallback_events_count: 0,
+            successful_retrain_count: 0,
+            stability_ticks: 0,
+            recovery_threshold_ticks: 50,
+            last_retrain_reason: "Initial link established",
+        }
+    }
+
+    /// Evaluates current link health telemetry and executes dynamic retraining fallback if warranted.
+    /// Returns `true` if link configuration was altered.
+    pub fn evaluate_and_retune(&mut self, monitor: &mut PcieLinkHealthMonitor) -> bool {
+        match monitor.health_state {
+            PcieLinkHealthState::Optimal => {
+                self.stability_ticks += 1;
+                // If in fallback mode and link has been stable for prolonged duration, probe upward
+                if self.state == RetrainingState::FallbackEngaged && self.stability_ticks >= self.recovery_threshold_ticks {
+                    return self.probe_upward_recovery(monitor);
+                }
+                false
+            }
+            PcieLinkHealthState::DegradedWarning => {
+                self.stability_ticks = 0;
+                // If correctable errors are rapidly accumulating or health score is dropping
+                if monitor.health_score < 70 {
+                    self.execute_fallback(monitor, "Excessive correctable AER errors / eye margin collapse");
+                    true
+                } else {
+                    false
+                }
+            }
+            PcieLinkHealthState::CriticalFailure => {
+                self.stability_ticks = 0;
+                self.execute_fallback(monitor, "Critical AER uncorrectable error or multi-lane eye closure");
+                true
+            }
+        }
+    }
+
+    /// Determines appropriate fallback configuration and directs hardware link retraining.
+    pub fn execute_fallback(&mut self, monitor: &mut PcieLinkHealthMonitor, reason: &'static str) {
+        self.state = RetrainingState::DegradationDetected;
+        self.last_retrain_reason = reason;
+
+        // Count degraded lanes to choose speed fallback vs lane isolation
+        let mut degraded_lanes = 0;
+        let active_lanes = self.current_width.lane_count() as usize;
+        let check_lanes = if active_lanes > MAX_PCIE_LANES { MAX_PCIE_LANES } else { active_lanes };
+        for i in 0..check_lanes {
+            if monitor.lane_telemetry[i].is_degraded() {
+                degraded_lanes += 1;
+            }
+        }
+
+        // Decision tree:
+        // 1. If only 1 lane is degraded out of 4 (e.g. solder microfracture on trace), downscale to x2
+        if degraded_lanes == 1 && self.current_width == PcieLinkWidth::X4 {
+            self.target_width = PcieLinkWidth::X2;
+            self.target_gen = self.current_gen;
+        } else {
+            // 2. High-frequency channel loss / general signal integrity failure -> down-train speed
+            match self.current_gen {
+                PcieGeneration::Gen5 => {
+                    self.target_gen = PcieGeneration::Gen4;
+                    self.target_width = self.current_width;
+                }
+                PcieGeneration::Gen4 => {
+                    self.target_gen = PcieGeneration::Gen3;
+                    self.target_width = self.current_width;
+                }
+                _ => {
+                    // Gen 3 or below: reduce width as last resort
+                    if self.current_width == PcieLinkWidth::X4 {
+                        self.target_width = PcieLinkWidth::X2;
+                    } else if self.current_width == PcieLinkWidth::X2 {
+                        self.target_width = PcieLinkWidth::X1;
+                    }
+                }
+            }
+        }
+
+        // Simulate LTSSM retraining transition
+        self.state = RetrainingState::RetrainingInProgress;
+        self.complete_retraining(monitor);
+    }
+
+    /// Completes the LTSSM retraining sequence into new target parameters.
+    pub fn complete_retraining(&mut self, monitor: &mut PcieLinkHealthMonitor) {
+        self.current_gen = self.target_gen;
+        self.current_width = self.target_width;
+        self.state = RetrainingState::FallbackEngaged;
+        self.fallback_events_count += 1;
+        self.successful_retrain_count += 1;
+
+        // Apply updated parameters to monitor
+        monitor.generation = self.current_gen;
+        monitor.width = self.current_width;
+        monitor.clear_error_registers();
+    }
+
+    /// Probes upward restoration (e.g. Gen4 -> Gen5 or x2 -> x4) after prolonged channel stability.
+    pub fn probe_upward_recovery(&mut self, monitor: &mut PcieLinkHealthMonitor) -> bool {
+        self.state = RetrainingState::ProbeRecovery;
+        self.last_retrain_reason = "Channel integrity restored; probing higher link rate";
+
+        // Step up generation first if previously down-trained
+        if self.current_gen < PcieGeneration::Gen5 {
+            self.target_gen = match self.current_gen {
+                PcieGeneration::Gen1 => PcieGeneration::Gen2,
+                PcieGeneration::Gen2 => PcieGeneration::Gen3,
+                PcieGeneration::Gen3 => PcieGeneration::Gen4,
+                PcieGeneration::Gen4 => PcieGeneration::Gen5,
+                PcieGeneration::Gen5 => PcieGeneration::Gen5,
+            };
+        } else if self.current_width < PcieLinkWidth::X4 {
+            self.target_width = PcieLinkWidth::X4;
+        } else {
+            self.state = RetrainingState::StableOperational;
+            return false;
+        }
+
+        self.current_gen = self.target_gen;
+        self.current_width = self.target_width;
+        self.successful_retrain_count += 1;
+        self.state = RetrainingState::StableOperational;
+        self.stability_ticks = 0;
+
+        monitor.generation = self.current_gen;
+        monitor.width = self.current_width;
+        monitor.clear_error_registers();
+        true
+    }
+}
+
+/// Verification test for dynamic link retraining and down-throttling fallback.
+pub fn verify_dynamic_link_retraining_and_fallback() -> bool {
+    let mut monitor = PcieLinkHealthMonitor::new(PcieGeneration::Gen5, PcieLinkWidth::X4);
+    let mut controller = DynamicLinkRetuningController::new(PcieGeneration::Gen5, PcieLinkWidth::X4);
+
+    // 1. Initial healthy state check
+    if controller.current_gen != PcieGeneration::Gen5 || controller.current_width != PcieLinkWidth::X4 {
+        return false;
+    }
+    if controller.state != RetrainingState::StableOperational {
+        return false;
+    }
+
+    // 2. Multi-lane eye degradation at 32 GT/s: lanes 0 and 1 have jitter/crosstalk
+    monitor.update_lane_telemetry(0, LaneEyeMarginTelemetry {
+        voltage_margin_mv: 20,
+        timing_margin_mui: 150,
+        snr_db: 12,
+        ber_exponent: -5,
+    });
+    monitor.update_lane_telemetry(1, LaneEyeMarginTelemetry {
+        voltage_margin_mv: 22,
+        timing_margin_mui: 160,
+        snr_db: 13,
+        ber_exponent: -5,
+    });
+
+    if monitor.health_state != PcieLinkHealthState::CriticalFailure {
+        return false;
+    }
+
+    // 3. Trigger retune: multiple lanes degraded -> speed fallback to Gen4 x4
+    let retuned = controller.evaluate_and_retune(&mut monitor);
+    if !retuned {
+        return false;
+    }
+    if controller.current_gen != PcieGeneration::Gen4 || controller.current_width != PcieLinkWidth::X4 {
+        return false;
+    }
+    if controller.state != RetrainingState::FallbackEngaged || controller.fallback_events_count != 1 {
+        return false;
+    }
+
+    // 4. Test single-lane isolation fallback on a Gen5 link:
+    let mut mon2 = PcieLinkHealthMonitor::new(PcieGeneration::Gen5, PcieLinkWidth::X4);
+    let mut ctrl2 = DynamicLinkRetuningController::new(PcieGeneration::Gen5, PcieLinkWidth::X4);
+    // Degrade only lane 3
+    mon2.update_lane_telemetry(3, LaneEyeMarginTelemetry {
+        voltage_margin_mv: 15,
+        timing_margin_mui: 120,
+        snr_db: 10,
+        ber_exponent: -4,
+    });
+    // Add correctable errors to drop health score below 70
+    for _ in 0..16 {
+        mon2.record_correctable_error(aer_cor_bits::RECEIVER_ERROR);
+    }
+    let retuned2 = ctrl2.evaluate_and_retune(&mut mon2);
+    if !retuned2 {
+        return false;
+    }
+    // Single lane issue should fall back width to x2 while staying Gen5
+    if ctrl2.current_width != PcieLinkWidth::X2 || ctrl2.current_gen != PcieGeneration::Gen5 {
+        return false;
+    }
+
+    // 5. Verify probe upward recovery after channel stabilizes
+    // Restore healthy telemetry on monitor 1
+    for i in 0..4 {
+        monitor.update_lane_telemetry(i, LaneEyeMarginTelemetry::default_healthy());
+    }
+    monitor.clear_error_registers();
+
+    // Advance 50 ticks of stability
+    for _ in 0..50 {
+        controller.evaluate_and_retune(&mut monitor);
+    }
+
+    // Controller should have restored Gen5 x4!
+    if controller.current_gen != PcieGeneration::Gen5 || controller.current_width != PcieLinkWidth::X4 {
+        return false;
+    }
+    if controller.state != RetrainingState::StableOperational {
+        return false;
+    }
+
+    true
+}
