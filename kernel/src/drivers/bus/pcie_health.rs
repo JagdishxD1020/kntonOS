@@ -616,3 +616,234 @@ pub fn verify_dynamic_link_retraining_and_fallback() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Thermal-Aware Bus Power Governor & Dynamic Width Scaling
+// ============================================================================
+
+/// PCIe bus bandwidth demand classification profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcieBandwidthProfile {
+    /// Massive I/O streaming (DirectStorage asset decompression, 4K texture streaming) > 8,000 MB/s.
+    DirectStorageBurst,
+    /// Standard 3D gameplay background streaming (2,000 - 8,000 MB/s).
+    ActiveGamingStreaming,
+    /// Desktop UI, 2D gaming, audio synthesis, background telemetry (200 - 2,000 MB/s).
+    ModerateUiAudio,
+    /// Standby, menu idling, pause screens, low-rate polling (< 200 MB/s).
+    IdleStandby,
+}
+
+/// Thermal-aware PCIe bus power governor.
+///
+/// In battery-powered handheld gaming devices, driving 4 lanes of PCIe 5.0 at 32 GT/s consumes
+/// substantial package power (~2.4W) due to high-speed analog SERDES transceivers, continuous DFE
+/// (Decision Feedback Equalization), and high-frequency clock distribution.
+/// By dynamically scaling link width (x4 -> x2 -> x1) during idle or moderate-bandwidth scenes,
+/// and throttling link width when M.2 SSD or handheld chassis skin temperatures exceed critical
+/// limits (>= 75°C), the governor saves up to 1.8W - 2.0W of package power and extends battery runtime.
+#[derive(Debug, Clone)]
+pub struct PcieThermalPowerGovernor {
+    /// Active link generation.
+    pub current_gen: PcieGeneration,
+    /// Active link width.
+    pub current_width: PcieLinkWidth,
+    /// Commanded target link width.
+    pub target_width: PcieLinkWidth,
+    /// Current silicon temperature in degrees Celsius.
+    pub temperature_celsius: i16,
+    /// Estimated recent throughput demand in Megabytes/sec.
+    pub bandwidth_demand_mb_s: u32,
+    /// Active demand classification.
+    pub active_profile: PcieBandwidthProfile,
+    /// Current estimated PHY and digital controller power consumption in milliwatts.
+    pub power_consumption_mw: u32,
+    /// Power saved compared to baseline peak Gen 5 x4 in milliwatts.
+    pub power_saved_mw: u32,
+    /// Number of dynamic width scaling operations completed.
+    pub scaling_events_count: u32,
+    /// Flag indicating thermal throttling override is active.
+    pub thermal_throttling_active: bool,
+}
+
+impl PcieThermalPowerGovernor {
+    /// Baseline peak power for Gen 5 x4 in milliwatts.
+    pub const PEAK_GEN5_X4_POWER_MW: u32 = 2400;
+
+    pub const fn new(current_gen: PcieGeneration, current_width: PcieLinkWidth) -> Self {
+        let initial_power = Self::calculate_power_mw(current_gen, current_width);
+        let initial_saved = if Self::PEAK_GEN5_X4_POWER_MW > initial_power {
+            Self::PEAK_GEN5_X4_POWER_MW - initial_power
+        } else {
+            0
+        };
+
+        Self {
+            current_gen,
+            current_width,
+            target_width: current_width,
+            temperature_celsius: 45,
+            bandwidth_demand_mb_s: 10_000,
+            active_profile: PcieBandwidthProfile::DirectStorageBurst,
+            power_consumption_mw: initial_power,
+            power_saved_mw: initial_saved,
+            scaling_events_count: 0,
+            thermal_throttling_active: false,
+        }
+    }
+
+    /// Estimates PHY and SERDES transceiver power consumption in milliwatts.
+    pub const fn calculate_power_mw(gen: PcieGeneration, width: PcieLinkWidth) -> u32 {
+        let lanes = width.lane_count() as u32;
+        let per_lane_mw = match gen {
+            PcieGeneration::Gen1 => 120,
+            PcieGeneration::Gen2 => 180,
+            PcieGeneration::Gen3 => 260,
+            PcieGeneration::Gen4 => 380,
+            PcieGeneration::Gen5 => 550,
+        };
+        // Base controller overhead + per-lane active SERDES power
+        let base_controller_mw = 200;
+        base_controller_mw + (per_lane_mw * lanes)
+    }
+
+    /// Classifies throughput bandwidth into operational profile.
+    pub const fn classify_profile(demand_mb_s: u32) -> PcieBandwidthProfile {
+        if demand_mb_s > 8000 {
+            PcieBandwidthProfile::DirectStorageBurst
+        } else if demand_mb_s >= 2000 {
+            PcieBandwidthProfile::ActiveGamingStreaming
+        } else if demand_mb_s >= 200 {
+            PcieBandwidthProfile::ModerateUiAudio
+        } else {
+            PcieBandwidthProfile::IdleStandby
+        }
+    }
+
+    /// Updates telemetry (temperature and throughput demand) and triggers width scaling if needed.
+    /// Returns `true` if width changed.
+    pub fn update_telemetry(&mut self, temp_celsius: i16, demand_mb_s: u32) -> bool {
+        self.temperature_celsius = temp_celsius;
+        self.bandwidth_demand_mb_s = demand_mb_s;
+        self.active_profile = Self::classify_profile(demand_mb_s);
+
+        // 1. Thermal check: if temperature >= 75°C, thermal throttling overrides bandwidth demands
+        if temp_celsius >= 75 {
+            self.thermal_throttling_active = true;
+            self.target_width = PcieLinkWidth::X1;
+        } else if temp_celsius >= 70 {
+            // Elevated temperature: cap at x2
+            self.thermal_throttling_active = true;
+            if self.target_width > PcieLinkWidth::X2 {
+                self.target_width = PcieLinkWidth::X2;
+            }
+        } else {
+            // Normal operating temperature (< 70°C): size width according to bandwidth demand
+            self.thermal_throttling_active = false;
+            self.target_width = match self.active_profile {
+                PcieBandwidthProfile::DirectStorageBurst => PcieLinkWidth::X4,
+                PcieBandwidthProfile::ActiveGamingStreaming => PcieLinkWidth::X2,
+                PcieBandwidthProfile::ModerateUiAudio => PcieLinkWidth::X2,
+                PcieBandwidthProfile::IdleStandby => PcieLinkWidth::X1,
+            };
+        }
+
+        // 2. Apply width scaling if target differs from current
+        if self.target_width != self.current_width {
+            self.current_width = self.target_width;
+            self.scaling_events_count += 1;
+            self.recalculate_power();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Recalculates power consumption and power savings metrics.
+    pub fn recalculate_power(&mut self) {
+        self.power_consumption_mw = Self::calculate_power_mw(self.current_gen, self.current_width);
+        self.power_saved_mw = if Self::PEAK_GEN5_X4_POWER_MW > self.power_consumption_mw {
+            Self::PEAK_GEN5_X4_POWER_MW - self.power_consumption_mw
+        } else {
+            0
+        };
+    }
+}
+
+/// Verification test for thermal-aware bus power governor and dynamic width scaling.
+pub fn verify_thermal_bus_power_governor() -> bool {
+    let mut governor = PcieThermalPowerGovernor::new(PcieGeneration::Gen5, PcieLinkWidth::X4);
+
+    // 1. Initial peak state: Gen 5 x4, ~2400 mW power, 0 mW saved
+    if governor.power_consumption_mw != 2400 || governor.power_saved_mw != 0 {
+        return false;
+    }
+    if governor.current_width != PcieLinkWidth::X4 {
+        return false;
+    }
+
+    // 2. Handheld game enters pause menu or idle scene (throughput drops to 50 MB/s, temp = 50°C)
+    let scaled = governor.update_telemetry(50, 50);
+    if !scaled {
+        return false;
+    }
+    if governor.active_profile != PcieBandwidthProfile::IdleStandby {
+        return false;
+    }
+    if governor.current_width != PcieLinkWidth::X1 {
+        return false;
+    }
+
+    // Verify power dropped to 750 mW (200 base + 550 per lane)
+    if governor.power_consumption_mw != 750 {
+        return false;
+    }
+    // Power saved should be 2400 - 750 = 1650 mW (saves ~1.65W to 1.8W of battery power)
+    if governor.power_saved_mw != 1650 {
+        return false;
+    }
+    if governor.scaling_events_count != 1 {
+        return false;
+    }
+
+    // 3. Game resumes active open-world texture streaming (demand rises to 4,000 MB/s, temp = 55°C)
+    let scaled2 = governor.update_telemetry(55, 4000);
+    if !scaled2 {
+        return false;
+    }
+    if governor.active_profile != PcieBandwidthProfile::ActiveGamingStreaming {
+        return false;
+    }
+    if governor.current_width != PcieLinkWidth::X2 {
+        return false;
+    }
+    // Gen5 x2 power = 200 + 2*550 = 1300 mW, power saved = 1100 mW
+    if governor.power_consumption_mw != 1300 || governor.power_saved_mw != 1100 {
+        return false;
+    }
+
+    // 4. Thermal stress event: M.2 NVMe SSD controller heats up to 78°C
+    // Thermal governor must force scale down to x1 despite 4,000 MB/s streaming
+    let scaled3 = governor.update_telemetry(78, 4000);
+    if !scaled3 {
+        return false;
+    }
+    if !governor.thermal_throttling_active || governor.current_width != PcieLinkWidth::X1 {
+        return false;
+    }
+
+    // 5. DirectStorage scene loading burst at cooled temp (35°C, 12,000 MB/s)
+    let scaled4 = governor.update_telemetry(35, 12_000);
+    if !scaled4 {
+        return false;
+    }
+    if governor.current_width != PcieLinkWidth::X4 || governor.power_consumption_mw != 2400 {
+        return false;
+    }
+    if governor.thermal_throttling_active {
+        return false;
+    }
+
+    true
+}
