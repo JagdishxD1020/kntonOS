@@ -425,6 +425,109 @@ pub fn win32_set_process_working_set_size_ex(
     }
 }
 
+pub const CLUSTER_PAGE_COUNT: usize = 16;
+pub const CLUSTER_SIZE_BYTES: usize = CLUSTER_PAGE_COUNT * PAGE_SIZE; // 64 KB
+
+/// Diagnostic metrics for page fault clustering engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageFaultClusterStats {
+    pub single_faults: usize,
+    pub clustered_faults: usize,
+    pub prefaulted_pages: usize,
+}
+
+/// Page Fault Clustering and Executable Pre-faulting Engine.
+pub struct FaultClusteringEngine {
+    pub enabled: AtomicBool,
+    pub stats: Spinlock<PageFaultClusterStats>,
+}
+
+impl FaultClusteringEngine {
+    pub const fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            stats: Spinlock::new(PageFaultClusterStats {
+                single_faults: 0,
+                clustered_faults: 0,
+                prefaulted_pages: 0,
+            }),
+        }
+    }
+
+    /// Demand fault handler: pre-faults adjacent 64KB cluster if target page is in executable/rodata region.
+    pub fn handle_page_fault(
+        &self,
+        governor: &WorkingSetGovernor,
+        pid: u32,
+        fault_address: usize,
+        is_write: bool,
+        is_exec: bool,
+        protection: u32,
+    ) -> Result<usize, NtStatus> {
+        let page_va = fault_address & !(PAGE_SIZE - 1);
+
+        // Pre-faulting is triggered for executable (.text) or read-only data (.rdata)
+        let is_cluster_candidate = is_exec
+            || (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ)) != 0
+            || (protection == PAGE_READONLY && !is_write);
+
+        if self.enabled.load(Ordering::Acquire) && is_cluster_candidate {
+            // Align fault address to 64KB cluster boundary
+            let cluster_base = fault_address & !(CLUSTER_SIZE_BYTES - 1);
+            let mut committed = 0;
+
+            for i in 0..CLUSTER_PAGE_COUNT {
+                let target_page = cluster_base + (i * PAGE_SIZE);
+                let entry = WorkingSetPageEntry {
+                    virtual_address: target_page,
+                    protection,
+                    share_count: 1,
+                    is_shared: false,
+                    numa_node: 0,
+                    is_locked: false,
+                    is_large_page: false,
+                    is_executable: is_exec || (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ)) != 0,
+                    age: 0,
+                };
+                governor.commit_resident_page(pid, entry);
+                committed += 1;
+            }
+
+            let mut st = self.stats.lock();
+            st.clustered_faults += 1;
+            st.prefaulted_pages += committed;
+
+            Ok(committed)
+        } else {
+            // Single page demand fault
+            let entry = WorkingSetPageEntry {
+                virtual_address: page_va,
+                protection,
+                share_count: 1,
+                is_shared: false,
+                numa_node: 0,
+                is_locked: false,
+                is_large_page: false,
+                is_executable: is_exec,
+                age: 0,
+            };
+            governor.commit_resident_page(pid, entry);
+
+            let mut st = self.stats.lock();
+            st.single_faults += 1;
+
+            Ok(1)
+        }
+    }
+
+    /// Retrieve engine statistics.
+    pub fn get_stats(&self) -> PageFaultClusterStats {
+        *self.stats.lock()
+    }
+}
+
+pub static FAULT_CLUSTERING_ENGINE: FaultClusteringEngine = FaultClusteringEngine::new();
+
 /// Emulates Win32 GetProcessWorkingSetSizeEx API.
 pub fn win32_get_process_working_set_size_ex(
     h_process: HANDLE,
