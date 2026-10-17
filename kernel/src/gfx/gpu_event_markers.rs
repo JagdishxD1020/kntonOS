@@ -479,3 +479,180 @@ impl GpuCpuTimestampCalibrator {
         }
     }
 }
+
+// Maximum number of draw pass performance records stored in the instrumentation ring buffer.
+pub const MAX_PASS_INSTRUMENTATION_CAPACITY: usize = 128;
+
+// Per-draw pass performance telemetry capturing GPU timeline, draw counts, and pipeline metrics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DrawPassMetrics {
+    pub pass_id: u32,
+    pub pass_name: MarkerName,
+    pub draw_call_count: u32,
+    pub dispatch_count: u32,
+    pub primitive_count: u64,
+    pub vertex_invocations: u64,
+    pub pixel_invocations: u64,
+    pub vram_read_bytes: u64,
+    pub vram_write_bytes: u64,
+    pub start_query_idx: u32,
+    pub end_query_idx: u32,
+    pub duration_gpu_ticks: u64,
+    pub duration_nanoseconds: u64,
+    pub color: PixColor,
+    pub completed: bool,
+}
+
+impl DrawPassMetrics {
+    // Creates an empty draw pass metric record.
+    pub const fn empty() -> Self {
+        Self {
+            pass_id: 0,
+            pass_name: MarkerName::empty(),
+            draw_call_count: 0,
+            dispatch_count: 0,
+            primitive_count: 0,
+            vertex_invocations: 0,
+            pixel_invocations: 0,
+            vram_read_bytes: 0,
+            vram_write_bytes: 0,
+            start_query_idx: 0,
+            end_query_idx: 0,
+            duration_gpu_ticks: 0,
+            duration_nanoseconds: 0,
+            color: PixColor::DEFAULT,
+            completed: false,
+        }
+    }
+}
+
+// Non-stalling per-draw pass performance instrumentation ring buffer.
+pub struct InstrumentationRingBuffer {
+    records: [DrawPassMetrics; MAX_PASS_INSTRUMENTATION_CAPACITY],
+    head: usize,
+    tail: usize,
+    count: usize,
+    total_recorded_passes: u64,
+}
+
+impl InstrumentationRingBuffer {
+    // Initializes a new draw pass instrumentation ring buffer.
+    pub const fn new() -> Self {
+        Self {
+            records: [DrawPassMetrics::empty(); MAX_PASS_INSTRUMENTATION_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+            total_recorded_passes: 0,
+        }
+    }
+
+    // Begins instrumentation of a draw pass, allocating a ring slot without GPU pipeline stalls.
+    pub fn begin_pass(
+        &mut self,
+        pass_id: u32,
+        name: &str,
+        color: PixColor,
+        start_query_idx: u32,
+    ) -> usize {
+        let slot = self.tail;
+        if self.count == MAX_PASS_INSTRUMENTATION_CAPACITY {
+            // Non-stalling overwrite: advance head pointer to drop oldest record.
+            self.head = (self.head + 1) % MAX_PASS_INSTRUMENTATION_CAPACITY;
+        } else {
+            self.count += 1;
+        }
+        self.tail = (self.tail + 1) % MAX_PASS_INSTRUMENTATION_CAPACITY;
+        self.total_recorded_passes += 1;
+
+        let mut metric = DrawPassMetrics::empty();
+        metric.pass_id = pass_id;
+        metric.pass_name = MarkerName::from_str(name);
+        metric.color = color;
+        metric.start_query_idx = start_query_idx;
+        metric.completed = false;
+
+        self.records[slot] = metric;
+        slot
+    }
+
+    // Ends instrumentation for an active draw pass, recording draw counts and pipeline counters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn end_pass(
+        &mut self,
+        slot: usize,
+        end_query_idx: u32,
+        draw_calls: u32,
+        dispatches: u32,
+        primitives: u64,
+        vertex_invocations: u64,
+        pixel_invocations: u64,
+        vram_read_bytes: u64,
+        vram_write_bytes: u64,
+    ) -> Result<(), MarkerError> {
+        if slot >= MAX_PASS_INSTRUMENTATION_CAPACITY {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        let record = &mut self.records[slot];
+        record.end_query_idx = end_query_idx;
+        record.draw_call_count = draw_calls;
+        record.dispatch_count = dispatches;
+        record.primitive_count = primitives;
+        record.vertex_invocations = vertex_invocations;
+        record.pixel_invocations = pixel_invocations;
+        record.vram_read_bytes = vram_read_bytes;
+        record.vram_write_bytes = vram_write_bytes;
+        record.completed = true;
+        Ok(())
+    }
+
+    // Resolves asynchronous query timestamps into pass execution duration without CPU waiting.
+    pub fn resolve_pass_timing(
+        &mut self,
+        slot: usize,
+        heap: &D3d12TimestampQueryHeap,
+        calibrator: &GpuCpuTimestampCalibrator,
+    ) -> Result<(), MarkerError> {
+        if slot >= MAX_PASS_INSTRUMENTATION_CAPACITY {
+            return Err(MarkerError::InvalidQueryIndex);
+        }
+        let record = &mut self.records[slot];
+        if !record.completed {
+            return Ok(());
+        }
+
+        let t_start = heap.read_timestamp(record.start_query_idx)?;
+        let t_end = heap.read_timestamp(record.end_query_idx)?;
+        let delta_ticks = if t_end >= t_start {
+            t_end - t_start
+        } else {
+            0
+        };
+
+        record.duration_gpu_ticks = delta_ticks;
+        record.duration_nanoseconds = calibrator.gpu_ticks_to_nanoseconds(delta_ticks);
+        Ok(())
+    }
+
+    // Returns a reference to the pass metrics record at the specified ring slot.
+    #[inline]
+    pub fn get_record(&self, slot: usize) -> Option<&DrawPassMetrics> {
+        if slot < MAX_PASS_INSTRUMENTATION_CAPACITY && self.records[slot].completed {
+            Some(&self.records[slot])
+        } else {
+            None
+        }
+    }
+
+    // Returns the total number of valid records currently stored in the ring buffer.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    // Returns the cumulative count of passes processed across the lifetime of the engine.
+    #[inline]
+    pub fn total_recorded_passes(&self) -> u64 {
+        self.total_recorded_passes
+    }
+}
