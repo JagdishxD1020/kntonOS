@@ -228,6 +228,163 @@ impl WorkingSetGovernor {
 
 pub static WORKING_SET_GOVERNOR: WorkingSetGovernor = WorkingSetGovernor::new();
 
+/// PSAPI_WORKING_SET_EX_BLOCK bitfield representation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PSAPI_WORKING_SET_EX_BLOCK {
+    pub Flags: usize,
+}
+
+impl PSAPI_WORKING_SET_EX_BLOCK {
+    pub const VALID_BIT: usize = 1 << 0;
+    pub const SHARE_COUNT_SHIFT: usize = 1;
+    pub const SHARE_COUNT_MASK: usize = 0x7 << Self::SHARE_COUNT_SHIFT; // 3 bits
+    pub const WIN32_PROTECT_SHIFT: usize = 4;
+    pub const WIN32_PROTECT_MASK: usize = 0x7FF << Self::WIN32_PROTECT_SHIFT; // 11 bits
+    pub const SHARED_BIT: usize = 1 << 15;
+    pub const NODE_SHIFT: usize = 16;
+    pub const NODE_MASK: usize = 0x3F << Self::NODE_SHIFT; // 6 bits
+    pub const LOCKED_BIT: usize = 1 << 22;
+    pub const LARGE_PAGE_BIT: usize = 1 << 23;
+    pub const BAD_BIT: usize = 1 << 31;
+
+    pub fn new(
+        valid: bool,
+        share_count: u8,
+        protect: u32,
+        shared: bool,
+        node: u8,
+        locked: bool,
+        large_page: bool,
+    ) -> Self {
+        let mut flags = 0usize;
+        if valid {
+            flags |= Self::VALID_BIT;
+        }
+        flags |= ((share_count as usize) & 0x7) << Self::SHARE_COUNT_SHIFT;
+        flags |= ((protect as usize) & 0x7FF) << Self::WIN32_PROTECT_SHIFT;
+        if shared {
+            flags |= Self::SHARED_BIT;
+        }
+        flags |= ((node as usize) & 0x3F) << Self::NODE_SHIFT;
+        if locked {
+            flags |= Self::LOCKED_BIT;
+        }
+        if large_page {
+            flags |= Self::LARGE_PAGE_BIT;
+        }
+        Self { Flags: flags }
+    }
+
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        (self.Flags & Self::VALID_BIT) != 0
+    }
+
+    #[inline]
+    pub fn get_protection(&self) -> u32 {
+        ((self.Flags & Self::WIN32_PROTECT_MASK) >> Self::WIN32_PROTECT_SHIFT) as u32
+    }
+
+    #[inline]
+    pub fn get_share_count(&self) -> u8 {
+        ((self.Flags & Self::SHARE_COUNT_MASK) >> Self::SHARE_COUNT_SHIFT) as u8
+    }
+
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        (self.Flags & Self::SHARED_BIT) != 0
+    }
+
+    #[inline]
+    pub fn get_node(&self) -> u8 {
+        ((self.Flags & Self::NODE_MASK) >> Self::NODE_SHIFT) as u8
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        (self.Flags & Self::LOCKED_BIT) != 0
+    }
+
+    #[inline]
+    pub fn is_large_page(&self) -> bool {
+        (self.Flags & Self::LARGE_PAGE_BIT) != 0
+    }
+}
+
+/// PSAPI_WORKING_SET_EX_INFORMATION query structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PSAPI_WORKING_SET_EX_INFORMATION {
+    pub VirtualAddress: usize,
+    pub VirtualAttributes: PSAPI_WORKING_SET_EX_BLOCK,
+}
+
+impl WorkingSetGovernor {
+    /// Query page residency status across a slice of addresses for a process.
+    pub fn query_working_set_ex(
+        &self,
+        pid: u32,
+        info_slice: &mut [PSAPI_WORKING_SET_EX_INFORMATION],
+    ) -> Result<usize, NtStatus> {
+        self.ensure_working_set(pid);
+        let map = self.sets.lock();
+        let ws = map.get(&pid).ok_or(STATUS_INVALID_PARAMETER)?;
+
+        let mut resident_count = 0;
+        for item in info_slice.iter_mut() {
+            let aligned_va = item.VirtualAddress & !(PAGE_SIZE - 1);
+            if let Some(entry) = ws.resident_pages.get(&aligned_va) {
+                item.VirtualAttributes = PSAPI_WORKING_SET_EX_BLOCK::new(
+                    true,
+                    entry.share_count,
+                    entry.protection,
+                    entry.is_shared,
+                    entry.numa_node,
+                    entry.is_locked,
+                    entry.is_large_page,
+                );
+                resident_count += 1;
+            } else {
+                item.VirtualAttributes = PSAPI_WORKING_SET_EX_BLOCK::default();
+            }
+        }
+        Ok(resident_count)
+    }
+}
+
+/// Emulates Win32 QueryWorkingSetEx API.
+pub fn win32_query_working_set_ex(
+    h_process: HANDLE,
+    pv: *mut PSAPI_WORKING_SET_EX_INFORMATION,
+    cb: u32,
+) -> bool {
+    if pv.is_null() || cb == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let struct_size = core::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>();
+    let count = (cb as usize) / struct_size;
+    if count == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    let pid = (h_process as u32).max(1);
+    let slice = unsafe { core::slice::from_raw_parts_mut(pv, count) };
+    match WORKING_SET_GOVERNOR.query_working_set_ex(pid, slice) {
+        Ok(_) => {
+            win32_set_last_error(ERROR_SUCCESS);
+            true
+        }
+        Err(_) => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            false
+        }
+    }
+}
+
 /// Emulates Win32 EmptyWorkingSet API.
 pub fn win32_empty_working_set(h_process: HANDLE) -> bool {
     let pid = (h_process as u32).max(1);
