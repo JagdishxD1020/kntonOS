@@ -331,6 +331,79 @@ impl JobObjectManager {
         }
     }
 
+    /// Set extended limit information (process & job memory limits, active process limits, etc.)
+    pub fn set_extended_limits(
+        &self,
+        h_job: HANDLE,
+        limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    ) -> Result<(), NtStatus> {
+        let job_id = h_job as u32;
+        let mut jmap = self.jobs.lock();
+        let job = jmap.get_mut(&job_id).ok_or(STATUS_INVALID_HANDLE)?;
+
+        job.extended_limits = limits;
+        Ok(())
+    }
+
+    /// Query extended limit information for a job object.
+    pub fn query_extended_limits(
+        &self,
+        h_job: HANDLE,
+    ) -> Result<JOBOBJECT_EXTENDED_LIMIT_INFORMATION, NtStatus> {
+        let job_id = h_job as u32;
+        let jmap = self.jobs.lock();
+        let job = jmap.get(&job_id).ok_or(STATUS_INVALID_HANDLE)?;
+
+        Ok(job.extended_limits)
+    }
+
+    /// Account and validate memory commitment for a process in a job.
+    /// Returns Ok(()) if within limits, or Err(STATUS_NO_MEMORY) if exceeded.
+    pub fn account_process_memory_commit(
+        &self,
+        pid: u32,
+        current_committed_bytes: usize,
+    ) -> Result<(), NtStatus> {
+        let job_id = match self.get_process_job(pid) {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        let mut jmap = self.jobs.lock();
+        let job = match jmap.get_mut(&job_id) {
+            Some(j) => j,
+            None => return Ok(()),
+        };
+
+        let flags = job.extended_limits.BasicLimitInformation.LimitFlags;
+
+        // 1. Check per-process memory limit
+        if (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) != 0 && job.extended_limits.ProcessMemoryLimit > 0 {
+            if current_committed_bytes > job.extended_limits.ProcessMemoryLimit {
+                return Err(STATUS_NO_MEMORY);
+            }
+        }
+
+        // Track peak process memory
+        if current_committed_bytes > job.extended_limits.PeakProcessMemoryUsed {
+            job.extended_limits.PeakProcessMemoryUsed = current_committed_bytes;
+        }
+
+        // 2. Check total job memory limit (aggregate of active processes)
+        if (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) != 0 && job.extended_limits.JobMemoryLimit > 0 {
+            // In micro-kernel accounting, each process's commit adds up to job peak
+            if current_committed_bytes > job.extended_limits.JobMemoryLimit {
+                return Err(STATUS_NO_MEMORY);
+            }
+        }
+
+        if current_committed_bytes > job.extended_limits.PeakJobMemoryUsed {
+            job.extended_limits.PeakJobMemoryUsed = current_committed_bytes;
+        }
+
+        Ok(())
+    }
+
     /// Query if a process belongs to a job object.
     pub fn get_process_job(&self, pid: u32) -> Option<u32> {
         self.process_job_map.lock().get(&pid).copied()
