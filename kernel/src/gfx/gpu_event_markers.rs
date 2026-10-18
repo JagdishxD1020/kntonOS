@@ -775,3 +775,140 @@ impl FrameBottleneckAnalyzer {
         }
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 Agility execution markers, queries, and bottleneck analyzer.
+pub fn test_gpu_event_markers_subsystem() -> bool {
+    crate::serial_write_str("[KNT-MARKERS] Initializing Direct3D 12 execution markers and PIX instrumentation test...\r\n");
+
+    // 1. Verify marker recording, hierarchy nesting, and stack integrity.
+    let mut recorder = CommandListMarkerRecorder::new();
+    let id_main = match recorder.begin_event("MainRenderPass", PixColor::GEOMETRY) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    let id_sub = match recorder.begin_event("ShadowDepthSubpass", PixColor::PIXEL) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+    if recorder.set_marker("BindShadowAtlas", PixColor::DEFAULT).is_err() {
+        return false;
+    }
+
+    let pop1 = match recorder.end_event() {
+        Ok(evt) => evt,
+        Err(_) => return false,
+    };
+    if pop1.name.as_str() != "ShadowDepthSubpass" || pop1.depth != 1 || pop1.correlation_id != id_sub {
+        return false;
+    }
+
+    let pop2 = match recorder.end_event() {
+        Ok(evt) => evt,
+        Err(_) => return false,
+    };
+    if pop2.name.as_str() != "MainRenderPass" || pop2.depth != 0 || pop2.correlation_id != id_main {
+        return false;
+    }
+
+    if recorder.recorded_events().len() != 5 {
+        return false;
+    }
+    if recorder.end_event().is_ok() {
+        return false;
+    }
+
+    // 2. Verify GPU timeline timestamp queries and CPU RDTSC calibration.
+    let mut heap = D3d12TimestampQueryHeap::new();
+    let q0 = match heap.allocate_query() {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+    let q1 = match heap.allocate_query() {
+        Ok(q) => q,
+        Err(_) => return false,
+    };
+    if heap.record_timestamp(q0, 100_000_000).is_err() || heap.record_timestamp(q1, 100_500_000).is_err() {
+        return false;
+    }
+
+    let mut readback = [0u64; 2];
+    if heap.resolve_query_data(q0, 2, &mut readback).is_err() || readback[0] != 100_000_000 || readback[1] != 100_500_000 {
+        return false;
+    }
+
+    let mut calibrator = GpuCpuTimestampCalibrator::new(1_000_000_000, 3_000_000_000);
+    calibrator.calibrate(100_000_000, 300_000_000);
+    if calibrator.gpu_ticks_to_nanoseconds(500_000) != 500_000 {
+        return false;
+    }
+    if calibrator.correlate_gpu_timestamp_to_cpu_rdtsc(100_500_000) != 301_500_000 {
+        return false;
+    }
+    if calibrator.correlate_cpu_rdtsc_to_gpu_timestamp(301_500_000) != 100_500_000 {
+        return false;
+    }
+
+    // 3. Verify per-draw pass performance instrumentation ring buffer.
+    let mut ring = InstrumentationRingBuffer::new();
+    let slot = ring.begin_pass(1, "OpaqueGeometry", PixColor::GEOMETRY, q0);
+    if ring.end_pass(slot, q1, 120, 0, 200_000, 300_000, 1_500_000, 10_000_000, 4_000_000).is_err() {
+        return false;
+    }
+    if ring.resolve_pass_timing(slot, &heap, &calibrator).is_err() {
+        return false;
+    }
+
+    let metric = match ring.get_record(slot) {
+        Some(m) => m,
+        None => return false,
+    };
+    if metric.duration_nanoseconds != 500_000 || !metric.completed {
+        return false;
+    }
+
+    // 4. Verify frame bottleneck analyzer classification.
+    let analyzer = FrameBottleneckAnalyzer::default_handheld();
+
+    // 4a. Pixel-bound evaluation.
+    let mut pb_metric = DrawPassMetrics::empty();
+    pb_metric.completed = true;
+    pb_metric.duration_nanoseconds = 1_000_000;
+    pb_metric.vertex_invocations = 50_000;
+    pb_metric.pixel_invocations = 1_000_000;
+    pb_metric.vram_read_bytes = 2_000_000;
+    pb_metric.vram_write_bytes = 1_000_000;
+    let res_pixel = analyzer.analyze_pass(&pb_metric);
+    if res_pixel.stage != BottleneckStage::PixelBound {
+        return false;
+    }
+
+    // 4b. Vertex-bound evaluation.
+    let mut vb_metric = DrawPassMetrics::empty();
+    vb_metric.completed = true;
+    vb_metric.duration_nanoseconds = 1_000_000;
+    vb_metric.vertex_invocations = 1_000_000;
+    vb_metric.pixel_invocations = 100_000;
+    vb_metric.vram_read_bytes = 2_000_000;
+    vb_metric.vram_write_bytes = 1_000_000;
+    let res_vertex = analyzer.analyze_pass(&vb_metric);
+    if res_vertex.stage != BottleneckStage::VertexBound {
+        return false;
+    }
+
+    // 4c. Memory bandwidth-bound evaluation.
+    let mut bw_metric = DrawPassMetrics::empty();
+    bw_metric.completed = true;
+    bw_metric.duration_nanoseconds = 1_000_000;
+    bw_metric.vertex_invocations = 100_000;
+    bw_metric.pixel_invocations = 100_000;
+    bw_metric.vram_read_bytes = 80_000_000;
+    bw_metric.vram_write_bytes = 50_000_000;
+    let res_bw = analyzer.analyze_pass(&bw_metric);
+    if res_bw.stage != BottleneckStage::MemoryBandwidthBound {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-MARKERS-PASS] Direct3D 12 execution markers & PIX instrumentation verified\r\n");
+    true
+}
