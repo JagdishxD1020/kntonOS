@@ -112,6 +112,45 @@ pub struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
     pub TotalTerminatedProcesses: u32,
 }
 
+// CPU Rate Control Flags
+pub const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x00000001;
+pub const JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED: u32 = 0x00000002;
+pub const JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP: u32 = 0x00000004;
+pub const JOB_OBJECT_CPU_RATE_CONTROL_NOTIFY: u32 = 0x00000008;
+pub const JOB_OBJECT_CPU_RATE_CONTROL_MIN_MAX_RATE: u32 = 0x00000010;
+
+/// JOBOBJECT_CPU_RATE_CONTROL_INFORMATION structure.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+    pub ControlFlags: u32,
+    pub CpuRate: u32, // Rate in cycles / 10,000 (e.g. 5000 = 50.00%)
+}
+
+/// Dynamic CPU Cycle Budget & Rate Governor per Job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCpuRateGovernor {
+    pub control_flags: u32,
+    pub target_rate_basis_points: u32, // 1 - 10000 (100.00%)
+    pub period_cycle_budget: u64,
+    pub period_consumed_cycles: u64,
+    pub hard_cap_enforced: bool,
+    pub throttled_ticks: u64,
+}
+
+impl Default for JobCpuRateGovernor {
+    fn default() -> Self {
+        Self {
+            control_flags: 0,
+            target_rate_basis_points: 10_000,
+            period_cycle_budget: 10_000_000, // standard quantum budget
+            period_consumed_cycles: 0,
+            hard_cap_enforced: false,
+            throttled_ticks: 0,
+        }
+    }
+}
+
 /// Job Object Core Structure.
 #[derive(Debug, Clone)]
 pub struct JobObject {
@@ -120,6 +159,7 @@ pub struct JobObject {
     pub assigned_pids: Vec<u32>,
     pub extended_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     pub accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    pub cpu_rate: JobCpuRateGovernor,
     pub is_closed: bool,
 }
 
@@ -131,6 +171,7 @@ impl JobObject {
             assigned_pids: Vec::new(),
             extended_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default(),
             accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default(),
+            cpu_rate: JobCpuRateGovernor::default(),
             is_closed: false,
         }
     }
@@ -207,6 +248,87 @@ impl JobObjectManager {
         pmap.insert(pid, job_id);
 
         Ok(())
+    }
+
+    /// Set CPU rate control information for a job object.
+    pub fn set_cpu_rate_control(
+        &self,
+        h_job: HANDLE,
+        info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    ) -> Result<(), NtStatus> {
+        let job_id = h_job as u32;
+        let mut jmap = self.jobs.lock();
+        let job = jmap.get_mut(&job_id).ok_or(STATUS_INVALID_HANDLE)?;
+
+        if (info.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE) != 0 {
+            if info.CpuRate == 0 || info.CpuRate > 10_000 {
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            job.cpu_rate.control_flags = info.ControlFlags;
+            job.cpu_rate.target_rate_basis_points = info.CpuRate;
+            job.cpu_rate.hard_cap_enforced = (info.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP) != 0;
+            // Recalculate cycle budget: proportional to 10M cycles baseline quantum
+            job.cpu_rate.period_cycle_budget = (10_000_000u64 * (info.CpuRate as u64)) / 10_000;
+            job.cpu_rate.period_consumed_cycles = 0;
+        } else {
+            job.cpu_rate.control_flags = 0;
+            job.cpu_rate.target_rate_basis_points = 10_000;
+            job.cpu_rate.period_cycle_budget = 10_000_000;
+            job.cpu_rate.hard_cap_enforced = false;
+        }
+
+        Ok(())
+    }
+
+    /// Query CPU rate control information for a job object.
+    pub fn query_cpu_rate_control(
+        &self,
+        h_job: HANDLE,
+    ) -> Result<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, NtStatus> {
+        let job_id = h_job as u32;
+        let jmap = self.jobs.lock();
+        let job = jmap.get(&job_id).ok_or(STATUS_INVALID_HANDLE)?;
+
+        Ok(JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+            ControlFlags: job.cpu_rate.control_flags,
+            CpuRate: job.cpu_rate.target_rate_basis_points,
+        })
+    }
+
+    /// Account CPU cycle consumption for a process belonging to a job.
+    /// Returns true if execution is permitted, false if hard cap exceeded and process must be throttled.
+    pub fn account_cpu_cycles(&self, pid: u32, consumed_cycles: u64) -> bool {
+        let job_id = match self.get_process_job(pid) {
+            Some(id) => id,
+            None => return true, // No job, unconstrained
+        };
+
+        let mut jmap = self.jobs.lock();
+        let job = match jmap.get_mut(&job_id) {
+            Some(j) => j,
+            None => return true,
+        };
+
+        if (job.cpu_rate.control_flags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE) == 0 {
+            return true;
+        }
+
+        job.cpu_rate.period_consumed_cycles = job.cpu_rate.period_consumed_cycles.saturating_add(consumed_cycles);
+        if job.cpu_rate.hard_cap_enforced && job.cpu_rate.period_consumed_cycles > job.cpu_rate.period_cycle_budget {
+            job.cpu_rate.throttled_ticks += 1;
+            return false; // Throttled due to hard cap
+        }
+
+        true
+    }
+
+    /// Reset periodic cycle counter (e.g. at timer quantum or 100ms accounting tick).
+    pub fn reset_cpu_rate_period(&self, h_job: HANDLE) {
+        let job_id = h_job as u32;
+        let mut jmap = self.jobs.lock();
+        if let Some(job) = jmap.get_mut(&job_id) {
+            job.cpu_rate.period_consumed_cycles = 0;
+        }
     }
 
     /// Query if a process belongs to a job object.
