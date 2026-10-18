@@ -1072,3 +1072,37 @@ pub fn verify_l1_pm_substates_and_exit_latency() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld PCIe 5.0 Link Health Monitor &
+/// Dynamic Lane Width / Speed Re-Tuning Engine (TASK-KNT-272).
+pub fn test_pcie_health_subsystem() -> bool {
+    crate::serial_write_str("[BUS-PCIE-HEALTH] Initiating PCIe 5.0 Link Health & Dynamic Retuning Verification...\r\n");
+
+    if !verify_pcie5_link_status_and_aer() {
+        crate::serial_write_str("[BUS-PCIE-HEALTH-ERR] PCIe 5.0 link status and AER monitoring test failed!\r\n");
+        return false;
+    }
+
+    if !verify_dynamic_link_retraining_and_fallback() {
+        crate::serial_write_str("[BUS-PCIE-HEALTH-ERR] Dynamic link retraining and fallback test failed!\r\n");
+        return false;
+    }
+
+    if !verify_thermal_bus_power_governor() {
+        crate::serial_write_str("[BUS-PCIE-HEALTH-ERR] Thermal bus power governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_l1_pm_substates_and_exit_latency() {
+        crate::serial_write_str("[BUS-PCIE-HEALTH-ERR] L1 PM substates and exit latency regulator test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-BUS-PCIE-HEALTH-PASS] PCIe 5.0 link health and dynamic retuning engine verified!\r\n");
+    true
+}
