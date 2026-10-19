@@ -982,6 +982,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] PCIe 5.0 link health and dynamic retuning self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld USB-C Billboard Device & DisplayPort Alternate Mode Firmware Handshake Driver (TASK-KNT-276)
+    if !drivers::bus::test_usb_billboard_subsystem() {
+        serial_write_str("[KNT-PANIC] USB-C Billboard and DP Alt Mode driver self-test failed!\r\n");
+    }
+
     // Initialize and verify USB Mass Storage Class (MSC) Bulk-Only Transport (BOT) Driver
     if !drivers::usb::test_usb_msc_subsystem() {
         serial_write_str("[KNT-PANIC] USB MSC BOT storage subsystem self-test failed!\r\n");
