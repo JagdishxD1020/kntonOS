@@ -486,3 +486,189 @@ pub fn win32_assign_process_to_job_object(h_job: HANDLE, h_process: HANDLE) -> b
         }
     }
 }
+
+/// Emulates Win32 SetInformationJobObject API.
+pub fn win32_set_information_job_object(
+    h_job: HANDLE,
+    job_object_info_class: u32,
+    lp_job_object_info: *const u8,
+    cb_job_object_info_length: u32,
+) -> bool {
+    if lp_job_object_info.is_null() || cb_job_object_info_length == 0 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    match job_object_info_class {
+        JobObjectExtendedLimitInformation => {
+            if (cb_job_object_info_length as usize) < core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() {
+                win32_set_last_error(ERROR_INVALID_PARAMETER);
+                return false;
+            }
+            let info = unsafe { *(lp_job_object_info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION) };
+            match JOB_OBJECT_MANAGER.set_extended_limits(h_job, info) {
+                Ok(_) => {
+                    win32_set_last_error(ERROR_SUCCESS);
+                    true
+                }
+                Err(_) => {
+                    win32_set_last_error(ERROR_INVALID_HANDLE);
+                    false
+                }
+            }
+        }
+        JobObjectCpuRateControlInformation => {
+            if (cb_job_object_info_length as usize) < core::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() {
+                win32_set_last_error(ERROR_INVALID_PARAMETER);
+                return false;
+            }
+            let info = unsafe { *(lp_job_object_info as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION) };
+            match JOB_OBJECT_MANAGER.set_cpu_rate_control(h_job, info) {
+                Ok(_) => {
+                    win32_set_last_error(ERROR_SUCCESS);
+                    true
+                }
+                Err(_) => {
+                    win32_set_last_error(ERROR_INVALID_PARAMETER);
+                    false
+                }
+            }
+        }
+        _ => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            false
+        }
+    }
+}
+
+/// Comprehensive self-test for Win32 Job Objects Subsystem.
+pub fn test_win32_job_objects_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-JOB-OBJECTS] Initializing Win32 Job Objects Subsystem self-test...\r\n");
+
+    // 1. Test Job Object Creation & Named Deduplication
+    let h_job1 = win32_create_job_object(Some("Global\\GameProcessJob"));
+    if h_job1 == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_create_job_object failed\r\n");
+        return false;
+    }
+
+    let h_job2 = win32_create_job_object(Some("Global\\GameProcessJob"));
+    if h_job2 != h_job1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Named job object did not return existing handle\r\n");
+        return false;
+    }
+
+    // 2. Test Process Assignment & Single Job Confinement
+    let test_pid1 = 8801;
+    let test_pid2 = 8802;
+    if !win32_assign_process_to_job_object(h_job1, test_pid1 as HANDLE) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_assign_process_to_job_object failed\r\n");
+        return false;
+    }
+
+    let h_job_other = win32_create_job_object(None);
+    if win32_assign_process_to_job_object(h_job_other, test_pid1 as HANDLE) {
+        crate::serial_write_str("[KNT-TEST-ERR] Process assigned to second job without nested support\r\n");
+        return false;
+    }
+
+    // 3. Test CPU Rate Limiting & Hard Cap Cycle Throttling
+    let cpu_info = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION {
+        ControlFlags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
+        CpuRate: 2_000, // 20.00% cap (2,000,000 cycles quantum budget)
+    };
+
+    let cpu_len = core::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32;
+    if !win32_set_information_job_object(
+        h_job1,
+        JobObjectCpuRateControlInformation,
+        &cpu_info as *const _ as *const u8,
+        cpu_len,
+    ) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set CPU rate control info\r\n");
+        return false;
+    }
+
+    // Consuming 1,500,000 cycles: under budget -> permitted
+    if !JOB_OBJECT_MANAGER.account_cpu_cycles(test_pid1, 1_500_000) {
+        crate::serial_write_str("[KNT-TEST-ERR] Execution throttled while under CPU cycle budget\r\n");
+        return false;
+    }
+
+    // Consuming an additional 1,000,000 cycles (total 2.5M > 2.0M cap) -> must throttle
+    if JOB_OBJECT_MANAGER.account_cpu_cycles(test_pid1, 1_000_000) {
+        crate::serial_write_str("[KNT-TEST-ERR] Hard cap failed to throttle exceeded CPU cycle budget\r\n");
+        return false;
+    }
+
+    // Reset period quantum -> should be permitted again
+    JOB_OBJECT_MANAGER.reset_cpu_rate_period(h_job1);
+    if !JOB_OBJECT_MANAGER.account_cpu_cycles(test_pid1, 500_000) {
+        crate::serial_write_str("[KNT-TEST-ERR] Execution failed after CPU period reset\r\n");
+        return false;
+    }
+
+    // 4. Test Memory Limits & Commit Quotas
+    let mut ext_limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    ext_limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY;
+    ext_limits.ProcessMemoryLimit = 32 * 1024 * 1024; // 32 MB per process limit
+    ext_limits.JobMemoryLimit = 64 * 1024 * 1024;     // 64 MB job total limit
+
+    let ext_len = core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    if !win32_set_information_job_object(
+        h_job1,
+        JobObjectExtendedLimitInformation,
+        &ext_limits as *const _ as *const u8,
+        ext_len,
+    ) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set extended limit info\r\n");
+        return false;
+    }
+
+    // Under process limit (24 MB) -> Ok
+    if JOB_OBJECT_MANAGER.account_process_memory_commit(test_pid1, 24 * 1024 * 1024).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Memory commit within limit rejected\r\n");
+        return false;
+    }
+
+    // Over process limit (40 MB > 32 MB) -> Err
+    if JOB_OBJECT_MANAGER.account_process_memory_commit(test_pid1, 40 * 1024 * 1024).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Exceeded process memory limit accepted\r\n");
+        return false;
+    }
+
+    // 5. Test Anti-Cheat Child Process Breakaway Prevention
+    // Case A: Job does NOT have JOB_OBJECT_LIMIT_BREAKAWAY_OK -> child spawn with breakaway must fail
+    let rogue_breakaway_res = JOB_OBJECT_MANAGER.evaluate_child_spawn_breakaway(test_pid1, test_pid2, true);
+    if rogue_breakaway_res != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Rogue child breakaway was not prevented\r\n");
+        return false;
+    }
+
+    // Case B: Normal spawn without breakaway -> child inherits parent's job
+    let normal_spawn_res = JOB_OBJECT_MANAGER.evaluate_child_spawn_breakaway(test_pid1, test_pid2, false);
+    if normal_spawn_res != Ok(Some(h_job1 as u32)) {
+        crate::serial_write_str("[KNT-TEST-ERR] Child did not inherit parent's job object\r\n");
+        return false;
+    }
+
+    if JOB_OBJECT_MANAGER.get_process_job(test_pid2) != Some(h_job1 as u32) {
+        crate::serial_write_str("[KNT-TEST-ERR] Child PID mapping not recorded in parent job\r\n");
+        return false;
+    }
+
+    // Case C: Grant JOB_OBJECT_LIMIT_BREAKAWAY_OK -> child breakaway succeeds
+    ext_limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    let _ = JOB_OBJECT_MANAGER.set_extended_limits(h_job1, ext_limits);
+
+    let test_pid3 = 8803;
+    let allowed_breakaway_res = JOB_OBJECT_MANAGER.evaluate_child_spawn_breakaway(test_pid1, test_pid3, true);
+    if allowed_breakaway_res != Ok(None) {
+        crate::serial_write_str("[KNT-TEST-ERR] Authorized breakaway was improperly blocked\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-JOB-OBJECTS-PASS] Win32 Job Objects Subsystem verified\r\n");
+    true
+}
