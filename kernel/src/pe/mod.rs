@@ -46,6 +46,7 @@ pub mod large_page_valloc;
 pub mod power_qos;
 pub mod working_set;
 pub mod job_objects;
+pub mod seh_unwind;
 
 pub use header::*;
 pub use ntdll::*;
