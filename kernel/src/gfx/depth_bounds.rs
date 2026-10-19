@@ -530,6 +530,87 @@ impl DynamicStencilRefState {
     }
 }
 
+// Calibrated view or light frustum depth extents in normalized device coordinates [0.0, 1.0].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct FrustumDepthBounds {
+    pub near_z: f32,
+    pub far_z: f32,
+}
+
+impl FrustumDepthBounds {
+    // Creates a new calibrated frustum depth range.
+    pub const fn new(near_z: f32, far_z: f32) -> Self {
+        Self { near_z, far_z }
+    }
+}
+
+// Early-Z culling accelerator rejecting draw passes before rasterizer dispatch.
+pub struct EarlyZCullingAccelerator {
+    pub calibrated_frustum: FrustumDepthBounds,
+    pub active_bounds: AgilityDepthBounds,
+    pub passes_evaluated: u64,
+    pub passes_culled: u64,
+    pub passes_passed: u64,
+    pub triangles_culled: u64,
+}
+
+impl EarlyZCullingAccelerator {
+    // Initializes the early-Z accelerator with active depth bounds.
+    pub const fn new(bounds: AgilityDepthBounds) -> Self {
+        Self {
+            calibrated_frustum: FrustumDepthBounds::new(0.0, 1.0),
+            active_bounds: bounds,
+            passes_evaluated: 0,
+            passes_culled: 0,
+            passes_passed: 0,
+            triangles_culled: 0,
+        }
+    }
+
+    // Calibrates the accelerator with active light or shadow frustum near/far clipping planes.
+    pub fn calibrate_frustum(&mut self, near_z: f32, far_z: f32) {
+        self.calibrated_frustum = FrustumDepthBounds::new(near_z.clamp(0.0, 1.0), far_z.clamp(0.0, 1.0));
+    }
+
+    // Updates active hardware depth bounds state.
+    pub fn set_depth_bounds(&mut self, bounds: AgilityDepthBounds) {
+        self.active_bounds = bounds;
+    }
+
+    // Tests whether a geometry pass depth range intersects the active volume, culling if outside.
+    pub fn evaluate_draw_pass(&mut self, min_z: f32, max_z: f32, triangle_count: u64) -> bool {
+        self.passes_evaluated = self.passes_evaluated.saturating_add(1);
+
+        // Discard if completely in front of active min depth or behind active max depth.
+        if self.active_bounds.enabled {
+            if max_z < self.active_bounds.min_depth || min_z > self.active_bounds.max_depth {
+                self.passes_culled = self.passes_culled.saturating_add(1);
+                self.triangles_culled = self.triangles_culled.saturating_add(triangle_count);
+                return false;
+            }
+        }
+
+        // Discard if completely outside the calibrated frustum bounds.
+        if max_z < self.calibrated_frustum.near_z || min_z > self.calibrated_frustum.far_z {
+            self.passes_culled = self.passes_culled.saturating_add(1);
+            self.triangles_culled = self.triangles_culled.saturating_add(triangle_count);
+            return false;
+        }
+
+        self.passes_passed = self.passes_passed.saturating_add(1);
+        true
+    }
+
+    // Returns percentage of evaluated draw passes discarded before rasterization [0, 100].
+    pub fn culling_rate_percent(&self) -> u32 {
+        if self.passes_evaluated == 0 {
+            0
+        } else {
+            ((self.passes_culled * 100) / self.passes_evaluated) as u32
+        }
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref
 pub fn test_depth_bounds_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS] Initializing Direct3D 12 Depth Bounds Testing self-test...\r\n");
