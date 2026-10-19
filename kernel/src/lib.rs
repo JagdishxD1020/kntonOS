@@ -546,6 +546,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_gpu_event_markers_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility execution markers & PIX self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Advanced Color Space & HDR10+ Engine (TASK-KNT-277)
+    if !gfx::test_hdr_colorspace_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility HDR color space & tonemapping self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
