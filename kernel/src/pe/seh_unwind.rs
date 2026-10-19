@@ -453,3 +453,112 @@ impl VectoredHandlerList {
 }
 
 pub static VECTORED_HANDLER_LIST: VectoredHandlerList = VectoredHandlerList::new();
+
+/// Anti-debugging trap type classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiDebugTrapType {
+    BreakpointInt3,
+    SingleStepTrap,
+    GuardPageViolation,
+}
+
+/// Anti-debugging trap virtualization action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapVirtualizationAction {
+    /// Trap was genuine debugging probe / hook attempt by cheat; redirected to dummy instruction.
+    RedirectDummyTrap { landing_rip: u64 },
+    /// Genuine application fault; pass through to normal exception dispatching.
+    PassToDispatcher,
+    /// Terminate malicious debugger process.
+    SuppressAndContinue { next_rip: u64 },
+}
+
+/// Statistics for virtualized anti-debugging events.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AntiDebugTrapStats {
+    pub breakpoint_traps_virtualized: u64,
+    pub single_step_traps_virtualized: u64,
+    pub guard_page_traps_virtualized: u64,
+}
+
+/// Anti-Debugging Trap Virtualization Engine.
+pub struct AntiDebugTrapVirtualizer {
+    pub virtualization_enabled: AtomicBool,
+    pub known_cheat_probes: Spinlock<Vec<u64>>, // Probe RIPs
+    pub stats: Spinlock<AntiDebugTrapStats>,
+}
+
+impl AntiDebugTrapVirtualizer {
+    pub const fn new() -> Self {
+        Self {
+            virtualization_enabled: AtomicBool::new(true),
+            known_cheat_probes: Spinlock::new(Vec::new()),
+            stats: Spinlock::new(AntiDebugTrapStats {
+                breakpoint_traps_virtualized: 0,
+                single_step_traps_virtualized: 0,
+                guard_page_traps_virtualized: 0,
+            }),
+        }
+    }
+
+    /// Register a known probe RIP (e.g. hook detour or debugger test site).
+    pub fn register_probe_site(&self, rip: u64) {
+        self.known_cheat_probes.lock().push(rip);
+    }
+
+    /// Virtualize an incoming hardware CPU trap or exception before it alerts userland debuggers.
+    pub fn virtualize_trap(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> TrapVirtualizationAction {
+        if !self.virtualization_enabled.load(Ordering::Acquire) {
+            return TrapVirtualizationAction::PassToDispatcher;
+        }
+
+        let is_probe = self.known_cheat_probes.lock().contains(&context.Rip);
+
+        match record.ExceptionCode {
+            EXCEPTION_BREAKPOINT => {
+                let mut st = self.stats.lock();
+                st.breakpoint_traps_virtualized += 1;
+
+                if is_probe {
+                    // Redirect to safe dummy landing zone (skipping the int3 instruction: 1 byte)
+                    let next_rip = context.Rip.saturating_add(1);
+                    context.Rip = next_rip;
+                    TrapVirtualizationAction::SuppressAndContinue { next_rip }
+                } else {
+                    TrapVirtualizationAction::PassToDispatcher
+                }
+            }
+            EXCEPTION_SINGLE_STEP => {
+                let mut st = self.stats.lock();
+                st.single_step_traps_virtualized += 1;
+
+                // Hardware watchpoint or TF flag probe detected: suppress TF and advance
+                let next_rip = context.Rip;
+                TrapVirtualizationAction::SuppressAndContinue { next_rip }
+            }
+            STATUS_GUARD_PAGE_VIOLATION => {
+                let mut st = self.stats.lock();
+                st.guard_page_traps_virtualized += 1;
+
+                if is_probe {
+                    // Stealth hook attempted on protected guard page
+                    TrapVirtualizationAction::RedirectDummyTrap { landing_rip: 0x0000_7FFF_0000 }
+                } else {
+                    TrapVirtualizationAction::PassToDispatcher
+                }
+            }
+            _ => TrapVirtualizationAction::PassToDispatcher,
+        }
+    }
+
+    /// Query statistics.
+    pub fn get_stats(&self) -> AntiDebugTrapStats {
+        *self.stats.lock()
+    }
+}
+
+pub static ANTI_DEBUG_TRAP_VIRTUALIZER: AntiDebugTrapVirtualizer = AntiDebugTrapVirtualizer::new();
