@@ -220,3 +220,134 @@ impl Hdr10PlusTonemapper {
         ]
     }
 }
+
+// ScRGB reference white luminance: 1.0 represents 80.0 nits SDR reference level.
+pub const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+
+// High dynamic range linear 4-component float pixel in ScRGB color space.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScRgbPixel {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl ScRgbPixel {
+    // Constructs an ScRGB linear pixel from float components.
+    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
+    }
+
+    // Creates an ScRGB pixel from absolute optical luminance in nits and alpha.
+    pub fn from_nits(r_nits: f32, g_nits: f32, b_nits: f32, alpha: f32) -> Self {
+        Self {
+            r: r_nits / SCRGB_REFERENCE_WHITE_NITS,
+            g: g_nits / SCRGB_REFERENCE_WHITE_NITS,
+            b: b_nits / SCRGB_REFERENCE_WHITE_NITS,
+            a: alpha,
+        }
+    }
+
+    // Converts ScRGB linear color channels to absolute physical luminance in nits.
+    pub fn to_nits(&self) -> [f32; 3] {
+        [
+            self.r * SCRGB_REFERENCE_WHITE_NITS,
+            self.g * SCRGB_REFERENCE_WHITE_NITS,
+            self.b * SCRGB_REFERENCE_WHITE_NITS,
+        ]
+    }
+
+    // Returns peak channel luminance in physical nits.
+    pub fn peak_nits(&self) -> f32 {
+        self.r.max(self.g).max(self.b) * SCRGB_REFERENCE_WHITE_NITS
+    }
+}
+
+// Bitwise IEEE 754 half-precision float (16-bit) conversion utilities for ScRGB textures.
+pub struct HalfFloat16;
+
+impl HalfFloat16 {
+    // Converts 32-bit single precision float into IEEE 754 16-bit half precision bits.
+    pub fn from_f32(val: f32) -> u16 {
+        let x = val.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let exp = ((x >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = (x & 0x007F_FFFF) as u32;
+
+        if exp <= 0 {
+            0 | sign
+        } else if exp >= 31 {
+            0x7C00 | sign
+        } else {
+            sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
+        }
+    }
+
+    // Decodes IEEE 754 16-bit half precision bits into 32-bit float without hardware F16C.
+    pub fn to_f32(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exp = ((bits >> 10) & 0x1F) as u32;
+        let mant = (bits & 0x03FF) as u32;
+
+        if exp == 0 {
+            if mant == 0 {
+                f32::from_bits(sign)
+            } else {
+                f32::from_bits(sign | (mant << 13))
+            }
+        } else if exp == 31 {
+            f32::from_bits(sign | 0x7F80_0000 | (mant << 13))
+        } else {
+            let exp32 = (exp + 127 - 15) << 23;
+            f32::from_bits(sign | exp32 | (mant << 13))
+        }
+    }
+}
+
+// Blend modes for High Dynamic Range ScRGB rendering pipelines.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScRgbBlendMode {
+    // Additive blending for emissive light, specular flares, and laser particles.
+    Additive,
+    // Linear alpha blending preserving unclamped specular highlights.
+    StraightAlpha,
+    // Premultiplied alpha blending standard for compositing surfaces.
+    PremultipliedAlpha,
+}
+
+// ScRGB 16-bit float linear blending governor preventing banding and highlight clipping.
+pub struct ScRgbLinearBlender;
+
+impl ScRgbLinearBlender {
+    // Blends source and destination pixels in linear optical luminance space.
+    pub fn blend(src: ScRgbPixel, dst: ScRgbPixel, mode: ScRgbBlendMode) -> ScRgbPixel {
+        match mode {
+            ScRgbBlendMode::Additive => ScRgbPixel {
+                r: dst.r + src.r,
+                g: dst.g + src.g,
+                b: dst.b + src.b,
+                a: dst.a.max(src.a),
+            },
+            ScRgbBlendMode::StraightAlpha => {
+                let a = src.a.clamp(0.0, 1.0);
+                let inv_a = 1.0 - a;
+                ScRgbPixel {
+                    r: src.r * a + dst.r * inv_a,
+                    g: src.g * a + dst.g * inv_a,
+                    b: src.b * a + dst.b * inv_a,
+                    a: src.a + dst.a * inv_a,
+                }
+            }
+            ScRgbBlendMode::PremultipliedAlpha => {
+                let inv_a = (1.0 - src.a).max(0.0);
+                ScRgbPixel {
+                    r: src.r + dst.r * inv_a,
+                    g: src.g + dst.g * inv_a,
+                    b: src.b + dst.b * inv_a,
+                    a: src.a + dst.a * inv_a,
+                }
+            }
+        }
+    }
+}
