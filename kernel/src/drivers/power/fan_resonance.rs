@@ -403,3 +403,175 @@ pub fn verify_acoustic_resonance_avoidance_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Anti-Vibration Micro-Dithering for Tonal Whine Dispersion
+// ============================================================================
+
+/// Number of control loop samples per 50 Hz dither cycle at 1 kHz governor tick rate.
+pub const DITHER_PERIOD_TICKS: u32 = 20;
+
+/// Default micro-dither amplitude in milli-percent (+/- 50 = +/- 0.50% PWM).
+pub const DEFAULT_DITHER_AMPLITUDE_MILLIPERCENT: i16 = 50;
+
+/// Handheld Anti-Vibration Micro-Dithering Engine.
+///
+/// Running a centrifugal fan at a perfectly static PWM duty cycle produces sharp single-frequency
+/// acoustic peaks at the blade pass frequency (BPF). In thin handheld consoles, this manifests as an
+/// annoying high-pitch piercing whine. Micro-dithering subtly modulates the PWM duty cycle by +/- 0.5%
+/// at a 50 Hz rate. This continuous spread-spectrum acoustic dispersion broadens the frequency envelope,
+/// lowering peak sound pressure levels by 3-5 dBA and making the fan sound like gentle white noise.
+#[derive(Debug, Clone)]
+pub struct AntiVibrationMicroDitherer {
+    /// Enable switch for acoustic micro-dithering.
+    pub enabled: bool,
+    /// Peak dither amplitude in milli-percent (+/- 50 = +/- 0.50% PWM duty).
+    pub amplitude_millipercent: i16,
+    /// Step index within the 20-tick 50 Hz modulation cycle (0..19).
+    pub cycle_step: u32,
+    /// Most recently computed dither offset in milli-percent.
+    pub current_dither_offset: i16,
+    /// Commanded PWM duty cycle after dither modulation in milli-percent (0..10,000).
+    pub modulated_duty_millipercent: u16,
+    /// Total modulation cycles executed.
+    pub total_cycles_completed: u32,
+}
+
+impl AntiVibrationMicroDitherer {
+    pub const fn new(amplitude_millipercent: i16) -> Self {
+        Self {
+            enabled: true,
+            amplitude_millipercent,
+            cycle_step: 0,
+            current_dither_offset: 0,
+            modulated_duty_millipercent: 0,
+            total_cycles_completed: 0,
+        }
+    }
+
+    /// Computes triangular wave dither offset (-amplitude .. +amplitude) for current step.
+    pub fn compute_dither_offset(&mut self) -> i16 {
+        if !self.enabled || self.amplitude_millipercent == 0 {
+            self.current_dither_offset = 0;
+            return 0;
+        }
+
+        // 20-step triangular waveform across 50 Hz period:
+        // Steps 0..5: ramp up from 0 to +amplitude
+        // Steps 5..15: ramp down from +amplitude to -amplitude
+        // Steps 15..20: ramp up from -amplitude back to 0
+        let amp = self.amplitude_millipercent as i32;
+        let step = self.cycle_step;
+
+        let offset: i32 = if step < 5 {
+            (amp * (step as i32)) / 5
+        } else if step < 15 {
+            amp - ((2 * amp * ((step - 5) as i32)) / 10)
+        } else {
+            -amp + ((amp * ((step - 15) as i32)) / 5)
+        };
+
+        self.cycle_step = (self.cycle_step + 1) % DITHER_PERIOD_TICKS;
+        if self.cycle_step == 0 {
+            self.total_cycles_completed += 1;
+        }
+
+        self.current_dither_offset = offset as i16;
+        self.current_dither_offset
+    }
+
+    /// Applies micro-dithering modulation to a base PWM duty cycle (0..10,000 milli-percent = 0..100.00%).
+    /// Clamps output safely between 0 and 10,000.
+    pub fn apply_dither(&mut self, base_duty_millipercent: u16) -> u16 {
+        let offset = self.compute_dither_offset();
+        let modulated = (base_duty_millipercent as i32) + (offset as i32);
+
+        let clamped = if modulated < 0 {
+            0
+        } else if modulated > 10_000 {
+            10_000
+        } else {
+            modulated as u16
+        };
+
+        self.modulated_duty_millipercent = clamped;
+        clamped
+    }
+
+    /// Calculates acoustic energy spread variance across a window of modulated duty samples.
+    pub fn calculate_dispersion_variance(samples: &[u16]) -> u32 {
+        if samples.is_empty() {
+            return 0;
+        }
+        let mut sum: u64 = 0;
+        for &s in samples {
+            sum += s as u64;
+        }
+        let mean = sum / (samples.len() as u64);
+
+        let mut var_sum: u64 = 0;
+        for &s in samples {
+            let diff = if (s as u64) >= mean {
+                (s as u64) - mean
+            } else {
+                mean - (s as u64)
+            };
+            var_sum += diff * diff;
+        }
+
+        (var_sum / (samples.len() as u64)) as u32
+    }
+}
+
+/// Verification test for anti-vibration micro-dithering and tonal whine dispersion.
+pub fn verify_anti_vibration_micro_dithering() -> bool {
+    let mut ditherer = AntiVibrationMicroDitherer::new(DEFAULT_DITHER_AMPLITUDE_MILLIPERCENT); // +/- 50 (+/- 0.50%)
+
+    // 1. Initial state
+    if !ditherer.enabled || ditherer.amplitude_millipercent != 50 {
+        return false;
+    }
+
+    // 2. Modulate a steady 50.00% PWM duty cycle (5000 milli-percent) over a full 20-sample 50Hz cycle
+    let base_duty = 5000u16;
+    let mut samples = [0u16; 20];
+    let mut min_val = 10_000u16;
+    let mut max_val = 0u16;
+
+    for i in 0..20 {
+        let modulated = ditherer.apply_dither(base_duty);
+        samples[i] = modulated;
+        if modulated < min_val {
+            min_val = modulated;
+        }
+        if modulated > max_val {
+            max_val = modulated;
+        }
+    }
+
+    // Peak amplitude must reach 5050 (+0.50%) and trough must reach 4950 (-0.50%)
+    if max_val != 5050 || min_val != 4950 {
+        return false;
+    }
+    if ditherer.total_cycles_completed != 1 {
+        return false;
+    }
+
+    // 3. Verify dispersion variance is positive (spread-spectrum dispersion active)
+    let variance = AntiVibrationMicroDitherer::calculate_dispersion_variance(&samples);
+    if variance == 0 || variance < 500 {
+        return false;
+    }
+
+    // 4. Test disabling dithering: output should remain exactly at base duty (5000)
+    ditherer.enabled = false;
+    for _ in 0..10 {
+        let unmodulated = ditherer.apply_dither(base_duty);
+        if unmodulated != 5000 {
+            return false;
+        }
+    }
+
+    true
+}
