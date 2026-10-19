@@ -419,6 +419,117 @@ impl AgilityDepthBounds {
     }
 }
 
+// Stencil face selection flags for independent front and back face configuration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StencilFace {
+    Front = 0x1,
+    Back = 0x2,
+    FrontAndBack = 0x3,
+}
+
+// Stencil comparison operations for dynamic reference testing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StencilComparisonOp {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+}
+
+// Runtime dynamic stencil reference values and dual-face masking state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DynamicStencilRefState {
+    pub front_ref: u8,
+    pub back_ref: u8,
+    pub front_read_mask: u8,
+    pub back_read_mask: u8,
+    pub front_write_mask: u8,
+    pub back_write_mask: u8,
+}
+
+impl DynamicStencilRefState {
+    // Initializes default stencil state with 0 ref and all-ones masks (0xFF).
+    pub const fn new() -> Self {
+        Self {
+            front_ref: 0,
+            back_ref: 0,
+            front_read_mask: 0xFF,
+            back_read_mask: 0xFF,
+            front_write_mask: 0xFF,
+            back_write_mask: 0xFF,
+        }
+    }
+
+    // Sets dynamic stencil reference value uniformly across front and back faces.
+    pub fn om_set_stencil_ref(&mut self, ref_val: u8) {
+        self.front_ref = ref_val;
+        self.back_ref = ref_val;
+    }
+
+    // Sets independent dynamic stencil reference value for specific faces.
+    pub fn om_set_stencil_ref_for_face(&mut self, face: StencilFace, ref_val: u8) {
+        match face {
+            StencilFace::Front => self.front_ref = ref_val,
+            StencilFace::Back => self.back_ref = ref_val,
+            StencilFace::FrontAndBack => {
+                self.front_ref = ref_val;
+                self.back_ref = ref_val;
+            }
+        }
+    }
+
+    // Configures read and write masks independently for front or back faces.
+    pub fn om_set_stencil_masks(&mut self, face: StencilFace, read_mask: u8, write_mask: u8) {
+        if (face as u8 & StencilFace::Front as u8) != 0 {
+            self.front_read_mask = read_mask;
+            self.front_write_mask = write_mask;
+        }
+        if (face as u8 & StencilFace::Back as u8) != 0 {
+            self.back_read_mask = read_mask;
+            self.back_write_mask = write_mask;
+        }
+    }
+
+    // Evaluates the stencil test comparison against an existing buffer value.
+    pub fn test_stencil(&self, face: StencilFace, buffer_val: u8, op: StencilComparisonOp) -> bool {
+        let (ref_val, mask) = if face == StencilFace::Back {
+            (self.back_ref, self.back_read_mask)
+        } else {
+            (self.front_ref, self.front_read_mask)
+        };
+
+        let masked_ref = ref_val & mask;
+        let masked_buf = buffer_val & mask;
+
+        match op {
+            StencilComparisonOp::Never => false,
+            StencilComparisonOp::Less => masked_ref < masked_buf,
+            StencilComparisonOp::Equal => masked_ref == masked_buf,
+            StencilComparisonOp::LessEqual => masked_ref <= masked_buf,
+            StencilComparisonOp::Greater => masked_ref > masked_buf,
+            StencilComparisonOp::NotEqual => masked_ref != masked_buf,
+            StencilComparisonOp::GreaterEqual => masked_ref >= masked_buf,
+            StencilComparisonOp::Always => true,
+        }
+    }
+
+    // Computes masked output value to write to the stencil buffer.
+    pub fn compute_stencil_write(&self, face: StencilFace, old_val: u8, new_val: u8) -> u8 {
+        let mask = if face == StencilFace::Back {
+            self.back_write_mask
+        } else {
+            self.front_write_mask
+        };
+        (old_val & !mask) | (new_val & mask)
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref
 pub fn test_depth_bounds_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS] Initializing Direct3D 12 Depth Bounds Testing self-test...\r\n");
