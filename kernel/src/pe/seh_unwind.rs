@@ -183,3 +183,139 @@ impl SehTableParser {
         })
     }
 }
+
+/// Simulated stack frame context for unwinding and dispatching.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UNWIND_CONTEXT {
+    pub Rip: u64,
+    pub Rsp: u64,
+    pub Rbp: u64,
+    pub Rax: u64,
+    pub Rbx: u64,
+    pub Rcx: u64,
+    pub Rdx: u64,
+    pub Rsi: u64,
+    pub Rdi: u64,
+    pub R12: u64,
+    pub R13: u64,
+    pub R14: u64,
+    pub R15: u64,
+}
+
+/// Simulated function frame registration for dispatch testing.
+#[derive(Debug, Clone)]
+pub struct FunctionFrameEntry {
+    pub image_base: u64,
+    pub runtime_function: RUNTIME_FUNCTION,
+    pub unwind_info: DecodedUnwindInfo,
+    pub frame_handler: Option<fn(record: &mut EXCEPTION_RECORD, context: &mut UNWIND_CONTEXT) -> i32>,
+}
+
+/// Dispatch status result of RtlDispatchException.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchResult {
+    Handled,
+    ContinueSearch,
+    FatalUnwindCollision,
+}
+
+/// 2-Phase Exception Dispatcher & Virtual Frame Unwinder.
+pub struct SehFrameDispatcher {
+    frames: Spinlock<Vec<FunctionFrameEntry>>,
+}
+
+impl SehFrameDispatcher {
+    pub const fn new() -> Self {
+        Self {
+            frames: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Register a function frame in the dispatcher table.
+    pub fn register_frame(&self, frame: FunctionFrameEntry) {
+        self.frames.lock().push(frame);
+    }
+
+    /// Phase 1: Search handlers across calling stack frames without altering execution state.
+    pub fn phase1_search_handlers(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> Option<usize> {
+        let frames = self.frames.lock();
+        for (idx, entry) in frames.iter().enumerate() {
+            let func_start = entry.image_base + entry.runtime_function.BeginAddress as u64;
+            let func_end = entry.image_base + entry.runtime_function.EndAddress as u64;
+
+            if context.Rip >= func_start && context.Rip < func_end {
+                if let Some(handler) = entry.frame_handler {
+                    let disposition = handler(record, context);
+                    if disposition == EXCEPTION_EXECUTE_HANDLER {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Phase 2: Unwind stack frames up to the target frame index (RtlUnwindEx).
+    pub fn phase2_unwind_to_target(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+        target_idx: usize,
+    ) -> Result<u64, DispatchResult> {
+        let frames = self.frames.lock();
+        if target_idx >= frames.len() {
+            return Err(DispatchResult::ContinueSearch);
+        }
+
+        record.ExceptionFlags |= EXCEPTION_UNWINDING;
+
+        // Apply unwind opcodes to virtual RSP/RBP
+        let target_frame = &frames[target_idx];
+        for op in &target_frame.unwind_info.opcodes {
+            match op {
+                UnwindOpcode::AllocSmall { size } => {
+                    context.Rsp = context.Rsp.saturating_add(*size as u64);
+                }
+                UnwindOpcode::AllocLarge { size } => {
+                    context.Rsp = context.Rsp.saturating_add(*size as u64);
+                }
+                UnwindOpcode::PushNonVol { .. } => {
+                    context.Rsp = context.Rsp.saturating_add(8);
+                }
+                _ => {}
+            }
+        }
+
+        // Return new virtual RIP
+        let landing_rip = target_frame.image_base + target_frame.runtime_function.BeginAddress as u64;
+        context.Rip = landing_rip;
+        Ok(landing_rip)
+    }
+
+    /// Full 2-Phase Dispatcher (RtlDispatchException).
+    pub fn dispatch_exception(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> DispatchResult {
+        // Phase 1: Search
+        match self.phase1_search_handlers(record, context) {
+            Some(target_idx) => {
+                // Phase 2: Unwind
+                if self.phase2_unwind_to_target(record, context, target_idx).is_ok() {
+                    DispatchResult::Handled
+                } else {
+                    DispatchResult::FatalUnwindCollision
+                }
+            }
+            None => DispatchResult::ContinueSearch,
+        }
+    }
+}
+
+pub static SEH_FRAME_DISPATCHER: SehFrameDispatcher = SehFrameDispatcher::new();
