@@ -626,3 +626,215 @@ pub fn verify_vdm_framing_and_dp_altmode_handshake() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: USB-C Dock Diagnostics, Power Wattage & Cable Compliance Alerts
+// ============================================================================
+
+/// USB-C Power Delivery Wattage Status for handheld consoles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockPowerStatus {
+    /// Completely unpowered dock (0W input; drawing power from console battery).
+    UnpoweredDock,
+    /// Inadequate wattage (< 45W; console battery may drain during gaming).
+    InadequateWattage,
+    /// Sufficient wattage for full APU boost and simultaneous battery charging (>= 45W).
+    AdequateGamingPower,
+}
+
+/// USB-C Cable Physical Signaling Capability (read from Cable E-Marker VDM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableSpeedRating {
+    /// USB 2.0 only (480 Mbps; lacks SuperSpeed pairs, CANNOT support DisplayPort Alt Mode).
+    Usb2Only,
+    /// USB 3.2 Gen 1 (5 Gbps; 2 or 4 high-speed pairs).
+    Usb3Gen1,
+    /// USB 3.2 Gen 2 (10 Gbps; full high-speed video routing supported).
+    Usb3Gen2,
+    /// USB4 / Thunderbolt 4 (40 Gbps ultra-high bandwidth).
+    Usb4_40Gbps,
+}
+
+/// USB-C Cable Compliance Assessment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CableComplianceStatus {
+    /// Cable verified fully compliant for DisplayPort Alt Mode video and high power.
+    FullyCompliant,
+    /// Cable lacks high-speed differential pairs (USB 2.0 charging cable only).
+    NonCompliantMissingVideoPairs,
+    /// Cable limited to 3A (60W max) despite > 60W charger connected.
+    CurrentLimited3A,
+}
+
+/// Handheld USB-C Dock & Power Diagnostic Monitor.
+#[derive(Debug, Clone)]
+pub struct UsbDockDiagnosticMonitor {
+    /// Measured VBUS input voltage in millivolts.
+    pub vbus_voltage_mv: u32,
+    /// Measured VBUS input current in milliamperes.
+    pub vbus_current_ma: u32,
+    /// Calculated negotiated power delivery wattage in Watts.
+    pub negotiated_wattage_w: u16,
+    /// Active dock power status.
+    pub power_status: DockPowerStatus,
+    /// Cable signaling speed rating from E-Marker.
+    pub cable_speed: CableSpeedRating,
+    /// Cable maximum current capacity in Amperes (3A or 5A).
+    pub cable_max_current_a: u8,
+    /// Cable compliance classification.
+    pub cable_status: CableComplianceStatus,
+    /// Alert flag: dock has 0W external power and is draining console battery.
+    pub alert_unpowered_dock: bool,
+    /// Alert flag: charger provides < 45W; battery will discharge while playing games.
+    pub alert_inadequate_wattage: bool,
+    /// Alert flag: cable is non-compliant for DisplayPort Alternate Mode video.
+    pub alert_non_compliant_cable: bool,
+    /// Total diagnostic alert events logged.
+    pub diagnostic_log_count: u32,
+    /// Last human-readable diagnostic message.
+    pub last_diagnostic_message: &'static str,
+}
+
+impl UsbDockDiagnosticMonitor {
+    /// Handheld gaming minimum sustained power threshold in Watts (45W).
+    pub const MIN_GAMING_WATTAGE_W: u16 = 45;
+
+    pub const fn new() -> Self {
+        Self {
+            vbus_voltage_mv: 0,
+            vbus_current_ma: 0,
+            negotiated_wattage_w: 0,
+            power_status: DockPowerStatus::UnpoweredDock,
+            cable_speed: CableSpeedRating::Usb3Gen2,
+            cable_max_current_a: 5,
+            cable_status: CableComplianceStatus::FullyCompliant,
+            alert_unpowered_dock: false,
+            alert_inadequate_wattage: false,
+            alert_non_compliant_cable: false,
+            diagnostic_log_count: 0,
+            last_diagnostic_message: "Subsystem initialized",
+        }
+    }
+
+    /// Evaluates USB Power Delivery contract voltage and current telemetry.
+    pub fn evaluate_power_contract(&mut self, voltage_mv: u32, current_ma: u32) {
+        self.vbus_voltage_mv = voltage_mv;
+        self.vbus_current_ma = current_ma;
+
+        // Calculate wattage: (mV * mA) / 1,000,000 = W
+        let microwatts = (voltage_mv as u64) * (current_ma as u64);
+        let wattage_w = (microwatts / 1_000_000) as u16;
+        self.negotiated_wattage_w = wattage_w;
+
+        if wattage_w == 0 || voltage_mv < 4000 {
+            self.power_status = DockPowerStatus::UnpoweredDock;
+            self.alert_unpowered_dock = true;
+            self.alert_inadequate_wattage = true;
+            self.diagnostic_log_count += 1;
+            self.last_diagnostic_message = "[USB-PD-WARN] Connected dock is unpowered; drawing power from handheld battery";
+        } else if wattage_w < Self::MIN_GAMING_WATTAGE_W {
+            self.power_status = DockPowerStatus::InadequateWattage;
+            self.alert_unpowered_dock = false;
+            self.alert_inadequate_wattage = true;
+            self.diagnostic_log_count += 1;
+            self.last_diagnostic_message = "[USB-PD-WARN] Inadequate charger wattage (<45W); handheld battery may drain during gameplay";
+        } else {
+            self.power_status = DockPowerStatus::AdequateGamingPower;
+            self.alert_unpowered_dock = false;
+            self.alert_inadequate_wattage = false;
+            self.diagnostic_log_count += 1;
+            self.last_diagnostic_message = "[USB-PD-INFO] Adequate USB-PD power established for gaming APU boost";
+        }
+    }
+
+    /// Evaluates USB Type-C Cable E-Marker capabilities.
+    pub fn evaluate_cable_emarker(&mut self, speed: CableSpeedRating, max_current_a: u8) {
+        self.cable_speed = speed;
+        self.cable_max_current_a = max_current_a;
+
+        if speed == CableSpeedRating::Usb2Only {
+            // Cable only has D+/D- lines; missing high-speed pairs for DisplayPort Alt Mode
+            self.cable_status = CableComplianceStatus::NonCompliantMissingVideoPairs;
+            self.alert_non_compliant_cable = true;
+            self.diagnostic_log_count += 1;
+            self.last_diagnostic_message = "[USB-C-WARN] Cable lacks high-speed video pairs (USB 2.0 only); DisplayPort Alt Mode unavailable";
+        } else if max_current_a < 5 && self.negotiated_wattage_w > 60 {
+            self.cable_status = CableComplianceStatus::CurrentLimited3A;
+            self.alert_non_compliant_cable = false;
+            self.diagnostic_log_count += 1;
+            self.last_diagnostic_message = "[USB-C-INFO] Cable rated for 3A (60W max); throttling charger wattage to 60W";
+        } else {
+            self.cable_status = CableComplianceStatus::FullyCompliant;
+            self.alert_non_compliant_cable = false;
+        }
+    }
+
+    /// Returns `true` if the connected cable and dock can physically transport DisplayPort video.
+    pub fn is_video_capable(&self) -> bool {
+        self.cable_speed != CableSpeedRating::Usb2Only
+    }
+}
+
+/// Verification test for dock power diagnostics, wattage alerts, and cable compliance.
+pub fn verify_dock_diagnostics_and_power_wattage_alerts() -> bool {
+    let mut diag = UsbDockDiagnosticMonitor::new();
+
+    // 1. Initial state
+    if diag.power_status != DockPowerStatus::UnpoweredDock {
+        return false;
+    }
+
+    // 2. Unpowered dock scenario (0V / 0mA)
+    diag.evaluate_power_contract(0, 0);
+    if !diag.alert_unpowered_dock || diag.negotiated_wattage_w != 0 {
+        return false;
+    }
+    if diag.power_status != DockPowerStatus::UnpoweredDock {
+        return false;
+    }
+
+    // 3. Inadequate 30W phone/tablet charger (15V @ 2000mA = 30W < 45W threshold)
+    diag.evaluate_power_contract(15_000, 2_000);
+    if diag.negotiated_wattage_w != 30 {
+        return false;
+    }
+    if !diag.alert_inadequate_wattage || diag.alert_unpowered_dock {
+        return false;
+    }
+    if diag.power_status != DockPowerStatus::InadequateWattage {
+        return false;
+    }
+
+    // 4. Adequate 65W gaming charger (20V @ 3250mA = 65W >= 45W)
+    diag.evaluate_power_contract(20_000, 3_250);
+    if diag.negotiated_wattage_w != 65 {
+        return false;
+    }
+    if diag.alert_inadequate_wattage || diag.alert_unpowered_dock {
+        return false;
+    }
+    if diag.power_status != DockPowerStatus::AdequateGamingPower {
+        return false;
+    }
+
+    // 5. Test non-compliant USB 2.0 charging cable attached
+    diag.evaluate_cable_emarker(CableSpeedRating::Usb2Only, 3);
+    if !diag.alert_non_compliant_cable || diag.is_video_capable() {
+        return false;
+    }
+    if diag.cable_status != CableComplianceStatus::NonCompliantMissingVideoPairs {
+        return false;
+    }
+
+    // 6. Test compliant full-featured USB 3.2 Gen 2 cable
+    diag.evaluate_cable_emarker(CableSpeedRating::Usb3Gen2, 5);
+    if diag.alert_non_compliant_cable || !diag.is_video_capable() {
+        return false;
+    }
+    if diag.cable_status != CableComplianceStatus::FullyCompliant {
+        return false;
+    }
+
+    true
+}
