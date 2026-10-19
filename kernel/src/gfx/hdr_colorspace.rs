@@ -474,3 +474,122 @@ impl OledBurnInCompensator {
         px
     }
 }
+
+// Helper function to check approximate float equality within a tolerance epsilon.
+fn approx_eq(a: f32, b: f32, eps: f32) -> bool {
+    let diff = if a >= b { a - b } else { b - a };
+    diff <= eps
+}
+
+// Comprehensive self-test suite for Direct3D 12 Agility HDR10+ and ScRGB color management.
+pub fn test_hdr_colorspace_subsystem() -> bool {
+    crate::serial_write_str("[KNT-HDR] Initializing Direct3D 12 Agility HDR color space and tonemapping self-test...\r\n");
+
+    // 1. Verify Rec.709 to Rec.2020 color gamut matrix transformation roundtrip.
+    let green_709 = [0.0f32, 1.0f32, 0.0f32];
+    let green_2020 = transform_rec709_to_rec2020(green_709);
+    let roundtrip_709 = transform_rec2020_to_rec709(green_2020);
+    if !approx_eq(roundtrip_709[0], 0.0, 0.01)
+        || !approx_eq(roundtrip_709[1], 1.0, 0.01)
+        || !approx_eq(roundtrip_709[2], 0.0, 0.01)
+    {
+        return false;
+    }
+
+    let white = [1.0f32, 1.0f32, 1.0f32];
+    let white_2020 = transform_rec709_to_rec2020(white);
+    if !approx_eq(white_2020[0], 1.0, 0.02)
+        || !approx_eq(white_2020[1], 1.0, 0.02)
+        || !approx_eq(white_2020[2], 1.0, 0.02)
+    {
+        return false;
+    }
+
+    // 2. Verify HDR10+ dynamic metadata frame-by-frame tonemapping.
+    let tonemapper = Hdr10PlusTonemapper::new(800.0, 0.001);
+
+    // 2a. Sub-peak content passes through 1:1 linearly.
+    let meta_sdr = Hdr10PlusDynamicMetadata::new(800, 200, 600, [0; 9], 60);
+    let luma_pass = tonemapper.map_luminance(400.0, &meta_sdr);
+    if !approx_eq(luma_pass, 400.0, 0.01) {
+        return false;
+    }
+
+    // 2b. High dynamic range content compresses smoothly to target display peak.
+    let meta_hdr = Hdr10PlusDynamicMetadata::new(800, 600, 4000, [0; 9], 60);
+    let luma_compressed = tonemapper.map_luminance(2000.0, &meta_hdr);
+    if luma_compressed <= 480.0 || luma_compressed >= 800.0 {
+        return false;
+    }
+
+    // 2c. Multi-channel chromaticity ratio preservation.
+    let rgb_mapped = tonemapper.map_rgb([2000.0, 1000.0, 500.0], &meta_hdr);
+    if !approx_eq(rgb_mapped[0] / rgb_mapped[1], 2.0, 0.02) {
+        return false;
+    }
+
+    // 3. Verify ScRGB 16-bit half float linear blending precision.
+    let h1 = HalfFloat16::from_f32(1.0);
+    let h12_5 = HalfFloat16::from_f32(12.5);
+    if !approx_eq(HalfFloat16::to_f32(h1), 1.0, 0.01)
+        || !approx_eq(HalfFloat16::to_f32(h12_5), 12.5, 0.05)
+    {
+        return false;
+    }
+
+    // 3a. Straight alpha blending preserving specular highlight above 80 nits reference.
+    let src_specular = ScRgbPixel::from_nits(1600.0, 800.0, 400.0, 0.5);
+    let dst_sdr = ScRgbPixel::from_nits(80.0, 80.0, 80.0, 1.0);
+    let blended_alpha = ScRgbLinearBlender::blend(src_specular, dst_sdr, ScRgbBlendMode::StraightAlpha);
+    let blended_nits = blended_alpha.to_nits();
+    if !approx_eq(blended_nits[0], 840.0, 1.0) || !approx_eq(blended_nits[1], 440.0, 1.0) {
+        return false;
+    }
+
+    // 3b. Additive emissive blending.
+    let blended_add = ScRgbLinearBlender::blend(src_specular, dst_sdr, ScRgbBlendMode::Additive);
+    if !approx_eq(blended_add.to_nits()[0], 1680.0, 1.0) {
+        return false;
+    }
+
+    // 4. Verify handheld OLED subpixel filtering and burn-in prevention governor.
+    let aa = OledSubpixelAntialiaser::new(OledSubpixelLayout::DiamondPentile);
+    let input_span = [
+        ScRgbPixel::new(0.0, 0.0, 0.0, 1.0),
+        ScRgbPixel::new(1.0, 1.0, 1.0, 1.0),
+        ScRgbPixel::new(0.0, 0.0, 0.0, 1.0),
+    ];
+    let mut output_span = [ScRgbPixel::new(0.0, 0.0, 0.0, 0.0); 3];
+    aa.filter_horizontal_span(&input_span, &mut output_span);
+    if !approx_eq(output_span[1].g, 1.0, 0.01)
+        || !approx_eq(output_span[1].r, 0.5, 0.01)
+        || !approx_eq(output_span[1].b, 0.5, 0.01)
+    {
+        return false;
+    }
+
+    let mut burn_in = OledBurnInCompensator::default_handheld();
+    for _ in 0..2400 {
+        burn_in.advance_frame(true);
+    }
+    let factor = burn_in.current_attenuation_factor();
+    if factor >= 1.0 || factor < 0.70 {
+        return false;
+    }
+
+    let static_ui = ScRgbPixel::from_nits(1000.0, 1000.0, 1000.0, 1.0);
+    let comp_ui = burn_in.compensate_pixel(static_ui, true);
+    if comp_ui.peak_nits() > 450.5 {
+        return false;
+    }
+
+    let dynamic_scene = ScRgbPixel::from_nits(1000.0, 1000.0, 1000.0, 1.0);
+    let comp_scene = burn_in.compensate_pixel(dynamic_scene, false);
+    if !approx_eq(comp_scene.peak_nits(), 1000.0, 0.5) {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-HDR-COLORSPACE-PASS] Direct3D 12 Agility HDR10+ & ScRGB engine verified\r\n");
+    true
+}
