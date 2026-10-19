@@ -354,6 +354,71 @@ impl D3D12_DEPTH_BOUNDS_COMMAND_RECORDER {
     }
 }
 
+// Direct3D 12 Agility Dynamic Depth Bounds specification with runtime clamping.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct AgilityDepthBounds {
+    pub min_depth: f32,
+    pub max_depth: f32,
+    pub enabled: bool,
+}
+
+impl AgilityDepthBounds {
+    // Creates a new disabled full-range depth bounds state spanning [0.0, 1.0].
+    pub const fn disabled() -> Self {
+        Self {
+            min_depth: 0.0,
+            max_depth: 1.0,
+            enabled: false,
+        }
+    }
+
+    // Creates an active clamped depth bounds state conforming to D3D12 Agility specs.
+    pub fn active(min_depth: f32, max_depth: f32) -> Self {
+        let clamped_min = min_depth.clamp(0.0, 1.0);
+        let clamped_max = max_depth.clamp(clamped_min, 1.0);
+        Self {
+            min_depth: clamped_min,
+            max_depth: clamped_max,
+            enabled: true,
+        }
+    }
+
+    // Updates depth bounds with automatic clamping to valid hardware range [0.0, 1.0].
+    pub fn set_bounds(&mut self, min_depth: f32, max_depth: f32) {
+        let clamped_min = min_depth.clamp(0.0, 1.0);
+        let clamped_max = max_depth.clamp(clamped_min, 1.0);
+        self.min_depth = clamped_min;
+        self.max_depth = clamped_max;
+        self.enabled = true;
+    }
+
+    // Evaluates whether a rasterized depth sample falls within active bounds.
+    #[inline(always)]
+    pub fn test_depth(&self, z: f32) -> bool {
+        if !self.enabled {
+            true
+        } else {
+            z >= self.min_depth && z <= self.max_depth
+        }
+    }
+
+    // Returns normalized depth range span [0.0, 1.0].
+    #[inline]
+    pub fn range_span(&self) -> f32 {
+        if self.enabled {
+            self.max_depth - self.min_depth
+        } else {
+            1.0
+        }
+    }
+
+    // Determines if depth bounds cover the entire viewport range.
+    #[inline]
+    pub fn is_full_range(&self) -> bool {
+        !self.enabled || (self.min_depth <= 0.0 && self.max_depth >= 1.0)
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref
 pub fn test_depth_bounds_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS] Initializing Direct3D 12 Depth Bounds Testing self-test...\r\n");
