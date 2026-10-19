@@ -1247,6 +1247,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_working_set_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Working Set subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Process & Thread Job Objects & CPU Rate Limiting Engine (TASK-KNT-275)
+    if !pe::test_win32_job_objects_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Job Objects subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
