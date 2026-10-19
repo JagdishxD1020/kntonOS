@@ -194,3 +194,212 @@ pub fn verify_fan_tachometer_pulse_capture() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Acoustic Resonance Avoidance Governor & Hysteresis Band Jumping
+// ============================================================================
+
+/// Chassis mechanical resonance band definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResonanceBand {
+    /// Lower boundary of resonant frequency RPM.
+    pub min_rpm: u32,
+    /// Upper boundary of resonant frequency RPM.
+    pub max_rpm: u32,
+    /// Safe stable hold RPM below the resonant zone.
+    pub safe_lower_rpm: u32,
+    /// Safe stable hold RPM above the resonant zone.
+    pub safe_upper_rpm: u32,
+}
+
+impl ResonanceBand {
+    pub const fn contains(&self, rpm: u32) -> bool {
+        rpm >= self.min_rpm && rpm <= self.max_rpm
+    }
+
+    pub const fn midpoint(&self) -> u32 {
+        (self.min_rpm + self.max_rpm) / 2
+    }
+}
+
+/// Known acoustic resonance bands measured in handheld chassis acoustic chambers.
+pub const CHASSIS_RESONANCE_BANDS: [ResonanceBand; 2] = [
+    // Band 1: 2400-2600 RPM (chassis cavity low-frequency body resonance)
+    ResonanceBand {
+        min_rpm: 2400,
+        max_rpm: 2600,
+        safe_lower_rpm: 2350,
+        safe_upper_rpm: 2650,
+    },
+    // Band 2: 3800-4000 RPM (blade-pass tonal resonance with heatsink copper fins)
+    ResonanceBand {
+        min_rpm: 3800,
+        max_rpm: 4000,
+        safe_lower_rpm: 3750,
+        safe_upper_rpm: 4050,
+    },
+];
+
+/// Handheld Acoustic Resonance Avoidance Governor.
+///
+/// If a fan lingers inside a resonant band, chassis acoustics amplify blade vibration by 6-10 dBA,
+/// producing an unbearable high-pitch or booming hum. This governor prevents the fan from ever
+/// sustaining speed inside [2400, 2600] RPM or [3800, 4000] RPM. When a thermal curve asks for an
+/// RPM inside these forbidden zones, the governor applies directional hysteresis to immediately
+/// jump across the band, holding at safe margins without hunting.
+#[derive(Debug, Clone)]
+pub struct AcousticResonanceGovernor {
+    /// Active governed speed output in RPM.
+    pub current_governed_rpm: u32,
+    /// Previously requested speed from APU thermal governor.
+    pub last_requested_rpm: u32,
+    /// Direction indicator: true = accelerating, false = decelerating.
+    pub is_accelerating: bool,
+    /// Flag indicating whether the last command triggered an active resonance band jump.
+    pub active_band_jump: bool,
+    /// Cumulative count of resonance band jump transitions executed.
+    pub jump_events_count: u32,
+    /// Total evaluations performed by governor.
+    pub total_evaluations: u32,
+}
+
+impl AcousticResonanceGovernor {
+    pub const fn new() -> Self {
+        Self {
+            current_governed_rpm: 0,
+            last_requested_rpm: 0,
+            is_accelerating: true,
+            active_band_jump: false,
+            jump_events_count: 0,
+            total_evaluations: 0,
+        }
+    }
+
+    /// Evaluates requested thermal RPM and filters out acoustic resonance zones using hysteresis.
+    pub fn govern_fan_speed(&mut self, requested_rpm: u32) -> u32 {
+        self.total_evaluations += 1;
+        self.active_band_jump = false;
+
+        // Determine acceleration direction
+        if requested_rpm >= self.last_requested_rpm {
+            self.is_accelerating = true;
+        } else {
+            self.is_accelerating = false;
+        }
+        self.last_requested_rpm = requested_rpm;
+
+        let mut output_rpm = requested_rpm;
+
+        // Check against known chassis resonance bands
+        for band in &CHASSIS_RESONANCE_BANDS {
+            if band.contains(requested_rpm) {
+                let mid = band.midpoint();
+                if self.is_accelerating {
+                    // Accelerating upward into resonance band:
+                    // Hold at safe_lower_rpm until thermal request reaches midpoint, then jump to safe_upper_rpm
+                    if requested_rpm < mid {
+                        output_rpm = band.safe_lower_rpm;
+                    } else {
+                        output_rpm = band.safe_upper_rpm;
+                        self.active_band_jump = true;
+                        self.jump_events_count += 1;
+                    }
+                } else {
+                    // Decelerating downward into resonance band:
+                    // Hold at safe_upper_rpm until thermal request drops below midpoint, then jump to safe_lower_rpm
+                    if requested_rpm > mid {
+                        output_rpm = band.safe_upper_rpm;
+                    } else {
+                        output_rpm = band.safe_lower_rpm;
+                        self.active_band_jump = true;
+                        self.jump_events_count += 1;
+                    }
+                }
+                break;
+            }
+        }
+
+        self.current_governed_rpm = output_rpm;
+        output_rpm
+    }
+
+    /// Checks if a given RPM falls inside any forbidden chassis resonance bands.
+    pub const fn is_in_resonance_band(rpm: u32) -> bool {
+        let mut i = 0;
+        while i < CHASSIS_RESONANCE_BANDS.len() {
+            if CHASSIS_RESONANCE_BANDS[i].contains(rpm) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+/// Verification test for acoustic resonance avoidance governor and hysteresis band jumping.
+pub fn verify_acoustic_resonance_avoidance_governor() -> bool {
+    let mut gov = AcousticResonanceGovernor::new();
+
+    // 1. Initial state
+    if gov.current_governed_rpm != 0 || gov.jump_events_count != 0 {
+        return false;
+    }
+
+    // 2. Normal non-resonant speed (2000 RPM)
+    let r1 = gov.govern_fan_speed(2000);
+    if r1 != 2000 || gov.active_band_jump {
+        return false;
+    }
+
+    // 3. Accelerating into Band 1 (2400-2600 RPM): request 2450 RPM (< 2500 mid)
+    let r2 = gov.govern_fan_speed(2450);
+    // Must be clamped to safe_lower_rpm (2350 RPM)
+    if r2 != 2350 || AcousticResonanceGovernor::is_in_resonance_band(r2) {
+        return false;
+    }
+
+    // Request 2550 RPM (>= 2500 mid) -> governor must immediately jump to safe_upper_rpm (2650 RPM)
+    let r3 = gov.govern_fan_speed(2550);
+    if r3 != 2650 || !gov.active_band_jump || AcousticResonanceGovernor::is_in_resonance_band(r3) {
+        return false;
+    }
+    if gov.jump_events_count != 1 {
+        return false;
+    }
+
+    // 4. Continue accelerating to 3000 RPM
+    let r4 = gov.govern_fan_speed(3000);
+    if r4 != 3000 {
+        return false;
+    }
+
+    // 5. Decelerating from 3000 RPM down into Band 1: request 2550 RPM (> 2500 mid)
+    let r5 = gov.govern_fan_speed(2550);
+    // Must be held at safe_upper_rpm (2650 RPM)
+    if r5 != 2650 || AcousticResonanceGovernor::is_in_resonance_band(r5) {
+        return false;
+    }
+
+    // Request 2450 RPM (<= 2500 mid) -> governor must immediately jump down to safe_lower_rpm (2350 RPM)
+    let r6 = gov.govern_fan_speed(2450);
+    if r6 != 2350 || !gov.active_band_jump || AcousticResonanceGovernor::is_in_resonance_band(r6) {
+        return false;
+    }
+    if gov.jump_events_count != 2 {
+        return false;
+    }
+
+    // 6. Test Band 2 (3800-4000 RPM): accelerate from 3500 up to 3950 RPM
+    gov.govern_fan_speed(3500);
+    let r7 = gov.govern_fan_speed(3850); // < 3900 mid
+    if r7 != 3750 {
+        return false;
+    }
+    let r8 = gov.govern_fan_speed(3950); // >= 3900 mid
+    if r8 != 4050 || !gov.active_band_jump {
+        return false;
+    }
+
+    true
+}
