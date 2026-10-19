@@ -351,3 +351,126 @@ impl ScRgbLinearBlender {
         }
     }
 }
+
+// Subpixel physical geometry arrangements for handheld display panels.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OledSubpixelLayout {
+    // Standard linear RGB subpixel stripe.
+    RgbStripe,
+    // Diamond PenTile layout with alternating RG and BG subpixel pairs.
+    DiamondPentile,
+}
+
+// Handheld OLED subpixel anti-aliasing filter optimizing text and vector rendering.
+pub struct OledSubpixelAntialiaser {
+    pub layout: OledSubpixelLayout,
+}
+
+impl OledSubpixelAntialiaser {
+    // Initializes the subpixel anti-aliaser for target display geometry.
+    pub const fn new(layout: OledSubpixelLayout) -> Self {
+        Self { layout }
+    }
+
+    // Filters a horizontal span of pixels to eliminate PenTile color fringing.
+    pub fn filter_horizontal_span(&self, input: &[ScRgbPixel], output: &mut [ScRgbPixel]) {
+        let count = input.len().min(output.len());
+        if count == 0 {
+            return;
+        }
+
+        match self.layout {
+            OledSubpixelLayout::RgbStripe => {
+                output[..count].copy_from_slice(&input[..count]);
+            }
+            OledSubpixelLayout::DiamondPentile => {
+                for i in 0..count {
+                    let left = if i > 0 { input[i - 1] } else { input[i] };
+                    let curr = input[i];
+                    let right = if i + 1 < count { input[i + 1] } else { input[i] };
+
+                    // PenTile energy distribution: distribute red and blue across neighboring subpixels.
+                    output[i] = ScRgbPixel {
+                        r: 0.25 * left.r + 0.5 * curr.r + 0.25 * right.r,
+                        g: curr.g,
+                        b: 0.25 * left.b + 0.5 * curr.b + 0.25 * right.b,
+                        a: curr.a,
+                    };
+                }
+            }
+        }
+    }
+}
+
+// OLED burn-in prevention governor and static HUD luminance drift compensator.
+pub struct OledBurnInCompensator {
+    static_frame_count: u32,
+    activation_threshold_frames: u32,
+    max_attenuation_percent: u32,
+    static_ui_peak_clamp_nits: f32,
+}
+
+impl OledBurnInCompensator {
+    // Initializes the burn-in compensator with threshold and clamp settings.
+    pub const fn new(
+        activation_threshold_frames: u32,
+        max_attenuation_percent: u32,
+        static_ui_peak_clamp_nits: f32,
+    ) -> Self {
+        Self {
+            static_frame_count: 0,
+            activation_threshold_frames,
+            max_attenuation_percent,
+            static_ui_peak_clamp_nits,
+        }
+    }
+
+    // Default configuration for handheld gaming OLED displays (30s threshold, 25% max attenuation).
+    pub const fn default_handheld() -> Self {
+        Self::new(1800, 25, 450.0)
+    }
+
+    // Advances governor timeline tracking static UI presence across consecutive frames.
+    pub fn advance_frame(&mut self, static_ui_present: bool) {
+        if static_ui_present {
+            self.static_frame_count = self.static_frame_count.saturating_add(1);
+        } else {
+            self.static_frame_count = self.static_frame_count.saturating_sub(4);
+        }
+    }
+
+    // Computes current luminance drift attenuation multiplier [0.0, 1.0].
+    pub fn current_attenuation_factor(&self) -> f32 {
+        if self.static_frame_count < self.activation_threshold_frames {
+            1.0
+        } else {
+            let elapsed_active = self.static_frame_count - self.activation_threshold_frames;
+            // Ramp smoothly down over 600 frames (10 seconds).
+            let ramp = (elapsed_active as f32 / 600.0).min(1.0);
+            let max_reduction = (self.max_attenuation_percent as f32) / 100.0;
+            1.0 - (ramp * max_reduction)
+        }
+    }
+
+    // Applies luminance drift compensation and peak nits clamping to a pixel.
+    pub fn compensate_pixel(&self, mut px: ScRgbPixel, is_static_ui: bool) -> ScRgbPixel {
+        if !is_static_ui {
+            return px;
+        }
+
+        let factor = self.current_attenuation_factor();
+        px.r *= factor;
+        px.g *= factor;
+        px.b *= factor;
+
+        // Clamp static UI peak luminance to protect emissive subpixels.
+        let max_nits = px.peak_nits();
+        if max_nits > self.static_ui_peak_clamp_nits && max_nits > 0.0 {
+            let scale = self.static_ui_peak_clamp_nits / max_nits;
+            px.r *= scale;
+            px.g *= scale;
+            px.b *= scale;
+        }
+        px
+    }
+}
