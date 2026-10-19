@@ -404,6 +404,44 @@ impl JobObjectManager {
         Ok(())
     }
 
+    /// Anti-cheat process breakaway evaluation when spawning a child process.
+    /// Checks if a parent process in a job is permitted to spawn an unconfined child (CREATE_BREAKAWAY_FROM_JOB).
+    /// If JOB_OBJECT_LIMIT_BREAKAWAY_OK is absent, spawning outside the job is strictly denied.
+    pub fn evaluate_child_spawn_breakaway(
+        &self,
+        parent_pid: u32,
+        child_pid: u32,
+        request_breakaway: bool,
+    ) -> Result<Option<u32>, NtStatus> {
+        let parent_job_id = match self.get_process_job(parent_pid) {
+            Some(id) => id,
+            None => return Ok(None), // Parent not in a job, child not in a job
+        };
+
+        let mut jmap = self.jobs.lock();
+        let job = jmap.get_mut(&parent_job_id).ok_or(STATUS_INVALID_HANDLE)?;
+        let flags = job.extended_limits.BasicLimitInformation.LimitFlags;
+
+        if request_breakaway {
+            // Anti-cheat verification: breakaway is ONLY permitted if job has explicit flag
+            if (flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)) != 0 {
+                // Breakaway allowed: child runs outside parent's job
+                Ok(None)
+            } else {
+                // Rogue breakaway attempt by game cheat or unconstrained worker!
+                Err(STATUS_ACCESS_DENIED)
+            }
+        } else {
+            // Child must inherit parent's job object
+            let mut pmap = self.process_job_map.lock();
+            job.assigned_pids.push(child_pid);
+            job.accounting.TotalProcesses += 1;
+            job.accounting.ActiveProcesses += 1;
+            pmap.insert(child_pid, parent_job_id);
+            Ok(Some(parent_job_id))
+        }
+    }
+
     /// Query if a process belongs to a job object.
     pub fn get_process_job(&self, pid: u32) -> Option<u32> {
         self.process_job_map.lock().get(&pid).copied()
