@@ -109,3 +109,114 @@ pub fn transform_rec709_to_rec2020(rgb: [f32; 3]) -> [f32; 3] {
 pub fn transform_rec2020_to_rec709(rgb: [f32; 3]) -> [f32; 3] {
     REC2020_TO_REC709.mul_vec(rgb)
 }
+
+// Static HDR mastering display metadata conforming to CTA-861-G and SMPTE ST 2086.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Hdr10StaticMetadata {
+    pub max_cll_nits: u32,
+    pub max_fall_nits: u32,
+    pub min_luminance_nits: f32,
+    pub max_luminance_nits: u32,
+}
+
+impl Hdr10StaticMetadata {
+    // Default static HDR10 metadata profile for 1,000 nit master.
+    pub const fn default_1000_nit() -> Self {
+        Self {
+            max_cll_nits: 1000,
+            max_fall_nits: 400,
+            min_luminance_nits: 0.001,
+            max_luminance_nits: 1000,
+        }
+    }
+}
+
+// HDR10+ dynamic frame-by-frame metadata conforming to SMPTE ST 2094-40.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Hdr10PlusDynamicMetadata {
+    pub targeted_system_display_maximum_luminance: u32,
+    pub average_maxrgb_nits: u32,
+    pub max_cll_nits: u32,
+    pub distribution_percentiles: [u32; 9],
+    pub knee_point_percent: u32,
+}
+
+impl Hdr10PlusDynamicMetadata {
+    // Constructs dynamic metadata for a specific frame luminance distribution.
+    pub const fn new(
+        target_display_nits: u32,
+        avg_maxrgb: u32,
+        max_cll: u32,
+        percentiles: [u32; 9],
+        knee_percent: u32,
+    ) -> Self {
+        Self {
+            targeted_system_display_maximum_luminance: target_display_nits,
+            average_maxrgb_nits: avg_maxrgb,
+            max_cll_nits: max_cll,
+            distribution_percentiles: percentiles,
+            knee_point_percent: knee_percent,
+        }
+    }
+}
+
+// Frame-by-frame luminance distribution tonemapping engine for HDR10+.
+pub struct Hdr10PlusTonemapper {
+    display_peak_nits: f32,
+    display_min_nits: f32,
+}
+
+impl Hdr10PlusTonemapper {
+    // Initializes the tonemapper configured for target display physical capabilities.
+    pub const fn new(display_peak_nits: f32, display_min_nits: f32) -> Self {
+        Self {
+            display_peak_nits,
+            display_min_nits,
+        }
+    }
+
+    // Default tonemapper configured for high-efficiency handheld OLED panels (e.g. 800 nits peak).
+    pub const fn default_handheld_oled() -> Self {
+        Self::new(800.0, 0.0005)
+    }
+
+    // Tonemaps a single luminance sample in nits using dynamic metadata knee and roll-off.
+    pub fn map_luminance(&self, input_nits: f32, meta: &Hdr10PlusDynamicMetadata) -> f32 {
+        if input_nits <= self.display_min_nits {
+            return self.display_min_nits;
+        }
+
+        let content_peak = meta.max_cll_nits as f32;
+        // If content peak is within target display range, pass through 1:1 linearly.
+        if content_peak <= self.display_peak_nits || input_nits <= 0.0 {
+            return input_nits.min(self.display_peak_nits);
+        }
+
+        let knee_nits = (self.display_peak_nits * (meta.knee_point_percent as f32)) / 100.0;
+        if input_nits <= knee_nits {
+            input_nits
+        } else {
+            // Smooth Reinhard-style roll-off curve above knee point.
+            let excess = input_nits - knee_nits;
+            let headroom = self.display_peak_nits - knee_nits;
+            let content_excess = (content_peak - knee_nits).max(1.0);
+            let compressed = (excess * headroom) / (excess + content_excess * 0.5);
+            knee_nits + compressed
+        }
+    }
+
+    // Applies dynamic tonemapping across an RGB color triplet in nits preserving chromaticity.
+    pub fn map_rgb(&self, rgb_nits: [f32; 3], meta: &Hdr10PlusDynamicMetadata) -> [f32; 3] {
+        let max_rgb = rgb_nits[0].max(rgb_nits[1]).max(rgb_nits[2]);
+        if max_rgb <= 0.0 {
+            return [0.0, 0.0, 0.0];
+        }
+        let mapped_max = self.map_luminance(max_rgb, meta);
+        let scale = mapped_max / max_rgb;
+        [
+            rgb_nits[0] * scale,
+            rgb_nits[1] * scale,
+            rgb_nits[2] * scale,
+        ]
+    }
+}
