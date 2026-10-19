@@ -1026,3 +1026,37 @@ pub fn verify_fast_fallback_to_usb_data_modes() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld USB-C Billboard Device &
+/// DisplayPort Alternate Mode Firmware Handshake Driver (TASK-KNT-276).
+pub fn test_usb_billboard_subsystem() -> bool {
+    crate::serial_write_str("[BUS-USB-BILLBOARD] Initiating USB-C Billboard & DP Alt Mode Handshake Verification...\r\n");
+
+    if !verify_billboard_descriptor_parsing_and_status() {
+        crate::serial_write_str("[BUS-USB-BILLBOARD-ERR] Billboard descriptor parsing test failed!\r\n");
+        return false;
+    }
+
+    if !verify_vdm_framing_and_dp_altmode_handshake() {
+        crate::serial_write_str("[BUS-USB-BILLBOARD-ERR] VDM framing and DP Alt Mode handshake test failed!\r\n");
+        return false;
+    }
+
+    if !verify_dock_diagnostics_and_power_wattage_alerts() {
+        crate::serial_write_str("[BUS-USB-BILLBOARD-ERR] Dock diagnostics and wattage alerts test failed!\r\n");
+        return false;
+    }
+
+    if !verify_fast_fallback_to_usb_data_modes() {
+        crate::serial_write_str("[BUS-USB-BILLBOARD-ERR] Fast fallback to USB data modes test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-BUS-USB-BILLBOARD-PASS] USB-C billboard device and DP Alt Mode driver verified!\r\n");
+    true
+}
