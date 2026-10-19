@@ -319,3 +319,137 @@ impl SehFrameDispatcher {
 }
 
 pub static SEH_FRAME_DISPATCHER: SehFrameDispatcher = SehFrameDispatcher::new();
+
+/// Vectored Exception/Continue Handler callback type.
+pub type PVECTORED_EXCEPTION_HANDLER =
+    fn(exception_info: &mut EXCEPTION_POINTERS_UNWIND) -> i32;
+
+/// Exception pointers passed to VEH/VCH.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EXCEPTION_POINTERS_UNWIND {
+    pub ExceptionRecord: *mut EXCEPTION_RECORD,
+    pub ContextRecord: *mut UNWIND_CONTEXT,
+}
+
+/// Node representing a registered VEH or VCH handler.
+#[derive(Clone)]
+pub struct VectoredHandlerEntry {
+    pub id: u32,
+    pub is_first: bool,
+    pub handler: PVECTORED_EXCEPTION_HANDLER,
+}
+
+/// Vectored Exception Handling (VEH) & Vectored Continue Handling (VCH) priority table.
+pub struct VectoredHandlerList {
+    veh_handlers: Spinlock<Vec<VectoredHandlerEntry>>,
+    vch_handlers: Spinlock<Vec<VectoredHandlerEntry>>,
+    next_id: AtomicU32,
+}
+
+impl VectoredHandlerList {
+    pub const fn new() -> Self {
+        Self {
+            veh_handlers: Spinlock::new(Vec::new()),
+            vch_handlers: Spinlock::new(Vec::new()),
+            next_id: AtomicU32::new(1),
+        }
+    }
+
+    /// Add a Vectored Exception Handler (AddVectoredExceptionHandler).
+    pub fn add_veh(&self, first: bool, handler: PVECTORED_EXCEPTION_HANDLER) -> HANDLE {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let entry = VectoredHandlerEntry {
+            id,
+            is_first: first,
+            handler,
+        };
+        let mut list = self.veh_handlers.lock();
+        if first {
+            list.insert(0, entry);
+        } else {
+            list.push(entry);
+        }
+        id as HANDLE
+    }
+
+    /// Add a Vectored Continue Handler (AddVectoredContinueHandler).
+    pub fn add_vch(&self, first: bool, handler: PVECTORED_EXCEPTION_HANDLER) -> HANDLE {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let entry = VectoredHandlerEntry {
+            id,
+            is_first: first,
+            handler,
+        };
+        let mut list = self.vch_handlers.lock();
+        if first {
+            list.insert(0, entry);
+        } else {
+            list.push(entry);
+        }
+        id as HANDLE
+    }
+
+    /// Execute VEH priority list before any frame SEH handler is called.
+    /// Returns true if an exception was handled (EXCEPTION_CONTINUE_EXECUTION), false otherwise.
+    pub fn execute_veh_list(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> bool {
+        let handlers = self.veh_handlers.lock().clone();
+        let mut ptrs = EXCEPTION_POINTERS_UNWIND {
+            ExceptionRecord: record as *mut _,
+            ContextRecord: context as *mut _,
+        };
+
+        for entry in handlers {
+            let res = (entry.handler)(&mut ptrs);
+            if res == EXCEPTION_CONTINUE_EXECUTION {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Execute VCH priority list when continuing execution.
+    pub fn execute_vch_list(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> bool {
+        let handlers = self.vch_handlers.lock().clone();
+        let mut ptrs = EXCEPTION_POINTERS_UNWIND {
+            ExceptionRecord: record as *mut _,
+            ContextRecord: context as *mut _,
+        };
+
+        for entry in handlers {
+            let res = (entry.handler)(&mut ptrs);
+            if res == EXCEPTION_CONTINUE_EXECUTION {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a registered vectored handler.
+    pub fn remove_vectored_handler(&self, handle: HANDLE) -> bool {
+        let id = handle as u32;
+        let mut veh = self.veh_handlers.lock();
+        if let Some(pos) = veh.iter().position(|e| e.id == id) {
+            veh.remove(pos);
+            return true;
+        }
+
+        let mut vch = self.vch_handlers.lock();
+        if let Some(pos) = vch.iter().position(|e| e.id == id) {
+            vch.remove(pos);
+            return true;
+        }
+
+        false
+    }
+}
+
+pub static VECTORED_HANDLER_LIST: VectoredHandlerList = VectoredHandlerList::new();
