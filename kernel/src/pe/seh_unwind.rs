@@ -13,42 +13,21 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::memory::spinlock::Spinlock;
+pub use crate::pe::guard_stack::STATUS_GUARD_PAGE_VIOLATION;
 pub use crate::pe::object_namespace::{ProcessTrustLevel, STATUS_ACCESS_DENIED};
 pub use crate::pe::seh_veh::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_CONTINUE_EXECUTION,
     EXCEPTION_CONTINUE_SEARCH, EXCEPTION_DATATYPE_MISALIGNMENT, EXCEPTION_EXECUTE_HANDLER,
     EXCEPTION_ILLEGAL_INSTRUCTION, EXCEPTION_MAXIMUM_PARAMETERS, EXCEPTION_NONCONTINUABLE,
     EXCEPTION_RECORD, EXCEPTION_SINGLE_STEP, EXCEPTION_STACK_OVERFLOW, EXCEPTION_UNWINDING,
+    RUNTIME_FUNCTION, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER,
+    UNW_FLAG_UHANDLER, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_PUSH_MACHFRAME,
+    UWOP_PUSH_NONVOL, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR, UWOP_SAVE_XMM128,
+    UWOP_SET_FPREG,
 };
 pub use crate::pe::synch::HANDLE;
 
-pub const STATUS_GUARD_PAGE_VIOLATION: u32 = 0x8000_0001;
-
-// x86-64 UNWIND_INFO flags
-pub const UNW_FLAG_NHANDLER: u8 = 0x0;
-pub const UNW_FLAG_EHANDLER: u8 = 0x1;
-pub const UNW_FLAG_UHANDLER: u8 = 0x2;
-pub const UNW_FLAG_CHAININFO: u8 = 0x4;
-
-// x86-64 Unwind Opcodes
-pub const UWOP_PUSH_NONVOL: u8 = 0;     // 1 node: push reg
-pub const UWOP_ALLOC_LARGE: u8 = 1;     // 2 or 3 nodes: alloc large stack
-pub const UWOP_ALLOC_SMALL: u8 = 2;     // 1 node: alloc small stack
-pub const UWOP_SET_FPREG: u8 = 3;       // 1 node: set frame pointer
-pub const UWOP_SAVE_NONVOL: u8 = 4;     // 2 nodes: save nonvolatile reg
-pub const UWOP_SAVE_NONVOL_FAR: u8 = 5; // 3 nodes: save nonvolatile reg far
-pub const UWOP_SAVE_XMM128: u8 = 8;     // 2 nodes: save 128-bit XMM reg
-pub const UWOP_SAVE_XMM128_FAR: u8 = 9; // 3 nodes: save 128-bit XMM reg far
-pub const UWOP_PUSH_MACHFRAME: u8 = 10; // 1 node: push machine frame
-
-/// Win32 x86-64 RUNTIME_FUNCTION representing an entry in the .pdata section.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RUNTIME_FUNCTION {
-    pub BeginAddress: u32,
-    pub EndAddress: u32,
-    pub UnwindData: u32,
-}
+pub const UWOP_SAVE_XMM128_FAR: u8 = 9;
 
 /// Decoded unwind code operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,3 +541,136 @@ impl AntiDebugTrapVirtualizer {
 }
 
 pub static ANTI_DEBUG_TRAP_VIRTUALIZER: AntiDebugTrapVirtualizer = AntiDebugTrapVirtualizer::new();
+
+/// Comprehensive self-test for Win32 SEH Vector Unwinding & Anti-Debugging Trap Virtualization Subsystem.
+pub fn test_win32_seh_unwind_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-SEH-UNWIND] Initializing Win32 SEH Unwind Subsystem self-test...\r\n");
+
+    // 1. Test .xdata UNWIND_INFO parsing (UWOP_PUSH_NONVOL, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_SAVE_XMM128)
+    let sample_xdata: [u8; 12] = [
+        0x09,       // Version = 1, Flags = UNW_FLAG_EHANDLER (0x1 << 3 = 0x8 | 1 = 0x9)
+        0x10,       // SizeOfProlog = 16
+        0x04,       // CountOfCodes = 4
+        0x00,       // FrameRegister = 0, FrameOffset = 0
+        0x0E, 0x02, // Opcode: UWOP_ALLOC_SMALL (op_info = 0 -> 8 bytes)
+        0x0A, 0x00, // Opcode: UWOP_PUSH_NONVOL (reg = 0: RAX)
+        0x05, 0x01, // Opcode: UWOP_ALLOC_LARGE (op_info = 0)
+        0x20, 0x00, // AllocLarge size = 0x20 * 8 = 256 bytes
+    ];
+
+    let decoded = match SehTableParser::parse_xdata(&sample_xdata) {
+        Some(d) => d,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] parse_xdata failed\r\n");
+            return false;
+        }
+    };
+
+    if decoded.version != 1 || (decoded.flags & UNW_FLAG_EHANDLER) == 0 || decoded.count_of_codes != 4 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decoded unwind info header mismatch\r\n");
+        return false;
+    }
+
+    if decoded.opcodes.len() != 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decoded opcodes count mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test 2-Phase Exception Dispatcher (Phase 1 search + Phase 2 stack frame unwinding)
+    fn mock_frame_handler(record: &mut EXCEPTION_RECORD, _ctx: &mut UNWIND_CONTEXT) -> i32 {
+        if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
+            EXCEPTION_EXECUTE_HANDLER
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
+        }
+    }
+
+    let frame = FunctionFrameEntry {
+        image_base: 0x0040_0000,
+        runtime_function: RUNTIME_FUNCTION {
+            BeginAddress: 0x1000,
+            EndAddress: 0x2000,
+            UnwindData: 0x3000,
+        },
+        unwind_info: decoded,
+        frame_handler: Some(mock_frame_handler),
+    };
+
+    SEH_FRAME_DISPATCHER.register_frame(frame);
+
+    let mut record = EXCEPTION_RECORD::default();
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+
+    let mut context = UNWIND_CONTEXT::default();
+    context.Rip = 0x0040_1050; // Inside registered function frame
+    context.Rsp = 0x0000_7FFF_1000;
+
+    let dispatch_res = SEH_FRAME_DISPATCHER.dispatch_exception(&mut record, &mut context);
+    if dispatch_res != DispatchResult::Handled {
+        crate::serial_write_str("[KNT-TEST-ERR] 2-Phase dispatch did not handle exception\r\n");
+        return false;
+    }
+
+    // After phase 2 unwinding, RSP should have been advanced by (8 + 8 + 256 = 272)
+    if context.Rsp != 0x0000_7FFF_1000 + 272 {
+        crate::serial_write_str("[KNT-TEST-ERR] Stack unwinding RSP adjustment mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Vectored Exception Handling (VEH) & Vectored Continue Handling (VCH)
+    static VEH_CALLED: AtomicBool = AtomicBool::new(false);
+    fn mock_veh(info: &mut EXCEPTION_POINTERS_UNWIND) -> i32 {
+        VEH_CALLED.store(true, Ordering::Release);
+        unsafe {
+            if (*info.ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    let h_veh = VECTORED_HANDLER_LIST.add_veh(true, mock_veh);
+    let mut ill_record = EXCEPTION_RECORD::default();
+    ill_record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+
+    let veh_handled = VECTORED_HANDLER_LIST.execute_veh_list(&mut ill_record, &mut context);
+    if !veh_handled || !VEH_CALLED.load(Ordering::Acquire) {
+        crate::serial_write_str("[KNT-TEST-ERR] VEH priority handler failed to intercept\r\n");
+        return false;
+    }
+
+    VECTORED_HANDLER_LIST.remove_vectored_handler(h_veh);
+
+    // 4. Test Anti-Debugging Trap Virtualization
+    let probe_rip = 0x0040_5555;
+    ANTI_DEBUG_TRAP_VIRTUALIZER.register_probe_site(probe_rip);
+
+    let mut bp_record = EXCEPTION_RECORD::default();
+    bp_record.ExceptionCode = EXCEPTION_BREAKPOINT;
+
+    let mut bp_ctx = UNWIND_CONTEXT::default();
+    bp_ctx.Rip = probe_rip;
+
+    let trap_action = ANTI_DEBUG_TRAP_VIRTUALIZER.virtualize_trap(&mut bp_record, &mut bp_ctx);
+    match trap_action {
+        TrapVirtualizationAction::SuppressAndContinue { next_rip } => {
+            if next_rip != probe_rip + 1 || bp_ctx.Rip != probe_rip + 1 {
+                crate::serial_write_str("[KNT-TEST-ERR] Breakpoint trap redirection RIP mismatch\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Anti-debug trap was not suppressed and continued\r\n");
+            return false;
+        }
+    }
+
+    let stats = ANTI_DEBUG_TRAP_VIRTUALIZER.get_stats();
+    if stats.breakpoint_traps_virtualized != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Trap virtualization counter mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-SEH-UNWIND-PASS] Win32 SEH Vector Unwind & Anti-Debug Virtualization verified\r\n");
+    true
+}
