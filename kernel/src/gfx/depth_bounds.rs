@@ -790,8 +790,73 @@ pub fn test_depth_bounds_subsystem() -> bool {
     }
     crate::serial_write_str("  * Output Merger token stream encoder and packet lifecycle verified\r\n");
 
-    // 5. Emit deterministic boot sentinel
+    // 5. Verify Agility dynamic depth bounds clamping and testing
+    let clamped_bounds = AgilityDepthBounds::active(-0.5, 1.5);
+    if clamped_bounds.min_depth != 0.0 || clamped_bounds.max_depth != 1.0 || !clamped_bounds.is_full_range() {
+        return false;
+    }
+
+    let mut agility_bounds = AgilityDepthBounds::disabled();
+    agility_bounds.set_bounds(0.3, 0.7);
+    if agility_bounds.test_depth(0.25) || !agility_bounds.test_depth(0.5) || agility_bounds.test_depth(0.75) {
+        return false;
+    }
+    let diff = agility_bounds.range_span() - 0.4;
+    if diff > 0.001 || diff < -0.001 {
+        return false;
+    }
+
+    // 6. Verify DynamicStencilRefState independent front/back refs and masks
+    let mut stencil_state = DynamicStencilRefState::new();
+    stencil_state.om_set_stencil_ref_for_face(StencilFace::Front, 0x55);
+    stencil_state.om_set_stencil_ref_for_face(StencilFace::Back, 0xAA);
+    stencil_state.om_set_stencil_masks(StencilFace::Front, 0x0F, 0x0F);
+
+    if !stencil_state.test_stencil(StencilFace::Front, 0x05, StencilComparisonOp::Equal) {
+        return false;
+    }
+    if stencil_state.test_stencil(StencilFace::Back, 0x0A, StencilComparisonOp::Equal) {
+        return false;
+    }
+    if stencil_state.compute_stencil_write(StencilFace::Front, 0xF0, 0x0A) != 0xFA {
+        return false;
+    }
+
+    // 7. Verify EarlyZCullingAccelerator frustum and depth bounds rejection
+    let mut early_z = EarlyZCullingAccelerator::new(agility_bounds);
+    early_z.calibrate_frustum(0.1, 0.9);
+    if early_z.evaluate_draw_pass(0.1, 0.2, 500) {
+        return false;
+    }
+    if !early_z.evaluate_draw_pass(0.4, 0.6, 1200) {
+        return false;
+    }
+    if early_z.evaluate_draw_pass(0.8, 0.9, 800) {
+        return false;
+    }
+    if early_z.culling_rate_percent() != 66 || early_z.triangles_culled != 1300 {
+        return false;
+    }
+
+    // 8. Verify HandheldShadowPassOptimizer clustered depth slicing and fillrate savings
+    let mut shadow_opt = HandheldShadowPassOptimizer::default_handheld();
+    let slice4 = shadow_opt.compute_slice_bounds(4);
+    if slice4.min_depth >= slice4.max_depth || !slice4.enabled {
+        return false;
+    }
+
+    let receiver = shadow_opt.optimize_shadow_receiver_bounds(0.35, 0.65, LightType::Spot);
+    if receiver.min_depth > 0.35 || receiver.max_depth < 0.65 {
+        return false;
+    }
+
+    shadow_opt.record_pass_metrics(100_000, 20_000);
+    if shadow_opt.fillrate_savings_percent() != 20 {
+        return false;
+    }
+
+    // 9. Emit deterministic boot sentinels
     crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS-PASS] Direct3D 12 depth bounds testing and dynamic stencil ref engine verified\r\n");
+    crate::serial_write_str("[KNT-D3D12-DEPTH-BOUNDS-PASS] Direct3D 12 Agility dynamic depth bounds & stencil optimizer verified\r\n");
     true
 }
-
