@@ -369,3 +369,121 @@ impl AntiCheatFlsScanner {
 }
 
 pub static ANTI_CHEAT_FLS_SCANNER: AntiCheatFlsScanner = AntiCheatFlsScanner::new();
+
+/// Comprehensive self-test for Win32 Fiber Local Storage Subsystem.
+pub fn test_win32_fls_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-FLS] Initializing Win32 FLS Subsystem self-test...\r\n");
+
+    static CALLBACK_CALLED_VAL: AtomicUsize = AtomicUsize::new(0);
+
+    fn mock_fls_callback(data: usize) {
+        CALLBACK_CALLED_VAL.store(data, Ordering::SeqCst);
+    }
+
+    // 1. Test FLS Slot Allocation with dynamic callback
+    let slot = win32_fls_alloc(Some(mock_fls_callback));
+    if slot == FLS_OUT_OF_INDEXES {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_fls_alloc failed\r\n");
+        return false;
+    }
+
+    if !FLS_SLOT_GOVERNOR.is_allocated(slot) {
+        crate::serial_write_str("[KNT-TEST-ERR] Slot not recorded as allocated in governor\r\n");
+        return false;
+    }
+
+    // 2. Test Value Retrieval & Storage across simulated fibers
+    let test_tid = 9001u64;
+    let fiber_a = 101u64;
+    let fiber_b = 102u64;
+    let magic_a = 0xAAAA_1111usize;
+    let magic_b = 0xBBBB_2222usize;
+
+    if !win32_fls_set_value(slot, magic_a, test_tid, fiber_a) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_fls_set_value for fiber A failed\r\n");
+        return false;
+    }
+
+    if !win32_fls_set_value(slot, magic_b, test_tid, fiber_b) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_fls_set_value for fiber B failed\r\n");
+        return false;
+    }
+
+    // Verify isolation between fibers
+    let val_a = win32_fls_get_value(slot, test_tid, fiber_a);
+    let val_b = win32_fls_get_value(slot, test_tid, fiber_b);
+
+    if val_a != magic_a || val_b != magic_b {
+        crate::serial_write_str("[KNT-TEST-ERR] FLS fiber isolation mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Dynamic Slot Expansion (e.g. slot index > 64 up to 4096)
+    let high_slot = 120u32;
+    // Artificially allocate high slot for test
+    {
+        let mut bitmap = FLS_SLOT_GOVERNOR.allocated_bitmap.lock();
+        bitmap[high_slot as usize / 64] |= 1 << (high_slot as usize % 64);
+        let mut slots = FLS_SLOT_GOVERNOR.slots.lock();
+        slots[high_slot as usize] = FlsSlotDescriptor {
+            allocated: true,
+            callback: None,
+            callback_hash: 0,
+        };
+    }
+
+    let magic_high = 0xCAFE_BABEusize;
+    if !win32_fls_set_value(high_slot, magic_high, test_tid, fiber_a) {
+        crate::serial_write_str("[KNT-TEST-ERR] Dynamic high slot expansion set failed\r\n");
+        return false;
+    }
+
+    let val_high = win32_fls_get_value(high_slot, test_tid, fiber_a);
+    if val_high != magic_high {
+        crate::serial_write_str("[KNT-TEST-ERR] Dynamic high slot value mismatch\r\n");
+        return false;
+    }
+
+    // 4. Test Fiber / Thread Termination Callback Invocation
+    let terminating_fiber_data = FLS_DATA_MANAGER.take_fls_data(test_tid, fiber_a);
+    let invoked = FlsTerminationGovernor::invoke_termination_callbacks(
+        &FLS_SLOT_GOVERNOR,
+        &terminating_fiber_data,
+    );
+
+    if invoked == 0 || CALLBACK_CALLED_VAL.load(Ordering::SeqCst) != magic_a {
+        crate::serial_write_str("[KNT-TEST-ERR] Termination callback was not invoked with correct value\r\n");
+        return false;
+    }
+
+    // 5. Test Anti-Cheat FLS Callback Integrity Scanner
+    if !ANTI_CHEAT_FLS_SCANNER.verify_callback_integrity(&FLS_SLOT_GOVERNOR) {
+        crate::serial_write_str("[KNT-TEST-ERR] Clean FLS state reported as corrupted\r\n");
+        return false;
+    }
+
+    // Simulate cheat tampering with callback pointer in slot
+    {
+        let mut slots = FLS_SLOT_GOVERNOR.slots.lock();
+        fn cheat_hook_callback(_data: usize) {}
+        slots[slot as usize].callback = Some(cheat_hook_callback);
+    }
+
+    if ANTI_CHEAT_FLS_SCANNER.verify_callback_integrity(&FLS_SLOT_GOVERNOR) {
+        crate::serial_write_str("[KNT-TEST-ERR] Tampered FLS callback pointer went undetected\r\n");
+        return false;
+    }
+
+    let violations = ANTI_CHEAT_FLS_SCANNER.get_violations();
+    if violations.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] Violations list empty after tamper\r\n");
+        return false;
+    }
+
+    // Cleanup slot
+    let _ = win32_fls_free(slot);
+    let _ = win32_fls_free(high_slot);
+
+    crate::serial_write_str("[KNT-WIN32-FLS-PASS] Win32 Fiber Local Storage Subsystem verified\r\n");
+    true
+}
