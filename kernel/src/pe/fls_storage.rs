@@ -307,3 +307,65 @@ pub fn win32_fls_set_value(dw_fls_index: u32, lp_fls_data: usize, tid: u64, fibe
         }
     }
 }
+
+/// Anti-cheat FLS callback violation types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlsTamperViolation {
+    CallbackPointerCorrupted {
+        slot: u32,
+        expected_hash: u64,
+        actual_hash: u64,
+    },
+    UnauthorizedCallbackInjection {
+        slot: u32,
+    },
+}
+
+/// Anti-Cheat FLS Callback Integrity Scanner.
+pub struct AntiCheatFlsScanner {
+    pub detection_enabled: AtomicBool,
+    pub detected_violations: Spinlock<Vec<FlsTamperViolation>>,
+}
+
+impl AntiCheatFlsScanner {
+    pub const fn new() -> Self {
+        Self {
+            detection_enabled: AtomicBool::new(true),
+            detected_violations: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Verify integrity of all registered FLS callbacks against their recorded creation hashes.
+    pub fn verify_callback_integrity(&self, governor: &FlsSlotGovernor) -> bool {
+        if !self.detection_enabled.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let slots = governor.slots.lock();
+        let mut violations = self.detected_violations.lock();
+        let mut clean = true;
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if slot.allocated {
+                let current_hash = compute_callback_hash(slot.callback);
+                if current_hash != slot.callback_hash {
+                    clean = false;
+                    violations.push(FlsTamperViolation::CallbackPointerCorrupted {
+                        slot: idx as u32,
+                        expected_hash: slot.callback_hash,
+                        actual_hash: current_hash,
+                    });
+                }
+            }
+        }
+
+        clean
+    }
+
+    /// Retrieve recorded violations.
+    pub fn get_violations(&self) -> Vec<FlsTamperViolation> {
+        self.detected_violations.lock().clone()
+    }
+}
+
+pub static ANTI_CHEAT_FLS_SCANNER: AntiCheatFlsScanner = AntiCheatFlsScanner::new();
