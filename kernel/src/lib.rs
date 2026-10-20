@@ -962,6 +962,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld thermal governor and dynamic fan curve engine self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Thermal Chamber Calibrated Fan Tachometer & Sub-Acoustic Resonance Anti-Vibration Governor (TASK-KNT-279)
+    if !drivers::power::test_fan_resonance_subsystem() {
+        serial_write_str("[KNT-PANIC] Fan tachometer and anti-resonance governor self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone Thermocouple & Peltier Active Cooler Module (TASK-KNT-119)
     if !drivers::thermal::test_peltier_active_cooler_subsystem() {
         serial_write_str("[KNT-PANIC] Peltier active cooler and thermocouple subsystem self-test failed!\r\n");

@@ -178,7 +178,7 @@ pub fn verify_fan_tachometer_pulse_capture() -> bool {
     }
 
     // 4. Test speed step to 6000 RPM (period = 5,000 µs)
-    for _ in 0..8 {
+    for _ in 0..10 {
         timestamp += 5_000;
         tach.record_tach_pulse(timestamp);
     }
@@ -838,5 +838,39 @@ pub fn verify_fan_stall_and_bearing_degradation() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Feature 5: Self-Test Suite & kmain Wire-In
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Thermal Chamber Calibrated Fan Tachometer &
+/// Sub-Acoustic Resonance Anti-Vibration Governor (TASK-KNT-279).
+pub fn test_fan_resonance_subsystem() -> bool {
+    crate::serial_write_str("[POWER-FAN-RESONANCE] Initiating Fan Tachometer & Anti-Resonance Governor Verification...\r\n");
+
+    if !verify_fan_tachometer_pulse_capture() {
+        crate::serial_write_str("[POWER-FAN-RESONANCE-ERR] Fan tachometer pulse capture test failed!\r\n");
+        return false;
+    }
+
+    if !verify_acoustic_resonance_avoidance_governor() {
+        crate::serial_write_str("[POWER-FAN-RESONANCE-ERR] Acoustic resonance avoidance governor test failed!\r\n");
+        return false;
+    }
+
+    if !verify_anti_vibration_micro_dithering() {
+        crate::serial_write_str("[POWER-FAN-RESONANCE-ERR] Anti-vibration micro-dithering test failed!\r\n");
+        return false;
+    }
+
+    if !verify_fan_stall_and_bearing_degradation() {
+        crate::serial_write_str("[POWER-FAN-RESONANCE-ERR] Fan stall and bearing degradation test failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-FAN-RESONANCE-PASS] Fan tachometer and anti-resonance governor verified!\r\n");
     true
 }
