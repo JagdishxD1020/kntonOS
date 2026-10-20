@@ -611,6 +611,85 @@ impl EarlyZCullingAccelerator {
     }
 }
 
+// Light source classifications for tailored shadow depth bounds optimization.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LightType {
+    Directional,
+    Spot,
+    Point,
+}
+
+// Handheld shadow pass optimizer dynamically shrinking depth bounds to conserve fragment fillrate.
+pub struct HandheldShadowPassOptimizer {
+    pub cluster_slices: u32,
+    pub total_fragments_evaluated: u64,
+    pub total_fragments_culled: u64,
+}
+
+impl HandheldShadowPassOptimizer {
+    // Initializes the optimizer with specified cluster depth slice granularity.
+    pub const fn new(cluster_slices: u32) -> Self {
+        Self {
+            cluster_slices,
+            total_fragments_evaluated: 0,
+            total_fragments_culled: 0,
+        }
+    }
+
+    // Default configuration optimized for handheld APU architectures (16 depth clusters).
+    pub const fn default_handheld() -> Self {
+        Self::new(16)
+    }
+
+    // Computes tightly fitted depth bounds for a specific clustered rendering slice.
+    pub fn compute_slice_bounds(&self, slice_index: u32) -> AgilityDepthBounds {
+        if self.cluster_slices == 0 {
+            return AgilityDepthBounds::disabled();
+        }
+        let total = self.cluster_slices as f32;
+        let idx = (slice_index.min(self.cluster_slices.saturating_sub(1))) as f32;
+
+        // Conservative depth bounds with slight overlap margin to prevent cluster seam artifacts.
+        let min_z = (idx / total * 0.98).clamp(0.0, 1.0);
+        let max_z = (((idx + 1.0) / total) * 1.02).clamp(min_z, 1.0);
+
+        AgilityDepthBounds::active(min_z, max_z)
+    }
+
+    // Tightly restricts shadow receiver depth bounds based on active light type and geometry span.
+    pub fn optimize_shadow_receiver_bounds(
+        &self,
+        min_receiver_z: f32,
+        max_receiver_z: f32,
+        light: LightType,
+    ) -> AgilityDepthBounds {
+        let margin = match light {
+            LightType::Directional => 0.05,
+            LightType::Spot => 0.02,
+            LightType::Point => 0.03,
+        };
+        let clamped_min = (min_receiver_z - margin).clamp(0.0, 1.0);
+        let clamped_max = (max_receiver_z + margin).clamp(clamped_min, 1.0);
+
+        AgilityDepthBounds::active(clamped_min, clamped_max)
+    }
+
+    // Records fragment shading metrics to track fillrate efficiency across clustered passes.
+    pub fn record_pass_metrics(&mut self, total_frags: u64, culled_frags: u64) {
+        self.total_fragments_evaluated = self.total_fragments_evaluated.saturating_add(total_frags);
+        self.total_fragments_culled = self.total_fragments_culled.saturating_add(culled_frags);
+    }
+
+    // Returns the percentage of fragment shading operations saved via depth bounds clamping.
+    pub fn fillrate_savings_percent(&self) -> u32 {
+        if self.total_fragments_evaluated == 0 {
+            0
+        } else {
+            ((self.total_fragments_culled * 100) / self.total_fragments_evaluated) as u32
+        }
+    }
+}
+
 // Comprehensive verification self-test suite for Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref
 pub fn test_depth_bounds_subsystem() -> bool {
     crate::serial_write_str("[KNT-GPU-DEPTHBOUNDS] Initializing Direct3D 12 Depth Bounds Testing self-test...\r\n");
