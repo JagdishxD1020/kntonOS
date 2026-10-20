@@ -184,3 +184,126 @@ impl FlsTerminationGovernor {
         invoked_count
     }
 }
+
+/// TEB / Fiber Local Storage Data Array Manager.
+/// Manages dynamically expanding FLS data arrays up to 4096 slots.
+pub struct FlsDataManager {
+    // Key: (ThreadID, FiberID) -> FLS values vector
+    storage: Spinlock<BTreeMap<(u64, u64), Vec<usize>>>,
+}
+
+impl FlsDataManager {
+    pub const fn new() -> Self {
+        Self {
+            storage: Spinlock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Retrieve value from fiber local storage.
+    pub fn fls_get_value(&self, tid: u64, fiber_id: u64, slot: u32) -> Option<usize> {
+        let slot_idx = slot as usize;
+        if slot_idx >= FLS_MAX_SLOTS {
+            return None;
+        }
+
+        let map = self.storage.lock();
+        if let Some(vec) = map.get(&(tid, fiber_id)) {
+            if slot_idx < vec.len() {
+                return Some(vec[slot_idx]);
+            }
+        }
+        Some(0)
+    }
+
+    /// Store value into fiber local storage, expanding dynamic slot array if necessary.
+    pub fn fls_set_value(
+        &self,
+        tid: u64,
+        fiber_id: u64,
+        slot: u32,
+        val: usize,
+    ) -> Result<(), NtStatus> {
+        let slot_idx = slot as usize;
+        if slot_idx >= FLS_MAX_SLOTS {
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+
+        let mut map = self.storage.lock();
+        let vec = map.entry((tid, fiber_id)).or_insert_with(Vec::new);
+
+        if slot_idx >= vec.len() {
+            vec.resize(slot_idx + 1, 0);
+        }
+
+        vec[slot_idx] = val;
+        Ok(())
+    }
+
+    /// Retrieve snapshot of FLS data array for termination.
+    pub fn take_fls_data(&self, tid: u64, fiber_id: u64) -> Vec<usize> {
+        let mut map = self.storage.lock();
+        map.remove(&(tid, fiber_id)).unwrap_or_default()
+    }
+}
+
+pub static FLS_DATA_MANAGER: FlsDataManager = FlsDataManager::new();
+
+/// Emulates Win32 FlsAlloc API.
+pub fn win32_fls_alloc(lp_callback: PFLS_CALLBACK_FUNCTION) -> u32 {
+    let idx = FLS_SLOT_GOVERNOR.fls_alloc(lp_callback);
+    if idx == FLS_OUT_OF_INDEXES {
+        win32_set_last_error(ERROR_NOT_ENOUGH_MEMORY);
+    } else {
+        win32_set_last_error(ERROR_SUCCESS);
+    }
+    idx
+}
+
+/// Emulates Win32 FlsFree API.
+pub fn win32_fls_free(dw_fls_index: u32) -> bool {
+    if FLS_SLOT_GOVERNOR.fls_free(dw_fls_index) {
+        win32_set_last_error(ERROR_SUCCESS);
+        true
+    } else {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        false
+    }
+}
+
+/// Emulates Win32 FlsGetValue API.
+pub fn win32_fls_get_value(dw_fls_index: u32, tid: u64, fiber_id: u64) -> usize {
+    if !FLS_SLOT_GOVERNOR.is_allocated(dw_fls_index) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    match FLS_DATA_MANAGER.fls_get_value(tid, fiber_id, dw_fls_index) {
+        Some(v) => {
+            win32_set_last_error(ERROR_SUCCESS);
+            v
+        }
+        None => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            0
+        }
+    }
+}
+
+/// Emulates Win32 FlsSetValue API.
+pub fn win32_fls_set_value(dw_fls_index: u32, lp_fls_data: usize, tid: u64, fiber_id: u64) -> bool {
+    if !FLS_SLOT_GOVERNOR.is_allocated(dw_fls_index) {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    match FLS_DATA_MANAGER.fls_set_value(tid, fiber_id, dw_fls_index, lp_fls_data) {
+        Ok(_) => {
+            win32_set_last_error(ERROR_SUCCESS);
+            true
+        }
+        Err(_) => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            false
+        }
+    }
+}
