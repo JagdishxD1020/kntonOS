@@ -575,3 +575,268 @@ pub fn verify_anti_vibration_micro_dithering() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Fan Stall & Bearing Degradation Warning Detector
+// ============================================================================
+
+/// Fan operational health status classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanHealthState {
+    /// Fan operating normally within factory thermal chamber calibrated tolerances.
+    HealthyOperational,
+    /// RPM lagging expected curve by > 20% or elevated motor current (bearing friction / dust clogging).
+    BearingDegradationWarning,
+    /// Commanded PWM active but fan rotor is jammed/stalled (0 RPM); immediate APU overheat risk.
+    FanStallCritical,
+}
+
+/// Factory thermal chamber calibrated fan speed curve point.
+#[derive(Debug, Clone, Copy)]
+pub struct FanCalibrationPoint {
+    /// Commanded PWM duty cycle in milli-percent (0..10,000).
+    pub duty_millipercent: u16,
+    /// Nominal expected speed in RPM measured in environmental chamber.
+    pub expected_rpm: u32,
+    /// Nominal expected motor coil current draw in milliamperes.
+    pub expected_current_ma: u16,
+}
+
+/// Standard factory thermal chamber calibration points for 50mm handheld blower fan.
+pub const FACTORY_CALIBRATION_CURVE: [FanCalibrationPoint; 5] = [
+    FanCalibrationPoint { duty_millipercent: 2000, expected_rpm: 1500, expected_current_ma: 80 },
+    FanCalibrationPoint { duty_millipercent: 4000, expected_rpm: 2800, expected_current_ma: 140 },
+    FanCalibrationPoint { duty_millipercent: 6000, expected_rpm: 4200, expected_current_ma: 210 },
+    FanCalibrationPoint { duty_millipercent: 8000, expected_rpm: 5500, expected_current_ma: 290 },
+    FanCalibrationPoint { duty_millipercent: 10000, expected_rpm: 6800, expected_current_ma: 380 },
+];
+
+/// Fan Stall and Bearing Degradation Health Monitor.
+///
+/// In portable handhelds subject to pocket lint, ambient dust, drops, and bearing grease dry-out,
+/// fan motor failure can cause rapid APU thermal throttling or thermal shutdown mid-game.
+/// This detector continuously compares real-time tachometer RPM and motor current draw against
+/// the factory thermal chamber calibrated curve. If RPM lags by > 20% or motor current spikes,
+/// an early bearing wear alert is raised. If PWM is applied for > 1.0s with 0 RPM detected,
+/// a critical fan stall alarm is triggered.
+#[derive(Debug, Clone)]
+pub struct FanBearingHealthDetector {
+    /// Active commanded PWM duty cycle in milli-percent.
+    pub commanded_duty_millipercent: u16,
+    /// Measured tachometer speed in RPM.
+    pub measured_rpm: u32,
+    /// Measured motor driver current in milliamperes.
+    pub measured_current_ma: u16,
+    /// Expected speed in RPM interpolated from factory calibration.
+    pub expected_rpm: u32,
+    /// Expected motor current in milliamperes from factory calibration.
+    pub expected_current_ma: u16,
+    /// Percentage lag between expected and measured speed.
+    pub rpm_lag_percentage: u8,
+    /// Consecutive time in milliseconds that fan has been commanded active while stopped.
+    pub stall_timer_ms: u32,
+    /// Current health status.
+    pub health_state: FanHealthState,
+    /// Critical fan stall alarm flag.
+    pub stall_alarm_active: bool,
+    /// Warning flag for bearing wear / friction.
+    pub bearing_warning_active: bool,
+    /// Cumulative count of alert conditions detected.
+    pub alert_counter: u32,
+    /// Human-readable diagnostic description of last fault event.
+    pub last_fault_message: &'static str,
+}
+
+impl FanBearingHealthDetector {
+    pub const fn new() -> Self {
+        Self {
+            commanded_duty_millipercent: 0,
+            measured_rpm: 0,
+            measured_current_ma: 0,
+            expected_rpm: 0,
+            expected_current_ma: 0,
+            rpm_lag_percentage: 0,
+            stall_timer_ms: 0,
+            health_state: FanHealthState::HealthyOperational,
+            stall_alarm_active: false,
+            bearing_warning_active: false,
+            alert_counter: 0,
+            last_fault_message: "Subsystem initialized",
+        }
+    }
+
+    /// Interpolates expected RPM from factory calibration curve for given PWM duty.
+    pub fn interpolate_expected_rpm(duty_millipercent: u16) -> u32 {
+        if duty_millipercent < 1500 {
+            return 0; // Below motor start threshold
+        }
+        if duty_millipercent <= FACTORY_CALIBRATION_CURVE[0].duty_millipercent {
+            return FACTORY_CALIBRATION_CURVE[0].expected_rpm;
+        }
+
+        let mut i = 0;
+        while i < FACTORY_CALIBRATION_CURVE.len() - 1 {
+            let p1 = &FACTORY_CALIBRATION_CURVE[i];
+            let p2 = &FACTORY_CALIBRATION_CURVE[i + 1];
+
+            if duty_millipercent >= p1.duty_millipercent && duty_millipercent <= p2.duty_millipercent {
+                let span_duty = (p2.duty_millipercent - p1.duty_millipercent) as u64;
+                let span_rpm = (p2.expected_rpm - p1.expected_rpm) as u64;
+                let offset_duty = (duty_millipercent - p1.duty_millipercent) as u64;
+                let interp = p1.expected_rpm as u64 + ((offset_duty * span_rpm) / span_duty);
+                return interp as u32;
+            }
+            i += 1;
+        }
+
+        FACTORY_CALIBRATION_CURVE[FACTORY_CALIBRATION_CURVE.len() - 1].expected_rpm
+    }
+
+    /// Interpolates expected current draw in mA from factory calibration curve.
+    pub fn interpolate_expected_current(duty_millipercent: u16) -> u16 {
+        if duty_millipercent < 1500 {
+            return 0;
+        }
+        let last_pt = &FACTORY_CALIBRATION_CURVE[FACTORY_CALIBRATION_CURVE.len() - 1];
+        if duty_millipercent >= last_pt.duty_millipercent {
+            return last_pt.expected_current_ma;
+        }
+
+        let mut i = 0;
+        while i < FACTORY_CALIBRATION_CURVE.len() - 1 {
+            let p1 = &FACTORY_CALIBRATION_CURVE[i];
+            let p2 = &FACTORY_CALIBRATION_CURVE[i + 1];
+
+            if duty_millipercent >= p1.duty_millipercent && duty_millipercent <= p2.duty_millipercent {
+                let span_duty = (p2.duty_millipercent - p1.duty_millipercent) as u32;
+                let span_curr = (p2.expected_current_ma - p1.expected_current_ma) as u32;
+                let offset_duty = (duty_millipercent - p1.duty_millipercent) as u32;
+                let interp = p1.expected_current_ma as u32 + ((offset_duty * span_curr) / span_duty);
+                return interp as u16;
+            }
+            i += 1;
+        }
+
+        FACTORY_CALIBRATION_CURVE[0].expected_current_ma
+    }
+
+    /// Evaluates fan health based on commanded duty, measured tachometer RPM, and motor current.
+    pub fn evaluate_health(
+        &mut self,
+        commanded_duty: u16,
+        measured_rpm: u32,
+        current_ma: u16,
+        elapsed_ms: u32,
+    ) -> FanHealthState {
+        self.commanded_duty_millipercent = commanded_duty;
+        self.measured_rpm = measured_rpm;
+        self.measured_current_ma = current_ma;
+        self.expected_rpm = Self::interpolate_expected_rpm(commanded_duty);
+        self.expected_current_ma = Self::interpolate_expected_current(commanded_duty);
+
+        // Calculate RPM lag percentage
+        if self.expected_rpm > 0 {
+            if measured_rpm < self.expected_rpm {
+                let lag = self.expected_rpm - measured_rpm;
+                self.rpm_lag_percentage = ((lag * 100) / self.expected_rpm) as u8;
+            } else {
+                self.rpm_lag_percentage = 0;
+            }
+        } else {
+            self.rpm_lag_percentage = 0;
+        }
+
+        // 1. Check for Fan Stall (commanded >= 25% duty, but speed < 300 RPM)
+        if commanded_duty >= 2500 && measured_rpm < 300 {
+            self.stall_timer_ms += elapsed_ms;
+            if self.stall_timer_ms >= 1000 {
+                // Stalled for > 1.0 second: critical stall alarm!
+                self.health_state = FanHealthState::FanStallCritical;
+                self.stall_alarm_active = true;
+                self.bearing_warning_active = false;
+                self.alert_counter += 1;
+                self.last_fault_message = "[FAN-CRITICAL] Fan rotor stalled/jammed under active PWM command!";
+                return self.health_state;
+            }
+        } else {
+            self.stall_timer_ms = 0;
+            self.stall_alarm_active = false;
+        }
+
+        // 2. Check for Bearing Degradation (RPM lag > 20% or current draw > 35% above expected)
+        let current_ratio_elevated = if self.expected_current_ma > 0 {
+            current_ma > ((self.expected_current_ma * 135) / 100)
+        } else {
+            false
+        };
+
+        if self.rpm_lag_percentage > 20 || current_ratio_elevated {
+            self.health_state = FanHealthState::BearingDegradationWarning;
+            self.bearing_warning_active = true;
+            self.alert_counter += 1;
+            self.last_fault_message = "[FAN-WARN] Fan speed lag / elevated motor current detected: bearing friction or dust buildup";
+            return self.health_state;
+        }
+
+        // 3. Normal healthy operation
+        self.health_state = FanHealthState::HealthyOperational;
+        self.bearing_warning_active = false;
+        self.stall_alarm_active = false;
+        self.health_state
+    }
+}
+
+/// Verification test for fan stall and bearing degradation warning detection.
+pub fn verify_fan_stall_and_bearing_degradation() -> bool {
+    let mut detector = FanBearingHealthDetector::new();
+
+    // 1. Initial healthy state
+    if detector.health_state != FanHealthState::HealthyOperational {
+        return false;
+    }
+
+    // 2. Normal healthy operation: 60% duty (6000), measured 4200 RPM, 210 mA
+    let state1 = detector.evaluate_health(6000, 4200, 210, 100);
+    if state1 != FanHealthState::HealthyOperational || detector.rpm_lag_percentage != 0 {
+        return false;
+    }
+    if detector.expected_rpm != 4200 || detector.expected_current_ma != 210 {
+        return false;
+    }
+    if detector.stall_alarm_active || detector.bearing_warning_active {
+        return false;
+    }
+
+    // 3. Bearing degradation test: 60% duty (expected 4200 RPM), but measured is only 2900 RPM (> 30% lag)
+    // and elevated current draw (290 mA vs 210 mA)
+    let state2 = detector.evaluate_health(6000, 2900, 290, 100);
+    if state2 != FanHealthState::BearingDegradationWarning || !detector.bearing_warning_active {
+        return false;
+    }
+    if detector.rpm_lag_percentage <= 20 {
+        return false;
+    }
+    if detector.stall_alarm_active {
+        return false;
+    }
+
+    // 4. Critical fan stall test: commanded 60% duty, but rotor is jammed (0 RPM) for 1500 ms
+    detector.evaluate_health(6000, 0, 350, 500); // 500ms elapsed (< 1000ms threshold)
+    if detector.stall_alarm_active {
+        return false;
+    }
+
+    let state3 = detector.evaluate_health(6000, 0, 350, 600); // total 1100ms elapsed (>= 1000ms)
+    if state3 != FanHealthState::FanStallCritical || !detector.stall_alarm_active {
+        return false;
+    }
+
+    // 5. Recovery test: fan unjammed, resumes 4200 RPM at 210 mA
+    let state4 = detector.evaluate_health(6000, 4200, 210, 100);
+    if state4 != FanHealthState::HealthyOperational || detector.stall_alarm_active || detector.bearing_warning_active {
+        return false;
+    }
+
+    true
+}
