@@ -48,6 +48,7 @@ pub mod working_set;
 pub mod job_objects;
 pub mod seh_unwind;
 pub mod fls_storage;
+pub mod pmu_trace;
 
 pub use header::*;
 pub use ntdll::*;
