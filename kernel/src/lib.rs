@@ -1269,6 +1269,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_seh_unwind_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 SEH Unwind subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Fiber Local Storage & Callback Destruction Governor (TASK-KNT-281)
+    if !pe::test_win32_fls_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 FLS subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {

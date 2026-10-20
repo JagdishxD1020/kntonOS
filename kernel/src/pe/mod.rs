@@ -47,6 +47,7 @@ pub mod power_qos;
 pub mod working_set;
 pub mod job_objects;
 pub mod seh_unwind;
+pub mod fls_storage;
 
 pub use header::*;
 pub use ntdll::*;
@@ -93,6 +94,7 @@ pub use power_qos::*;
 pub use working_set::*;
 pub use job_objects::*;
 pub use seh_unwind::test_win32_seh_unwind_subsystem;
+pub use fls_storage::test_win32_fls_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
