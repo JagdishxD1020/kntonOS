@@ -1,0 +1,676 @@
+//! Win32 Structured Exception Handling (SEH) Vector Unwinding & Anti-Debugging Trap Virtualization.
+//!
+//! Implements x86-64 SEH .pdata / .xdata table parsing (RUNTIME_FUNCTION, UNWIND_INFO, opcode decoding),
+//! 2-phase exception dispatcher (search handlers & unwind stack frames), Vectored Exception / Continue
+//! Handlers (VEH/VCH), and anti-debugging trap virtualization (int3, single-step, guard page redirection).
+
+#![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, unused_imports, dead_code)]
+
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use crate::memory::spinlock::Spinlock;
+pub use crate::pe::guard_stack::STATUS_GUARD_PAGE_VIOLATION;
+pub use crate::pe::object_namespace::{ProcessTrustLevel, STATUS_ACCESS_DENIED};
+pub use crate::pe::seh_veh::{
+    EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_CONTINUE_EXECUTION,
+    EXCEPTION_CONTINUE_SEARCH, EXCEPTION_DATATYPE_MISALIGNMENT, EXCEPTION_EXECUTE_HANDLER,
+    EXCEPTION_ILLEGAL_INSTRUCTION, EXCEPTION_MAXIMUM_PARAMETERS, EXCEPTION_NONCONTINUABLE,
+    EXCEPTION_RECORD, EXCEPTION_SINGLE_STEP, EXCEPTION_STACK_OVERFLOW, EXCEPTION_UNWINDING,
+    RUNTIME_FUNCTION, UNW_FLAG_CHAININFO, UNW_FLAG_EHANDLER, UNW_FLAG_NHANDLER,
+    UNW_FLAG_UHANDLER, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_PUSH_MACHFRAME,
+    UWOP_PUSH_NONVOL, UWOP_SAVE_NONVOL, UWOP_SAVE_NONVOL_FAR, UWOP_SAVE_XMM128,
+    UWOP_SET_FPREG,
+};
+pub use crate::pe::synch::HANDLE;
+
+pub const UWOP_SAVE_XMM128_FAR: u8 = 9;
+
+/// Decoded unwind code operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindOpcode {
+    PushNonVol { reg: u8 },
+    AllocLarge { size: u32 },
+    AllocSmall { size: u32 },
+    SetFpReg,
+    SaveNonVol { reg: u8, offset: u32 },
+    SaveXmm128 { reg: u8, offset: u32 },
+    PushMachFrame { error_code: bool },
+    Other { code: u8, info: u8 },
+}
+
+/// Decoded UNWIND_INFO from .xdata.
+#[derive(Debug, Clone)]
+pub struct DecodedUnwindInfo {
+    pub version: u8,
+    pub flags: u8,
+    pub size_of_prolog: u8,
+    pub count_of_codes: u8,
+    pub frame_register: u8,
+    pub frame_offset: u8,
+    pub opcodes: Vec<UnwindOpcode>,
+    pub exception_handler_rva: Option<u32>,
+}
+
+/// Parser for x86-64 .pdata and .xdata tables.
+pub struct SehTableParser;
+
+impl SehTableParser {
+    /// Parse raw byte slice of .xdata UNWIND_INFO.
+    pub fn parse_xdata(xdata: &[u8]) -> Option<DecodedUnwindInfo> {
+        if xdata.len() < 4 {
+            return None;
+        }
+
+        let byte0 = xdata[0];
+        let version = byte0 & 0x07;
+        let flags = (byte0 >> 3) & 0x1F;
+        let size_of_prolog = xdata[1];
+        let count_of_codes = xdata[2];
+        let byte3 = xdata[3];
+        let frame_register = byte3 & 0x0F;
+        let frame_offset = (byte3 >> 4) & 0x0F;
+
+        let mut opcodes = Vec::new();
+        let mut idx = 4;
+        let mut code_idx = 0;
+
+        while code_idx < count_of_codes as usize && idx + 2 <= xdata.len() {
+            let _prolog_offset = xdata[idx];
+            let op_byte = xdata[idx + 1];
+            let opcode_id = op_byte & 0x0F;
+            let op_info = (op_byte >> 4) & 0x0F;
+            idx += 2;
+            code_idx += 1;
+
+            match opcode_id {
+                UWOP_PUSH_NONVOL => {
+                    opcodes.push(UnwindOpcode::PushNonVol { reg: op_info });
+                }
+                UWOP_ALLOC_LARGE => {
+                    if op_info == 0 {
+                        if idx + 2 <= xdata.len() {
+                            let sz = u16::from_le_bytes([xdata[idx], xdata[idx + 1]]) as u32 * 8;
+                            idx += 2;
+                            code_idx += 1;
+                            opcodes.push(UnwindOpcode::AllocLarge { size: sz });
+                        }
+                    } else if op_info == 1 {
+                        if idx + 4 <= xdata.len() {
+                            let sz = u32::from_le_bytes([xdata[idx], xdata[idx + 1], xdata[idx + 2], xdata[idx + 3]]);
+                            idx += 4;
+                            code_idx += 2;
+                            opcodes.push(UnwindOpcode::AllocLarge { size: sz });
+                        }
+                    }
+                }
+                UWOP_ALLOC_SMALL => {
+                    let sz = (op_info as u32 * 8) + 8;
+                    opcodes.push(UnwindOpcode::AllocSmall { size: sz });
+                }
+                UWOP_SET_FPREG => {
+                    opcodes.push(UnwindOpcode::SetFpReg);
+                }
+                UWOP_SAVE_NONVOL => {
+                    if idx + 2 <= xdata.len() {
+                        let off = u16::from_le_bytes([xdata[idx], xdata[idx + 1]]) as u32 * 8;
+                        idx += 2;
+                        code_idx += 1;
+                        opcodes.push(UnwindOpcode::SaveNonVol { reg: op_info, offset: off });
+                    }
+                }
+                UWOP_SAVE_XMM128 => {
+                    if idx + 2 <= xdata.len() {
+                        let off = u16::from_le_bytes([xdata[idx], xdata[idx + 1]]) as u32 * 16;
+                        idx += 2;
+                        code_idx += 1;
+                        opcodes.push(UnwindOpcode::SaveXmm128 { reg: op_info, offset: off });
+                    }
+                }
+                UWOP_PUSH_MACHFRAME => {
+                    opcodes.push(UnwindOpcode::PushMachFrame { error_code: op_info == 1 });
+                }
+                _ => {
+                    opcodes.push(UnwindOpcode::Other { code: opcode_id, info: op_info });
+                }
+            }
+        }
+
+        // Align idx if codes count was odd
+        if (count_of_codes & 1) != 0 {
+            idx += 2;
+        }
+
+        let mut exception_handler_rva = None;
+        if (flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) != 0 && idx + 4 <= xdata.len() {
+            let rva = u32::from_le_bytes([xdata[idx], xdata[idx + 1], xdata[idx + 2], xdata[idx + 3]]);
+            exception_handler_rva = Some(rva);
+        }
+
+        Some(DecodedUnwindInfo {
+            version,
+            flags,
+            size_of_prolog,
+            count_of_codes,
+            frame_register,
+            frame_offset,
+            opcodes,
+            exception_handler_rva,
+        })
+    }
+}
+
+/// Simulated stack frame context for unwinding and dispatching.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UNWIND_CONTEXT {
+    pub Rip: u64,
+    pub Rsp: u64,
+    pub Rbp: u64,
+    pub Rax: u64,
+    pub Rbx: u64,
+    pub Rcx: u64,
+    pub Rdx: u64,
+    pub Rsi: u64,
+    pub Rdi: u64,
+    pub R12: u64,
+    pub R13: u64,
+    pub R14: u64,
+    pub R15: u64,
+}
+
+/// Simulated function frame registration for dispatch testing.
+#[derive(Debug, Clone)]
+pub struct FunctionFrameEntry {
+    pub image_base: u64,
+    pub runtime_function: RUNTIME_FUNCTION,
+    pub unwind_info: DecodedUnwindInfo,
+    pub frame_handler: Option<fn(record: &mut EXCEPTION_RECORD, context: &mut UNWIND_CONTEXT) -> i32>,
+}
+
+/// Dispatch status result of RtlDispatchException.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchResult {
+    Handled,
+    ContinueSearch,
+    FatalUnwindCollision,
+}
+
+/// 2-Phase Exception Dispatcher & Virtual Frame Unwinder.
+pub struct SehFrameDispatcher {
+    frames: Spinlock<Vec<FunctionFrameEntry>>,
+}
+
+impl SehFrameDispatcher {
+    pub const fn new() -> Self {
+        Self {
+            frames: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Register a function frame in the dispatcher table.
+    pub fn register_frame(&self, frame: FunctionFrameEntry) {
+        self.frames.lock().push(frame);
+    }
+
+    /// Phase 1: Search handlers across calling stack frames without altering execution state.
+    pub fn phase1_search_handlers(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> Option<usize> {
+        let frames = self.frames.lock();
+        for (idx, entry) in frames.iter().enumerate() {
+            let func_start = entry.image_base + entry.runtime_function.BeginAddress as u64;
+            let func_end = entry.image_base + entry.runtime_function.EndAddress as u64;
+
+            if context.Rip >= func_start && context.Rip < func_end {
+                if let Some(handler) = entry.frame_handler {
+                    let disposition = handler(record, context);
+                    if disposition == EXCEPTION_EXECUTE_HANDLER {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Phase 2: Unwind stack frames up to the target frame index (RtlUnwindEx).
+    pub fn phase2_unwind_to_target(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+        target_idx: usize,
+    ) -> Result<u64, DispatchResult> {
+        let frames = self.frames.lock();
+        if target_idx >= frames.len() {
+            return Err(DispatchResult::ContinueSearch);
+        }
+
+        record.ExceptionFlags |= EXCEPTION_UNWINDING;
+
+        // Apply unwind opcodes to virtual RSP/RBP
+        let target_frame = &frames[target_idx];
+        for op in &target_frame.unwind_info.opcodes {
+            match op {
+                UnwindOpcode::AllocSmall { size } => {
+                    context.Rsp = context.Rsp.saturating_add(*size as u64);
+                }
+                UnwindOpcode::AllocLarge { size } => {
+                    context.Rsp = context.Rsp.saturating_add(*size as u64);
+                }
+                UnwindOpcode::PushNonVol { .. } => {
+                    context.Rsp = context.Rsp.saturating_add(8);
+                }
+                _ => {}
+            }
+        }
+
+        // Return new virtual RIP
+        let landing_rip = target_frame.image_base + target_frame.runtime_function.BeginAddress as u64;
+        context.Rip = landing_rip;
+        Ok(landing_rip)
+    }
+
+    /// Full 2-Phase Dispatcher (RtlDispatchException).
+    pub fn dispatch_exception(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> DispatchResult {
+        // Phase 1: Search
+        match self.phase1_search_handlers(record, context) {
+            Some(target_idx) => {
+                // Phase 2: Unwind
+                if self.phase2_unwind_to_target(record, context, target_idx).is_ok() {
+                    DispatchResult::Handled
+                } else {
+                    DispatchResult::FatalUnwindCollision
+                }
+            }
+            None => DispatchResult::ContinueSearch,
+        }
+    }
+}
+
+pub static SEH_FRAME_DISPATCHER: SehFrameDispatcher = SehFrameDispatcher::new();
+
+/// Vectored Exception/Continue Handler callback type.
+pub type PVECTORED_EXCEPTION_HANDLER =
+    fn(exception_info: &mut EXCEPTION_POINTERS_UNWIND) -> i32;
+
+/// Exception pointers passed to VEH/VCH.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct EXCEPTION_POINTERS_UNWIND {
+    pub ExceptionRecord: *mut EXCEPTION_RECORD,
+    pub ContextRecord: *mut UNWIND_CONTEXT,
+}
+
+/// Node representing a registered VEH or VCH handler.
+#[derive(Clone)]
+pub struct VectoredHandlerEntry {
+    pub id: u32,
+    pub is_first: bool,
+    pub handler: PVECTORED_EXCEPTION_HANDLER,
+}
+
+/// Vectored Exception Handling (VEH) & Vectored Continue Handling (VCH) priority table.
+pub struct VectoredHandlerList {
+    veh_handlers: Spinlock<Vec<VectoredHandlerEntry>>,
+    vch_handlers: Spinlock<Vec<VectoredHandlerEntry>>,
+    next_id: AtomicU32,
+}
+
+impl VectoredHandlerList {
+    pub const fn new() -> Self {
+        Self {
+            veh_handlers: Spinlock::new(Vec::new()),
+            vch_handlers: Spinlock::new(Vec::new()),
+            next_id: AtomicU32::new(1),
+        }
+    }
+
+    /// Add a Vectored Exception Handler (AddVectoredExceptionHandler).
+    pub fn add_veh(&self, first: bool, handler: PVECTORED_EXCEPTION_HANDLER) -> HANDLE {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let entry = VectoredHandlerEntry {
+            id,
+            is_first: first,
+            handler,
+        };
+        let mut list = self.veh_handlers.lock();
+        if first {
+            list.insert(0, entry);
+        } else {
+            list.push(entry);
+        }
+        id as HANDLE
+    }
+
+    /// Add a Vectored Continue Handler (AddVectoredContinueHandler).
+    pub fn add_vch(&self, first: bool, handler: PVECTORED_EXCEPTION_HANDLER) -> HANDLE {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let entry = VectoredHandlerEntry {
+            id,
+            is_first: first,
+            handler,
+        };
+        let mut list = self.vch_handlers.lock();
+        if first {
+            list.insert(0, entry);
+        } else {
+            list.push(entry);
+        }
+        id as HANDLE
+    }
+
+    /// Execute VEH priority list before any frame SEH handler is called.
+    /// Returns true if an exception was handled (EXCEPTION_CONTINUE_EXECUTION), false otherwise.
+    pub fn execute_veh_list(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> bool {
+        let handlers = self.veh_handlers.lock().clone();
+        let mut ptrs = EXCEPTION_POINTERS_UNWIND {
+            ExceptionRecord: record as *mut _,
+            ContextRecord: context as *mut _,
+        };
+
+        for entry in handlers {
+            let res = (entry.handler)(&mut ptrs);
+            if res == EXCEPTION_CONTINUE_EXECUTION {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Execute VCH priority list when continuing execution.
+    pub fn execute_vch_list(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> bool {
+        let handlers = self.vch_handlers.lock().clone();
+        let mut ptrs = EXCEPTION_POINTERS_UNWIND {
+            ExceptionRecord: record as *mut _,
+            ContextRecord: context as *mut _,
+        };
+
+        for entry in handlers {
+            let res = (entry.handler)(&mut ptrs);
+            if res == EXCEPTION_CONTINUE_EXECUTION {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove a registered vectored handler.
+    pub fn remove_vectored_handler(&self, handle: HANDLE) -> bool {
+        let id = handle as u32;
+        let mut veh = self.veh_handlers.lock();
+        if let Some(pos) = veh.iter().position(|e| e.id == id) {
+            veh.remove(pos);
+            return true;
+        }
+
+        let mut vch = self.vch_handlers.lock();
+        if let Some(pos) = vch.iter().position(|e| e.id == id) {
+            vch.remove(pos);
+            return true;
+        }
+
+        false
+    }
+}
+
+pub static VECTORED_HANDLER_LIST: VectoredHandlerList = VectoredHandlerList::new();
+
+/// Anti-debugging trap type classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AntiDebugTrapType {
+    BreakpointInt3,
+    SingleStepTrap,
+    GuardPageViolation,
+}
+
+/// Anti-debugging trap virtualization action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrapVirtualizationAction {
+    /// Trap was genuine debugging probe / hook attempt by cheat; redirected to dummy instruction.
+    RedirectDummyTrap { landing_rip: u64 },
+    /// Genuine application fault; pass through to normal exception dispatching.
+    PassToDispatcher,
+    /// Terminate malicious debugger process.
+    SuppressAndContinue { next_rip: u64 },
+}
+
+/// Statistics for virtualized anti-debugging events.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AntiDebugTrapStats {
+    pub breakpoint_traps_virtualized: u64,
+    pub single_step_traps_virtualized: u64,
+    pub guard_page_traps_virtualized: u64,
+}
+
+/// Anti-Debugging Trap Virtualization Engine.
+pub struct AntiDebugTrapVirtualizer {
+    pub virtualization_enabled: AtomicBool,
+    pub known_cheat_probes: Spinlock<Vec<u64>>, // Probe RIPs
+    pub stats: Spinlock<AntiDebugTrapStats>,
+}
+
+impl AntiDebugTrapVirtualizer {
+    pub const fn new() -> Self {
+        Self {
+            virtualization_enabled: AtomicBool::new(true),
+            known_cheat_probes: Spinlock::new(Vec::new()),
+            stats: Spinlock::new(AntiDebugTrapStats {
+                breakpoint_traps_virtualized: 0,
+                single_step_traps_virtualized: 0,
+                guard_page_traps_virtualized: 0,
+            }),
+        }
+    }
+
+    /// Register a known probe RIP (e.g. hook detour or debugger test site).
+    pub fn register_probe_site(&self, rip: u64) {
+        self.known_cheat_probes.lock().push(rip);
+    }
+
+    /// Virtualize an incoming hardware CPU trap or exception before it alerts userland debuggers.
+    pub fn virtualize_trap(
+        &self,
+        record: &mut EXCEPTION_RECORD,
+        context: &mut UNWIND_CONTEXT,
+    ) -> TrapVirtualizationAction {
+        if !self.virtualization_enabled.load(Ordering::Acquire) {
+            return TrapVirtualizationAction::PassToDispatcher;
+        }
+
+        let is_probe = self.known_cheat_probes.lock().contains(&context.Rip);
+
+        match record.ExceptionCode {
+            EXCEPTION_BREAKPOINT => {
+                let mut st = self.stats.lock();
+                st.breakpoint_traps_virtualized += 1;
+
+                if is_probe {
+                    // Redirect to safe dummy landing zone (skipping the int3 instruction: 1 byte)
+                    let next_rip = context.Rip.saturating_add(1);
+                    context.Rip = next_rip;
+                    TrapVirtualizationAction::SuppressAndContinue { next_rip }
+                } else {
+                    TrapVirtualizationAction::PassToDispatcher
+                }
+            }
+            EXCEPTION_SINGLE_STEP => {
+                let mut st = self.stats.lock();
+                st.single_step_traps_virtualized += 1;
+
+                // Hardware watchpoint or TF flag probe detected: suppress TF and advance
+                let next_rip = context.Rip;
+                TrapVirtualizationAction::SuppressAndContinue { next_rip }
+            }
+            STATUS_GUARD_PAGE_VIOLATION => {
+                let mut st = self.stats.lock();
+                st.guard_page_traps_virtualized += 1;
+
+                if is_probe {
+                    // Stealth hook attempted on protected guard page
+                    TrapVirtualizationAction::RedirectDummyTrap { landing_rip: 0x0000_7FFF_0000 }
+                } else {
+                    TrapVirtualizationAction::PassToDispatcher
+                }
+            }
+            _ => TrapVirtualizationAction::PassToDispatcher,
+        }
+    }
+
+    /// Query statistics.
+    pub fn get_stats(&self) -> AntiDebugTrapStats {
+        *self.stats.lock()
+    }
+}
+
+pub static ANTI_DEBUG_TRAP_VIRTUALIZER: AntiDebugTrapVirtualizer = AntiDebugTrapVirtualizer::new();
+
+/// Comprehensive self-test for Win32 SEH Vector Unwinding & Anti-Debugging Trap Virtualization Subsystem.
+pub fn test_win32_seh_unwind_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-SEH-UNWIND] Initializing Win32 SEH Unwind Subsystem self-test...\r\n");
+
+    // 1. Test .xdata UNWIND_INFO parsing (UWOP_PUSH_NONVOL, UWOP_ALLOC_LARGE, UWOP_ALLOC_SMALL, UWOP_SAVE_XMM128)
+    let sample_xdata: [u8; 12] = [
+        0x09,       // Version = 1, Flags = UNW_FLAG_EHANDLER (0x1 << 3 = 0x8 | 1 = 0x9)
+        0x10,       // SizeOfProlog = 16
+        0x04,       // CountOfCodes = 4
+        0x00,       // FrameRegister = 0, FrameOffset = 0
+        0x0E, 0x02, // Opcode: UWOP_ALLOC_SMALL (op_info = 0 -> 8 bytes)
+        0x0A, 0x00, // Opcode: UWOP_PUSH_NONVOL (reg = 0: RAX)
+        0x05, 0x01, // Opcode: UWOP_ALLOC_LARGE (op_info = 0)
+        0x20, 0x00, // AllocLarge size = 0x20 * 8 = 256 bytes
+    ];
+
+    let decoded = match SehTableParser::parse_xdata(&sample_xdata) {
+        Some(d) => d,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] parse_xdata failed\r\n");
+            return false;
+        }
+    };
+
+    if decoded.version != 1 || (decoded.flags & UNW_FLAG_EHANDLER) == 0 || decoded.count_of_codes != 4 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decoded unwind info header mismatch\r\n");
+        return false;
+    }
+
+    if decoded.opcodes.len() != 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decoded opcodes count mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test 2-Phase Exception Dispatcher (Phase 1 search + Phase 2 stack frame unwinding)
+    fn mock_frame_handler(record: &mut EXCEPTION_RECORD, _ctx: &mut UNWIND_CONTEXT) -> i32 {
+        if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
+            EXCEPTION_EXECUTE_HANDLER
+        } else {
+            EXCEPTION_CONTINUE_SEARCH
+        }
+    }
+
+    let frame = FunctionFrameEntry {
+        image_base: 0x0040_0000,
+        runtime_function: RUNTIME_FUNCTION {
+            BeginAddress: 0x1000,
+            EndAddress: 0x2000,
+            UnwindData: 0x3000,
+        },
+        unwind_info: decoded,
+        frame_handler: Some(mock_frame_handler),
+    };
+
+    SEH_FRAME_DISPATCHER.register_frame(frame);
+
+    let mut record = EXCEPTION_RECORD::default();
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+
+    let mut context = UNWIND_CONTEXT::default();
+    context.Rip = 0x0040_1050; // Inside registered function frame
+    context.Rsp = 0x0000_7FFF_1000;
+
+    let dispatch_res = SEH_FRAME_DISPATCHER.dispatch_exception(&mut record, &mut context);
+    if dispatch_res != DispatchResult::Handled {
+        crate::serial_write_str("[KNT-TEST-ERR] 2-Phase dispatch did not handle exception\r\n");
+        return false;
+    }
+
+    // After phase 2 unwinding, RSP should have been advanced by (8 + 8 + 256 = 272)
+    if context.Rsp != 0x0000_7FFF_1000 + 272 {
+        crate::serial_write_str("[KNT-TEST-ERR] Stack unwinding RSP adjustment mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Vectored Exception Handling (VEH) & Vectored Continue Handling (VCH)
+    static VEH_CALLED: AtomicBool = AtomicBool::new(false);
+    fn mock_veh(info: &mut EXCEPTION_POINTERS_UNWIND) -> i32 {
+        VEH_CALLED.store(true, Ordering::Release);
+        unsafe {
+            if (*info.ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    let h_veh = VECTORED_HANDLER_LIST.add_veh(true, mock_veh);
+    let mut ill_record = EXCEPTION_RECORD::default();
+    ill_record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+
+    let veh_handled = VECTORED_HANDLER_LIST.execute_veh_list(&mut ill_record, &mut context);
+    if !veh_handled || !VEH_CALLED.load(Ordering::Acquire) {
+        crate::serial_write_str("[KNT-TEST-ERR] VEH priority handler failed to intercept\r\n");
+        return false;
+    }
+
+    VECTORED_HANDLER_LIST.remove_vectored_handler(h_veh);
+
+    // 4. Test Anti-Debugging Trap Virtualization
+    let probe_rip = 0x0040_5555;
+    ANTI_DEBUG_TRAP_VIRTUALIZER.register_probe_site(probe_rip);
+
+    let mut bp_record = EXCEPTION_RECORD::default();
+    bp_record.ExceptionCode = EXCEPTION_BREAKPOINT;
+
+    let mut bp_ctx = UNWIND_CONTEXT::default();
+    bp_ctx.Rip = probe_rip;
+
+    let trap_action = ANTI_DEBUG_TRAP_VIRTUALIZER.virtualize_trap(&mut bp_record, &mut bp_ctx);
+    match trap_action {
+        TrapVirtualizationAction::SuppressAndContinue { next_rip } => {
+            if next_rip != probe_rip + 1 || bp_ctx.Rip != probe_rip + 1 {
+                crate::serial_write_str("[KNT-TEST-ERR] Breakpoint trap redirection RIP mismatch\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Anti-debug trap was not suppressed and continued\r\n");
+            return false;
+        }
+    }
+
+    let stats = ANTI_DEBUG_TRAP_VIRTUALIZER.get_stats();
+    if stats.breakpoint_traps_virtualized != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Trap virtualization counter mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-SEH-UNWIND-PASS] Win32 SEH Vector Unwind & Anti-Debug Virtualization verified\r\n");
+    true
+}
