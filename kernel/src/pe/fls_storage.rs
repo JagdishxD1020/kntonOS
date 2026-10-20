@@ -153,3 +153,34 @@ impl FlsSlotGovernor {
 }
 
 pub static FLS_SLOT_GOVERNOR: FlsSlotGovernor = FlsSlotGovernor::new();
+
+/// Thread / Fiber termination context for invoking FLS callbacks.
+pub struct FlsTerminationGovernor;
+
+impl FlsTerminationGovernor {
+    /// Invoke all registered FLS callbacks for non-null slot values of terminating thread/fiber.
+    pub fn invoke_termination_callbacks(
+        governor: &FlsSlotGovernor,
+        fls_data: &[usize],
+    ) -> usize {
+        let mut invoked_count = 0;
+        let limit = fls_data.len().min(FLS_MAX_SLOTS);
+
+        for slot_idx in 0..limit {
+            let val = fls_data[slot_idx];
+            if val == 0 {
+                continue;
+            }
+
+            if let Some(desc) = governor.get_slot_descriptor(slot_idx as u32) {
+                if let Some(cb) = desc.callback {
+                    // Invoke destructor callback
+                    cb(val);
+                    invoked_count += 1;
+                }
+            }
+        }
+
+        invoked_count
+    }
+}
