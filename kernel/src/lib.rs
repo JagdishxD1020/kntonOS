@@ -392,9 +392,9 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Direct3D 12 command signature and execute indirect self-test failed!\r\n");
     }
 
-    // Initialize and verify Direct3D 12 Depth Bounds Testing & Dynamic Stencil Ref Engine (TASK-KNT-193)
+    // Initialize and verify Direct3D 12 Agility Dynamic Depth Bounds & Stencil Optimizer (TASK-KNT-280)
     if !gfx::test_depth_bounds_subsystem() {
-        serial_write_str("[KNT-PANIC] Direct3D 12 depth bounds testing self-test failed!\r\n");
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility dynamic depth bounds self-test failed!\r\n");
     }
 
     // Initialize and verify Direct3D 12 Conservative Rasterization & Pixel Coverage Engine (TASK-KNT-179)
