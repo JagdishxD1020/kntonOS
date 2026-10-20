@@ -339,6 +339,39 @@ impl VariableOverdriveEngine {
 
         boosted.clamp(0.0, 255.0) as u8
     }
+
+    /// Calculates temperature compensation scaling factor for liquid crystal rotational viscosity.
+    /// Nominal calibration reference: 25.0°C (factor = 1.0).
+    /// Cold temperature (<25°C): boost overdrive voltage (> 1.0, up to 1.30 at 10°C).
+    /// Hot temperature (>25°C): dampen overdrive voltage (< 1.0, down to 0.70 at 45°C).
+    pub fn temperature_compensation_factor(panel_temp_c: f32) -> f32 {
+        let temp = panel_temp_c.clamp(5.0, 60.0);
+        let factor = 1.0 - 0.015 * (temp - 25.0);
+        factor.clamp(0.65, 1.35)
+    }
+
+    /// Computes temperature-compensated overdrive pixel drive value with VRR frequency interpolation.
+    pub fn compute_overdrive_with_temp(
+        &self,
+        from_gray: u8,
+        to_gray: u8,
+        current_refresh_hz: f32,
+        panel_temp_c: f32,
+    ) -> u8 {
+        if from_gray == to_gray {
+            return to_gray;
+        }
+
+        let base_overdrive = self.compute_overdrive(from_gray, to_gray, current_refresh_hz) as f32;
+        let target = to_gray as f32;
+        let delta = base_overdrive - target;
+
+        let temp_factor = Self::temperature_compensation_factor(panel_temp_c);
+        let compensated_delta = delta * temp_factor;
+        let final_drive = target + compensated_delta;
+
+        final_drive.clamp(0.0, 255.0) as u8
+    }
 }
 
 /// Unit test verifying variable overdrive LUT interpolation and corona suppression.
@@ -386,6 +419,53 @@ pub fn verify_variable_overdrive() -> bool {
     };
     let unsuppressed_60 = engine_no_suppress.compute_overdrive(0, 128, 60.0);
     if up_60 > unsuppressed_60 {
+        return false;
+    }
+
+    true
+}
+
+/// Verification test for temperature-compensated dynamic panel overdrive lookup tables.
+pub fn verify_temperature_compensated_overdrive() -> bool {
+    let engine = VariableOverdriveEngine::new();
+
+    // 1. Nominal temperature (25°C): should match base compute_overdrive
+    let nom_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 25.0);
+    let base_up = engine.compute_overdrive(0, 128, 120.0);
+    if nom_up != base_up {
+        return false;
+    }
+
+    // 2. Cold temperature (10°C, outdoor gaming in winter): liquid crystals are sluggish,
+    // so overdrive must provide extra voltage boost (> nominal 25°C)
+    let cold_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 10.0);
+    if cold_up <= nom_up {
+        return false;
+    }
+
+    // 3. Hot temperature (45°C, high APU load heating up backplate): liquid crystals rotate faster,
+    // so overdrive voltage must be reduced (< nominal 25°C) to prevent inverse coronas
+    let hot_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 45.0);
+    if hot_up >= nom_up || hot_up < 128 {
+        return false;
+    }
+
+    // 4. Downward transition (255 -> 64):
+    // Nominal undershoot:
+    let nom_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 25.0);
+    let cold_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 10.0);
+    let hot_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 45.0);
+
+    // Cold panel requires deeper undershoot (< nominal); hot panel requires milder undershoot (> nominal)
+    if cold_down >= nom_down || hot_down <= nom_down {
+        return false;
+    }
+
+    // 5. Static pixel (128 -> 128) must never move regardless of temperature
+    if engine.compute_overdrive_with_temp(128, 128, 120.0, 10.0) != 128 {
+        return false;
+    }
+    if engine.compute_overdrive_with_temp(128, 128, 120.0, 45.0) != 128 {
         return false;
     }
 
