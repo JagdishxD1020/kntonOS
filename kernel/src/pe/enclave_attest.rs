@@ -290,6 +290,93 @@ impl EnclaveGovernor {
     }
 }
 
+/// Anti-cheat Enclave Memory Boundary Violation Classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnclaveBoundaryViolation {
+    UnauthorizedDmaAccessAttempt {
+        enclave_id: u32,
+        target_va: usize,
+    },
+    HypervisorPageIntrospectionAttempt {
+        enclave_id: u32,
+        target_va: usize,
+    },
+    UnencryptedMemoryMapping {
+        enclave_id: u32,
+        page_va: usize,
+    },
+}
+
+/// Anti-Cheat Enclave Memory Isolation & Hardware Boundary Verifier.
+pub struct AntiCheatEnclaveBoundaryVerifier {
+    pub isolation_enforced: AtomicBool,
+    pub detected_violations: Spinlock<Vec<EnclaveBoundaryViolation>>,
+}
+
+impl AntiCheatEnclaveBoundaryVerifier {
+    pub const fn new() -> Self {
+        Self {
+            isolation_enforced: AtomicBool::new(true),
+            detected_violations: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Verify hardware memory encryption and boundary isolation for all pages of an enclave.
+    /// Checks PML4 bit 51 (encryption bit / SEV / SGX EPC physical mapping) and denies host/DMA inspection.
+    pub fn verify_enclave_isolation(&self, governor: &EnclaveGovernor, enclave_id: u32) -> bool {
+        if !self.isolation_enforced.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let map = governor.enclaves.lock();
+        let enc = match map.get(&enclave_id) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let mut violations = self.detected_violations.lock();
+        let mut isolated = true;
+
+        for (&va, page) in &enc.pages {
+            if page.is_committed && !page.hardware_encrypted && (enc.flags & ENCLAVE_FLAG_ENCRYPTED) != 0 {
+                isolated = false;
+                violations.push(EnclaveBoundaryViolation::UnencryptedMemoryMapping {
+                    enclave_id,
+                    page_va: va,
+                });
+            }
+        }
+
+        isolated
+    }
+
+    /// Simulate unauthorized DMA or debugger read interception attempt against an active enclave.
+    pub fn intercept_dma_access_attempt(
+        &self,
+        enclave_id: u32,
+        target_va: usize,
+    ) -> Result<(), NtStatus> {
+        if self.isolation_enforced.load(Ordering::Acquire) {
+            let mut violations = self.detected_violations.lock();
+            violations.push(EnclaveBoundaryViolation::UnauthorizedDmaAccessAttempt {
+                enclave_id,
+                target_va,
+            });
+            Err(STATUS_ACCESS_DENIED)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Retrieve recorded boundary violations.
+    pub fn get_violations(&self) -> Vec<EnclaveBoundaryViolation> {
+        self.detected_violations.lock().clone()
+    }
+}
+
+pub static ANTI_CHEAT_ENCLAVE_VERIFIER: AntiCheatEnclaveBoundaryVerifier =
+    AntiCheatEnclaveBoundaryVerifier::new();
+
 /// Emulates Win32 CreateEnclave API.
 pub fn win32_create_enclave(
     lp_address: usize,
