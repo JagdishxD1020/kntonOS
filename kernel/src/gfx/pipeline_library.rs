@@ -116,27 +116,36 @@ pub fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, D3d12Pipeline
     Ok(dst_pos)
 }
 
-// Compresses raw bytes into an LZ4 block containing literals and match sequences.
+// Compresses raw bytes into an LZ4 block containing valid literal and sequence framing.
 pub fn lz4_compress(src: &[u8], dst: &mut [u8]) -> Result<usize, D3d12PipelineLibraryError> {
-    let mut src_pos = 0usize;
-    let mut dst_pos = 0usize;
     let src_len = src.len();
-    let dst_len = dst.len();
+    let mut dst_pos = 0usize;
 
-    while src_pos < src_len {
-        let chunk_len = (src_len - src_pos).min(14);
-        if dst_pos + 1 + chunk_len > dst_len {
+    if src_len < 15 {
+        if dst.len() < 1 + src_len {
             return Err(D3d12PipelineLibraryError::BufferTooSmall);
         }
-
-        let token = (chunk_len as u8) << 4;
-        dst[dst_pos] = token;
+        dst[dst_pos] = (src_len as u8) << 4;
         dst_pos += 1;
-
-        dst[dst_pos..dst_pos + chunk_len].copy_from_slice(&src[src_pos..src_pos + chunk_len]);
-        dst_pos += chunk_len;
-        src_pos += chunk_len;
+    } else {
+        let mut rem = src_len - 15;
+        let extra_bytes = rem / 255 + 1;
+        if dst.len() < 1 + extra_bytes + src_len {
+            return Err(D3d12PipelineLibraryError::BufferTooSmall);
+        }
+        dst[dst_pos] = 0xF0;
+        dst_pos += 1;
+        while rem >= 255 {
+            dst[dst_pos] = 255;
+            dst_pos += 1;
+            rem -= 255;
+        }
+        dst[dst_pos] = rem as u8;
+        dst_pos += 1;
     }
+
+    dst[dst_pos..dst_pos + src_len].copy_from_slice(src);
+    dst_pos += src_len;
 
     Ok(dst_pos)
 }
@@ -600,4 +609,105 @@ impl AntiStutterShaderPrewarmer {
     pub fn stutters_prevented(&self) -> u32 {
         self.stutters_prevented
     }
+}
+
+// Comprehensive self-test suite for Direct3D 12 Agility Pipeline Library and shader cache.
+pub fn test_pipeline_library_subsystem() -> bool {
+    crate::serial_write_str("[KNT-PIPELIB] Initializing Direct3D 12 Agility Pipeline Library self-test...\r\n");
+
+    // 1. Verify PSO serialization, CRC32 checksum, and LZ4 decompression.
+    let entry0 = SerializedPsoEntry {
+        pso_id: 0x1000_A001,
+        pso_type: PipelineStateType::Graphics,
+        bytecode: alloc::vec![0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44],
+    };
+    let entry1 = SerializedPsoEntry {
+        pso_id: 0x2000_B002,
+        pso_type: PipelineStateType::Compute,
+        bytecode: alloc::vec![0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xEE, 0xFF],
+    };
+
+    let serialized = match PipelineLibraryDiskStorage::serialize(&[entry0.clone(), entry1.clone()]) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    let deserialized = match PipelineLibraryDiskStorage::deserialize(&serialized) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    if deserialized.len() != 2 || deserialized[0] != entry0 || deserialized[1] != entry1 {
+        return false;
+    }
+
+    // Corrupted payload verification.
+    let mut corrupted = serialized.clone();
+    let last_idx = corrupted.len() - 1;
+    corrupted[last_idx] ^= 0xFF;
+    if PipelineLibraryDiskStorage::deserialize(&corrupted) != Err(D3d12PipelineLibraryError::ChecksumMismatch) {
+        return false;
+    }
+
+    // 2. Verify background asynchronous PSO compilation queue and worker dispatch.
+    let mut queue = AsyncPsoCompilationQueue::new();
+    queue.enqueue_pso(0x3000_C003, PipelineStateType::Graphics, 1, 1024);
+    queue.enqueue_pso(0x4000_D004, PipelineStateType::Compute, 2, 2048);
+
+    if queue.query_status(0x3000_C003) != Some(AsyncPsoStatus::Queued) {
+        return false;
+    }
+
+    // First dispatch advances to Compiling.
+    queue.dispatch_worker_threads(2);
+    if queue.query_status(0x4000_D004) != Some(AsyncPsoStatus::Compiling) {
+        return false;
+    }
+
+    // Second dispatch completes compilation to Ready.
+    queue.dispatch_worker_threads(2);
+    if !queue.is_ready(0x4000_D004) || !queue.is_ready(0x3000_C003) || queue.completed_count() != 2 {
+        return false;
+    }
+
+    // 3. Verify driver shader cache eviction governor (LRU trimming under quota).
+    let mut governor = DriverShaderCacheEvictionGovernor::new(100_000);
+    if governor.insert_shader(0x101, 40_000) != Ok(0) || governor.insert_shader(0x102, 40_000) != Ok(0) {
+        return false;
+    }
+    if !governor.contains(0x101) || !governor.contains(0x102) {
+        return false;
+    }
+
+    // Touch 0x101 to make 0x102 the least-recently used entry.
+    governor.touch_shader(0x101);
+
+    // Inserting 0x103 (40,000 bytes) requires 80,000 + 40,000 > 100,000, evicting 0x102.
+    let evicted = match governor.insert_shader(0x103, 40_000) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if evicted != 1 || !governor.contains(0x101) || governor.contains(0x102) || !governor.contains(0x103) {
+        return false;
+    }
+    if governor.current_usage_bytes() != 80_000 {
+        return false;
+    }
+
+    // 4. Verify anti-stutter shader pre-warming during level loading.
+    let mut manifest = LevelShaderPrewarmManifest::new(101);
+    manifest.add_dependency(0x5000_E005);
+    manifest.add_dependency(0x6000_F006);
+
+    let mut prewarmer = AntiStutterShaderPrewarmer::new();
+    prewarmer.stage_level(manifest);
+
+    let prewarmed = prewarmer.prewarm_level_dependencies(&mut queue, &mut governor);
+    if prewarmed != 2 || !prewarmer.is_level_ready(&queue, &governor) || prewarmer.stutters_prevented() != 2 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-PIPE-LIB-PASS] Direct3D 12 Agility pipeline library & shader cache engine verified\r\n");
+    true
 }
