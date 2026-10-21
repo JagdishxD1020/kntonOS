@@ -357,3 +357,140 @@ impl AntiCheatFlowIntegrityGovernor {
 
 pub static ANTI_CHEAT_FLOW_GOVERNOR: AntiCheatFlowIntegrityGovernor =
     AntiCheatFlowIntegrityGovernor::new();
+
+/// Comprehensive self-test for Win32 PMU Counters & Intel PT / AMD Execution Trace Virtualization Subsystem.
+pub fn test_win32_pmu_trace_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-PMU-TRACE] Initializing Win32 PMU & Branch Trace Subsystem self-test...\r\n");
+
+    // 1. Test PMU MSR Programming & Counter Configuration
+    let global_ctrl = 0x0007_0000_000F; // Fixed CTR 0..2 + General PMC 0..3 enabled
+    let fixed_ctrl = 0x333;              // Usr + OS counting on all 3 fixed counters
+    let selectors = [
+        0x0043_003C, // Core cycles
+        0x0043_00C0, // Instructions retired
+        0x0043_412E, // LLC misses
+        0x0043_00C5, // Branch mispredictions
+    ];
+
+    PMU_CONTROLLER.program_pmu(global_ctrl, fixed_ctrl, selectors, 50_000, true);
+
+    let cfg = PMU_CONTROLLER.get_configuration();
+    if cfg.global_ctrl != global_ctrl || cfg.fixed_ctr_ctrl != fixed_ctrl || !cfg.pmi_enabled {
+        crate::serial_write_str("[KNT-TEST-ERR] PMU controller configuration mismatch\r\n");
+        return false;
+    }
+
+    PMU_CONTROLLER.increment_counter(0, 100_000);
+    if PMU_CONTROLLER.read_counter(0) != 100_000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Counter 0 read mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test Zero-Jitter PMI Sampling Interrupt Handler (Vector 0xFE)
+    PMI_SAMPLING_ENGINE.clear();
+    let sample_rip = 0x0000_0000_0040_1080u64;
+    let sample_tid = 7001u64;
+    let sample_tsc = 123_456_789u64;
+
+    PMI_SAMPLING_ENGINE.handle_pmi_interrupt(sample_rip, sample_tid, sample_tsc, 1);
+
+    if PMI_SAMPLING_ENGINE.get_sample_count() != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] PMI sample count mismatch\r\n");
+        return false;
+    }
+
+    let samples = PMI_SAMPLING_ENGINE.get_samples();
+    if samples[0].instruction_pointer != sample_rip || samples[0].thread_id != sample_tid {
+        crate::serial_write_str("[KNT-TEST-ERR] PMI sample fields mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Intel PT / AMD Branch Trace Streaming
+    EXECUTION_TRACE_STREAMER.set_tracing_enabled(true);
+
+    let module_start = 0x0040_0000u64;
+    let module_end = 0x0050_0000u64;
+    ANTI_CHEAT_FLOW_GOVERNOR.register_module_range(module_start, module_end);
+
+    let normal_packet = ExecutionTracePacket {
+        source_ip: 0x0040_1000,
+        target_ip: 0x0040_1200,
+        is_indirect: false,
+        is_call: true,
+        is_return: false,
+        tsc: 100,
+    };
+
+    if !EXECUTION_TRACE_STREAMER.push_trace_packet(normal_packet) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to push normal trace packet\r\n");
+        return false;
+    }
+
+    let drained = EXECUTION_TRACE_STREAMER.drain_packets();
+    if drained.len() != 1 || drained[0].target_ip != 0x0040_1200 {
+        crate::serial_write_str("[KNT-TEST-ERR] Drained trace packets mismatch\r\n");
+        return false;
+    }
+
+    if !ANTI_CHEAT_FLOW_GOVERNOR.verify_branch_integrity(&drained) {
+        crate::serial_write_str("[KNT-TEST-ERR] Normal execution reported as CFI violation\r\n");
+        return false;
+    }
+
+    // 4. Test Anti-Cheat Unauthorized Detour Detection (Jump outside valid module range)
+    let detour_packet = [ExecutionTracePacket {
+        source_ip: 0x0040_1500,
+        target_ip: 0x0000_7FFF_1111_0000, // External hook landing zone
+        is_indirect: true,
+        is_call: false,
+        is_return: false,
+        tsc: 200,
+    }];
+
+    if ANTI_CHEAT_FLOW_GOVERNOR.verify_branch_integrity(&detour_packet) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unauthorized runtime detour went undetected\r\n");
+        return false;
+    }
+
+    // 5. Test Anti-Cheat ROP Gadget Chain Detection (3 consecutive returns)
+    let rop_packets = [
+        ExecutionTracePacket {
+            source_ip: 0x0040_2000,
+            target_ip: 0x0040_3001,
+            is_indirect: false,
+            is_call: false,
+            is_return: true,
+            tsc: 301,
+        },
+        ExecutionTracePacket {
+            source_ip: 0x0040_3005,
+            target_ip: 0x0040_4001,
+            is_indirect: false,
+            is_call: false,
+            is_return: true,
+            tsc: 302,
+        },
+        ExecutionTracePacket {
+            source_ip: 0x0040_4008,
+            target_ip: 0x0040_5001,
+            is_indirect: false,
+            is_call: false,
+            is_return: true,
+            tsc: 303,
+        },
+    ];
+
+    if ANTI_CHEAT_FLOW_GOVERNOR.verify_branch_integrity(&rop_packets) {
+        crate::serial_write_str("[KNT-TEST-ERR] ROP gadget chain went undetected\r\n");
+        return false;
+    }
+
+    let violations = ANTI_CHEAT_FLOW_GOVERNOR.get_violations();
+    if violations.len() < 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Violations count mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-PMU-TRACE-PASS] Win32 PMU & Processor Trace Subsystem verified\r\n");
+    true
+}

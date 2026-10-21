@@ -96,6 +96,7 @@ pub use working_set::*;
 pub use job_objects::*;
 pub use seh_unwind::test_win32_seh_unwind_subsystem;
 pub use fls_storage::test_win32_fls_subsystem;
+pub use pmu_trace::test_win32_pmu_trace_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
