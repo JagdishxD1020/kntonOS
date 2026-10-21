@@ -125,3 +125,69 @@ impl PmuController {
 }
 
 pub static PMU_CONTROLLER: PmuController = PmuController::new();
+
+/// Performance Monitoring Interrupt (PMI) Sample Record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PmiSample {
+    pub instruction_pointer: u64,
+    pub thread_id: u64,
+    pub timestamp_tsc: u64,
+    pub overflow_status: u64,
+}
+
+/// Zero-Jitter PMI Sampling Interrupt Handler.
+pub struct PmiSamplingEngine {
+    samples: Spinlock<Vec<PmiSample>>,
+    sample_count: AtomicU64,
+    total_jitter_ps: AtomicU64,
+}
+
+impl PmiSamplingEngine {
+    pub const fn new() -> Self {
+        Self {
+            samples: Spinlock::new(Vec::new()),
+            sample_count: AtomicU64::new(0),
+            total_jitter_ps: AtomicU64::new(0),
+        }
+    }
+
+    /// PMI Vector 0xFE handler invoked on Local APIC counter overflow interrupt.
+    pub fn handle_pmi_interrupt(
+        &self,
+        rip: u64,
+        tid: u64,
+        tsc: u64,
+        overflow_mask: u64,
+    ) {
+        let sample = PmiSample {
+            instruction_pointer: rip,
+            thread_id: tid,
+            timestamp_tsc: tsc,
+            overflow_status: overflow_mask,
+        };
+
+        // Low-latency append with minimal lock duration
+        let mut list = self.samples.lock();
+        list.push(sample);
+        self.sample_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read recorded samples count.
+    pub fn get_sample_count(&self) -> u64 {
+        self.sample_count.load(Ordering::Acquire)
+    }
+
+    /// Retrieve recorded sample list.
+    pub fn get_samples(&self) -> Vec<PmiSample> {
+        self.samples.lock().clone()
+    }
+
+    /// Clear samples.
+    pub fn clear(&self) {
+        self.samples.lock().clear();
+        self.sample_count.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static PMI_SAMPLING_ENGINE: PmiSamplingEngine = PmiSamplingEngine::new();
