@@ -898,6 +898,163 @@ pub fn verify_vrr_backlight_strobe_sync() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: MPRT Motion Blur Reduction Governor & Low-FPS Flicker Lockout
+// ============================================================================
+
+/// Threshold below which backlight strobing produces nauseating human-perceptible flicker.
+pub const MPRT_HARD_LOCKOUT_FLICKER_HZ: f32 = 60.0;
+
+/// Threshold above which backlight strobing can safely engage (100Hz / 120Hz).
+pub const MPRT_MIN_ENGAGE_HZ: f32 = 100.0;
+
+/// Number of consecutive high-refresh frames required before re-engaging strobing (anti-chatter).
+pub const MPRT_STABILITY_FRAME_COUNT: u32 = 10;
+
+/// MPRT (Motion Picture Response Time) Motion Blur Reduction Strobe Governor.
+///
+/// In handheld gaming, Variable Refresh Rate (VRR) allows the framerate to fluctuate between
+/// 40Hz and 144Hz depending on GPU load. While 120Hz/144Hz strobing delivers CRT-grade motion clarity
+/// without flicker, pulsing the backlight below 60Hz produces severe, nauseating visual flicker.
+/// This governor monitors real-time VRR framerate: it automatically enables strobing at high refresh
+/// rates (120Hz/144Hz) and enforces a hard lockout below 60Hz, instantly falling back to pure DC dimming.
+#[derive(Debug, Clone)]
+pub struct MprtStrobeGovernor {
+    /// User preference toggle from KntonOS Quick Access overlay.
+    pub user_mprt_enabled: bool,
+    /// Whether backlight strobing is currently active and driving the LED gate.
+    pub strobe_actively_engaged: bool,
+    /// Flag indicating low-FPS anti-flicker lockout is active.
+    pub flicker_lockout_active: bool,
+    /// Current measured VRR framerate in Hz / FPS.
+    pub current_vrr_fps: f32,
+    /// Consecutive frames running above engage threshold.
+    pub high_fps_stable_frames: u32,
+    /// Total count of emergency flicker lockout transitions.
+    pub lockout_events_count: u32,
+    /// Total count of successful strobe engagement transitions.
+    pub mprt_engagement_count: u32,
+    /// Estimated effective Motion Picture Response Time in milliseconds (e.g. 0.8ms vs 8.3ms).
+    pub effective_mprt_ms: f32,
+}
+
+impl MprtStrobeGovernor {
+    pub const fn new() -> Self {
+        Self {
+            user_mprt_enabled: true,
+            strobe_actively_engaged: false,
+            flicker_lockout_active: false,
+            current_vrr_fps: 60.0,
+            high_fps_stable_frames: 0,
+            lockout_events_count: 0,
+            mprt_engagement_count: 0,
+            effective_mprt_ms: 8.3, // Baseline 120Hz sample-and-hold without strobing
+        }
+    }
+
+    /// Evaluates current VRR framerate and updates strobe engagement and flicker lockout state.
+    /// Returns `true` if backlight strobing is allowed to operate.
+    pub fn update_framerate(&mut self, current_fps: f32) -> bool {
+        self.current_vrr_fps = current_fps;
+
+        if !self.user_mprt_enabled {
+            self.strobe_actively_engaged = false;
+            self.flicker_lockout_active = false;
+            self.high_fps_stable_frames = 0;
+            self.effective_mprt_ms = 1000.0 / current_fps.max(30.0);
+            return false;
+        }
+
+        // 1. Hard flicker lockout check: if framerate drops below 60Hz, immediately disengage strobing
+        if current_fps < MPRT_HARD_LOCKOUT_FLICKER_HZ {
+            if self.strobe_actively_engaged {
+                self.lockout_events_count += 1;
+            }
+            self.strobe_actively_engaged = false;
+            self.flicker_lockout_active = true;
+            self.high_fps_stable_frames = 0;
+            self.effective_mprt_ms = 1000.0 / current_fps.max(30.0);
+            return false;
+        }
+
+        // 2. High refresh rate engagement check (>= 100Hz / 120Hz / 144Hz)
+        if current_fps >= MPRT_MIN_ENGAGE_HZ {
+            self.high_fps_stable_frames += 1;
+            if self.high_fps_stable_frames >= MPRT_STABILITY_FRAME_COUNT {
+                if !self.strobe_actively_engaged {
+                    self.mprt_engagement_count += 1;
+                }
+                self.strobe_actively_engaged = true;
+                self.flicker_lockout_active = false;
+                self.effective_mprt_ms = 0.8; // Sub-millisecond MPRT motion clarity!
+            }
+        } else {
+            // In the intermediate hysteresis band (60Hz to 100Hz):
+            // If already engaged, disengage if it drops below 75Hz to prevent peripheral flicker
+            if current_fps < 75.0 && self.strobe_actively_engaged {
+                self.strobe_actively_engaged = false;
+                self.flicker_lockout_active = true;
+                self.lockout_events_count += 1;
+                self.effective_mprt_ms = 1000.0 / current_fps;
+            }
+            self.high_fps_stable_frames = 0;
+        }
+
+        self.strobe_actively_engaged
+    }
+}
+
+/// Verification test for MPRT motion blur reduction governor and low-framerate flicker lockout.
+pub fn verify_mprt_flicker_lockout_governor() -> bool {
+    let mut gov = MprtStrobeGovernor::new();
+
+    // 1. Initial state
+    if !gov.user_mprt_enabled || gov.strobe_actively_engaged {
+        return false;
+    }
+
+    // 2. Feed 120Hz framerate for 10 stable frames -> strobing engages!
+    for _ in 0..10 {
+        gov.update_framerate(120.0);
+    }
+    if !gov.strobe_actively_engaged || gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.mprt_engagement_count != 1 || gov.effective_mprt_ms > 1.0 {
+        return false;
+    }
+
+    // 3. Heavy game scene causes framerate to drop to 48 FPS (< 60Hz threshold)
+    let allowed = gov.update_framerate(48.0);
+    // Must immediately disengage strobing and enter flicker lockout
+    if allowed || gov.strobe_actively_engaged || !gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.lockout_events_count != 1 {
+        return false;
+    }
+
+    // 4. Framerate recovers slightly to 70 FPS (inside hysteresis lockout zone < 100Hz)
+    // Strobing must remain locked out to prevent flickering on unstable frame times
+    let allowed2 = gov.update_framerate(70.0);
+    if allowed2 || gov.strobe_actively_engaged {
+        return false;
+    }
+
+    // 5. Framerate recovers to 144 FPS and holds for 10 frames -> re-engages cleanly
+    for _ in 0..10 {
+        gov.update_framerate(144.0);
+    }
+    if !gov.strobe_actively_engaged || gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.mprt_engagement_count != 2 {
+        return false;
+    }
+
+    true
+}
+
 /// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
 pub fn test_panel_overdrive_subsystem() -> bool {
     crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
