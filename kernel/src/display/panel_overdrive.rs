@@ -1055,6 +1055,135 @@ pub fn verify_mprt_flicker_lockout_governor() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Panel Thermal Safety Limiter & Peak Strobe Current Clamping
+// ============================================================================
+
+/// Maximum permissible peak backlight strobe current at room temperature (1200 mA).
+pub const NOMINAL_PEAK_STROBE_CURRENT_MA: u16 = 1200;
+
+/// Thermal threshold above which strobe current is progressively clamped (40°C).
+pub const STROBE_THERMAL_CLAMP_START_C: f32 = 40.0;
+
+/// Thermal threshold above which strobing is completely shut down (58°C).
+pub const STROBE_THERMAL_SHUTDOWN_C: f32 = 58.0;
+
+/// Display Panel Thermal Safety Limiter for Backlight Strobing.
+///
+/// Because backlight strobing energizes LEDs for only ~10% of the frame interval, the peak drive
+/// current must reach up to 1200 mA to maintain acceptable image luminance. Under intense handheld
+/// gaming sessions where the APU thermal dissipation elevates chassis temperatures, driving 1200 mA
+/// pulses risks phosphor burning, optical diffuser warping, and localized panel discoloration.
+/// This limiter dynamically clamps the maximum allowable strobe pulse current as panel temperature
+/// rises, and enforces an emergency thermal shutdown of strobing above 58°C.
+#[derive(Debug, Clone)]
+pub struct PanelStrobeThermalLimiter {
+    /// Nominal target peak strobe current in milliamperes at room temperature.
+    pub nominal_peak_current_ma: u16,
+    /// Currently enforced peak strobe drive current ceiling in milliamperes.
+    pub current_peak_limit_ma: u16,
+    /// Measured panel temperature in degrees Celsius.
+    pub panel_temperature_c: f32,
+    /// Flag indicating peak current is actively being clamped due to thermal stress.
+    pub thermal_clamp_active: bool,
+    /// Flag indicating strobing is completely disabled due to critical panel overheat.
+    pub strobe_thermally_prohibited: bool,
+    /// Cumulative count of thermal clamp / shutdown interventions.
+    pub thermal_interventions_count: u32,
+}
+
+impl PanelStrobeThermalLimiter {
+    pub const fn new(nominal_peak_current_ma: u16) -> Self {
+        Self {
+            nominal_peak_current_ma,
+            current_peak_limit_ma: nominal_peak_current_ma,
+            panel_temperature_c: 25.0,
+            thermal_clamp_active: false,
+            strobe_thermally_prohibited: false,
+            thermal_interventions_count: 0,
+        }
+    }
+
+    /// Evaluates panel temperature and clamps peak backlight strobe drive current.
+    /// Returns the maximum allowable peak current in milliamperes.
+    pub fn evaluate_thermal_limits(&mut self, panel_temp_c: f32) -> u16 {
+        self.panel_temperature_c = panel_temp_c;
+
+        if panel_temp_c >= STROBE_THERMAL_SHUTDOWN_C {
+            // Critical thermal emergency: prohibit strobing completely; fall back to safe DC current (250 mA)
+            if !self.strobe_thermally_prohibited {
+                self.thermal_interventions_count += 1;
+            }
+            self.strobe_thermally_prohibited = true;
+            self.thermal_clamp_active = true;
+            self.current_peak_limit_ma = 250;
+        } else if panel_temp_c >= STROBE_THERMAL_CLAMP_START_C {
+            // Progressive thermal clamping: 40°C -> 1200 mA, 50°C -> 600 mA, 58°C -> 400 mA
+            if !self.thermal_clamp_active {
+                self.thermal_interventions_count += 1;
+            }
+            self.strobe_thermally_prohibited = false;
+            self.thermal_clamp_active = true;
+
+            let excess = panel_temp_c - STROBE_THERMAL_CLAMP_START_C;
+            let reduction = (excess / (STROBE_THERMAL_SHUTDOWN_C - STROBE_THERMAL_CLAMP_START_C)) * ((self.nominal_peak_current_ma - 400) as f32);
+            let clamped = (self.nominal_peak_current_ma as f32) - reduction;
+            self.current_peak_limit_ma = clamped.clamp(400.0, self.nominal_peak_current_ma as f32) as u16;
+        } else {
+            // Safe normal thermal range (< 40°C)
+            self.strobe_thermally_prohibited = false;
+            self.thermal_clamp_active = false;
+            self.current_peak_limit_ma = self.nominal_peak_current_ma;
+        }
+
+        self.current_peak_limit_ma
+    }
+}
+
+/// Verification test for panel thermal safety limiter and peak strobe current clamping.
+pub fn verify_panel_thermal_safety_limiter() -> bool {
+    let mut limiter = PanelStrobeThermalLimiter::new(NOMINAL_PEAK_STROBE_CURRENT_MA); // 1200 mA
+
+    // 1. Initial healthy state at 25°C
+    if limiter.current_peak_limit_ma != 1200 || limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    // 2. Normal operational temp (35°C < 40°C threshold): full 1200 mA allowed
+    let lim1 = limiter.evaluate_thermal_limits(35.0);
+    if lim1 != 1200 || limiter.thermal_clamp_active {
+        return false;
+    }
+
+    // 3. Elevated temperature (49°C, midway through clamp range):
+    // excess = 9°C out of 18°C span (50%) -> reduction = 0.50 * (1200 - 400) = 400 mA -> ~800 mA limit
+    let lim2 = limiter.evaluate_thermal_limits(49.0);
+    if lim2 >= 1200 || lim2 <= 400 || !limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+    if (lim2 as i32 - 800).abs() > 20 {
+        return false;
+    }
+    if limiter.thermal_interventions_count != 1 {
+        return false;
+    }
+
+    // 4. Critical panel overheat (60°C >= 58°C shutdown threshold):
+    // Strobing must be shut down, current clamped to safe DC 250 mA
+    let lim3 = limiter.evaluate_thermal_limits(60.0);
+    if lim3 != 250 || !limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    // 5. Thermal recovery below 38°C: restores full 1200 mA peak strobe current
+    let lim4 = limiter.evaluate_thermal_limits(36.0);
+    if lim4 != 1200 || limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    true
+}
+
 /// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
 pub fn test_panel_overdrive_subsystem() -> bool {
     crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
