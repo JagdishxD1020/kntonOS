@@ -191,3 +191,79 @@ impl PmiSamplingEngine {
 }
 
 pub static PMI_SAMPLING_ENGINE: PmiSamplingEngine = PmiSamplingEngine::new();
+
+/// Intel PT / AMD Branch Packet Type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchPacketType {
+    TakenBranch,
+    NotTakenBranch,
+    TargetIp { target_ip: u64 },
+    PagingModeUpdate { cr3: u64 },
+    Overflow,
+}
+
+/// Decoded Execution Branch Trace Packet.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionTracePacket {
+    pub source_ip: u64,
+    pub target_ip: u64,
+    pub is_indirect: bool,
+    pub is_call: bool,
+    pub is_return: bool,
+    pub tsc: u64,
+}
+
+/// SPSC Ring Buffer for streaming execution trace packets.
+pub const TRACE_RING_BUFFER_CAPACITY: usize = 1024;
+
+pub struct ExecutionTraceStreamer {
+    ring_buffer: Spinlock<Vec<ExecutionTracePacket>>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    tracing_enabled: AtomicBool,
+}
+
+impl ExecutionTraceStreamer {
+    pub const fn new() -> Self {
+        Self {
+            ring_buffer: Spinlock::new(Vec::new()),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            tracing_enabled: AtomicBool::new(false),
+        }
+    }
+
+    /// Enable or disable execution branch tracing.
+    pub fn set_tracing_enabled(&self, enabled: bool) {
+        self.tracing_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Push a branch trace packet to the ring buffer.
+    pub fn push_trace_packet(&self, packet: ExecutionTracePacket) -> bool {
+        if !self.tracing_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let mut buf = self.ring_buffer.lock();
+        if buf.len() < TRACE_RING_BUFFER_CAPACITY {
+            buf.push(packet);
+        } else {
+            let h = self.head.load(Ordering::Relaxed) % TRACE_RING_BUFFER_CAPACITY;
+            buf[h] = packet;
+        }
+        self.head.fetch_add(1, Ordering::Release);
+        true
+    }
+
+    /// Read available packets from the ring buffer.
+    pub fn drain_packets(&self) -> Vec<ExecutionTracePacket> {
+        let mut buf = self.ring_buffer.lock();
+        let drained = buf.clone();
+        buf.clear();
+        self.head.store(0, Ordering::Relaxed);
+        drained
+    }
+}
+
+pub static EXECUTION_TRACE_STREAMER: ExecutionTraceStreamer = ExecutionTraceStreamer::new();
