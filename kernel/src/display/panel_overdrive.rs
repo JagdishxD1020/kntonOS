@@ -724,6 +724,180 @@ pub fn verify_panel_overdrive_manager() -> bool {
 }
 
 
+// ============================================================================
+// Feature 2: Backlight Strobe Timing Synchronization with VRR VSYNC Pulses
+// ============================================================================
+
+/// State of the backlight strobe timing generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrobeState {
+    /// Strobe disabled; continuous illumination (DC dimming).
+    ContinuousDc,
+    /// VSYNC received; waiting for liquid crystal molecules to settle across screen (dark period).
+    SettlingDarkPhase,
+    /// Liquid crystals settled; high-brightness sub-millisecond strobe active.
+    StrobeActive,
+}
+
+/// Backlight Strobe Timing Synchronizer with Variable Refresh Rate (VRR) VSYNC.
+///
+/// In sample-and-hold LCD displays, motion blur is caused by retinal persistence over the entire
+/// frame duration (e.g. 8.3ms at 120Hz). By pulsing the backlight for a sub-millisecond duration
+/// (e.g. 0.5ms - 1.2ms) only after liquid crystals have settled following the VSYNC scanout,
+/// Motion Picture Response Time (MPRT) drops to < 1.0ms, giving CRT-like motion clarity.
+#[derive(Debug, Clone)]
+pub struct BacklightStrobeSynchronizer {
+    /// Whether strobe synchronization is enabled.
+    pub enabled: bool,
+    /// Sub-millisecond strobe flash pulse width in microseconds (e.g. 800 µs = 0.8ms).
+    pub strobe_pulse_width_us: u32,
+    /// Strobe phase delay from VSYNC leading edge in microseconds (settling window).
+    pub strobe_phase_delay_us: u32,
+    /// Percentage of frame interval allocated to liquid crystal settling (e.g. 80%).
+    pub settling_ratio_percent: u8,
+    /// Timestamp of most recent VSYNC interrupt in microseconds.
+    pub last_vsync_timestamp_us: u64,
+    /// Measured frame interval between consecutive VSYNC pulses in microseconds.
+    pub frame_interval_us: u32,
+    /// Timestamp when current/next strobe pulse turns on.
+    pub planned_strobe_start_us: u64,
+    /// Timestamp when current strobe pulse turns off.
+    pub planned_strobe_end_us: u64,
+    /// Current hardware strobe state.
+    pub state: StrobeState,
+    /// Hardware strobe driver gate signal (true = LEDs illuminated, false = dark).
+    pub strobe_gate_active: bool,
+    /// Total count of strobe pulses fired.
+    pub total_pulses_fired: u64,
+}
+
+impl BacklightStrobeSynchronizer {
+    pub const fn new(strobe_pulse_width_us: u32) -> Self {
+        Self {
+            enabled: true,
+            strobe_pulse_width_us,
+            strobe_phase_delay_us: 6500,
+            settling_ratio_percent: 80,
+            last_vsync_timestamp_us: 0,
+            frame_interval_us: 8333, // 120 Hz default
+            planned_strobe_start_us: 0,
+            planned_strobe_end_us: 0,
+            state: StrobeState::ContinuousDc,
+            strobe_gate_active: false,
+            total_pulses_fired: 0,
+        }
+    }
+
+    /// Handles hardware VRR VSYNC interrupt leading edge.
+    pub fn on_vrr_vsync(&mut self, timestamp_us: u64) {
+        if !self.enabled {
+            self.state = StrobeState::ContinuousDc;
+            self.strobe_gate_active = true;
+            return;
+        }
+
+        if self.last_vsync_timestamp_us > 0 {
+            let delta = timestamp_us.saturating_sub(self.last_vsync_timestamp_us);
+            if delta >= 6000 && delta <= 25_000 {
+                self.frame_interval_us = delta as u32;
+            }
+        }
+        self.last_vsync_timestamp_us = timestamp_us;
+
+        // Calculate dynamic phase delay to align with bottom-of-screen LC settling:
+        // phase_delay = frame_interval * (settling_ratio / 100)
+        self.strobe_phase_delay_us = (self.frame_interval_us * (self.settling_ratio_percent as u32)) / 100;
+
+        self.planned_strobe_start_us = timestamp_us + (self.strobe_phase_delay_us as u64);
+        self.planned_strobe_end_us = self.planned_strobe_start_us + (self.strobe_pulse_width_us as u64);
+
+        // Turn off backlight for settling dark phase
+        self.state = StrobeState::SettlingDarkPhase;
+        self.strobe_gate_active = false;
+    }
+
+    /// Timer tick handler checking if the strobe pulse should be energized.
+    pub fn update_timer(&mut self, current_time_us: u64) -> bool {
+        if !self.enabled {
+            self.state = StrobeState::ContinuousDc;
+            self.strobe_gate_active = true;
+            return true;
+        }
+
+        if current_time_us >= self.planned_strobe_start_us && current_time_us < self.planned_strobe_end_us {
+            if self.state != StrobeState::StrobeActive {
+                self.state = StrobeState::StrobeActive;
+                self.strobe_gate_active = true;
+                self.total_pulses_fired += 1;
+            }
+        } else {
+            self.state = StrobeState::SettlingDarkPhase;
+            self.strobe_gate_active = false;
+        }
+
+        self.strobe_gate_active
+    }
+}
+
+/// Verification test for backlight strobe timing synchronization with VRR VSYNC pulses.
+pub fn verify_vrr_backlight_strobe_sync() -> bool {
+    let mut sync = BacklightStrobeSynchronizer::new(800); // 800 µs sub-millisecond pulse width
+
+    // 1. Initial state
+    if !sync.enabled || sync.strobe_pulse_width_us != 800 {
+        return false;
+    }
+
+    // 2. Simulate 120Hz VRR stream (interval = 8333 µs)
+    let vsync_1 = 1_000_000u64;
+    sync.on_vrr_vsync(vsync_1);
+
+    let vsync_2 = vsync_1 + 8333;
+    sync.on_vrr_vsync(vsync_2);
+
+    if sync.frame_interval_us != 8333 {
+        return false;
+    }
+
+    // Phase delay should be (8333 * 80) / 100 = 6666 µs
+    if sync.strobe_phase_delay_us != 6666 {
+        return false;
+    }
+
+    // Check t = vsync_2 + 2000 µs (during dark settling period)
+    let gate_dark = sync.update_timer(vsync_2 + 2000);
+    if gate_dark || sync.state != StrobeState::SettlingDarkPhase {
+        return false;
+    }
+
+    // Check t = vsync_2 + 7000 µs (during active strobe pulse)
+    let gate_active = sync.update_timer(vsync_2 + 7000);
+    if !gate_active || sync.state != StrobeState::StrobeActive {
+        return false;
+    }
+    if sync.total_pulses_fired != 1 {
+        return false;
+    }
+
+    // Check t = vsync_2 + 7800 µs (after strobe end, before next vsync)
+    let gate_end = sync.update_timer(vsync_2 + 7800);
+    if gate_end || sync.state != StrobeState::SettlingDarkPhase {
+        return false;
+    }
+
+    // 3. Test dynamic VRR shift to 144Hz (6944 µs interval)
+    let vsync_3 = vsync_2 + 6944;
+    sync.on_vrr_vsync(vsync_3);
+    if sync.frame_interval_us != 6944 {
+        return false;
+    }
+    if sync.strobe_phase_delay_us != 5555 {
+        return false;
+    }
+
+    true
+}
+
 /// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
 pub fn test_panel_overdrive_subsystem() -> bool {
     crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
