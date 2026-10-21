@@ -290,3 +290,97 @@ impl PipelineLibraryDiskStorage {
         Ok(entries)
     }
 }
+
+// Asynchronous background PSO compilation execution status.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AsyncPsoStatus {
+    Queued,
+    Compiling,
+    Ready,
+    Failed,
+}
+
+// Background PSO compilation request task metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsyncPsoTask {
+    pub pso_id: u64,
+    pub priority: u8,
+    pub pso_type: PipelineStateType,
+    pub status: AsyncPsoStatus,
+    pub bytecode_bytes: usize,
+    pub worker_thread_id: Option<u32>,
+}
+
+// Asynchronous multi-threaded pipeline state compilation queue.
+pub struct AsyncPsoCompilationQueue {
+    tasks: Vec<AsyncPsoTask>,
+    completed_count: usize,
+}
+
+impl AsyncPsoCompilationQueue {
+    // Initializes an empty asynchronous PSO compilation queue.
+    pub const fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            completed_count: 0,
+        }
+    }
+
+    // Submits a pipeline state compilation task to the background queue with priority ordering.
+    pub fn enqueue_pso(
+        &mut self,
+        pso_id: u64,
+        pso_type: PipelineStateType,
+        priority: u8,
+        bytecode_bytes: usize,
+    ) {
+        let task = AsyncPsoTask {
+            pso_id,
+            priority,
+            pso_type,
+            status: AsyncPsoStatus::Queued,
+            bytecode_bytes,
+            worker_thread_id: None,
+        };
+
+        // Insert maintaining descending priority order (higher priority at the front).
+        let idx = self.tasks.iter().position(|t| t.priority < priority).unwrap_or(self.tasks.len());
+        self.tasks.insert(idx, task);
+    }
+
+    // Simulates multi-threaded worker dispatch to compile queued PSO jobs concurrently.
+    pub fn dispatch_worker_threads(&mut self, thread_count: usize) {
+        let mut active_worker = 0u32;
+        for task in self.tasks.iter_mut() {
+            if task.status == AsyncPsoStatus::Queued && (active_worker as usize) < thread_count {
+                task.status = AsyncPsoStatus::Compiling;
+                task.worker_thread_id = Some(active_worker);
+                active_worker += 1;
+            } else if task.status == AsyncPsoStatus::Compiling {
+                // Advance compiling jobs to Ready on worker completion.
+                task.status = AsyncPsoStatus::Ready;
+                self.completed_count += 1;
+            }
+        }
+    }
+
+    // Queries compilation readiness for a specific pipeline state object.
+    pub fn query_status(&self, pso_id: u64) -> Option<AsyncPsoStatus> {
+        self.tasks.iter().find(|t| t.pso_id == pso_id).map(|t| t.status)
+    }
+
+    // Determines if a pipeline state object is compiled and ready for immediate draw binding.
+    pub fn is_ready(&self, pso_id: u64) -> bool {
+        self.query_status(pso_id) == Some(AsyncPsoStatus::Ready)
+    }
+
+    // Returns the count of tasks currently queued or compiling in the background.
+    pub fn pending_count(&self) -> usize {
+        self.tasks.iter().filter(|t| t.status != AsyncPsoStatus::Ready && t.status != AsyncPsoStatus::Failed).count()
+    }
+
+    // Returns total count of successfully compiled pipeline state objects.
+    pub fn completed_count(&self) -> usize {
+        self.completed_count
+    }
+}
