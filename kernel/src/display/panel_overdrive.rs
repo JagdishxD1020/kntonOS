@@ -1184,21 +1184,44 @@ pub fn verify_panel_thermal_safety_limiter() -> bool {
     true
 }
 
-/// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
+/// Comprehensive verification self-test suite for Handheld Dynamic Display Panel Overdrive &
+/// Motion Blur Reduction Strobe Governor (TASK-KNT-282 / TASK-KNT-212).
 pub fn test_panel_overdrive_subsystem() -> bool {
-    crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
+    crate::serial_write_str("[KNT-DISPLAY] Testing Dynamic Panel Overdrive & Motion Blur Reduction Strobe Governor...\r\n");
+
     if !verify_dc_dimming_curve() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] DC dimming curve verification failed!\r\n");
         return false;
     }
     if !verify_variable_overdrive() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Variable overdrive verification failed!\r\n");
+        return false;
+    }
+    if !verify_temperature_compensated_overdrive() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Temperature-compensated overdrive verification failed!\r\n");
+        return false;
+    }
+    if !verify_vrr_backlight_strobe_sync() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] VRR backlight strobe synchronization verification failed!\r\n");
+        return false;
+    }
+    if !verify_mprt_flicker_lockout_governor() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] MPRT flicker lockout governor verification failed!\r\n");
+        return false;
+    }
+    if !verify_panel_thermal_safety_limiter() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Panel thermal safety limiter verification failed!\r\n");
         return false;
     }
     if !verify_hdr_boost_governor() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] HDR boost governor verification failed!\r\n");
         return false;
     }
     if !verify_panel_overdrive_manager() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Panel overdrive manager verification failed!\r\n");
         return false;
     }
-    crate::serial_write_str("[KNT-DISPLAY-OVERDRIVE-PASS] Handheld direct display DC dimming and variable overdrive controller verified\r\n");
+
+    crate::serial_write_str("[KNT-DISPLAY-OVERDRIVE-PASS] Dynamic display panel overdrive and motion blur reduction strobe governor verified\r\n");
     true
 }

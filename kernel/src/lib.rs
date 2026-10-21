@@ -894,9 +894,9 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld USB-C docking station and DP MST manager self-test failed!\r\n");
     }
 
-    // Initialize and verify Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller (TASK-KNT-212)
+    // Initialize and verify Handheld Dynamic Display Panel Overdrive & Motion Blur Reduction Strobe Governor (TASK-KNT-282)
     if !display::test_panel_overdrive_subsystem() {
-        serial_write_str("[KNT-PANIC] Handheld direct display DC dimming and variable overdrive self-test failed!\r\n");
+        serial_write_str("[KNT-PANIC] Handheld dynamic display panel overdrive and strobe governor self-test failed!\r\n");
     }
 
     // Initialize and verify Handheld Display DSC & Adaptive Refresh Rate (VRR) Fast-Sync Engine (TASK-KNT-238)
