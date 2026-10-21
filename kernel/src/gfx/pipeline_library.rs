@@ -384,3 +384,114 @@ impl AsyncPsoCompilationQueue {
         self.completed_count
     }
 }
+
+// Default disk shader cache storage quota (512 Megabytes).
+pub const DEFAULT_SHADER_CACHE_QUOTA_BYTES: usize = 512 * 1024 * 1024;
+
+// Cache entry tracked by the driver shader cache eviction governor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShaderCacheEntry {
+    pub pso_id: u64,
+    pub size_bytes: usize,
+    pub last_access_tick: u64,
+    pub access_count: u32,
+}
+
+// Driver shader cache eviction governor managing disk page-cache trimming under quota pressure.
+pub struct DriverShaderCacheEvictionGovernor {
+    quota_bytes: usize,
+    current_usage_bytes: usize,
+    entries: Vec<ShaderCacheEntry>,
+    access_counter: u64,
+}
+
+impl DriverShaderCacheEvictionGovernor {
+    // Creates a new eviction governor with specified cache quota limit.
+    pub const fn new(quota_bytes: usize) -> Self {
+        Self {
+            quota_bytes,
+            current_usage_bytes: 0,
+            entries: Vec::new(),
+            access_counter: 1,
+        }
+    }
+
+    // Default governor initialized with standard 512MB disk shader cache quota.
+    pub const fn default_quota() -> Self {
+        Self::new(DEFAULT_SHADER_CACHE_QUOTA_BYTES)
+    }
+
+    // Inserts or updates a cached shader binary, trimming LRU entries when quota is exceeded.
+    pub fn insert_shader(&mut self, pso_id: u64, size_bytes: usize) -> Result<usize, D3d12PipelineLibraryError> {
+        if size_bytes > self.quota_bytes {
+            return Err(D3d12PipelineLibraryError::QuotaExceeded);
+        }
+
+        // If entry already exists, update size and access tick.
+        if let Some(pos) = self.entries.iter().position(|e| e.pso_id == pso_id) {
+            let old_size = self.entries[pos].size_bytes;
+            self.current_usage_bytes = self.current_usage_bytes.saturating_sub(old_size);
+            self.entries.remove(pos);
+        }
+
+        let mut evicted_count = 0usize;
+        // Evict least-recently-used entries until sufficient quota headroom is restored.
+        while self.current_usage_bytes.saturating_add(size_bytes) > self.quota_bytes && !self.entries.is_empty() {
+            // Find entry with minimum last_access_tick.
+            let min_idx = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_access_tick)
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+
+            let removed = self.entries.remove(min_idx);
+            self.current_usage_bytes = self.current_usage_bytes.saturating_sub(removed.size_bytes);
+            evicted_count += 1;
+        }
+
+        self.access_counter += 1;
+        self.entries.push(ShaderCacheEntry {
+            pso_id,
+            size_bytes,
+            last_access_tick: self.access_counter,
+            access_count: 1,
+        });
+        self.current_usage_bytes += size_bytes;
+
+        Ok(evicted_count)
+    }
+
+    // Marks a cached shader entry as active, refreshing its LRU eviction timeline.
+    pub fn touch_shader(&mut self, pso_id: u64) -> bool {
+        self.access_counter += 1;
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.pso_id == pso_id) {
+            entry.last_access_tick = self.access_counter;
+            entry.access_count = entry.access_count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    // Indicates whether the specified PSO currently resides in the disk shader cache.
+    pub fn contains(&self, pso_id: u64) -> bool {
+        self.entries.iter().any(|e| e.pso_id == pso_id)
+    }
+
+    // Returns current memory/disk consumption of cached shaders in bytes.
+    pub fn current_usage_bytes(&self) -> usize {
+        self.current_usage_bytes
+    }
+
+    // Returns the total allocated quota limit in bytes.
+    pub fn quota_bytes(&self) -> usize {
+        self.quota_bytes
+    }
+
+    // Returns count of active entries currently held in the cache.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
