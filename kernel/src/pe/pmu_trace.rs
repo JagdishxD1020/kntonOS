@@ -267,3 +267,93 @@ impl ExecutionTraceStreamer {
 }
 
 pub static EXECUTION_TRACE_STREAMER: ExecutionTraceStreamer = ExecutionTraceStreamer::new();
+
+/// Anti-cheat execution flow violation types detected via Processor Trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlowIntegrityViolation {
+    RopGadgetChainDetected {
+        gadget_ip: u64,
+        return_target: u64,
+    },
+    UnauthorizedRuntimeDetour {
+        source_ip: u64,
+        hook_landing_ip: u64,
+    },
+    IndirectBranchTargetSmashing {
+        source_ip: u64,
+        target_ip: u64,
+    },
+}
+
+/// Anti-Cheat Control Flow Integrity (CFI) & Trace Scanner.
+pub struct AntiCheatFlowIntegrityGovernor {
+    pub detection_enabled: AtomicBool,
+    pub valid_module_ranges: Spinlock<Vec<(u64, u64)>>, // (Start, End)
+    pub detected_violations: Spinlock<Vec<FlowIntegrityViolation>>,
+}
+
+impl AntiCheatFlowIntegrityGovernor {
+    pub const fn new() -> Self {
+        Self {
+            detection_enabled: AtomicBool::new(true),
+            valid_module_ranges: Spinlock::new(Vec::new()),
+            detected_violations: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Register a legitimate executable module virtual address range.
+    pub fn register_module_range(&self, start: u64, end: u64) {
+        self.valid_module_ranges.lock().push((start, end));
+    }
+
+    /// Analyze a batch of execution branch packets for CFI violations, ROP gadgets, and unauthorized detours.
+    pub fn verify_branch_integrity(&self, packets: &[ExecutionTracePacket]) -> bool {
+        if !self.detection_enabled.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let ranges = self.valid_module_ranges.lock();
+        let mut violations = self.detected_violations.lock();
+        let mut clean = true;
+
+        let mut consecutive_returns = 0;
+        let mut last_return_source = 0u64;
+
+        for pkt in packets {
+            // 1. Check if branch lands outside all valid executable module bounds (Unauthorized Detour / Shellcode)
+            let is_target_in_range = ranges.iter().any(|(s, e)| pkt.target_ip >= *s && pkt.target_ip < *e);
+            if !is_target_in_range && pkt.target_ip != 0 {
+                clean = false;
+                violations.push(FlowIntegrityViolation::UnauthorizedRuntimeDetour {
+                    source_ip: pkt.source_ip,
+                    hook_landing_ip: pkt.target_ip,
+                });
+            }
+
+            // 2. Check for ROP gadget chains: rapid sequence of ret instructions without intervening calls
+            if pkt.is_return {
+                consecutive_returns += 1;
+                if consecutive_returns >= 3 {
+                    clean = false;
+                    violations.push(FlowIntegrityViolation::RopGadgetChainDetected {
+                        gadget_ip: last_return_source,
+                        return_target: pkt.target_ip,
+                    });
+                }
+                last_return_source = pkt.source_ip;
+            } else if pkt.is_call {
+                consecutive_returns = 0;
+            }
+        }
+
+        clean
+    }
+
+    /// Retrieve recorded flow integrity violations.
+    pub fn get_violations(&self) -> Vec<FlowIntegrityViolation> {
+        self.detected_violations.lock().clone()
+    }
+}
+
+pub static ANTI_CHEAT_FLOW_GOVERNOR: AntiCheatFlowIntegrityGovernor =
+    AntiCheatFlowIntegrityGovernor::new();
