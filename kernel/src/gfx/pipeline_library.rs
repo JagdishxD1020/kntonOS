@@ -495,3 +495,109 @@ impl DriverShaderCacheEvictionGovernor {
         self.entries.len()
     }
 }
+
+// Game level shader pre-warming manifest specifying PSO dependencies for seamless loading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelShaderPrewarmManifest {
+    pub level_id: u32,
+    pub pso_dependencies: Vec<u64>,
+}
+
+impl LevelShaderPrewarmManifest {
+    // Creates a new shader pre-warm manifest for a specific game level or scene.
+    pub const fn new(level_id: u32) -> Self {
+        Self {
+            level_id,
+            pso_dependencies: Vec::new(),
+        }
+    }
+
+    // Registers a required pipeline state object dependency.
+    pub fn add_dependency(&mut self, pso_id: u64) {
+        if !self.pso_dependencies.contains(&pso_id) {
+            self.pso_dependencies.push(pso_id);
+        }
+    }
+}
+
+// Anti-stutter shader pre-warming governor eliminating runtime compilation hitches.
+pub struct AntiStutterShaderPrewarmer {
+    active_manifest: Option<LevelShaderPrewarmManifest>,
+    prewarmed_count: usize,
+    stutters_prevented: u32,
+}
+
+impl AntiStutterShaderPrewarmer {
+    // Initializes the anti-stutter shader pre-warmer.
+    pub const fn new() -> Self {
+        Self {
+            active_manifest: None,
+            prewarmed_count: 0,
+            stutters_prevented: 0,
+        }
+    }
+
+    // Stages a game level manifest to initiate proactive PSO pre-compilation.
+    pub fn stage_level(&mut self, manifest: LevelShaderPrewarmManifest) {
+        self.active_manifest = Some(manifest);
+    }
+
+    // Executes pre-warming dispatch, compiling missing PSOs during level loading screens.
+    pub fn prewarm_level_dependencies(
+        &mut self,
+        queue: &mut AsyncPsoCompilationQueue,
+        governor: &mut DriverShaderCacheEvictionGovernor,
+    ) -> usize {
+        let manifest = match &self.active_manifest {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        let mut enqueued = 0usize;
+        for &pso_id in &manifest.pso_dependencies {
+            // Check if PSO is already in disk cache or already queued.
+            if !governor.contains(pso_id) && queue.query_status(pso_id).is_none() {
+                // Priority 2 = Critical loading pre-warm priority.
+                queue.enqueue_pso(pso_id, PipelineStateType::Graphics, 2, 4096);
+                enqueued += 1;
+            }
+        }
+
+        // Dispatch background worker threads until all prewarm tasks complete.
+        while queue.pending_count() > 0 {
+            queue.dispatch_worker_threads(4);
+        }
+
+        // Register compiled PSOs into driver disk cache governor.
+        for &pso_id in &manifest.pso_dependencies {
+            if !governor.contains(pso_id) {
+                let _ = governor.insert_shader(pso_id, 4096);
+                self.prewarmed_count += 1;
+                self.stutters_prevented = self.stutters_prevented.saturating_add(1);
+            }
+        }
+
+        enqueued
+    }
+
+    // Verifies whether all PSOs required for the active game level are compiled and cached.
+    pub fn is_level_ready(
+        &self,
+        queue: &AsyncPsoCompilationQueue,
+        governor: &DriverShaderCacheEvictionGovernor,
+    ) -> bool {
+        let manifest = match &self.active_manifest {
+            Some(m) => m,
+            None => return true,
+        };
+
+        manifest.pso_dependencies.iter().all(|&id| {
+            governor.contains(id) || queue.is_ready(id)
+        })
+    }
+
+    // Returns cumulative number of runtime shader compilation stutters avoided.
+    pub fn stutters_prevented(&self) -> u32 {
+        self.stutters_prevented
+    }
+}
