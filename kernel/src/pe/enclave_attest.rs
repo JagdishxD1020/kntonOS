@@ -455,3 +455,101 @@ pub fn win32_call_enclave(
         }
     }
 }
+
+/// Comprehensive self-test for Win32 Memory Enclave Dynamic Page Revocation & Attestation Subsystem.
+pub fn test_win32_enclave_attest_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-ENCLAVE-ATTEST] Initializing Win32 Enclave Attestation Subsystem self-test...\r\n");
+
+    // 1. Test Enclave Creation & Code Loading
+    let base_va = 0x0000_0001_0000_0000usize;
+    let enc_size = 64 * 1024; // 64 KB
+    let h_enc = win32_create_enclave(base_va, enc_size, ENCLAVE_TYPE_VBS, ENCLAVE_FLAG_ENCRYPTED);
+    if h_enc == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_create_enclave failed\r\n");
+        return false;
+    }
+
+    let code_payload = [0x90u8; 8192]; // 2 pages of NOPs
+    let written = win32_load_enclave_data(h_enc, base_va, &code_payload, PAGE_EXECUTE_READ);
+    if written != code_payload.len() {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_load_enclave_data failed\r\n");
+        return false;
+    }
+
+    // 2. Test Enclave Initialization & Secure Call
+    let signer = [0x5Au8; 32];
+    if !win32_initialize_enclave(h_enc, base_va, &signer) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_initialize_enclave failed\r\n");
+        return false;
+    }
+
+    let mut call_res = 0usize;
+    if !win32_call_enclave(h_enc, base_va, 0x1234, &mut call_res) {
+        crate::serial_write_str("[KNT-TEST-ERR] win32_call_enclave failed\r\n");
+        return false;
+    }
+
+    // 3. Test Dynamic Enclave Page Revocation & Secure Zeroing
+    let revoke_page = base_va + 4096;
+    let revoked_count = match ENCLAVE_GOVERNOR.revoke_enclave_pages(h_enc as u32, revoke_page, 4096) {
+        Ok(c) => c,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] revoke_enclave_pages returned error\r\n");
+            return false;
+        }
+    };
+
+    if revoked_count != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Page revocation count mismatch\r\n");
+        return false;
+    }
+
+    let revoked_entry = match ENCLAVE_GOVERNOR.get_page_entry(h_enc as u32, revoke_page) {
+        Some(e) => e,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Revoked page entry missing\r\n");
+            return false;
+        }
+    };
+
+    if revoked_entry.is_committed || !revoked_entry.is_secure_zeroed || revoked_entry.protection != PAGE_NOACCESS {
+        crate::serial_write_str("[KNT-TEST-ERR] Revoked page state mismatch\r\n");
+        return false;
+    }
+
+    // 4. Test Hardware Cryptographic Attestation Report Generation
+    let user_nonce = [0xEEu8; 64];
+    let report = match ENCLAVE_GOVERNOR.generate_attestation_report(h_enc as u32, &user_nonce) {
+        Ok(r) => r,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] generate_attestation_report returned error\r\n");
+            return false;
+        }
+    };
+
+    if !report.is_valid || report.enclave_id != (h_enc as u32) || report.mrsigner != signer {
+        crate::serial_write_str("[KNT-TEST-ERR] Attestation report fields mismatch\r\n");
+        return false;
+    }
+
+    // 5. Test Anti-Cheat Enclave Memory Isolation & DMA Interception
+    if !ANTI_CHEAT_ENCLAVE_VERIFIER.verify_enclave_isolation(&ENCLAVE_GOVERNOR, h_enc as u32) {
+        crate::serial_write_str("[KNT-TEST-ERR] Legitimate encrypted enclave failed isolation check\r\n");
+        return false;
+    }
+
+    let dma_attempt = ANTI_CHEAT_ENCLAVE_VERIFIER.intercept_dma_access_attempt(h_enc as u32, base_va);
+    if dma_attempt != Err(STATUS_ACCESS_DENIED) {
+        crate::serial_write_str("[KNT-TEST-ERR] Rogue DMA access attempt was not blocked\r\n");
+        return false;
+    }
+
+    let violations = ANTI_CHEAT_ENCLAVE_VERIFIER.get_violations();
+    if violations.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] Boundary violation record missing\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-ENCLAVE-ATTEST-PASS] Win32 Enclave Attestation & Revocation verified\r\n");
+    true
+}
