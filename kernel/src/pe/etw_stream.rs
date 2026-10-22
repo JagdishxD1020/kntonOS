@@ -373,3 +373,162 @@ impl AntiCheatEtwStreamVerifier {
 }
 
 pub static ANTI_CHEAT_ETW_VERIFIER: AntiCheatEtwStreamVerifier = AntiCheatEtwStreamVerifier::new();
+
+/// Comprehensive self-test for Win32 Process/Thread High-Resolution ETW Real-Time Compression & Ring Buffer Subsystem.
+pub fn test_win32_etw_stream_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-ETW-STREAM] Initializing Win32 ETW Stream Subsystem self-test...\r\n");
+
+    // 1. Test Integer Delta / Run-Length Event Compression & Decompression
+    let sample_events = [
+        RawEtwEvent {
+            sequence_number: 1001,
+            timestamp_tsc: 50_000,
+            provider_id: 1,
+            event_id: 10,
+            level: 4,
+            channel: 0,
+            keyword: 0x1,
+            payload_val: 120,
+        },
+        RawEtwEvent {
+            sequence_number: 1002,
+            timestamp_tsc: 50_250,
+            provider_id: 1,
+            event_id: 11,
+            level: 4,
+            channel: 0,
+            keyword: 0x1,
+            payload_val: 140,
+        },
+        RawEtwEvent {
+            sequence_number: 1003,
+            timestamp_tsc: 50_600,
+            provider_id: 1,
+            event_id: 12,
+            level: 3,
+            channel: 0,
+            keyword: 0x2,
+            payload_val: 200,
+        },
+    ];
+
+    let compressed = EtwDeltaEncoder::compress_events(&sample_events);
+    if compressed.event_count != 3 || compressed.base_sequence != 1001 || compressed.base_timestamp != 50_000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Compressed block header mismatch\r\n");
+        return false;
+    }
+
+    let decompressed = EtwDeltaEncoder::decompress_events(&compressed);
+    if decompressed.len() != 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decompressed events count mismatch\r\n");
+        return false;
+    }
+
+    if decompressed[1].timestamp_tsc != 50_250 || decompressed[1].payload_val != 140 {
+        crate::serial_write_str("[KNT-TEST-ERR] Decompressed event 1 fields mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test Lock-Free SPSC Ring Buffer Streaming
+    let ring_event = RawEtwEvent {
+        sequence_number: 2001,
+        timestamp_tsc: 80_000,
+        provider_id: 2,
+        event_id: 5,
+        level: 2,
+        channel: 0,
+        keyword: 0x4,
+        payload_val: 999,
+    };
+
+    if !ETW_STREAM_RING_BUFFER.enqueue_event(ring_event) {
+        crate::serial_write_str("[KNT-TEST-ERR] Enqueue event to SPSC ring buffer failed\r\n");
+        return false;
+    }
+
+    let dequeued = ETW_STREAM_RING_BUFFER.dequeue_batch();
+    if dequeued.len() != 1 || dequeued[0].sequence_number != 2001 {
+        crate::serial_write_str("[KNT-TEST-ERR] Dequeued ring buffer batch mismatch\r\n");
+        return false;
+    }
+
+    // 3. Test Dynamic Provider Filter Masking (Level & Keyword)
+    let prov_id = 42u32;
+    ETW_FILTER_GOVERNOR.update_provider_filter(
+        prov_id,
+        3,          // Max level = 3 (Warning or higher priority)
+        0x0000_000F, // Match any keyword in lower nibble
+        0,
+        true,
+    );
+
+    // Event with level 2 (higher priority) and matching keyword -> Allowed
+    if !ETW_FILTER_GOVERNOR.is_event_allowed(prov_id, 2, 0x0000_0001) {
+        crate::serial_write_str("[KNT-TEST-ERR] Legitimate event was improperly filtered out\r\n");
+        return false;
+    }
+
+    // Event with level 5 (lower priority: verbose) -> Discarded
+    if ETW_FILTER_GOVERNOR.is_event_allowed(prov_id, 5, 0x0000_0001) {
+        crate::serial_write_str("[KNT-TEST-ERR] Low priority event was improperly allowed\r\n");
+        return false;
+    }
+
+    // Event with non-matching keyword -> Discarded
+    if ETW_FILTER_GOVERNOR.is_event_allowed(prov_id, 2, 0x0000_00F0) {
+        crate::serial_write_str("[KNT-TEST-ERR] Event with non-matching keyword was allowed\r\n");
+        return false;
+    }
+
+    // 4. Test Anti-Cheat Sequence Gap & Monotonic Timestamp Verification
+    ANTI_CHEAT_ETW_VERIFIER.reset(1001, 50_000);
+
+    // Clean batch
+    if !ANTI_CHEAT_ETW_VERIFIER.verify_stream_integrity(&sample_events) {
+        crate::serial_write_str("[KNT-TEST-ERR] Clean stream reported as tampered\r\n");
+        return false;
+    }
+
+    // Tampered batch: sequence gap (jump from 1004 to 1010)
+    let tampered_seq_events = [RawEtwEvent {
+        sequence_number: 1010, // Gap!
+        timestamp_tsc: 55_000,
+        provider_id: 1,
+        event_id: 20,
+        level: 2,
+        channel: 0,
+        keyword: 0,
+        payload_val: 0,
+    }];
+
+    if ANTI_CHEAT_ETW_VERIFIER.verify_stream_integrity(&tampered_seq_events) {
+        crate::serial_write_str("[KNT-TEST-ERR] Telemetry sequence gap went undetected\r\n");
+        return false;
+    }
+
+    // Tampered batch: non-monotonic timestamp (timestamp moves backwards)
+    let backwards_ts_events = [RawEtwEvent {
+        sequence_number: 1011,
+        timestamp_tsc: 40_000, // Backwards in time!
+        provider_id: 1,
+        event_id: 21,
+        level: 2,
+        channel: 0,
+        keyword: 0,
+        payload_val: 0,
+    }];
+
+    if ANTI_CHEAT_ETW_VERIFIER.verify_stream_integrity(&backwards_ts_events) {
+        crate::serial_write_str("[KNT-TEST-ERR] Backwards timestamp spoofing went undetected\r\n");
+        return false;
+    }
+
+    let violations = ANTI_CHEAT_ETW_VERIFIER.get_violations();
+    if violations.len() < 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Verifier violations count mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-ETW-STREAM-PASS] Win32 ETW Stream Compression & Ring Buffer verified\r\n");
+    true
+}

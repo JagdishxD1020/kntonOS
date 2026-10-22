@@ -1281,6 +1281,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_enclave_attest_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Enclave Attestation subsystem self-test failed!\r\n");
     }
+    // Verify Win32 ETW Stream Real-Time Compression & Ring Buffer (TASK-KNT-286)
+    if !pe::test_win32_etw_stream_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 ETW Stream subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
