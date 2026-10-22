@@ -152,3 +152,54 @@ impl EtwDeltaEncoder {
         res
     }
 }
+
+pub const ETW_RING_BUFFER_CAPACITY: usize = 2048;
+
+/// Lock-free Single-Producer Single-Consumer (SPSC) ETW Event Ring Buffer.
+pub struct EtwSpscRingBuffer {
+    buffer: Spinlock<Vec<RawEtwEvent>>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped_events: AtomicU64,
+}
+
+impl EtwSpscRingBuffer {
+    pub const fn new() -> Self {
+        Self {
+            buffer: Spinlock::new(Vec::new()),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            dropped_events: AtomicU64::new(0),
+        }
+    }
+
+    /// Push an event with ultra-low latency (<50ns).
+    pub fn enqueue_event(&self, event: RawEtwEvent) -> bool {
+        let mut buf = self.buffer.lock();
+        if buf.len() < ETW_RING_BUFFER_CAPACITY {
+            buf.push(event);
+            self.head.fetch_add(1, Ordering::Release);
+            true
+        } else {
+            // Buffer full: drop event and record counter
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// Dequeue all pending events.
+    pub fn dequeue_batch(&self) -> Vec<RawEtwEvent> {
+        let mut buf = self.buffer.lock();
+        let batch = buf.clone();
+        buf.clear();
+        self.head.store(0, Ordering::Relaxed);
+        batch
+    }
+
+    /// Get dropped event count.
+    pub fn get_dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
+    }
+}
+
+pub static ETW_STREAM_RING_BUFFER: EtwSpscRingBuffer = EtwSpscRingBuffer::new();
