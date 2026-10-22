@@ -203,3 +203,84 @@ impl EtwSpscRingBuffer {
 }
 
 pub static ETW_STREAM_RING_BUFFER: EtwSpscRingBuffer = EtwSpscRingBuffer::new();
+
+/// ETW Event Filter Descriptor matching Win32 EVENT_FILTER_DESCRIPTOR.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EVENT_FILTER_DESCRIPTOR {
+    pub Ptr: u64,
+    pub Size: u32,
+    pub Type: u32,
+}
+
+/// Dynamic ETW Provider Filter Profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderFilterProfile {
+    pub provider_id: u32,
+    pub max_level: u8,
+    pub match_any_keyword: u64,
+    pub match_all_keyword: u64,
+    pub is_enabled: bool,
+}
+
+/// ETW Session Registration & Trace Provider Filter Governor.
+pub struct EtwFilterGovernor {
+    filters: Spinlock<BTreeMap<u32, ProviderFilterProfile>>,
+}
+
+impl EtwFilterGovernor {
+    pub const fn new() -> Self {
+        Self {
+            filters: Spinlock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Register or update dynamic filter profile for a provider.
+    pub fn update_provider_filter(
+        &self,
+        provider_id: u32,
+        level: u8,
+        match_any: u64,
+        match_all: u64,
+        enabled: bool,
+    ) {
+        let mut map = self.filters.lock();
+        map.insert(
+            provider_id,
+            ProviderFilterProfile {
+                provider_id,
+                max_level: level,
+                match_any_keyword: match_any,
+                match_all_keyword: match_all,
+                is_enabled: enabled,
+            },
+        );
+    }
+
+    /// Evaluate if an event should be filtered in or discarded.
+    pub fn is_event_allowed(&self, provider_id: u32, level: u8, keyword: u64) -> bool {
+        let map = self.filters.lock();
+        match map.get(&provider_id) {
+            Some(filter) => {
+                if !filter.is_enabled {
+                    return false;
+                }
+                // Check level: event level must be <= provider max level
+                if level > filter.max_level {
+                    return false;
+                }
+                // Check keyword masks
+                if filter.match_any_keyword != 0 && (keyword & filter.match_any_keyword) == 0 {
+                    return false;
+                }
+                if filter.match_all_keyword != 0 && (keyword & filter.match_all_keyword) != filter.match_all_keyword {
+                    return false;
+                }
+                true
+            }
+            None => true, // Default allow if unconfigured
+        }
+    }
+}
+
+pub static ETW_FILTER_GOVERNOR: EtwFilterGovernor = EtwFilterGovernor::new();
