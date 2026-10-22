@@ -284,3 +284,92 @@ impl EtwFilterGovernor {
 }
 
 pub static ETW_FILTER_GOVERNOR: EtwFilterGovernor = EtwFilterGovernor::new();
+
+/// Anti-cheat ETW telemetry violation types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EtwTamperViolation {
+    SequenceGapDetected {
+        expected_seq: u64,
+        actual_seq: u64,
+    },
+    NonMonotonicTimestamp {
+        prev_tsc: u64,
+        actual_tsc: u64,
+    },
+    SpoofedDroppedEventCount {
+        reported: u64,
+        expected: u64,
+    },
+}
+
+/// Anti-Cheat Telemetry Stream Verifier.
+pub struct AntiCheatEtwStreamVerifier {
+    pub verification_enabled: AtomicBool,
+    pub last_verified_sequence: AtomicU64,
+    pub last_verified_timestamp: AtomicU64,
+    pub detected_violations: Spinlock<Vec<EtwTamperViolation>>,
+}
+
+impl AntiCheatEtwStreamVerifier {
+    pub const fn new() -> Self {
+        Self {
+            verification_enabled: AtomicBool::new(true),
+            last_verified_sequence: AtomicU64::new(0),
+            last_verified_timestamp: AtomicU64::new(0),
+            detected_violations: Spinlock::new(Vec::new()),
+        }
+    }
+
+    /// Reset verifier baseline.
+    pub fn reset(&self, base_seq: u64, base_ts: u64) {
+        self.last_verified_sequence.store(base_seq, Ordering::SeqCst);
+        self.last_verified_timestamp.store(base_ts, Ordering::SeqCst);
+        self.detected_violations.lock().clear();
+    }
+
+    /// Verify sequence continuity and timestamp monotonicity of an incoming batch.
+    pub fn verify_stream_integrity(&self, events: &[RawEtwEvent]) -> bool {
+        if !self.verification_enabled.load(Ordering::Acquire) || events.is_empty() {
+            return true;
+        }
+
+        let mut expected_seq = self.last_verified_sequence.load(Ordering::Relaxed);
+        let mut prev_ts = self.last_verified_timestamp.load(Ordering::Relaxed);
+        let mut clean = true;
+        let mut violations = self.detected_violations.lock();
+
+        for ev in events {
+            // 1. Sequence number continuity check
+            if expected_seq != 0 && ev.sequence_number != expected_seq {
+                clean = false;
+                violations.push(EtwTamperViolation::SequenceGapDetected {
+                    expected_seq,
+                    actual_seq: ev.sequence_number,
+                });
+            }
+            expected_seq = ev.sequence_number + 1;
+
+            // 2. Monotonic high-resolution timestamp integrity check
+            if prev_ts != 0 && ev.timestamp_tsc < prev_ts {
+                clean = false;
+                violations.push(EtwTamperViolation::NonMonotonicTimestamp {
+                    prev_tsc: prev_ts,
+                    actual_tsc: ev.timestamp_tsc,
+                });
+            }
+            prev_ts = ev.timestamp_tsc;
+        }
+
+        self.last_verified_sequence.store(expected_seq, Ordering::Relaxed);
+        self.last_verified_timestamp.store(prev_ts, Ordering::Relaxed);
+
+        clean
+    }
+
+    /// Retrieve detected violations.
+    pub fn get_violations(&self) -> Vec<EtwTamperViolation> {
+        self.detected_violations.lock().clone()
+    }
+}
+
+pub static ANTI_CHEAT_ETW_VERIFIER: AntiCheatEtwStreamVerifier = AntiCheatEtwStreamVerifier::new();
