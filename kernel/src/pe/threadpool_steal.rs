@@ -226,3 +226,84 @@ impl HighPriorityGameWorkerScheduler {
 
 pub static GAME_WORKER_SCHEDULER: HighPriorityGameWorkerScheduler =
     HighPriorityGameWorkerScheduler::new();
+
+/// Fiber State Snapshot for Work-Stealing Migration.
+#[derive(Debug, Clone)]
+pub struct StealableFiber {
+    pub fiber_id: u64,
+    pub owning_thread_id: u64,
+    pub fls_slots: Vec<usize>,
+    pub execution_quantum_ticks: u32,
+    pub starvation_boost_applied: bool,
+    pub is_yielded: bool,
+}
+
+/// Fiber-to-Thread Work-Stealing Migration Governor.
+pub struct FiberMigrationGovernor {
+    fibers: Spinlock<BTreeMap<u64, StealableFiber>>,
+    starvation_threshold_ticks: u32,
+}
+
+impl FiberMigrationGovernor {
+    pub const fn new() -> Self {
+        Self {
+            fibers: Spinlock::new(BTreeMap::new()),
+            starvation_threshold_ticks: 100,
+        }
+    }
+
+    /// Register a fiber with its current FLS state array.
+    pub fn register_fiber(&self, fiber_id: u64, thread_id: u64, fls_data: Vec<usize>) {
+        let fiber = StealableFiber {
+            fiber_id,
+            owning_thread_id: thread_id,
+            fls_slots: fls_data,
+            execution_quantum_ticks: 0,
+            starvation_boost_applied: false,
+            is_yielded: false,
+        };
+        self.fibers.lock().insert(fiber_id, fiber);
+    }
+
+    /// Yield execution from current worker thread.
+    pub fn yield_fiber(&self, fiber_id: u64) {
+        let mut map = self.fibers.lock();
+        if let Some(f) = map.get_mut(&fiber_id) {
+            f.is_yielded = true;
+            f.execution_quantum_ticks += 1;
+            if f.execution_quantum_ticks >= self.starvation_threshold_ticks {
+                f.starvation_boost_applied = true;
+            }
+        }
+    }
+
+    /// Migrate yielded fiber to a new destination worker thread, preserving FLS continuity.
+    pub fn migrate_fiber_to_thread(
+        &self,
+        fiber_id: u64,
+        target_thread_id: u64,
+    ) -> Result<Vec<usize>, ()> {
+        let mut map = self.fibers.lock();
+        let f = map.get_mut(&fiber_id).ok_or(())?;
+
+        if !f.is_yielded && !f.starvation_boost_applied {
+            return Err(());
+        }
+
+        // Migrate ownership
+        f.owning_thread_id = target_thread_id;
+        f.is_yielded = false;
+        f.execution_quantum_ticks = 0;
+        f.starvation_boost_applied = false;
+
+        // Return preserved FLS slots
+        Ok(f.fls_slots.clone())
+    }
+
+    /// Query fiber state.
+    pub fn get_fiber(&self, fiber_id: u64) -> Option<StealableFiber> {
+        self.fibers.lock().get(&fiber_id).cloned()
+    }
+}
+
+pub static FIBER_MIGRATION_GOVERNOR: FiberMigrationGovernor = FiberMigrationGovernor::new();
