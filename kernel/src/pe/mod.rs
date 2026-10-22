@@ -50,6 +50,7 @@ pub mod seh_unwind;
 pub mod fls_storage;
 pub mod pmu_trace;
 pub mod enclave_attest;
+pub mod etw_stream;
 
 pub use header::*;
 pub use ntdll::*;
