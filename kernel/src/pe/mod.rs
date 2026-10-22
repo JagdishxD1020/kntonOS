@@ -51,6 +51,7 @@ pub mod fls_storage;
 pub mod pmu_trace;
 pub mod enclave_attest;
 pub mod etw_stream;
+pub mod threadpool_steal;
 
 pub use header::*;
 pub use ntdll::*;
