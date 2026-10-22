@@ -550,6 +550,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_hdr_colorspace_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility HDR color space & tonemapping self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Pipeline Library & Shader Cache Engine (TASK-KNT-284)
+    if !gfx::test_pipeline_library_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility pipeline library self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
