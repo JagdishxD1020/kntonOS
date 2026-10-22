@@ -339,6 +339,39 @@ impl VariableOverdriveEngine {
 
         boosted.clamp(0.0, 255.0) as u8
     }
+
+    /// Calculates temperature compensation scaling factor for liquid crystal rotational viscosity.
+    /// Nominal calibration reference: 25.0°C (factor = 1.0).
+    /// Cold temperature (<25°C): boost overdrive voltage (> 1.0, up to 1.30 at 10°C).
+    /// Hot temperature (>25°C): dampen overdrive voltage (< 1.0, down to 0.70 at 45°C).
+    pub fn temperature_compensation_factor(panel_temp_c: f32) -> f32 {
+        let temp = panel_temp_c.clamp(5.0, 60.0);
+        let factor = 1.0 - 0.015 * (temp - 25.0);
+        factor.clamp(0.65, 1.35)
+    }
+
+    /// Computes temperature-compensated overdrive pixel drive value with VRR frequency interpolation.
+    pub fn compute_overdrive_with_temp(
+        &self,
+        from_gray: u8,
+        to_gray: u8,
+        current_refresh_hz: f32,
+        panel_temp_c: f32,
+    ) -> u8 {
+        if from_gray == to_gray {
+            return to_gray;
+        }
+
+        let base_overdrive = self.compute_overdrive(from_gray, to_gray, current_refresh_hz) as f32;
+        let target = to_gray as f32;
+        let delta = base_overdrive - target;
+
+        let temp_factor = Self::temperature_compensation_factor(panel_temp_c);
+        let compensated_delta = delta * temp_factor;
+        let final_drive = target + compensated_delta;
+
+        final_drive.clamp(0.0, 255.0) as u8
+    }
 }
 
 /// Unit test verifying variable overdrive LUT interpolation and corona suppression.
@@ -386,6 +419,53 @@ pub fn verify_variable_overdrive() -> bool {
     };
     let unsuppressed_60 = engine_no_suppress.compute_overdrive(0, 128, 60.0);
     if up_60 > unsuppressed_60 {
+        return false;
+    }
+
+    true
+}
+
+/// Verification test for temperature-compensated dynamic panel overdrive lookup tables.
+pub fn verify_temperature_compensated_overdrive() -> bool {
+    let engine = VariableOverdriveEngine::new();
+
+    // 1. Nominal temperature (25°C): should match base compute_overdrive
+    let nom_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 25.0);
+    let base_up = engine.compute_overdrive(0, 128, 120.0);
+    if nom_up != base_up {
+        return false;
+    }
+
+    // 2. Cold temperature (10°C, outdoor gaming in winter): liquid crystals are sluggish,
+    // so overdrive must provide extra voltage boost (> nominal 25°C)
+    let cold_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 10.0);
+    if cold_up <= nom_up {
+        return false;
+    }
+
+    // 3. Hot temperature (45°C, high APU load heating up backplate): liquid crystals rotate faster,
+    // so overdrive voltage must be reduced (< nominal 25°C) to prevent inverse coronas
+    let hot_up = engine.compute_overdrive_with_temp(0, 128, 120.0, 45.0);
+    if hot_up >= nom_up || hot_up < 128 {
+        return false;
+    }
+
+    // 4. Downward transition (255 -> 64):
+    // Nominal undershoot:
+    let nom_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 25.0);
+    let cold_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 10.0);
+    let hot_down = engine.compute_overdrive_with_temp(255, 64, 120.0, 45.0);
+
+    // Cold panel requires deeper undershoot (< nominal); hot panel requires milder undershoot (> nominal)
+    if cold_down >= nom_down || hot_down <= nom_down {
+        return false;
+    }
+
+    // 5. Static pixel (128 -> 128) must never move regardless of temperature
+    if engine.compute_overdrive_with_temp(128, 128, 120.0, 10.0) != 128 {
+        return false;
+    }
+    if engine.compute_overdrive_with_temp(128, 128, 120.0, 45.0) != 128 {
         return false;
     }
 
@@ -644,21 +724,504 @@ pub fn verify_panel_overdrive_manager() -> bool {
 }
 
 
-/// Comprehensive verification self-test suite for Handheld Direct Display Brightness, DC Dimming & Variable Overdrive Controller.
+// ============================================================================
+// Feature 2: Backlight Strobe Timing Synchronization with VRR VSYNC Pulses
+// ============================================================================
+
+/// State of the backlight strobe timing generator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrobeState {
+    /// Strobe disabled; continuous illumination (DC dimming).
+    ContinuousDc,
+    /// VSYNC received; waiting for liquid crystal molecules to settle across screen (dark period).
+    SettlingDarkPhase,
+    /// Liquid crystals settled; high-brightness sub-millisecond strobe active.
+    StrobeActive,
+}
+
+/// Backlight Strobe Timing Synchronizer with Variable Refresh Rate (VRR) VSYNC.
+///
+/// In sample-and-hold LCD displays, motion blur is caused by retinal persistence over the entire
+/// frame duration (e.g. 8.3ms at 120Hz). By pulsing the backlight for a sub-millisecond duration
+/// (e.g. 0.5ms - 1.2ms) only after liquid crystals have settled following the VSYNC scanout,
+/// Motion Picture Response Time (MPRT) drops to < 1.0ms, giving CRT-like motion clarity.
+#[derive(Debug, Clone)]
+pub struct BacklightStrobeSynchronizer {
+    /// Whether strobe synchronization is enabled.
+    pub enabled: bool,
+    /// Sub-millisecond strobe flash pulse width in microseconds (e.g. 800 µs = 0.8ms).
+    pub strobe_pulse_width_us: u32,
+    /// Strobe phase delay from VSYNC leading edge in microseconds (settling window).
+    pub strobe_phase_delay_us: u32,
+    /// Percentage of frame interval allocated to liquid crystal settling (e.g. 80%).
+    pub settling_ratio_percent: u8,
+    /// Timestamp of most recent VSYNC interrupt in microseconds.
+    pub last_vsync_timestamp_us: u64,
+    /// Measured frame interval between consecutive VSYNC pulses in microseconds.
+    pub frame_interval_us: u32,
+    /// Timestamp when current/next strobe pulse turns on.
+    pub planned_strobe_start_us: u64,
+    /// Timestamp when current strobe pulse turns off.
+    pub planned_strobe_end_us: u64,
+    /// Current hardware strobe state.
+    pub state: StrobeState,
+    /// Hardware strobe driver gate signal (true = LEDs illuminated, false = dark).
+    pub strobe_gate_active: bool,
+    /// Total count of strobe pulses fired.
+    pub total_pulses_fired: u64,
+}
+
+impl BacklightStrobeSynchronizer {
+    pub const fn new(strobe_pulse_width_us: u32) -> Self {
+        Self {
+            enabled: true,
+            strobe_pulse_width_us,
+            strobe_phase_delay_us: 6500,
+            settling_ratio_percent: 80,
+            last_vsync_timestamp_us: 0,
+            frame_interval_us: 8333, // 120 Hz default
+            planned_strobe_start_us: 0,
+            planned_strobe_end_us: 0,
+            state: StrobeState::ContinuousDc,
+            strobe_gate_active: false,
+            total_pulses_fired: 0,
+        }
+    }
+
+    /// Handles hardware VRR VSYNC interrupt leading edge.
+    pub fn on_vrr_vsync(&mut self, timestamp_us: u64) {
+        if !self.enabled {
+            self.state = StrobeState::ContinuousDc;
+            self.strobe_gate_active = true;
+            return;
+        }
+
+        if self.last_vsync_timestamp_us > 0 {
+            let delta = timestamp_us.saturating_sub(self.last_vsync_timestamp_us);
+            if delta >= 6000 && delta <= 25_000 {
+                self.frame_interval_us = delta as u32;
+            }
+        }
+        self.last_vsync_timestamp_us = timestamp_us;
+
+        // Calculate dynamic phase delay to align with bottom-of-screen LC settling:
+        // phase_delay = frame_interval * (settling_ratio / 100)
+        self.strobe_phase_delay_us = (self.frame_interval_us * (self.settling_ratio_percent as u32)) / 100;
+
+        self.planned_strobe_start_us = timestamp_us + (self.strobe_phase_delay_us as u64);
+        self.planned_strobe_end_us = self.planned_strobe_start_us + (self.strobe_pulse_width_us as u64);
+
+        // Turn off backlight for settling dark phase
+        self.state = StrobeState::SettlingDarkPhase;
+        self.strobe_gate_active = false;
+    }
+
+    /// Timer tick handler checking if the strobe pulse should be energized.
+    pub fn update_timer(&mut self, current_time_us: u64) -> bool {
+        if !self.enabled {
+            self.state = StrobeState::ContinuousDc;
+            self.strobe_gate_active = true;
+            return true;
+        }
+
+        if current_time_us >= self.planned_strobe_start_us && current_time_us < self.planned_strobe_end_us {
+            if self.state != StrobeState::StrobeActive {
+                self.state = StrobeState::StrobeActive;
+                self.strobe_gate_active = true;
+                self.total_pulses_fired += 1;
+            }
+        } else {
+            self.state = StrobeState::SettlingDarkPhase;
+            self.strobe_gate_active = false;
+        }
+
+        self.strobe_gate_active
+    }
+}
+
+/// Verification test for backlight strobe timing synchronization with VRR VSYNC pulses.
+pub fn verify_vrr_backlight_strobe_sync() -> bool {
+    let mut sync = BacklightStrobeSynchronizer::new(800); // 800 µs sub-millisecond pulse width
+
+    // 1. Initial state
+    if !sync.enabled || sync.strobe_pulse_width_us != 800 {
+        return false;
+    }
+
+    // 2. Simulate 120Hz VRR stream (interval = 8333 µs)
+    let vsync_1 = 1_000_000u64;
+    sync.on_vrr_vsync(vsync_1);
+
+    let vsync_2 = vsync_1 + 8333;
+    sync.on_vrr_vsync(vsync_2);
+
+    if sync.frame_interval_us != 8333 {
+        return false;
+    }
+
+    // Phase delay should be (8333 * 80) / 100 = 6666 µs
+    if sync.strobe_phase_delay_us != 6666 {
+        return false;
+    }
+
+    // Check t = vsync_2 + 2000 µs (during dark settling period)
+    let gate_dark = sync.update_timer(vsync_2 + 2000);
+    if gate_dark || sync.state != StrobeState::SettlingDarkPhase {
+        return false;
+    }
+
+    // Check t = vsync_2 + 7000 µs (during active strobe pulse)
+    let gate_active = sync.update_timer(vsync_2 + 7000);
+    if !gate_active || sync.state != StrobeState::StrobeActive {
+        return false;
+    }
+    if sync.total_pulses_fired != 1 {
+        return false;
+    }
+
+    // Check t = vsync_2 + 7800 µs (after strobe end, before next vsync)
+    let gate_end = sync.update_timer(vsync_2 + 7800);
+    if gate_end || sync.state != StrobeState::SettlingDarkPhase {
+        return false;
+    }
+
+    // 3. Test dynamic VRR shift to 144Hz (6944 µs interval)
+    let vsync_3 = vsync_2 + 6944;
+    sync.on_vrr_vsync(vsync_3);
+    if sync.frame_interval_us != 6944 {
+        return false;
+    }
+    if sync.strobe_phase_delay_us != 5555 {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 3: MPRT Motion Blur Reduction Governor & Low-FPS Flicker Lockout
+// ============================================================================
+
+/// Threshold below which backlight strobing produces nauseating human-perceptible flicker.
+pub const MPRT_HARD_LOCKOUT_FLICKER_HZ: f32 = 60.0;
+
+/// Threshold above which backlight strobing can safely engage (100Hz / 120Hz).
+pub const MPRT_MIN_ENGAGE_HZ: f32 = 100.0;
+
+/// Number of consecutive high-refresh frames required before re-engaging strobing (anti-chatter).
+pub const MPRT_STABILITY_FRAME_COUNT: u32 = 10;
+
+/// MPRT (Motion Picture Response Time) Motion Blur Reduction Strobe Governor.
+///
+/// In handheld gaming, Variable Refresh Rate (VRR) allows the framerate to fluctuate between
+/// 40Hz and 144Hz depending on GPU load. While 120Hz/144Hz strobing delivers CRT-grade motion clarity
+/// without flicker, pulsing the backlight below 60Hz produces severe, nauseating visual flicker.
+/// This governor monitors real-time VRR framerate: it automatically enables strobing at high refresh
+/// rates (120Hz/144Hz) and enforces a hard lockout below 60Hz, instantly falling back to pure DC dimming.
+#[derive(Debug, Clone)]
+pub struct MprtStrobeGovernor {
+    /// User preference toggle from KntonOS Quick Access overlay.
+    pub user_mprt_enabled: bool,
+    /// Whether backlight strobing is currently active and driving the LED gate.
+    pub strobe_actively_engaged: bool,
+    /// Flag indicating low-FPS anti-flicker lockout is active.
+    pub flicker_lockout_active: bool,
+    /// Current measured VRR framerate in Hz / FPS.
+    pub current_vrr_fps: f32,
+    /// Consecutive frames running above engage threshold.
+    pub high_fps_stable_frames: u32,
+    /// Total count of emergency flicker lockout transitions.
+    pub lockout_events_count: u32,
+    /// Total count of successful strobe engagement transitions.
+    pub mprt_engagement_count: u32,
+    /// Estimated effective Motion Picture Response Time in milliseconds (e.g. 0.8ms vs 8.3ms).
+    pub effective_mprt_ms: f32,
+}
+
+impl MprtStrobeGovernor {
+    pub const fn new() -> Self {
+        Self {
+            user_mprt_enabled: true,
+            strobe_actively_engaged: false,
+            flicker_lockout_active: false,
+            current_vrr_fps: 60.0,
+            high_fps_stable_frames: 0,
+            lockout_events_count: 0,
+            mprt_engagement_count: 0,
+            effective_mprt_ms: 8.3, // Baseline 120Hz sample-and-hold without strobing
+        }
+    }
+
+    /// Evaluates current VRR framerate and updates strobe engagement and flicker lockout state.
+    /// Returns `true` if backlight strobing is allowed to operate.
+    pub fn update_framerate(&mut self, current_fps: f32) -> bool {
+        self.current_vrr_fps = current_fps;
+
+        if !self.user_mprt_enabled {
+            self.strobe_actively_engaged = false;
+            self.flicker_lockout_active = false;
+            self.high_fps_stable_frames = 0;
+            self.effective_mprt_ms = 1000.0 / current_fps.max(30.0);
+            return false;
+        }
+
+        // 1. Hard flicker lockout check: if framerate drops below 60Hz, immediately disengage strobing
+        if current_fps < MPRT_HARD_LOCKOUT_FLICKER_HZ {
+            if self.strobe_actively_engaged {
+                self.lockout_events_count += 1;
+            }
+            self.strobe_actively_engaged = false;
+            self.flicker_lockout_active = true;
+            self.high_fps_stable_frames = 0;
+            self.effective_mprt_ms = 1000.0 / current_fps.max(30.0);
+            return false;
+        }
+
+        // 2. High refresh rate engagement check (>= 100Hz / 120Hz / 144Hz)
+        if current_fps >= MPRT_MIN_ENGAGE_HZ {
+            self.high_fps_stable_frames += 1;
+            if self.high_fps_stable_frames >= MPRT_STABILITY_FRAME_COUNT {
+                if !self.strobe_actively_engaged {
+                    self.mprt_engagement_count += 1;
+                }
+                self.strobe_actively_engaged = true;
+                self.flicker_lockout_active = false;
+                self.effective_mprt_ms = 0.8; // Sub-millisecond MPRT motion clarity!
+            }
+        } else {
+            // In the intermediate hysteresis band (60Hz to 100Hz):
+            // If already engaged, disengage if it drops below 75Hz to prevent peripheral flicker
+            if current_fps < 75.0 && self.strobe_actively_engaged {
+                self.strobe_actively_engaged = false;
+                self.flicker_lockout_active = true;
+                self.lockout_events_count += 1;
+                self.effective_mprt_ms = 1000.0 / current_fps;
+            }
+            self.high_fps_stable_frames = 0;
+        }
+
+        self.strobe_actively_engaged
+    }
+}
+
+/// Verification test for MPRT motion blur reduction governor and low-framerate flicker lockout.
+pub fn verify_mprt_flicker_lockout_governor() -> bool {
+    let mut gov = MprtStrobeGovernor::new();
+
+    // 1. Initial state
+    if !gov.user_mprt_enabled || gov.strobe_actively_engaged {
+        return false;
+    }
+
+    // 2. Feed 120Hz framerate for 10 stable frames -> strobing engages!
+    for _ in 0..10 {
+        gov.update_framerate(120.0);
+    }
+    if !gov.strobe_actively_engaged || gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.mprt_engagement_count != 1 || gov.effective_mprt_ms > 1.0 {
+        return false;
+    }
+
+    // 3. Heavy game scene causes framerate to drop to 48 FPS (< 60Hz threshold)
+    let allowed = gov.update_framerate(48.0);
+    // Must immediately disengage strobing and enter flicker lockout
+    if allowed || gov.strobe_actively_engaged || !gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.lockout_events_count != 1 {
+        return false;
+    }
+
+    // 4. Framerate recovers slightly to 70 FPS (inside hysteresis lockout zone < 100Hz)
+    // Strobing must remain locked out to prevent flickering on unstable frame times
+    let allowed2 = gov.update_framerate(70.0);
+    if allowed2 || gov.strobe_actively_engaged {
+        return false;
+    }
+
+    // 5. Framerate recovers to 144 FPS and holds for 10 frames -> re-engages cleanly
+    for _ in 0..10 {
+        gov.update_framerate(144.0);
+    }
+    if !gov.strobe_actively_engaged || gov.flicker_lockout_active {
+        return false;
+    }
+    if gov.mprt_engagement_count != 2 {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 4: Panel Thermal Safety Limiter & Peak Strobe Current Clamping
+// ============================================================================
+
+/// Maximum permissible peak backlight strobe current at room temperature (1200 mA).
+pub const NOMINAL_PEAK_STROBE_CURRENT_MA: u16 = 1200;
+
+/// Thermal threshold above which strobe current is progressively clamped (40°C).
+pub const STROBE_THERMAL_CLAMP_START_C: f32 = 40.0;
+
+/// Thermal threshold above which strobing is completely shut down (58°C).
+pub const STROBE_THERMAL_SHUTDOWN_C: f32 = 58.0;
+
+/// Display Panel Thermal Safety Limiter for Backlight Strobing.
+///
+/// Because backlight strobing energizes LEDs for only ~10% of the frame interval, the peak drive
+/// current must reach up to 1200 mA to maintain acceptable image luminance. Under intense handheld
+/// gaming sessions where the APU thermal dissipation elevates chassis temperatures, driving 1200 mA
+/// pulses risks phosphor burning, optical diffuser warping, and localized panel discoloration.
+/// This limiter dynamically clamps the maximum allowable strobe pulse current as panel temperature
+/// rises, and enforces an emergency thermal shutdown of strobing above 58°C.
+#[derive(Debug, Clone)]
+pub struct PanelStrobeThermalLimiter {
+    /// Nominal target peak strobe current in milliamperes at room temperature.
+    pub nominal_peak_current_ma: u16,
+    /// Currently enforced peak strobe drive current ceiling in milliamperes.
+    pub current_peak_limit_ma: u16,
+    /// Measured panel temperature in degrees Celsius.
+    pub panel_temperature_c: f32,
+    /// Flag indicating peak current is actively being clamped due to thermal stress.
+    pub thermal_clamp_active: bool,
+    /// Flag indicating strobing is completely disabled due to critical panel overheat.
+    pub strobe_thermally_prohibited: bool,
+    /// Cumulative count of thermal clamp / shutdown interventions.
+    pub thermal_interventions_count: u32,
+}
+
+impl PanelStrobeThermalLimiter {
+    pub const fn new(nominal_peak_current_ma: u16) -> Self {
+        Self {
+            nominal_peak_current_ma,
+            current_peak_limit_ma: nominal_peak_current_ma,
+            panel_temperature_c: 25.0,
+            thermal_clamp_active: false,
+            strobe_thermally_prohibited: false,
+            thermal_interventions_count: 0,
+        }
+    }
+
+    /// Evaluates panel temperature and clamps peak backlight strobe drive current.
+    /// Returns the maximum allowable peak current in milliamperes.
+    pub fn evaluate_thermal_limits(&mut self, panel_temp_c: f32) -> u16 {
+        self.panel_temperature_c = panel_temp_c;
+
+        if panel_temp_c >= STROBE_THERMAL_SHUTDOWN_C {
+            // Critical thermal emergency: prohibit strobing completely; fall back to safe DC current (250 mA)
+            if !self.strobe_thermally_prohibited {
+                self.thermal_interventions_count += 1;
+            }
+            self.strobe_thermally_prohibited = true;
+            self.thermal_clamp_active = true;
+            self.current_peak_limit_ma = 250;
+        } else if panel_temp_c >= STROBE_THERMAL_CLAMP_START_C {
+            // Progressive thermal clamping: 40°C -> 1200 mA, 50°C -> 600 mA, 58°C -> 400 mA
+            if !self.thermal_clamp_active {
+                self.thermal_interventions_count += 1;
+            }
+            self.strobe_thermally_prohibited = false;
+            self.thermal_clamp_active = true;
+
+            let excess = panel_temp_c - STROBE_THERMAL_CLAMP_START_C;
+            let reduction = (excess / (STROBE_THERMAL_SHUTDOWN_C - STROBE_THERMAL_CLAMP_START_C)) * ((self.nominal_peak_current_ma - 400) as f32);
+            let clamped = (self.nominal_peak_current_ma as f32) - reduction;
+            self.current_peak_limit_ma = clamped.clamp(400.0, self.nominal_peak_current_ma as f32) as u16;
+        } else {
+            // Safe normal thermal range (< 40°C)
+            self.strobe_thermally_prohibited = false;
+            self.thermal_clamp_active = false;
+            self.current_peak_limit_ma = self.nominal_peak_current_ma;
+        }
+
+        self.current_peak_limit_ma
+    }
+}
+
+/// Verification test for panel thermal safety limiter and peak strobe current clamping.
+pub fn verify_panel_thermal_safety_limiter() -> bool {
+    let mut limiter = PanelStrobeThermalLimiter::new(NOMINAL_PEAK_STROBE_CURRENT_MA); // 1200 mA
+
+    // 1. Initial healthy state at 25°C
+    if limiter.current_peak_limit_ma != 1200 || limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    // 2. Normal operational temp (35°C < 40°C threshold): full 1200 mA allowed
+    let lim1 = limiter.evaluate_thermal_limits(35.0);
+    if lim1 != 1200 || limiter.thermal_clamp_active {
+        return false;
+    }
+
+    // 3. Elevated temperature (49°C, midway through clamp range):
+    // excess = 9°C out of 18°C span (50%) -> reduction = 0.50 * (1200 - 400) = 400 mA -> ~800 mA limit
+    let lim2 = limiter.evaluate_thermal_limits(49.0);
+    if lim2 >= 1200 || lim2 <= 400 || !limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+    if (lim2 as i32 - 800).abs() > 20 {
+        return false;
+    }
+    if limiter.thermal_interventions_count != 1 {
+        return false;
+    }
+
+    // 4. Critical panel overheat (60°C >= 58°C shutdown threshold):
+    // Strobing must be shut down, current clamped to safe DC 250 mA
+    let lim3 = limiter.evaluate_thermal_limits(60.0);
+    if lim3 != 250 || !limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    // 5. Thermal recovery below 38°C: restores full 1200 mA peak strobe current
+    let lim4 = limiter.evaluate_thermal_limits(36.0);
+    if lim4 != 1200 || limiter.thermal_clamp_active || limiter.strobe_thermally_prohibited {
+        return false;
+    }
+
+    true
+}
+
+/// Comprehensive verification self-test suite for Handheld Dynamic Display Panel Overdrive &
+/// Motion Blur Reduction Strobe Governor (TASK-KNT-282 / TASK-KNT-212).
 pub fn test_panel_overdrive_subsystem() -> bool {
-    crate::serial_write_str("[KNT-DISPLAY] Testing Direct Display Brightness, DC Dimming & Variable Overdrive Controller...\r\n");
+    crate::serial_write_str("[KNT-DISPLAY] Testing Dynamic Panel Overdrive & Motion Blur Reduction Strobe Governor...\r\n");
+
     if !verify_dc_dimming_curve() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] DC dimming curve verification failed!\r\n");
         return false;
     }
     if !verify_variable_overdrive() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Variable overdrive verification failed!\r\n");
+        return false;
+    }
+    if !verify_temperature_compensated_overdrive() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Temperature-compensated overdrive verification failed!\r\n");
+        return false;
+    }
+    if !verify_vrr_backlight_strobe_sync() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] VRR backlight strobe synchronization verification failed!\r\n");
+        return false;
+    }
+    if !verify_mprt_flicker_lockout_governor() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] MPRT flicker lockout governor verification failed!\r\n");
+        return false;
+    }
+    if !verify_panel_thermal_safety_limiter() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Panel thermal safety limiter verification failed!\r\n");
         return false;
     }
     if !verify_hdr_boost_governor() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] HDR boost governor verification failed!\r\n");
         return false;
     }
     if !verify_panel_overdrive_manager() {
+        crate::serial_write_str("[KNT-DISPLAY-ERR] Panel overdrive manager verification failed!\r\n");
         return false;
     }
-    crate::serial_write_str("[KNT-DISPLAY-OVERDRIVE-PASS] Handheld direct display DC dimming and variable overdrive controller verified\r\n");
+
+    crate::serial_write_str("[KNT-DISPLAY-OVERDRIVE-PASS] Dynamic display panel overdrive and motion blur reduction strobe governor verified\r\n");
     true
 }
