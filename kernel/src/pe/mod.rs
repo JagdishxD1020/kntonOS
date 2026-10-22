@@ -50,6 +50,7 @@ pub mod seh_unwind;
 pub mod fls_storage;
 pub mod pmu_trace;
 pub mod enclave_attest;
+pub mod etw_stream;
 
 pub use header::*;
 pub use ntdll::*;
@@ -99,6 +100,7 @@ pub use seh_unwind::test_win32_seh_unwind_subsystem;
 pub use fls_storage::test_win32_fls_subsystem;
 pub use pmu_trace::test_win32_pmu_trace_subsystem;
 pub use enclave_attest::test_win32_enclave_attest_subsystem;
+pub use etw_stream::test_win32_etw_stream_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
