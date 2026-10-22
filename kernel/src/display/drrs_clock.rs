@@ -192,3 +192,235 @@ pub fn verify_drrs_refresh_profiles_and_timings() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Hardware Fractional-N PLL Divider & Multiplier Calculator
+// ============================================================================
+
+/// Display controller reference crystal clock frequency in kHz (24.0 MHz).
+pub const PLL_REF_CLOCK_KHZ: u32 = 24_000;
+
+/// Minimum allowable Voltage-Controlled Oscillator (VCO) frequency in kHz (2.0 GHz).
+pub const PLL_VCO_MIN_KHZ: u32 = 2_000_000;
+
+/// Maximum allowable Voltage-Controlled Oscillator (VCO) frequency in kHz (4.5 GHz).
+pub const PLL_VCO_MAX_KHZ: u32 = 4_500_000;
+
+/// Fractional accumulator resolution (24-bit: 2^24 = 16,777,216).
+pub const PLL_FRAC_DENOMINATOR: u64 = 16_777_216;
+
+/// Hardware Phase-Locked Loop (PLL) Divider & Multiplier Register Settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PllRegisterSettings {
+    /// Input reference pre-divider N (typically 1).
+    pub pre_divider_n: u8,
+    /// Feedback integer multiplier M (typically 80..180).
+    pub feedback_mult_m: u16,
+    /// 24-bit fractional feedback accumulator value K (0..16,777,215).
+    pub frac_accumulator_k: u32,
+    /// Output post-divider Q (typically 6..32).
+    pub post_divider_q: u8,
+    /// Intermediate Voltage-Controlled Oscillator (VCO) frequency in kHz.
+    pub vco_freq_khz: u32,
+    /// Actual synthesized output pixel clock in kHz.
+    pub actual_pixel_clock_khz: u32,
+    /// Frequency error relative to target in Parts Per Million (PPM).
+    pub error_ppm: u32,
+}
+
+impl PllRegisterSettings {
+    pub const fn empty() -> Self {
+        Self {
+            pre_divider_n: 1,
+            feedback_mult_m: 100,
+            frac_accumulator_k: 0,
+            post_divider_q: 10,
+            vco_freq_khz: 2_400_000,
+            actual_pixel_clock_khz: 240_000,
+            error_ppm: 0,
+        }
+    }
+}
+
+/// Hardware Fractional-N Display PLL Synthesizer.
+///
+/// In modern handheld graphics display controllers (AMD DCN, Intel Xe Display Engine),
+/// pixel clocks cannot be changed by simple integer dividers without introducing massive jitter.
+/// This synthesizer calculates 24-bit Fractional-N PLL parameters to achieve sub-ppm accuracy
+/// across any requested refresh rate (40Hz to 165Hz) while ensuring the analog VCO stays safely
+/// within its linear high-gain operational window (2.0 GHz - 4.5 GHz).
+#[derive(Debug, Clone)]
+pub struct DisplayPllSynthesizer {
+    /// Active reference crystal clock in kHz (24,000 kHz).
+    pub ref_clock_khz: u32,
+    /// Currently latched hardware PLL registers.
+    pub active_settings: PllRegisterSettings,
+    /// Shadow register bank staged for next VBLANK latch.
+    pub shadow_settings: PllRegisterSettings,
+    /// PLL lock status flag.
+    pub pll_locked: bool,
+    /// Total PLL re-calculation and latch operations completed.
+    pub reconfig_count: u32,
+}
+
+impl DisplayPllSynthesizer {
+    pub const fn new(ref_clock_khz: u32) -> Self {
+        Self {
+            ref_clock_khz,
+            active_settings: PllRegisterSettings::empty(),
+            shadow_settings: PllRegisterSettings::empty(),
+            pll_locked: true,
+            reconfig_count: 0,
+        }
+    }
+
+    /// Computes optimal Fractional-N PLL divider and multiplier settings for target pixel clock.
+    pub fn calculate_pll_settings(&self, target_pclk_khz: u32) -> Result<PllRegisterSettings, &'static str> {
+        if target_pclk_khz == 0 {
+            return Err("Target pixel clock must be non-zero");
+        }
+
+        let pre_n = 1u8;
+        let f_ref = (self.ref_clock_khz as u64) / (pre_n as u64);
+
+        // Find post_divider_q such that vco_freq = target * q is within [2.0 GHz, 4.5 GHz]
+        let mut best_q = 0u8;
+        let mut min_vco_dist = u64::MAX;
+        let vco_center = ((PLL_VCO_MIN_KHZ as u64) + (PLL_VCO_MAX_KHZ as u64)) / 2;
+
+        for q in 6..=32 {
+            let candidate_vco = (target_pclk_khz as u64) * (q as u64);
+            if candidate_vco >= (PLL_VCO_MIN_KHZ as u64) && candidate_vco <= (PLL_VCO_MAX_KHZ as u64) {
+                let dist = if candidate_vco >= vco_center {
+                    candidate_vco - vco_center
+                } else {
+                    vco_center - candidate_vco
+                };
+                if dist < min_vco_dist {
+                    min_vco_dist = dist;
+                    best_q = q;
+                }
+            }
+        }
+
+        if best_q == 0 {
+            return Err("Unable to find post-divider within VCO safe frequency limits");
+        }
+
+        let target_vco = (target_pclk_khz as u64) * (best_q as u64);
+
+        // Compute feedback multiplier M and 24-bit fractional K:
+        // target_vco = f_ref * (M + K / 2^24)
+        // M = target_vco / f_ref
+        // rem = target_vco % f_ref
+        // K = (rem * 2^24 + f_ref / 2) / f_ref
+        let mult_m = (target_vco / f_ref) as u16;
+        let rem = target_vco % f_ref;
+        let frac_k = ((rem * PLL_FRAC_DENOMINATOR + f_ref / 2) / f_ref) as u32;
+
+        // Calculate exact synthesized actual VCO and pixel clock:
+        // actual_vco = f_ref * M + (f_ref * K) / 2^24
+        let actual_vco_khz = (f_ref * (mult_m as u64) + ((f_ref * (frac_k as u64)) / PLL_FRAC_DENOMINATOR)) as u32;
+        let actual_pclk_khz = actual_vco_khz / (best_q as u32);
+
+        // Calculate frequency error in PPM: |target - actual| / target * 1,000,000
+        let diff = if actual_pclk_khz >= target_pclk_khz {
+            (actual_pclk_khz - target_pclk_khz) as u64
+        } else {
+            (target_pclk_khz - actual_pclk_khz) as u64
+        };
+        let error_ppm = ((diff * 1_000_000) / (target_pclk_khz as u64)) as u32;
+
+        Ok(PllRegisterSettings {
+            pre_divider_n: pre_n,
+            feedback_mult_m: mult_m,
+            frac_accumulator_k: frac_k,
+            post_divider_q: best_q,
+            vco_freq_khz: actual_vco_khz,
+            actual_pixel_clock_khz: actual_pclk_khz,
+            error_ppm,
+        })
+    }
+
+    /// Stages new target PLL parameters into shadow registers for next VBLANK latch.
+    pub fn stage_target_clock(&mut self, target_pclk_khz: u32) -> Result<(), &'static str> {
+        let settings = self.calculate_pll_settings(target_pclk_khz)?;
+        self.shadow_settings = settings;
+        Ok(())
+    }
+
+    /// Latches shadow settings into active hardware PLL registers during vertical blanking.
+    pub fn commit_shadow_registers(&mut self) {
+        self.active_settings = self.shadow_settings;
+        self.pll_locked = true;
+        self.reconfig_count += 1;
+    }
+}
+
+/// Verification test for hardware Fractional-N PLL synthesizer and divider calculation.
+pub fn verify_display_pll_synthesizer_and_dividers() -> bool {
+    let mut synth = DisplayPllSynthesizer::new(PLL_REF_CLOCK_KHZ);
+    let timings = DisplayTimingParameters::standard_fhd();
+
+    // 1. Calculate and verify 60Hz pixel clock (138,652 kHz)
+    let pclk_60 = timings.compute_pixel_clock_khz(DrrsRefreshRate::Hz60);
+    let pll_60 = match synth.calculate_pll_settings(pclk_60) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // VCO must be inside 2.0 GHz - 4.5 GHz range
+    if pll_60.vco_freq_khz < PLL_VCO_MIN_KHZ || pll_60.vco_freq_khz > PLL_VCO_MAX_KHZ {
+        return false;
+    }
+    // Accuracy must be exceptionally tight (< 50 PPM error)
+    if pll_60.error_ppm > 50 {
+        return false;
+    }
+    // Check synthesized clock within 2 kHz of 138,652 kHz
+    let diff_60 = (pll_60.actual_pixel_clock_khz as i32 - pclk_60 as i32).abs();
+    if diff_60 > 2 {
+        return false;
+    }
+
+    // 2. Calculate and verify 120Hz pixel clock (277,305 kHz)
+    let pclk_120 = timings.compute_pixel_clock_khz(DrrsRefreshRate::Hz120);
+    let pll_120 = match synth.calculate_pll_settings(pclk_120) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if pll_120.vco_freq_khz < PLL_VCO_MIN_KHZ || pll_120.vco_freq_khz > PLL_VCO_MAX_KHZ {
+        return false;
+    }
+    if pll_120.error_ppm > 50 {
+        return false;
+    }
+
+    // 3. Calculate and verify 165Hz peak pixel clock (381,295 kHz)
+    let pclk_165 = timings.compute_pixel_clock_khz(DrrsRefreshRate::Hz165);
+    let pll_165 = match synth.calculate_pll_settings(pclk_165) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if pll_165.vco_freq_khz < PLL_VCO_MIN_KHZ || pll_165.vco_freq_khz > PLL_VCO_MAX_KHZ {
+        return false;
+    }
+    if pll_165.error_ppm > 50 {
+        return false;
+    }
+
+    // 4. Test staging into shadow registers and committing
+    if synth.stage_target_clock(pclk_120).is_err() {
+        return false;
+    }
+    synth.commit_shadow_registers();
+    if synth.active_settings.actual_pixel_clock_khz != pll_120.actual_pixel_clock_khz {
+        return false;
+    }
+    if synth.reconfig_count != 1 || !synth.pll_locked {
+        return false;
+    }
+
+    true
+}
