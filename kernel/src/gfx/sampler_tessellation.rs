@@ -144,3 +144,99 @@ impl MipmapResidencyTracker {
         self.total_mips.saturating_sub(1)
     }
 }
+
+// Maximum hardware tessellation factor conforming to Direct3D 12 Agility limits.
+pub const MAX_HARDWARE_TESSELLATION_FACTOR: f32 = 64.0;
+pub const MIN_HARDWARE_TESSELLATION_FACTOR: f32 = 1.0;
+
+// Continuous fractional tessellation factors for quad and triangle patches.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PatchTessellationFactors {
+    pub edge_factors: [f32; 4],
+    pub inside_factors: [f32; 2],
+    pub is_culled: bool,
+}
+
+impl PatchTessellationFactors {
+    // Creates a culled patch state requiring zero geometry amplification.
+    pub const fn culled() -> Self {
+        Self {
+            edge_factors: [0.0; 4],
+            inside_factors: [0.0; 2],
+            is_culled: true,
+        }
+    }
+
+    // Creates uniform tessellation factors across all edges and interior.
+    pub fn uniform(factor: f32) -> Self {
+        let f = factor.clamp(MIN_HARDWARE_TESSELLATION_FACTOR, MAX_HARDWARE_TESSELLATION_FACTOR);
+        Self {
+            edge_factors: [f; 4],
+            inside_factors: [f; 2],
+            is_culled: false,
+        }
+    }
+}
+
+// Evaluates continuous tessellation factors combining sampler feedback density and camera distance.
+pub struct ContinuousTessellationCalculator {
+    pub near_distance: f32,
+    pub far_distance: f32,
+    pub max_feedback_mip: f32,
+}
+
+impl ContinuousTessellationCalculator {
+    // Initializes the continuous tessellation calculator with view distance boundaries.
+    pub const fn new(near_distance: f32, far_distance: f32) -> Self {
+        Self {
+            near_distance,
+            far_distance,
+            max_feedback_mip: 8.0,
+        }
+    }
+
+    // Calculates continuous tessellation factor for a geometry patch.
+    pub fn calculate_tessellation_factor(&self, camera_distance: f32, feedback_mip: u8) -> f32 {
+        if camera_distance > self.far_distance {
+            return MIN_HARDWARE_TESSELLATION_FACTOR;
+        }
+
+        // Distance attenuation factor [0.0, 1.0].
+        let dist_span = (self.far_distance - self.near_distance).max(0.001);
+        let dist_factor = 1.0 - ((camera_distance - self.near_distance) / dist_span).clamp(0.0, 1.0);
+
+        // Feedback sampling density factor [0.0, 1.0].
+        let feedback_factor = if feedback_mip == UNREFERENCED_FEEDBACK_MIP {
+            0.0
+        } else {
+            1.0 - ((feedback_mip as f32) / self.max_feedback_mip).clamp(0.0, 1.0)
+        };
+
+        // Weighted continuous synthesis (60% distance importance, 40% sampler feedback detail).
+        let combined = 0.6 * dist_factor + 0.4 * feedback_factor;
+        let factor = MIN_HARDWARE_TESSELLATION_FACTOR + (MAX_HARDWARE_TESSELLATION_FACTOR - MIN_HARDWARE_TESSELLATION_FACTOR) * combined;
+
+        factor.clamp(MIN_HARDWARE_TESSELLATION_FACTOR, MAX_HARDWARE_TESSELLATION_FACTOR)
+    }
+
+    // Evaluates quad patch tessellation factors from corner distances and feedback tile.
+    pub fn evaluate_quad_patch(
+        &self,
+        corner_distances: [f32; 4],
+        feedback_mip: u8,
+    ) -> PatchTessellationFactors {
+        let e0 = self.calculate_tessellation_factor((corner_distances[0] + corner_distances[1]) * 0.5, feedback_mip);
+        let e1 = self.calculate_tessellation_factor((corner_distances[1] + corner_distances[2]) * 0.5, feedback_mip);
+        let e2 = self.calculate_tessellation_factor((corner_distances[2] + corner_distances[3]) * 0.5, feedback_mip);
+        let e3 = self.calculate_tessellation_factor((corner_distances[3] + corner_distances[0]) * 0.5, feedback_mip);
+
+        let inside_x = (e1 + e3) * 0.5;
+        let inside_y = (e0 + e2) * 0.5;
+
+        PatchTessellationFactors {
+            edge_factors: [e0, e1, e2, e3],
+            inside_factors: [inside_x, inside_y],
+            is_culled: false,
+        }
+    }
+}
