@@ -240,3 +240,97 @@ impl ContinuousTessellationCalculator {
         }
     }
 }
+
+// Default per-frame VRAM streaming transfer budget (64 Megabytes per frame at 60 FPS).
+pub const DEFAULT_MAX_STREAMING_BANDWIDTH_BYTES: usize = 64 * 1024 * 1024;
+
+// Texture residency transfer request tracking staging uploads or evictions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResidencyTransferRequest {
+    pub texture_id: u32,
+    pub mip_level: u8,
+    pub size_bytes: usize,
+    pub is_upload: bool,
+}
+
+// GPU memory bandwidth throttle governor preventing VRAM thrashing during texture streaming.
+pub struct VramBandwidthThrottleGovernor {
+    max_bytes_per_frame: usize,
+    current_frame_bytes: usize,
+    thrash_counter: u32,
+    active_lod_clamp_bias: u8,
+    total_transfers_throttled: u64,
+}
+
+impl VramBandwidthThrottleGovernor {
+    // Initializes the throttle governor with target per-frame transfer bandwidth ceiling.
+    pub const fn new(max_bytes_per_frame: usize) -> Self {
+        Self {
+            max_bytes_per_frame,
+            current_frame_bytes: 0,
+            thrash_counter: 0,
+            active_lod_clamp_bias: 0,
+            total_transfers_throttled: 0,
+        }
+    }
+
+    // Default governor configured for handheld unified APU bus constraints.
+    pub const fn default_handheld() -> Self {
+        Self::new(DEFAULT_MAX_STREAMING_BANDWIDTH_BYTES)
+    }
+
+    // Requests bandwidth budget to stage a texture residency transfer, throttling if budget is full.
+    pub fn request_transfer(&mut self, request: &ResidencyTransferRequest) -> bool {
+        // Evictions do not consume PCIe/storage upload bandwidth.
+        if !request.is_upload {
+            return true;
+        }
+
+        // Check if adding request exceeds frame budget.
+        if self.current_frame_bytes.saturating_add(request.size_bytes) > self.max_bytes_per_frame {
+            self.total_transfers_throttled += 1;
+            self.thrash_counter = self.thrash_counter.saturating_add(1);
+            if self.thrash_counter > 5 {
+                // Engage anti-thrashing LOD clamp bias under continuous saturation.
+                self.active_lod_clamp_bias = (self.active_lod_clamp_bias + 1).min(3);
+            }
+            return false;
+        }
+
+        self.current_frame_bytes += request.size_bytes;
+        true
+    }
+
+    // Advances the governor timeline at frame boundary, resetting per-frame bandwidth counter.
+    pub fn advance_frame(&mut self) {
+        if self.current_frame_bytes < (self.max_bytes_per_frame / 2) {
+            // Relieve thrash pressure when bandwidth demand drops.
+            self.thrash_counter = self.thrash_counter.saturating_sub(1);
+            if self.thrash_counter == 0 {
+                self.active_lod_clamp_bias = self.active_lod_clamp_bias.saturating_sub(1);
+            }
+        }
+        self.current_frame_bytes = 0;
+    }
+
+    // Returns the active anti-thrashing LOD clamp bias (0 = unconstrained).
+    #[inline]
+    pub fn active_lod_clamp_bias(&self) -> u8 {
+        self.active_lod_clamp_bias
+    }
+
+    // Returns current bandwidth utilization percentage for the active frame [0, 100].
+    pub fn frame_utilization_percent(&self) -> u32 {
+        if self.max_bytes_per_frame == 0 {
+            0
+        } else {
+            ((self.current_frame_bytes as u128 * 100) / self.max_bytes_per_frame as u128) as u32
+        }
+    }
+
+    // Returns cumulative number of transfer operations delayed by bandwidth throttling.
+    #[inline]
+    pub fn total_transfers_throttled(&self) -> u64 {
+        self.total_transfers_throttled
+    }
+}
