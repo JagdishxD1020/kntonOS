@@ -157,3 +157,77 @@ impl AdaptiveSpinEscalationEngine {
         false // Did not change, must escalate to sleeping wait
     }
 }
+
+/// Emulates Win32 WaitOnAddress API.
+pub unsafe fn win32_wait_on_address(
+    address: *const u8,
+    compare_address: *const u8,
+    address_size: usize,
+    _milliseconds: u32,
+    tid: u64,
+) -> bool {
+    if address.is_null() || compare_address.is_null() {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    if address_size != 1 && address_size != 2 && address_size != 4 && address_size != 8 {
+        win32_set_last_error(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    // Initial check: if values already differ, return true immediately (no wait needed)
+    let current_val = match read_address_val(address, address_size) {
+        Ok(v) => v,
+        Err(_) => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+    let compare_val = match read_address_val(compare_address, address_size) {
+        Ok(v) => v,
+        Err(_) => {
+            win32_set_last_error(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+    };
+
+    if current_val != compare_val {
+        win32_set_last_error(ERROR_SUCCESS);
+        return true;
+    }
+
+    // Fast path: Adaptive spin loop
+    if AdaptiveSpinEscalationEngine::spin_check(address, compare_address, address_size) {
+        win32_set_last_error(ERROR_SUCCESS);
+        return true;
+    }
+
+    // Slow path: Escalate to kernel wait queue
+    let node = WaitAddressNode {
+        thread_id: tid,
+        address: address as usize,
+        compare_size: address_size,
+        compare_val,
+        is_woken: false,
+        priority_boosted: true, // Anti-inversion priority boost applied
+    };
+
+    ADDRESS_WAIT_TABLE.enqueue_waiter(node);
+    win32_set_last_error(ERROR_SUCCESS);
+    true
+}
+
+/// Emulates Win32 WakeByAddressSingle API.
+pub unsafe fn win32_wake_by_address_single(address: *const u8) {
+    if !address.is_null() {
+        ADDRESS_WAIT_TABLE.wake_single(address as usize);
+    }
+}
+
+/// Emulates Win32 WakeByAddressAll API.
+pub unsafe fn win32_wake_by_address_all(address: *const u8) {
+    if !address.is_null() {
+        ADDRESS_WAIT_TABLE.wake_all(address as usize);
+    }
+}
