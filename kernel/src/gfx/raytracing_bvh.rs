@@ -260,3 +260,92 @@ impl BvhRefitGovernor {
         if total == 0 { 0 } else { (self.refits_executed * 100) / total }
     }
 }
+
+// Scratch buffer block state in the recycling pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchBufferBlock {
+    pub block_id: u32,
+    pub gpu_va: u64,
+    pub size_bytes: u64,
+    pub fence_value: u64,
+    pub in_use: bool,
+}
+
+// GPU scratch buffer recycling pool synchronized with timeline fences.
+#[derive(Debug)]
+pub struct GpuScratchBufferPool {
+    pub base_gpu_va: u64,
+    pub total_pool_size: u64,
+    pub block_size: u64,
+    pub blocks: Vec<ScratchBufferBlock>,
+    pub allocations_served: u64,
+    pub reuses_served: u64,
+}
+
+impl GpuScratchBufferPool {
+    pub fn new(base_gpu_va: u64, total_pool_size: u64, block_size: u64) -> Result<Self, &'static str> {
+        if (base_gpu_va % D3D12_RAYTRACING_BVH_SCRATCH_ALIGNMENT) != 0 {
+            return Err("Scratch pool base VA must be 256-byte aligned");
+        }
+        if (block_size % D3D12_RAYTRACING_BVH_SCRATCH_ALIGNMENT) != 0 {
+            return Err("Scratch block size must be 256-byte aligned");
+        }
+        let block_count = (total_pool_size / block_size) as u32;
+        let mut blocks = Vec::with_capacity(block_count as usize);
+
+        for i in 0..block_count {
+            blocks.push(ScratchBufferBlock {
+                block_id: i,
+                gpu_va: base_gpu_va + (i as u64) * block_size,
+                size_bytes: block_size,
+                fence_value: 0,
+                in_use: false,
+            });
+        }
+
+        Ok(Self {
+            base_gpu_va,
+            total_pool_size,
+            block_size,
+            blocks,
+            allocations_served: 0,
+            reuses_served: 0,
+        })
+    }
+
+    // Retires completed blocks based on GPU timeline fence value.
+    pub fn advance_fence(&mut self, completed_fence: u64) {
+        for block in &mut self.blocks {
+            if block.in_use && block.fence_value <= completed_fence {
+                block.in_use = false;
+            }
+        }
+    }
+
+    // Acquires a 256-byte aligned scratch buffer segment tagged with fence.
+    pub fn acquire_scratch(&mut self, required_size: u64, fence_tag: u64) -> Result<u64, &'static str> {
+        if required_size > self.block_size {
+            return Err("Requested scratch exceeds block size");
+        }
+
+        // Look for existing free block.
+        for block in &mut self.blocks {
+            if !block.in_use {
+                block.in_use = true;
+                block.fence_value = fence_tag;
+                self.allocations_served += 1;
+                if block.fence_value > 0 {
+                    self.reuses_served += 1;
+                }
+                return Ok(block.gpu_va);
+            }
+        }
+
+        Err("No free scratch blocks available")
+    }
+
+    #[inline(always)]
+    pub fn active_blocks_count(&self) -> usize {
+        self.blocks.iter().filter(|b| b.in_use).count()
+    }
+}
