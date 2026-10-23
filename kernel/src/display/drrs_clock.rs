@@ -606,3 +606,284 @@ pub fn verify_seamless_vblank_clock_transition() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Content Framerate Detection & Adaptive DRRS Hysteresis Governor
+// ============================================================================
+
+/// Content category classified based on observed frame delivery rhythm and application state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentCategory {
+    /// Static desktop UI, document reader, e-reader, idle browsing (1 - 35 FPS).
+    StaticUi,
+    /// 24 FPS / 48 FPS cinematic content benefiting from 48Hz integer 2:2 pulldown.
+    CinemaVideo24Fps,
+    /// Standard 60 FPS video or desktop UI scrolling.
+    StandardVideo60Fps,
+    /// High-motion, esports or 3D gaming running at >= 90 FPS.
+    HighFramerateGaming,
+}
+
+/// Rolling window content framerate detector.
+#[derive(Debug, Clone)]
+pub struct ContentFramerateDetector {
+    /// Circular buffer of recent frame intervals in microseconds.
+    frame_intervals_us: [u32; 16],
+    /// Ring index.
+    sample_index: usize,
+    /// Number of valid samples gathered.
+    sample_count: usize,
+    /// Timestamp in microseconds of previous frame delivery.
+    last_timestamp_us: u64,
+    /// Filtered moving average FPS estimate.
+    smoothed_fps: u32,
+    /// Consecutive frames matching current classification.
+    stable_category_count: u32,
+}
+
+impl ContentFramerateDetector {
+    pub const fn new() -> Self {
+        Self {
+            frame_intervals_us: [0; 16],
+            sample_index: 0,
+            sample_count: 0,
+            last_timestamp_us: 0,
+            smoothed_fps: 60,
+            stable_category_count: 0,
+        }
+    }
+
+    /// Record a frame presentation timestamp (in microseconds) and update rolling cadence.
+    pub fn record_frame(&mut self, timestamp_us: u64) -> u32 {
+        if self.last_timestamp_us > 0 && timestamp_us > self.last_timestamp_us {
+            let interval = (timestamp_us - self.last_timestamp_us) as u32;
+            if interval >= 2000 && interval <= 1_000_000 {
+                self.frame_intervals_us[self.sample_index] = interval;
+                self.sample_index = (self.sample_index + 1) % 16;
+                if self.sample_count < 16 {
+                    self.sample_count += 1;
+                }
+
+                // Compute mean interval over valid samples
+                let mut sum_us: u64 = 0;
+                let mut i = 0;
+                while i < self.sample_count {
+                    sum_us += self.frame_intervals_us[i] as u64;
+                    i += 1;
+                }
+                let avg_interval_us = sum_us / (self.sample_count as u64);
+                if avg_interval_us > 0 {
+                    self.smoothed_fps = (1_000_000u64 / avg_interval_us) as u32;
+                }
+            }
+        }
+        self.last_timestamp_us = timestamp_us;
+        self.smoothed_fps
+    }
+
+    /// Classify content category from smoothed FPS rhythm.
+    pub fn classify_content(&self) -> ContentCategory {
+        if (self.smoothed_fps >= 22 && self.smoothed_fps <= 26) || (self.smoothed_fps >= 46 && self.smoothed_fps <= 50) {
+            ContentCategory::CinemaVideo24Fps
+        } else if self.smoothed_fps <= 35 {
+            ContentCategory::StaticUi
+        } else if self.smoothed_fps >= 55 && self.smoothed_fps <= 75 {
+            ContentCategory::StandardVideo60Fps
+        } else {
+            ContentCategory::HighFramerateGaming
+        }
+    }
+
+    pub fn smoothed_fps(&self) -> u32 {
+        self.smoothed_fps
+    }
+}
+
+/// Adaptive DRRS Hysteresis Governor.
+///
+/// Prevents rapid rate flapping when framerates oscillate near tier boundaries.
+/// - Step-up (promotion) is zero-delay (1 frame) upon high-framerate burst or user touch/input.
+/// - Step-down (demotion) requires N consecutive stable lower frames before triggering.
+/// - Low battery levels enforce aggressive downscaling caps to preserve runtime.
+#[derive(Debug, Clone)]
+pub struct AdaptiveDrrsGovernor {
+    /// Framerate cadence detector.
+    pub detector: ContentFramerateDetector,
+    /// Currently commanded target refresh rate.
+    current_target_rate: DrrsRefreshRate,
+    /// System battery remaining percentage (0 - 100).
+    battery_percentage: u8,
+    /// User input / touch event recently signaled.
+    user_interaction_active: bool,
+    /// Consecutive frames where candidate target is lower than current.
+    stable_down_counter: u32,
+    /// Required hysteresis frame threshold before stepping down (e.g. 60 frames = 1 sec at 60Hz).
+    step_down_threshold_frames: u32,
+    /// Total successful rate transitions initiated by the governor.
+    governor_transitions: u32,
+}
+
+impl AdaptiveDrrsGovernor {
+    pub const fn new(initial_rate: DrrsRefreshRate) -> Self {
+        Self {
+            detector: ContentFramerateDetector::new(),
+            current_target_rate: initial_rate,
+            battery_percentage: 100,
+            user_interaction_active: false,
+            stable_down_counter: 0,
+            step_down_threshold_frames: 60,
+            governor_transitions: 0,
+        }
+    }
+
+    /// Update battery state of charge (percentage 0 - 100).
+    pub fn set_battery_percentage(&mut self, pct: u8) {
+        self.battery_percentage = pct;
+    }
+
+    /// Signal an interactive touch, stylus, gamepad, or keyboard input event.
+    /// Triggers immediate 0-delay promotion to ensure ultra-smooth UI response.
+    pub fn on_user_interaction(&mut self) {
+        self.user_interaction_active = true;
+    }
+
+    /// Evaluate candidate refresh rate based on content cadence and power envelope.
+    pub fn evaluate_candidate_rate(&self, category: ContentCategory) -> DrrsRefreshRate {
+        // Battery conservation mode overrides high-refresh rates when battery is critically low (<= 20%)
+        let is_low_battery = self.battery_percentage <= 20;
+
+        if self.user_interaction_active {
+            if is_low_battery {
+                return DrrsRefreshRate::Hz60;
+            } else {
+                return DrrsRefreshRate::Hz120;
+            }
+        }
+
+        match category {
+            ContentCategory::StaticUi => {
+                DrrsRefreshRate::Hz40
+            }
+            ContentCategory::CinemaVideo24Fps => {
+                // 48Hz provides native 2:2 pulldown with zero frame repeat judder and lower power than 120Hz
+                DrrsRefreshRate::Hz48
+            }
+            ContentCategory::StandardVideo60Fps => {
+                DrrsRefreshRate::Hz60
+            }
+            ContentCategory::HighFramerateGaming => {
+                if is_low_battery {
+                    DrrsRefreshRate::Hz60
+                } else {
+                    DrrsRefreshRate::Hz144
+                }
+            }
+        }
+    }
+
+    /// Process a newly submitted frame timestamp and determine if a refresh rate change is needed.
+    ///
+    /// Returns Some(target_rate) if a switch should be scheduled, or None if maintaining current rate.
+    pub fn on_frame_submit(&mut self, timestamp_us: u64) -> Option<DrrsRefreshRate> {
+        self.detector.record_frame(timestamp_us);
+        let category = self.detector.classify_content();
+        let candidate = self.evaluate_candidate_rate(category);
+
+        // Clear one-shot user interaction flag
+        self.user_interaction_active = false;
+
+        let candidate_hz = candidate.hz();
+        let current_hz = self.current_target_rate.hz();
+
+        if candidate_hz > current_hz {
+            // Immediate promotion (0-frame hysteresis delay)
+            self.current_target_rate = candidate;
+            self.stable_down_counter = 0;
+            self.governor_transitions += 1;
+            Some(candidate)
+        } else if candidate_hz < current_hz {
+            // Hysteresis suppression: must stay consistently lower for threshold frames
+            self.stable_down_counter += 1;
+            if self.stable_down_counter >= self.step_down_threshold_frames {
+                self.current_target_rate = candidate;
+                self.stable_down_counter = 0;
+                self.governor_transitions += 1;
+                Some(candidate)
+            } else {
+                None
+            }
+        } else {
+            // Rates match: reset down counter
+            self.stable_down_counter = 0;
+            None
+        }
+    }
+
+    pub fn current_target_rate(&self) -> DrrsRefreshRate {
+        self.current_target_rate
+    }
+
+    pub fn transitions_count(&self) -> u32 {
+        self.governor_transitions
+    }
+}
+
+/// Verification test for content framerate detector and adaptive DRRS hysteresis governor.
+pub fn verify_adaptive_drrs_hysteresis_governor() -> bool {
+    let mut governor = AdaptiveDrrsGovernor::new(DrrsRefreshRate::Hz60);
+
+    // 1. Initial state
+    if governor.current_target_rate() != DrrsRefreshRate::Hz60 {
+        return false;
+    }
+
+    // 2. Immediate promotion test via user interaction
+    governor.on_user_interaction();
+    let change = governor.on_frame_submit(100_000);
+    if change != Some(DrrsRefreshRate::Hz120) || governor.current_target_rate() != DrrsRefreshRate::Hz120 {
+        return false;
+    }
+
+    // 3. Test hysteresis suppression: simulate dropping to static UI (e.g. 30 FPS / 33333 us)
+    let mut t = 100_000u64;
+    for _ in 1..=59 {
+        t += 33_333;
+        let c = governor.on_frame_submit(t);
+        // Before 60 frames, hysteresis MUST block step-down
+        if c.is_some() || governor.current_target_rate() != DrrsRefreshRate::Hz120 {
+            return false;
+        }
+    }
+
+    // On the 60th frame, governor must step down to 40Hz
+    t += 33_333;
+    let step_down = governor.on_frame_submit(t);
+    if step_down != Some(DrrsRefreshRate::Hz40) || governor.current_target_rate() != DrrsRefreshRate::Hz40 {
+        return false;
+    }
+
+    // 4. Test 24 FPS cinema video detection: 41666 us intervals
+    // First immediate jump to 48Hz since 48 > 40
+    for _ in 0..16 {
+        t += 41_666;
+        governor.on_frame_submit(t);
+    }
+    let cat = governor.detector.classify_content();
+    if cat != ContentCategory::CinemaVideo24Fps {
+        return false;
+    }
+    let eval = governor.evaluate_candidate_rate(cat);
+    if eval != DrrsRefreshRate::Hz48 {
+        return false;
+    }
+
+    // 5. Test low battery (<= 20%) capping
+    governor.set_battery_percentage(15);
+    let low_bat_eval = governor.evaluate_candidate_rate(ContentCategory::HighFramerateGaming);
+    if low_bat_eval != DrrsRefreshRate::Hz60 {
+        return false;
+    }
+
+    true
+}
