@@ -401,3 +401,94 @@ impl StreamingTessellationOptimizer {
         }
     }
 }
+
+// Comprehensive self-test suite for Direct3D 12 Agility Sampler Feedback and Streaming Tessellation.
+pub fn test_sampler_tessellation_subsystem() -> bool {
+    crate::serial_write_str("[KNT-SAMPLER-TESS] Initializing Direct3D 12 Agility sampler feedback & tessellation test...\r\n");
+
+    // 1. Verify sampler feedback minification map decoding and mip residency tracking.
+    let mut feedback = FeedbackMinificationMap::new();
+    feedback.record_sample(0, 0, 2);
+    feedback.record_sample(1, 0, 4);
+    feedback.record_sample(2, 2, 1);
+
+    if feedback.min_sampled_mip() != 1 || feedback.referenced_tile_count() != 3 {
+        return false;
+    }
+
+    let hist = feedback.compute_mip_histogram();
+    if hist[1] != 1 || hist[2] != 1 || hist[4] != 1 || hist[0] != 0 {
+        return false;
+    }
+
+    // Residency tracking with initial tail mips 4..8 resident (0x00F0).
+    let mut tracker = MipmapResidencyTracker::new(8, 0x00F0);
+    let (to_load, to_evict) = tracker.evaluate_residency_demands(&feedback);
+    if to_load != 0x000E || to_evict != 0 {
+        return false;
+    }
+
+    tracker.apply_residency_update(to_load, to_evict);
+    if !tracker.is_mip_resident(1) || !tracker.is_mip_resident(2) || !tracker.is_mip_resident(4) {
+        return false;
+    }
+    if tracker.min_resident_mip() != 1 {
+        return false;
+    }
+
+    // 2. Verify continuous tessellation factor calculation from feedback density and camera distance.
+    let calc = ContinuousTessellationCalculator::new(2.0, 100.0);
+    let close_factor = calc.calculate_tessellation_factor(5.0, 0);
+    if close_factor < 40.0 || close_factor > MAX_HARDWARE_TESSELLATION_FACTOR {
+        return false;
+    }
+
+    let far_factor = calc.calculate_tessellation_factor(120.0, 5);
+    if far_factor != MIN_HARDWARE_TESSELLATION_FACTOR {
+        return false;
+    }
+
+    let quad_factors = calc.evaluate_quad_patch([5.0, 5.0, 5.0, 5.0], 1);
+    if quad_factors.is_culled || quad_factors.edge_factors[0] < 20.0 {
+        return false;
+    }
+
+    // 3. Verify VRAM bandwidth throttle governor and anti-thrashing controller.
+    let mut governor = VramBandwidthThrottleGovernor::new(10_000_000);
+    let req1 = ResidencyTransferRequest {
+        texture_id: 101,
+        mip_level: 1,
+        size_bytes: 6_000_000,
+        is_upload: true,
+    };
+    if !governor.request_transfer(&req1) || governor.frame_utilization_percent() != 60 {
+        return false;
+    }
+
+    let req2 = ResidencyTransferRequest {
+        texture_id: 102,
+        mip_level: 0,
+        size_bytes: 6_000_000,
+        is_upload: true,
+    };
+    // Exceeds 10MB budget: must be throttled.
+    if governor.request_transfer(&req2) || governor.total_transfers_throttled() != 1 {
+        return false;
+    }
+
+    governor.advance_frame();
+    if governor.frame_utilization_percent() != 0 {
+        return false;
+    }
+
+    // 4. Verify streaming tessellation optimizer and meshlet LOD evaluation.
+    let optimizer = StreamingTessellationOptimizer::default_handheld();
+    let meshlet = optimizer.evaluate_meshlet(1001, 64, 8.0, &feedback, 2, 2);
+    if meshlet.meshlet_id != 1001 || meshlet.feedback_min_mip != 1 || meshlet.amplified_primitives <= 64 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-SAMPLER-TESSELLATION-PASS] Direct3D 12 Agility sampler feedback & tessellation verified\r\n");
+    true
+}
