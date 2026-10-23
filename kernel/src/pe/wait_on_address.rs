@@ -231,3 +231,101 @@ pub unsafe fn win32_wake_by_address_all(address: *const u8) {
         ADDRESS_WAIT_TABLE.wake_all(address as usize);
     }
 }
+
+/// Comprehensive self-test for Win32 WaitOnAddress / WakeByAddress Subsystem.
+pub fn test_win32_wait_on_address_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-WAIT-ADDRESS] Initializing Win32 WaitOnAddress Subsystem self-test...\r\n");
+
+    // 1. Test Immediate Return when value already differs (No wait, no spin)
+    let sync_var_32: u32 = 42;
+    let compare_diff_32: u32 = 99;
+
+    let ret_diff = unsafe {
+        win32_wait_on_address(
+            &sync_var_32 as *const _ as *const u8,
+            &compare_diff_32 as *const _ as *const u8,
+            4,
+            1000,
+            1001,
+        )
+    };
+
+    if !ret_diff {
+        crate::serial_write_str("[KNT-TEST-ERR] WaitOnAddress failed on differing value check\r\n");
+        return false;
+    }
+
+    if ADDRESS_WAIT_TABLE.count_waiters(&sync_var_32 as *const _ as usize) != 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Waiter enqueued despite differing compare value\r\n");
+        return false;
+    }
+
+    // 2. Test Multi-Size Predicate Matching (1, 2, 4, 8 bytes)
+    let val_u8: u8 = 0xAA;
+    let cmp_u8: u8 = 0xAA;
+    let ret_u8 = unsafe {
+        win32_wait_on_address(
+            &val_u8 as *const _ as *const u8,
+            &cmp_u8 as *const _ as *const u8,
+            1,
+            0,
+            1002,
+        )
+    };
+    if !ret_u8 || ADDRESS_WAIT_TABLE.count_waiters(&val_u8 as *const _ as usize) != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] 1-byte predicate wait queue enqueuing failed\r\n");
+        return false;
+    }
+    unsafe { win32_wake_by_address_single(&val_u8 as *const _ as *const u8) };
+
+    let val_u64: u64 = 0x0123_4567_89AB_CDEF;
+    let cmp_u64: u64 = 0x0123_4567_89AB_CDEF;
+    let ret_u64 = unsafe {
+        win32_wait_on_address(
+            &val_u64 as *const _ as *const u8,
+            &cmp_u64 as *const _ as *const u8,
+            8,
+            0,
+            1003,
+        )
+    };
+    if !ret_u64 || ADDRESS_WAIT_TABLE.count_waiters(&val_u64 as *const _ as usize) != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] 8-byte predicate wait queue enqueuing failed\r\n");
+        return false;
+    }
+    unsafe { win32_wake_by_address_single(&val_u64 as *const _ as *const u8) };
+
+    // 3. Test WakeByAddressSingle & WakeByAddressAll
+    let shared_mutex: u32 = 1;
+    let cmp_mutex: u32 = 1;
+
+    // Enqueue 3 waiters
+    unsafe {
+        win32_wait_on_address(&shared_mutex as *const _ as *const u8, &cmp_mutex as *const _ as *const u8, 4, 0, 2001);
+        win32_wait_on_address(&shared_mutex as *const _ as *const u8, &cmp_mutex as *const _ as *const u8, 4, 0, 2002);
+        win32_wait_on_address(&shared_mutex as *const _ as *const u8, &cmp_mutex as *const _ as *const u8, 4, 0, 2003);
+    }
+
+    let shared_addr = &shared_mutex as *const _ as usize;
+    if ADDRESS_WAIT_TABLE.count_waiters(shared_addr) != 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] 3 waiters not found in address queue\r\n");
+        return false;
+    }
+
+    // Wake single waiter
+    unsafe { win32_wake_by_address_single(&shared_mutex as *const _ as *const u8) };
+    if ADDRESS_WAIT_TABLE.count_waiters(shared_addr) != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] WakeByAddressSingle did not wake exactly 1 waiter\r\n");
+        return false;
+    }
+
+    // Wake all remaining waiters
+    unsafe { win32_wake_by_address_all(&shared_mutex as *const _ as *const u8) };
+    if ADDRESS_WAIT_TABLE.count_waiters(shared_addr) != 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] WakeByAddressAll did not clear remaining waiters\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-WAIT-ADDRESS-PASS] Win32 WaitOnAddress & WakeByAddress verified\r\n");
+    true
+}
