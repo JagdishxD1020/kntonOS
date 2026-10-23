@@ -478,3 +478,109 @@ impl BvhDefragAllocator {
         (((total_free - max_free) * 100) / total_free) as u32
     }
 }
+
+// Verification self-test suite for D3D12 Agility BVH compaction & dynamic refit engine.
+pub fn test_raytracing_bvh_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 BVH compaction & dynamic refit engine...\r\n");
+
+    // 1. Verify DXR 1.1 post-build compaction querying and memory compaction.
+    let mut compactor = BvhCompactionEngine::new();
+    let uncompacted_size = 1024 * 1024;
+    let flags = BvhBuildFlags(BvhBuildFlags::ALLOW_COMPACTION.bits() | BvhBuildFlags::MINIMIZE_MEMORY.bits());
+    let query_compact = compactor.query_compact_size(uncompacted_size, flags);
+
+    if query_compact >= uncompacted_size || (query_compact % D3D12_RAYTRACING_BVH_BYTE_ALIGNMENT) != 0 {
+        return false;
+    }
+
+    let compaction_desc = match BvhCompactionDescriptor::new(
+        BvhStructureType::BottomLevel,
+        0x0000_7000_1000_0000,
+        0x0000_7000_2000_0000,
+        uncompacted_size,
+        query_compact,
+    ) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    if compaction_desc.savings_percentage() != 50 {
+        return false;
+    }
+
+    if compactor.execute_compaction(compaction_desc).is_err() {
+        return false;
+    }
+    if compactor.total_compactions_executed != 1 || compactor.total_vram_saved_bytes() == 0 {
+        return false;
+    }
+
+    // 2. Verify Dynamic BVH Refit Governor for skinned meshes.
+    let baseline_aabb = BvhAabb::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+    let mut governor = BvhRefitGovernor::new(baseline_aabb);
+
+    let small_deform_aabb = BvhAabb::new([-10.5, -10.5, -10.5], [10.5, 10.5, 10.5]);
+    let mode1 = governor.evaluate_build_mode(small_deform_aabb, 1.5);
+    if mode1 != BvhBuildMode::DynamicRefit {
+        return false;
+    }
+
+    let large_deform_aabb = BvhAabb::new([-25.0, -25.0, -25.0], [25.0, 25.0, 25.0]);
+    let mode2 = governor.evaluate_build_mode(large_deform_aabb, 20.0);
+    if mode2 != BvhBuildMode::FullRebuild {
+        return false;
+    }
+    if governor.refits_executed != 1 || governor.rebuilds_executed != 1 {
+        return false;
+    }
+
+    // 3. Verify GPU scratch buffer recycling pool and timeline fence tracking.
+    let mut scratch_pool = match GpuScratchBufferPool::new(0x0000_8000_0000, 1024 * 1024, 64 * 1024) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let scratch_va1 = match scratch_pool.acquire_scratch(32 * 1024, 10) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+    if (scratch_va1 % D3D12_RAYTRACING_BVH_SCRATCH_ALIGNMENT) != 0 {
+        return false;
+    }
+
+    scratch_pool.advance_fence(10);
+    let scratch_va2 = match scratch_pool.acquire_scratch(16 * 1024, 20) {
+        Ok(va) => va,
+        Err(_) => return false,
+    };
+    if scratch_va2 != scratch_va1 {
+        return false;
+    }
+
+    // 4. Verify VRAM defragmentation allocator and heap compaction.
+    let mut defrag_alloc = match BvhDefragAllocator::new(0x0000_9000_0000, 256 * 1024) {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    let _b1 = defrag_alloc.allocate(1, 32 * 1024).unwrap();
+    let _b2 = defrag_alloc.allocate(2, 32 * 1024).unwrap();
+    let _b3 = defrag_alloc.allocate(3, 32 * 1024).unwrap();
+
+    if !defrag_alloc.free(2) {
+        return false;
+    }
+    if defrag_alloc.fragmentation_percentage() == 0 {
+        return false;
+    }
+
+    let moved = defrag_alloc.defragment();
+    if moved != 1 || defrag_alloc.fragmentation_percentage() != 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-BVH-COMPACT-PASS] Direct3D 12 BVH compaction & dynamic refit engine verified\r\n");
+
+    true
+}
