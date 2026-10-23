@@ -111,3 +111,49 @@ impl AddressWaitQueueTable {
 }
 
 pub static ADDRESS_WAIT_TABLE: AddressWaitQueueTable = AddressWaitQueueTable::new();
+
+pub const ADAPTIVE_SPIN_LIMIT: u32 = 400; // 400 iterations before kernel sleep escalation
+
+/// Helper to read value at target address based on compare_address_size.
+#[inline]
+pub unsafe fn read_address_val(addr: *const u8, size: usize) -> Result<u64, ()> {
+    if addr.is_null() {
+        return Err(());
+    }
+    match size {
+        1 => Ok(*(addr as *const u8) as u64),
+        2 => Ok(*(addr as *const u16) as u64),
+        4 => Ok(*(addr as *const u32) as u64),
+        8 => Ok(*(addr as *const u64)),
+        _ => Err(()),
+    }
+}
+
+/// Adaptive spin-then-sleep lock escalation engine.
+pub struct AdaptiveSpinEscalationEngine;
+
+impl AdaptiveSpinEscalationEngine {
+    /// Perform adaptive spin check on target address value.
+    /// Returns true if predicate changed during spin (avoiding kernel sleep), false if unchanged.
+    pub unsafe fn spin_check(
+        address: *const u8,
+        compare_address: *const u8,
+        size: usize,
+    ) -> bool {
+        let expected = match read_address_val(compare_address, size) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        for _ in 0..ADAPTIVE_SPIN_LIMIT {
+            core::hint::spin_loop();
+            if let Ok(current) = read_address_val(address, size) {
+                if current != expected {
+                    return true; // Predicate changed during spin!
+                }
+            }
+        }
+
+        false // Did not change, must escalate to sleeping wait
+    }
+}
