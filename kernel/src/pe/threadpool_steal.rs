@@ -307,3 +307,131 @@ impl FiberMigrationGovernor {
 }
 
 pub static FIBER_MIGRATION_GOVERNOR: FiberMigrationGovernor = FiberMigrationGovernor::new();
+
+/// Comprehensive self-test for Win32 Thread Pool High-Priority Worker Queues & Work-Stealing Scheduler.
+pub fn test_win32_threadpool_steal_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-THREADPOOL-STEAL] Initializing Win32 Work-Stealing Subsystem self-test...\r\n");
+
+    // 1. Test Chase-Lev Deque Push, Pop (LIFO), and Steal (FIFO)
+    let deque = ChaseLevDeque::new(16);
+
+    let item1 = ThreadPoolWorkItem {
+        work_id: 1,
+        task_fn: 0x0040_1000,
+        context: 0x1111,
+        priority: 0,
+        enqueue_tsc: 100,
+    };
+    let item2 = ThreadPoolWorkItem {
+        work_id: 2,
+        task_fn: 0x0040_2000,
+        context: 0x2222,
+        priority: 1,
+        enqueue_tsc: 200,
+    };
+    let item3 = ThreadPoolWorkItem {
+        work_id: 3,
+        task_fn: 0x0040_3000,
+        context: 0x3333,
+        priority: 2,
+        enqueue_tsc: 300,
+    };
+
+    deque.push(item1);
+    deque.push(item2);
+    deque.push(item3);
+
+    // Thief steals from top (FIFO: item1 first)
+    let stolen = match deque.steal() {
+        Some(s) => s,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Chase-Lev steal failed\r\n");
+            return false;
+        }
+    };
+    if stolen.work_id != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Stolen item was not item 1 (FIFO order violation)\r\n");
+        return false;
+    }
+
+    // Owner pops from bottom (LIFO: item3 first)
+    let popped = match deque.pop() {
+        Some(p) => p,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Chase-Lev pop failed\r\n");
+            return false;
+        }
+    };
+    if popped.work_id != 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Popped item was not item 3 (LIFO order violation)\r\n");
+        return false;
+    }
+
+    // 2. Test High-Priority Game Worker Scheduling & P-Core Pinning
+    let sched = &GAME_WORKER_SCHEDULER;
+    sched.register_worker(5001, 0, true);  // Worker 0: P-core 0
+    sched.register_worker(5002, 2, false); // Worker 1: E-core 2
+
+    // Schedule critical game task (priority = 2) -> Must land on P-Core worker (Worker 0)
+    let crit_id = sched.schedule_game_task(0x0040_9000, 0xCAFE, 2);
+
+    // Worker 0 executes local task
+    let exec_p = match sched.worker_execute_next(0) {
+        Some(e) => e,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Worker 0 failed to execute local task\r\n");
+            return false;
+        }
+    };
+    if exec_p.work_id != crit_id || exec_p.priority != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Executed task was not the critical game task\r\n");
+        return false;
+    }
+
+    // 3. Test Inter-Worker Work-Stealing
+    // Enqueue normal task onto Worker 0
+    let normal_id = sched.schedule_game_task(0x0040_8000, 0xBEEF, 0);
+
+    // Worker 1 (idle on E-core) steals task from Worker 0
+    let exec_e = match sched.worker_execute_next(1) {
+        Some(e) => e,
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Worker 1 failed to steal task from Worker 0\r\n");
+            return false;
+        }
+    };
+    if exec_e.work_id != normal_id {
+        crate::serial_write_str("[KNT-TEST-ERR] Stolen task ID mismatch\r\n");
+        return false;
+    }
+
+    // 4. Test Fiber-to-Thread Migration & FLS Continuity
+    let fls_initial = alloc::vec![0x1234usize, 0x5678usize];
+    FIBER_MIGRATION_GOVERNOR.register_fiber(777, 5001, fls_initial);
+
+    // Yield fiber
+    FIBER_MIGRATION_GOVERNOR.yield_fiber(777);
+
+    // Migrate to Worker 1 (TID 5002)
+    let migrated_fls = match FIBER_MIGRATION_GOVERNOR.migrate_fiber_to_thread(777, 5002) {
+        Ok(slots) => slots,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Fiber migration to thread 5002 failed\r\n");
+            return false;
+        }
+    };
+
+    if migrated_fls.len() != 2 || migrated_fls[0] != 0x1234 || migrated_fls[1] != 0x5678 {
+        crate::serial_write_str("[KNT-TEST-ERR] Migrated fiber FLS state corrupted\r\n");
+        return false;
+    }
+
+    let f_post = FIBER_MIGRATION_GOVERNOR.get_fiber(777).unwrap();
+    if f_post.owning_thread_id != 5002 {
+        crate::serial_write_str("[KNT-TEST-ERR] Fiber owning thread ID mismatch after migration\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-THREADPOOL-STEAL-PASS] Win32 Work-Stealing & Fiber Scheduler verified\r\n");
+    true
+}
