@@ -1293,6 +1293,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_threadpool_steal_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Thread Pool Steal subsystem self-test failed!\r\n");
     }
+    // Verify Win32 WaitOnAddress & Lightweight User-Mode Synchronization Governor (TASK-KNT-290)
+    if !pe::test_win32_wait_on_address_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 WaitOnAddress subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
