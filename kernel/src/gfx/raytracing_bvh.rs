@@ -168,3 +168,95 @@ impl BvhCompactionEngine {
         ((self.total_vram_saved_bytes() * 100) / self.total_uncompacted_bytes) as u32
     }
 }
+
+
+// BVH Build and Refit Operation Mode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhBuildMode {
+    FullRebuild = 0,
+    DynamicRefit = 1,
+}
+
+// Axis-Aligned Bounding Box (AABB) for BVH bounds updates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BvhAabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+impl BvhAabb {
+    pub const fn new(min: [f32; 3], max: [f32; 3]) -> Self {
+        Self { min, max }
+    }
+
+    #[inline(always)]
+    pub fn surface_area(&self) -> f32 {
+        let dx = self.max[0] - self.min[0];
+        let dy = self.max[1] - self.min[1];
+        let dz = self.max[2] - self.min[2];
+        2.0 * (dx * dy + dy * dz + dz * dx)
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, other: &Self) -> bool {
+        self.min[0] <= other.min[0] && self.min[1] <= other.min[1] && self.min[2] <= other.min[2] &&
+        self.max[0] >= other.max[0] && self.max[1] >= other.max[1] && self.max[2] >= other.max[2]
+    }
+
+    // Expand AABB by including another AABB.
+    pub fn union_with(&mut self, other: &Self) {
+        for i in 0..3 {
+            if other.min[i] < self.min[i] { self.min[i] = other.min[i]; }
+            if other.max[i] > self.max[i] { self.max[i] = other.max[i]; }
+        }
+    }
+}
+
+// Dynamic BVH Refit Governor for deformable skinned meshes.
+#[derive(Debug)]
+pub struct BvhRefitGovernor {
+    pub max_surface_area_expansion_ratio: f32,
+    pub max_vertex_motion_threshold: f32,
+    pub refits_executed: u32,
+    pub rebuilds_executed: u32,
+    pub current_bounds: BvhAabb,
+    pub baseline_bounds: BvhAabb,
+}
+
+impl BvhRefitGovernor {
+    pub fn new(baseline_bounds: BvhAabb) -> Self {
+        Self {
+            max_surface_area_expansion_ratio: 1.35,
+            max_vertex_motion_threshold: 12.0,
+            refits_executed: 0,
+            rebuilds_executed: 0,
+            current_bounds: baseline_bounds,
+            baseline_bounds,
+        }
+    }
+
+    // Evaluates motion delta and surface area expansion to determine build mode.
+    pub fn evaluate_build_mode(&mut self, new_bounds: BvhAabb, max_motion: f32) -> BvhBuildMode {
+        let base_sa = self.baseline_bounds.surface_area();
+        let new_sa = new_bounds.surface_area();
+        let sa_ratio = if base_sa > 0.0 { new_sa / base_sa } else { 1.0 };
+
+        if sa_ratio > self.max_surface_area_expansion_ratio || max_motion > self.max_vertex_motion_threshold {
+            self.rebuilds_executed += 1;
+            self.baseline_bounds = new_bounds;
+            self.current_bounds = new_bounds;
+            BvhBuildMode::FullRebuild
+        } else {
+            self.refits_executed += 1;
+            self.current_bounds = new_bounds;
+            BvhBuildMode::DynamicRefit
+        }
+    }
+
+    #[inline(always)]
+    pub fn refit_ratio_percentage(&self) -> u32 {
+        let total = self.refits_executed + self.rebuilds_executed;
+        if total == 0 { 0 } else { (self.refits_executed * 100) / total }
+    }
+}
