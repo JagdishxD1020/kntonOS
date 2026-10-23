@@ -334,3 +334,70 @@ impl VramBandwidthThrottleGovernor {
         self.total_transfers_throttled
     }
 }
+
+// Evaluated tessellation parameters and geometry expansion for a streaming meshlet.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TessellatedMeshletLod {
+    pub meshlet_id: u32,
+    pub base_primitives: u32,
+    pub amplified_primitives: u32,
+    pub tessellation_factor: f32,
+    pub feedback_min_mip: u8,
+}
+
+// Integrated streaming tessellation and feedback minification optimizer.
+pub struct StreamingTessellationOptimizer {
+    pub tess_calculator: ContinuousTessellationCalculator,
+    pub throttle_governor: VramBandwidthThrottleGovernor,
+}
+
+impl StreamingTessellationOptimizer {
+    // Initializes the streaming tessellation optimizer.
+    pub const fn new(near_dist: f32, far_dist: f32, max_bandwidth_bytes: usize) -> Self {
+        Self {
+            tess_calculator: ContinuousTessellationCalculator::new(near_dist, far_dist),
+            throttle_governor: VramBandwidthThrottleGovernor::new(max_bandwidth_bytes),
+        }
+    }
+
+    // Default optimizer configured for standard handheld hardware profiles.
+    pub const fn default_handheld() -> Self {
+        Self::new(2.0, 100.0, DEFAULT_MAX_STREAMING_BANDWIDTH_BYTES)
+    }
+
+    // Evaluates dynamic tessellation factors for a meshlet taking into account bandwidth constraints.
+    pub fn evaluate_meshlet(
+        &self,
+        meshlet_id: u32,
+        base_primitives: u32,
+        camera_distance: f32,
+        feedback_map: &FeedbackMinificationMap,
+        tile_x: usize,
+        tile_y: usize,
+    ) -> TessellatedMeshletLod {
+        let feedback_mip = if tile_x < FEEDBACK_GRID_WIDTH && tile_y < FEEDBACK_GRID_HEIGHT {
+            feedback_map.tiles[tile_y][tile_x]
+        } else {
+            UNREFERENCED_FEEDBACK_MIP
+        };
+
+        let mut raw_factor = self.tess_calculator.calculate_tessellation_factor(camera_distance, feedback_mip);
+
+        // Apply anti-thrashing LOD clamp bias if active.
+        let bias = self.throttle_governor.active_lod_clamp_bias();
+        if bias > 0 {
+            raw_factor = (raw_factor / ((1 << bias) as f32)).max(MIN_HARDWARE_TESSELLATION_FACTOR);
+        }
+
+        let expansion = (raw_factor * raw_factor) as u32;
+        let amplified = base_primitives.saturating_mul(expansion.max(1));
+
+        TessellatedMeshletLod {
+            meshlet_id,
+            base_primitives,
+            amplified_primitives: amplified,
+            tessellation_factor: raw_factor,
+            feedback_min_mip: feedback_mip,
+        }
+    }
+}
