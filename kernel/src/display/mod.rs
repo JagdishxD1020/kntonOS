@@ -23,3 +23,6 @@ pub use dsc_vrr::*;
 
 pub mod dp_alt_mode;
 pub use dp_alt_mode::*;
+
+pub mod drrs_clock;
+pub use drrs_clock::*;
