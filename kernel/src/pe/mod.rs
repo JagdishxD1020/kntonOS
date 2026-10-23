@@ -52,6 +52,7 @@ pub mod pmu_trace;
 pub mod enclave_attest;
 pub mod etw_stream;
 pub mod threadpool_steal;
+pub mod wait_on_address;
 
 pub use header::*;
 pub use ntdll::*;
@@ -103,6 +104,7 @@ pub use pmu_trace::test_win32_pmu_trace_subsystem;
 pub use enclave_attest::test_win32_enclave_attest_subsystem;
 pub use etw_stream::test_win32_etw_stream_subsystem;
 pub use threadpool_steal::test_win32_threadpool_steal_subsystem;
+pub use wait_on_address::test_win32_wait_on_address_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
