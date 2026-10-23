@@ -53,6 +53,7 @@ pub mod enclave_attest;
 pub mod etw_stream;
 pub mod threadpool_steal;
 pub mod wait_on_address;
+pub mod enclave_callgate;
 
 pub use header::*;
 pub use ntdll::*;
