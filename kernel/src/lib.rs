@@ -1289,6 +1289,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_etw_stream_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 ETW Stream subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Thread Pool Game Worker Queues & Work-Stealing Scheduler (TASK-KNT-289)
+    if !pe::test_win32_threadpool_steal_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Thread Pool Steal subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
