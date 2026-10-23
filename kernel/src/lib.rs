@@ -913,6 +913,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld USB-C DP Alt Mode and eDP hot-plug governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Dynamic Display Refresh Rate Switching (DRRS) & Seamless Pixel Clock Re-PLL Engine (TASK-KNT-287)
+    if !display::test_drrs_clock_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld dynamic display refresh rate switching and seamless clock re-PLL self-test failed!\r\n");
+    }
+
 
 
     // Initialize and verify Handheld PC Dual-Battery Balance Manager & Fast USB-PD 3.1 EPR Engine (TASK-KNT-116)

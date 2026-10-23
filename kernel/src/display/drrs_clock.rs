@@ -887,3 +887,35 @@ pub fn verify_adaptive_drrs_hysteresis_governor() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Dynamic Display Refresh Rate Switching (DRRS) & Seamless Pixel Clock Re-PLL Engine.
+pub fn test_drrs_clock_subsystem() -> bool {
+    crate::serial_write_str("[KNT-DISPLAY-DRRS] Initiating DRRS and seamless pixel clock re-PLL self-test...\r\n");
+
+    if !verify_drrs_refresh_profiles_and_timings() {
+        crate::serial_write_str("[KNT-DISPLAY-DRRS-FAIL] DRRS refresh profiles and timings verification failed\r\n");
+        return false;
+    }
+
+    if !verify_display_pll_synthesizer_and_dividers() {
+        crate::serial_write_str("[KNT-DISPLAY-DRRS-FAIL] Display PLL synthesizer and dividers calculation failed\r\n");
+        return false;
+    }
+
+    if !verify_seamless_vblank_clock_transition() {
+        crate::serial_write_str("[KNT-DISPLAY-DRRS-FAIL] Seamless vertical blanking-interval clock transition failed\r\n");
+        return false;
+    }
+
+    if !verify_adaptive_drrs_hysteresis_governor() {
+        crate::serial_write_str("[KNT-DISPLAY-DRRS-FAIL] Adaptive DRRS hysteresis governor verification failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-DISPLAY-DRRS-PASS] Handheld dynamic display refresh rate switching and seamless clock re-PLL verified\r\n");
+    true
+}
