@@ -349,3 +349,132 @@ impl GpuScratchBufferPool {
         self.blocks.iter().filter(|b| b.in_use).count()
     }
 }
+
+// VRAM allocation block descriptor for compacted BVH trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BvhVramBlock {
+    pub bvh_id: u32,
+    pub offset: u64,
+    pub size_bytes: u64,
+    pub is_free: bool,
+}
+
+// VRAM defragmentation allocator for ray tracing acceleration structures.
+#[derive(Debug)]
+pub struct BvhDefragAllocator {
+    pub base_gpu_va: u64,
+    pub total_heap_bytes: u64,
+    pub blocks: Vec<BvhVramBlock>,
+    pub defragmentation_passes: u32,
+}
+
+impl BvhDefragAllocator {
+    pub fn new(base_gpu_va: u64, total_heap_bytes: u64) -> Result<Self, &'static str> {
+        if (base_gpu_va % D3D12_RAYTRACING_BVH_BYTE_ALIGNMENT) != 0 {
+            return Err("BVH heap base VA must be 64-byte aligned");
+        }
+        let initial_block = BvhVramBlock {
+            bvh_id: 0,
+            offset: 0,
+            size_bytes: total_heap_bytes,
+            is_free: true,
+        };
+        let mut blocks = Vec::new();
+        blocks.push(initial_block);
+
+        Ok(Self {
+            base_gpu_va,
+            total_heap_bytes,
+            blocks,
+            defragmentation_passes: 0,
+        })
+    }
+
+    // Suballocates 64-byte aligned VRAM for a compacted BVH.
+    pub fn allocate(&mut self, bvh_id: u32, size_bytes: u64) -> Result<u64, &'static str> {
+        let aligned_size = (size_bytes + (D3D12_RAYTRACING_BVH_BYTE_ALIGNMENT - 1)) & !(D3D12_RAYTRACING_BVH_BYTE_ALIGNMENT - 1);
+        for i in 0..self.blocks.len() {
+            if self.blocks[i].is_free && self.blocks[i].size_bytes >= aligned_size {
+                let remaining = self.blocks[i].size_bytes - aligned_size;
+                let offset = self.blocks[i].offset;
+
+                self.blocks[i].bvh_id = bvh_id;
+                self.blocks[i].size_bytes = aligned_size;
+                self.blocks[i].is_free = false;
+
+                if remaining >= D3D12_RAYTRACING_BVH_BYTE_ALIGNMENT {
+                    self.blocks.insert(i + 1, BvhVramBlock {
+                        bvh_id: 0,
+                        offset: offset + aligned_size,
+                        size_bytes: remaining,
+                        is_free: true,
+                    });
+                }
+                return Ok(self.base_gpu_va + offset);
+            }
+        }
+        Err("Out of VRAM memory for BVH allocation")
+    }
+
+    // Frees an allocated BVH block.
+    pub fn free(&mut self, bvh_id: u32) -> bool {
+        let mut found = false;
+        for block in &mut self.blocks {
+            if !block.is_free && block.bvh_id == bvh_id {
+                block.is_free = true;
+                block.bvh_id = 0;
+                found = true;
+                break;
+            }
+        }
+        found
+    }
+
+    // Compacts active allocations and coalesces free memory into a contiguous tail.
+    pub fn defragment(&mut self) -> u32 {
+        let mut moved_count = 0;
+        let mut current_offset = 0;
+        let mut compacted_blocks = Vec::new();
+
+        // Pass 1: Pack active blocks contiguously to the head of heap.
+        for block in &self.blocks {
+            if !block.is_free {
+                if block.offset != current_offset {
+                    moved_count += 1;
+                }
+                compacted_blocks.push(BvhVramBlock {
+                    bvh_id: block.bvh_id,
+                    offset: current_offset,
+                    size_bytes: block.size_bytes,
+                    is_free: false,
+                });
+                current_offset += block.size_bytes;
+            }
+        }
+
+        // Pass 2: Coalesce all remaining space as a single tail free block.
+        let remaining_tail = self.total_heap_bytes - current_offset;
+        if remaining_tail > 0 {
+            compacted_blocks.push(BvhVramBlock {
+                bvh_id: 0,
+                offset: current_offset,
+                size_bytes: remaining_tail,
+                is_free: true,
+            });
+        }
+
+        self.blocks = compacted_blocks;
+        self.defragmentation_passes += 1;
+        moved_count
+    }
+
+    // Computes external fragmentation ratio in percent.
+    pub fn fragmentation_percentage(&self) -> u32 {
+        let total_free: u64 = self.blocks.iter().filter(|b| b.is_free).map(|b| b.size_bytes).sum();
+        let max_free = self.blocks.iter().filter(|b| b.is_free).map(|b| b.size_bytes).max().unwrap_or(0);
+        if total_free == 0 {
+            return 0;
+        }
+        (((total_free - max_free) * 100) / total_free) as u32
+    }
+}
