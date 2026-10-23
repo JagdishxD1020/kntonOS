@@ -64,6 +64,7 @@ pub mod gpu_event_markers;
 pub mod hdr_colorspace;
 pub mod pipeline_library;
 pub mod sampler_tessellation;
+pub mod raytracing_bvh;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -128,6 +129,7 @@ pub use gpu_event_markers::*;
 pub use hdr_colorspace::*;
 pub use pipeline_library::*;
 pub use sampler_tessellation::*;
+pub use raytracing_bvh::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
