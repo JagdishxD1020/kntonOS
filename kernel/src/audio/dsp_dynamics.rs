@@ -652,3 +652,264 @@ pub fn verify_psychoacoustic_harmonic_bass_booster() -> bool {
 }
 
 
+
+// ============================================================================
+// Feature 3: Voice-Coil Thermal & Diaphragm Excursion Protection Governor
+// ============================================================================
+
+/// Physical transducer parameters for handheld micro-speakers.
+#[derive(Debug, Clone, Copy)]
+pub struct MicroSpeakerPhysicalProfile {
+    /// Nominal DC electrical resistance in Ohms (e.g. 4.0 Ohms).
+    pub dc_resistance_ohms: f32,
+    /// Force factor Bl in N/A (e.g. 1.2 N/A).
+    pub force_factor_bl: f32,
+    /// Moving mass Mms in grams (e.g. 0.15 g = 0.00015 kg).
+    pub moving_mass_kg: f32,
+    /// Mechanical resonance frequency in Hz (e.g. 210.0 Hz).
+    pub resonance_freq_hz: f32,
+    /// Damping ratio zeta (e.g. 0.45).
+    pub damping_zeta: f32,
+    /// Maximum safe linear diaphragm excursion in millimeters (e.g. 0.45 mm).
+    pub x_max_mm: f32,
+    /// Voice-coil thermal resistance in K/W (e.g. 45.0 K/W).
+    pub thermal_resistance_k_per_w: f32,
+    /// Voice-coil thermal capacity in J/K (e.g. 0.08 J/K).
+    pub thermal_capacity_j_per_k: f32,
+    /// Maximum safe voice-coil temperature in degrees Celsius (e.g. 95.0 C).
+    pub max_voice_coil_temp_c: f32,
+    /// Thermal warning threshold where compression engages (e.g. 80.0 C).
+    pub warning_temp_c: f32,
+    /// Maximum peak voice-coil voltage clamp in Volts (e.g. 4.8 V).
+    pub peak_voltage_clamp_v: f32,
+    /// Digital full-scale voltage calibration (1.0 FS = V_ref, e.g. 5.0 V).
+    pub v_full_scale: f32,
+}
+
+impl MicroSpeakerPhysicalProfile {
+    pub const fn steam_deck_rog_ally_profile() -> Self {
+        Self {
+            dc_resistance_ohms: 4.0,
+            force_factor_bl: 1.2,
+            moving_mass_kg: 0.00015,
+            resonance_freq_hz: 210.0,
+            damping_zeta: 0.45,
+            x_max_mm: 0.45,
+            thermal_resistance_k_per_w: 45.0,
+            thermal_capacity_j_per_k: 0.08,
+            max_voice_coil_temp_c: 95.0,
+            warning_temp_c: 80.0,
+            peak_voltage_clamp_v: 4.8,
+            v_full_scale: 5.0,
+        }
+    }
+}
+
+/// Dynamic electro-mechanical transducer protection governor.
+///
+/// Prevents:
+/// 1. Mechanical bottoming-out when low frequency audio demands excessive cone travel ($X > X_{max}$).
+/// 2. Thermal voice-coil burnout under sustained high-RMS loudness.
+/// 3. Amplifier power-rail clipping distortion by soft-saturating output voltage.
+#[derive(Debug, Clone)]
+pub struct SpeakerExcursionThermalGovernor {
+    profile: MicroSpeakerPhysicalProfile,
+    /// Estimated displacement in mm for Left and Right channels.
+    displacement_mm_l: f32,
+    displacement_mm_r: f32,
+    displacement_velocity_l: f32,
+    displacement_velocity_r: f32,
+    /// Filtered voice-coil temperature rise above ambient (in deg C).
+    voice_coil_temp_rise_c: f32,
+    /// Ambient chassis temperature in deg C.
+    ambient_temp_c: f32,
+    /// Dynamic excursion attenuation factor (0.0 to 1.0).
+    excursion_attenuation: f32,
+    /// Dynamic thermal attenuation factor (0.0 to 1.0).
+    thermal_attenuation: f32,
+    /// Sample rate.
+    sample_rate: f32,
+    /// Total protection events triggered.
+    excursion_clamp_events: u64,
+    thermal_clamp_events: u64,
+    voltage_clamp_events: u64,
+}
+
+impl SpeakerExcursionThermalGovernor {
+    pub fn new(profile: MicroSpeakerPhysicalProfile, sample_rate: f32) -> Self {
+        Self {
+            profile,
+            displacement_mm_l: 0.0,
+            displacement_mm_r: 0.0,
+            displacement_velocity_l: 0.0,
+            displacement_velocity_r: 0.0,
+            voice_coil_temp_rise_c: 0.0,
+            ambient_temp_c: 25.0,
+            excursion_attenuation: 1.0,
+            thermal_attenuation: 1.0,
+            sample_rate,
+            excursion_clamp_events: 0,
+            thermal_clamp_events: 0,
+            voltage_clamp_events: 0,
+        }
+    }
+
+    /// Soft saturation polynomial: clamps voltage smoothly without hard clipping.
+    fn soft_voltage_clamp(&mut self, voltage: f32) -> f32 {
+        let v_clamp = self.profile.peak_voltage_clamp_v;
+        if voltage > v_clamp {
+            self.voltage_clamp_events += 1;
+            let excess = voltage - v_clamp;
+            v_clamp + (excess / (1.0 + excess / v_clamp)) * 0.1
+        } else if voltage < -v_clamp {
+            self.voltage_clamp_events += 1;
+            let excess = -voltage - v_clamp;
+            -v_clamp - (excess / (1.0 + excess / v_clamp)) * 0.1
+        } else {
+            voltage
+        }
+    }
+
+    /// Update dynamic displacement and thermal models for a stereo frame.
+    pub fn process_stereo_frame(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let dt = 1.0 / self.sample_rate;
+        let w0 = 2.0 * PI * self.profile.resonance_freq_hz;
+        let w0_sq = w0 * w0;
+        let gamma = 2.0 * self.profile.damping_zeta * w0;
+        let force_scale = (self.profile.force_factor_bl / (self.profile.moving_mass_kg * self.profile.dc_resistance_ohms)) * 1000.0; // mm/s^2 per Volt
+
+        // Convert normalized digital inputs (-1.0 to 1.0) to actual voice-coil voltage
+        let v_in_l = in_l * self.profile.v_full_scale * self.excursion_attenuation * self.thermal_attenuation;
+        let v_in_r = in_r * self.profile.v_full_scale * self.excursion_attenuation * self.thermal_attenuation;
+
+        // 1. Numerical integration of electro-mechanical 2nd-order diaphragm displacement (Euler-Cromer)
+        let accel_l = force_scale * v_in_l - w0_sq * self.displacement_mm_l - gamma * self.displacement_velocity_l;
+        self.displacement_velocity_l += accel_l * dt;
+        self.displacement_mm_l += self.displacement_velocity_l * dt;
+
+        let accel_r = force_scale * v_in_r - w0_sq * self.displacement_mm_r - gamma * self.displacement_velocity_r;
+        self.displacement_velocity_r += accel_r * dt;
+        self.displacement_mm_r += self.displacement_velocity_r * dt;
+
+        let max_displacement = max_f32(abs_f32(self.displacement_mm_l), abs_f32(self.displacement_mm_r));
+
+        // 2. Excursion protection governor: fast attack limiter if predicted cone travel approaches X_max
+        let x_threshold = self.profile.x_max_mm * 0.85;
+        if max_displacement > x_threshold {
+            self.excursion_clamp_events += 1;
+            let excess_ratio = max_displacement / self.profile.x_max_mm;
+            let target_attenuation = (1.0 / excess_ratio).clamp(0.1, 1.0);
+            // Fast attack (sub-millisecond)
+            self.excursion_attenuation = self.excursion_attenuation * 0.90 + target_attenuation * 0.10;
+        } else {
+            // Slow smooth release back to unity gain
+            self.excursion_attenuation = (self.excursion_attenuation + 0.0001).min(1.0);
+        }
+
+        // 3. Thermal model: compute instantaneous electrical power dissipation P = V^2 / R
+        let v_sq_mean = (v_in_l * v_in_l + v_in_r * v_in_r) * 0.5;
+        let p_elec = v_sq_mean / self.profile.dc_resistance_ohms;
+
+        // dT/dt = P / C_th - T_rise / (R_th * C_th)
+        let heat_in = p_elec / self.profile.thermal_capacity_j_per_k;
+        let heat_out = self.voice_coil_temp_rise_c / (self.profile.thermal_resistance_k_per_w * self.profile.thermal_capacity_j_per_k);
+        self.voice_coil_temp_rise_c += (heat_in - heat_out) * dt;
+        if self.voice_coil_temp_rise_c < 0.0 {
+            self.voice_coil_temp_rise_c = 0.0;
+        }
+
+        let current_temp = self.ambient_temp_c + self.voice_coil_temp_rise_c;
+
+        // 4. Thermal protection governor: clamp gain when voice coil exceeds warning temperature
+        if current_temp > self.profile.warning_temp_c {
+            self.thermal_clamp_events += 1;
+            let delta = current_temp - self.profile.warning_temp_c;
+            let span = self.profile.max_voice_coil_temp_c - self.profile.warning_temp_c;
+            let target_thermal = (1.0 - (delta / span) * 0.7).clamp(0.3, 1.0);
+            self.thermal_attenuation = self.thermal_attenuation * 0.999 + target_thermal * 0.001;
+        } else {
+            self.thermal_attenuation = (self.thermal_attenuation + 0.00001).min(1.0);
+        }
+
+        // 5. Apply excursion & thermal attenuation and soft voltage clamp to prevent rail clipping
+        let v_clamped_l = self.soft_voltage_clamp(v_in_l);
+        let v_clamped_r = self.soft_voltage_clamp(v_in_r);
+
+        // Convert back to normalized digital full-scale (-1.0 to 1.0)
+        let out_l = v_clamped_l / self.profile.v_full_scale;
+        let out_r = v_clamped_r / self.profile.v_full_scale;
+
+        (out_l, out_r)
+    }
+
+    pub fn current_voice_coil_temp_c(&self) -> f32 {
+        self.ambient_temp_c + self.voice_coil_temp_rise_c
+    }
+
+    pub fn excursion_attenuation(&self) -> f32 {
+        self.excursion_attenuation
+    }
+
+    pub fn thermal_attenuation(&self) -> f32 {
+        self.thermal_attenuation
+    }
+
+    pub fn clamp_events_total(&self) -> u64 {
+        self.excursion_clamp_events + self.thermal_clamp_events + self.voltage_clamp_events
+    }
+}
+
+/// Verification test for voice-coil thermal and diaphragm excursion protection governor.
+pub fn verify_speaker_excursion_thermal_governor() -> bool {
+    let profile = MicroSpeakerPhysicalProfile::steam_deck_rog_ally_profile();
+    let mut governor = SpeakerExcursionThermalGovernor::new(profile, AUDIO_SAMPLE_RATE);
+
+    // 1. Initial state verification
+    if abs_f32(governor.current_voice_coil_temp_c() - 25.0) > 0.1 {
+        return false;
+    }
+    if governor.excursion_attenuation() != 1.0 || governor.thermal_attenuation() != 1.0 {
+        return false;
+    }
+
+    // 2. High excursion test: simulate intense low frequency tone near speaker resonance (200 Hz)
+    // Driving full rail signal (+3 dBFS = 1.4 FS)
+    let w = 2.0 * PI * 200.0 / AUDIO_SAMPLE_RATE;
+    for n in 0..1000 {
+        let sample = sin_f32(w * (n as f32)) * 1.4;
+        governor.process_stereo_frame(sample, sample);
+    }
+
+    // Excursion governor must have detected high cone travel and reduced gain (attenuation < 1.0)
+    if governor.excursion_attenuation() >= 1.0 {
+        return false;
+    }
+    // Must have registered clamp events
+    if governor.clamp_events_total() == 0 {
+        return false;
+    }
+
+    // 3. Simulated thermal heating test: inject sustained high power
+    // Artificially step up thermal state to verify governor reaction
+    governor.voice_coil_temp_rise_c = 60.0; // 25 + 60 = 85 C (> warning_temp_c 80 C)
+    for _ in 0..500 {
+        governor.process_stereo_frame(0.8, 0.8);
+    }
+
+    if governor.current_voice_coil_temp_c() <= 80.0 {
+        return false;
+    }
+    if governor.thermal_attenuation() >= 1.0 {
+        return false;
+    }
+
+    // 4. Soft voltage clamp test: excessive voltage (+8.0V) must be smoothly clamped below 5.5V
+    let clamped = governor.soft_voltage_clamp(8.0);
+    if clamped > 5.5 || clamped < 4.8 {
+        return false;
+    }
+
+    true
+}
+
+
