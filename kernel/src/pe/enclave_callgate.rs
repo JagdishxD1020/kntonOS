@@ -232,3 +232,117 @@ impl EnclaveThreadGovernor {
 }
 
 pub static ENCLAVE_THREAD_GOVERNOR: EnclaveThreadGovernor = EnclaveThreadGovernor::new();
+
+/// Comprehensive self-test for Win32 Enclave Call Gate & Hardware Exception Virtualization Subsystem.
+pub fn test_win32_enclave_callgate_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-ENCLAVE-CALLGATE] Initializing Win32 Enclave Call Gate Subsystem self-test...\r\n");
+
+    // 1. Test Call Gate Transition & Register Sanitization
+    let gate = EnclaveCallGate::new(
+        101,
+        0x0000_0001_0000_1000, // Enclave entry RVA
+        0x0000_7FFF_1000_0000, // Secure stack base
+        64 * 1024,              // 64 KB stack
+    );
+
+    let untrusted_rip = 0x0000_0000_0040_2222u64;
+    let untrusted_rsp = 0x0000_7FFF_EEEE_0000u64;
+    let untrusted_rbp = 0x0000_7FFF_EEEE_0010u64;
+
+    let frame = gate.enter_enclave(untrusted_rip, untrusted_rsp, untrusted_rbp);
+
+    if !frame.sanitized_registers || frame.enclave_rip != 0x0000_0001_0000_1000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Call gate enter frame sanitized mismatch\r\n");
+        return false;
+    }
+
+    if frame.enclave_rsp != (0x0000_7FFF_1000_0000 + 64 * 1024 - 16) {
+        crate::serial_write_str("[KNT-TEST-ERR] Enclave secure stack pointer mismatch\r\n");
+        return false;
+    }
+
+    let (res_rip, res_rsp, res_rbp) = gate.exit_enclave(&frame);
+    if res_rip != untrusted_rip || res_rsp != untrusted_rsp || res_rbp != untrusted_rbp {
+        crate::serial_write_str("[KNT-TEST-ERR] Call gate exit restored registers mismatch\r\n");
+        return false;
+    }
+
+    // 2. Test Hardware Exception Virtualization & Anti-Debug Cloaking
+    let enc_base = 0x0000_0001_0000_0000u64;
+    let enc_size = 0x0000_0000_0010_0000u64; // 1 MB
+    let fault_rip = 0x0000_0001_0000_5000u64;
+
+    // A: Anti-debug INT3 cloaking
+    let bp_disp = ENCLAVE_EXCEPTION_HANDLER.virtualize_enclave_exception(
+        EXCEPTION_BREAKPOINT,
+        fault_rip,
+        enc_base,
+        enc_size,
+    );
+    match bp_disp {
+        EnclaveExceptionDisposition::CloakedDebugTrap { resume_rip } => {
+            if resume_rip != fault_rip + 1 {
+                crate::serial_write_str("[KNT-TEST-ERR] Cloaked breakpoint resume RIP mismatch\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Breakpoint exception was not cloaked\r\n");
+            return false;
+        }
+    }
+
+    // B: Internal Enclave Exception Handler Routing
+    let internal_handler_rva = 0x0000_0001_0000_9000usize;
+    ENCLAVE_EXCEPTION_HANDLER.set_enclave_handler(internal_handler_rva);
+
+    let access_disp = ENCLAVE_EXCEPTION_HANDLER.virtualize_enclave_exception(
+        0xC000_0005, // STATUS_ACCESS_VIOLATION
+        fault_rip,
+        enc_base,
+        enc_size,
+    );
+    match access_disp {
+        EnclaveExceptionDisposition::HandledByEnclave { resume_rip } => {
+            if resume_rip != internal_handler_rva as u64 {
+                crate::serial_write_str("[KNT-TEST-ERR] Enclave exception routing mismatch\r\n");
+                return false;
+            }
+        }
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Access violation was not routed to enclave handler\r\n");
+            return false;
+        }
+    }
+
+    // 3. Test Thread Binding & TLS Isolation
+    let test_tid = 6001u64;
+    ENCLAVE_THREAD_GOVERNOR.bind_thread(test_tid, 101, 16);
+
+    let magic_tls = 0xBADC_0FFEusize;
+    if ENCLAVE_THREAD_GOVERNOR.set_enclave_tls(test_tid, 3, magic_tls).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to set enclave TLS slot\r\n");
+        return false;
+    }
+
+    if ENCLAVE_THREAD_GOVERNOR.get_enclave_tls(test_tid, 3) != Some(magic_tls) {
+        crate::serial_write_str("[KNT-TEST-ERR] Enclave TLS slot value mismatch\r\n");
+        return false;
+    }
+
+    // 4. Test Asynchronous Enclave Abort
+    if ENCLAVE_THREAD_GOVERNOR.is_thread_aborted(test_tid) {
+        crate::serial_write_str("[KNT-TEST-ERR] Thread reported aborted before abort triggered\r\n");
+        return false;
+    }
+
+    ENCLAVE_THREAD_GOVERNOR.abort_enclave(101);
+
+    if !ENCLAVE_THREAD_GOVERNOR.is_thread_aborted(test_tid) {
+        crate::serial_write_str("[KNT-TEST-ERR] Thread not aborted after enclave abort call\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-ENCLAVE-CALLGATE-PASS] Win32 Enclave Call Gate & Exception Handler verified\r\n");
+    true
+}
