@@ -558,6 +558,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_sampler_tessellation_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility sampler feedback & tessellation self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility BVH Compaction & Dynamic Refit (TASK-KNT-291)
+    if !gfx::test_raytracing_bvh_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility BVH compaction & dynamic refit self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
