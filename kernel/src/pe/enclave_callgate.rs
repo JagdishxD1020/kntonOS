@@ -154,3 +154,81 @@ impl EnclaveExceptionHandler {
 }
 
 pub static ENCLAVE_EXCEPTION_HANDLER: EnclaveExceptionHandler = EnclaveExceptionHandler::new();
+
+/// Enclave Thread Context Binding & TLS Isolation.
+#[derive(Debug, Clone)]
+pub struct EnclaveThreadBinding {
+    pub thread_id: u64,
+    pub enclave_id: u32,
+    pub enclave_tls_slots: Vec<usize>,
+    pub is_aborted: bool,
+}
+
+/// Asynchronous Enclave Abort & Thread Binding Governor.
+pub struct EnclaveThreadGovernor {
+    bindings: Spinlock<BTreeMap<u64, EnclaveThreadBinding>>,
+    enclave_aborted_flags: Spinlock<BTreeMap<u32, bool>>,
+}
+
+impl EnclaveThreadGovernor {
+    pub const fn new() -> Self {
+        Self {
+            bindings: Spinlock::new(BTreeMap::new()),
+            enclave_aborted_flags: Spinlock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Bind a thread to an enclave instance with isolated TLS storage.
+    pub fn bind_thread(&self, tid: u64, enc_id: u32, tls_size: usize) {
+        let mut map = self.bindings.lock();
+        map.insert(
+            tid,
+            EnclaveThreadBinding {
+                thread_id: tid,
+                enclave_id: enc_id,
+                enclave_tls_slots: alloc::vec![0; tls_size],
+                is_aborted: false,
+            },
+        );
+    }
+
+    /// Trigger asynchronous abort on an enclave instance (forcefully terminating active bound threads).
+    pub fn abort_enclave(&self, enc_id: u32) {
+        self.enclave_aborted_flags.lock().insert(enc_id, true);
+        let mut map = self.bindings.lock();
+        for b in map.values_mut() {
+            if b.enclave_id == enc_id {
+                b.is_aborted = true;
+            }
+        }
+    }
+
+    /// Check if a thread's enclave execution has been asynchronously aborted.
+    pub fn is_thread_aborted(&self, tid: u64) -> bool {
+        let map = self.bindings.lock();
+        match map.get(&tid) {
+            Some(b) => b.is_aborted,
+            None => false,
+        }
+    }
+
+    /// Read or write isolated enclave TLS slot.
+    pub fn set_enclave_tls(&self, tid: u64, slot: usize, val: usize) -> Result<(), NtStatus> {
+        let mut map = self.bindings.lock();
+        let b = map.get_mut(&tid).ok_or(STATUS_INVALID_HANDLE)?;
+        if slot < b.enclave_tls_slots.len() {
+            b.enclave_tls_slots[slot] = val;
+            Ok(())
+        } else {
+            Err(STATUS_INVALID_PARAMETER)
+        }
+    }
+
+    pub fn get_enclave_tls(&self, tid: u64, slot: usize) -> Option<usize> {
+        let map = self.bindings.lock();
+        let b = map.get(&tid)?;
+        b.enclave_tls_slots.get(slot).copied()
+    }
+}
+
+pub static ENCLAVE_THREAD_GOVERNOR: EnclaveThreadGovernor = EnclaveThreadGovernor::new();
