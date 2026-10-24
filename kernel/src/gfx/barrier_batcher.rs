@@ -328,3 +328,136 @@ impl DynamicSplitBarrierGenerator {
         false
     }
 }
+
+
+// Subresource layout tracking entry for barrier deduplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubresourceLayoutEntry {
+    pub current_layout: BatchBarrierLayout,
+    pub current_access: BarrierMemoryAccessFlags,
+    pub current_sync: BarrierPipelineStageFlags,
+}
+
+// Subresource layout state tracker per registered texture.
+#[derive(Debug, Clone)]
+pub struct TextureLayoutTracker {
+    pub texture_id: u32,
+    pub mip_count: u32,
+    pub slice_count: u32,
+    pub subresources: Vec<SubresourceLayoutEntry>,
+}
+
+impl TextureLayoutTracker {
+    pub fn new(texture_id: u32, mip_count: u32, slice_count: u32, initial_layout: BatchBarrierLayout) -> Self {
+        let total = (mip_count * slice_count).max(1) as usize;
+        let mut subresources = Vec::with_capacity(total);
+        for _ in 0..total {
+            subresources.push(SubresourceLayoutEntry {
+                current_layout: initial_layout,
+                current_access: BarrierMemoryAccessFlags::COMMON,
+                current_sync: BarrierPipelineStageFlags::ALL,
+            });
+        }
+        Self {
+            texture_id,
+            mip_count,
+            slice_count,
+            subresources,
+        }
+    }
+}
+
+// Redundant subresource layout transition deduplication and barrier elimination governor.
+#[derive(Debug)]
+pub struct BarrierEliminationGovernor {
+    pub texture_trackers: Vec<TextureLayoutTracker>,
+    pub redundant_barriers_eliminated: u64,
+    pub total_barriers_processed: u64,
+}
+
+impl BarrierEliminationGovernor {
+    pub fn new() -> Self {
+        Self {
+            texture_trackers: Vec::new(),
+            redundant_barriers_eliminated: 0,
+            total_barriers_processed: 0,
+        }
+    }
+
+    // Registers a texture resource for layout tracking.
+    pub fn register_texture(&mut self, texture_id: u32, mips: u32, slices: u32, initial_layout: BatchBarrierLayout) {
+        self.texture_trackers.push(TextureLayoutTracker::new(texture_id, mips, slices, initial_layout));
+    }
+
+    // Filters redundant texture transitions from a barrier batch.
+    pub fn filter_batch(&mut self, batch: BarrierBatch) -> BarrierBatch {
+        let mut filtered = BarrierBatch::new();
+        filtered.global_barriers = batch.global_barriers;
+        filtered.buffer_barriers = batch.buffer_barriers;
+
+        for barrier in batch.texture_barriers {
+            self.total_barriers_processed += 1;
+            let mut is_redundant = false;
+
+            if let Some(tracker) = self.texture_trackers.iter_mut().find(|t| t.texture_id == barrier.texture_id) {
+                // If layout is unchanged, access is compatible, and not discard, barrier can be eliminated.
+                if barrier.layout_before == barrier.layout_after && !barrier.discard_contents {
+                    let mut all_match = true;
+                    if barrier.subresources.is_all() {
+                        for sub in &tracker.subresources {
+                            if sub.current_layout != barrier.layout_after {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        let idx = barrier.subresources.first_mip as usize;
+                        if let Some(sub) = tracker.subresources.get(idx) {
+                            if sub.current_layout != barrier.layout_after {
+                                all_match = false;
+                            }
+                        }
+                    }
+                    if all_match {
+                        is_redundant = true;
+                    }
+                }
+
+                if !is_redundant {
+                    // Update tracked layouts
+                    if barrier.subresources.is_all() {
+                        for sub in &mut tracker.subresources {
+                            sub.current_layout = barrier.layout_after;
+                            sub.current_access = barrier.access_after;
+                            sub.current_sync = barrier.sync_after;
+                        }
+                    } else {
+                        let idx = barrier.subresources.first_mip as usize;
+                        if let Some(sub) = tracker.subresources.get_mut(idx) {
+                            sub.current_layout = barrier.layout_after;
+                            sub.current_access = barrier.access_after;
+                            sub.current_sync = barrier.sync_after;
+                        }
+                    }
+                }
+            }
+
+            if is_redundant {
+                self.redundant_barriers_eliminated += 1;
+            } else {
+                filtered.texture_barriers.push(barrier);
+            }
+        }
+
+        filtered
+    }
+
+    #[inline(always)]
+    pub fn elimination_percentage(&self) -> u32 {
+        if self.total_barriers_processed == 0 {
+            0
+        } else {
+            ((self.redundant_barriers_eliminated * 100) / self.total_barriers_processed) as u32
+        }
+    }
+}
