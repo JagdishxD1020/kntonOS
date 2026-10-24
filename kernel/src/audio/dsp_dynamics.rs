@@ -374,3 +374,281 @@ pub fn verify_lookahead_soft_knee_compressor() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Psychoacoustic Bass Booster & Harmonic Bass Synthesizer
+// ============================================================================
+
+use crate::graphics::types::{cos_f32, sin_f32, PI};
+
+/// 2nd-order Direct Form II Transposed IIR Biquad Filter.
+#[derive(Debug, Clone, Copy)]
+pub struct DspBiquadFilter {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl DspBiquadFilter {
+    pub const fn empty() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1_l: 0.0,
+            z2_l: 0.0,
+            z1_r: 0.0,
+            z2_r: 0.0,
+        }
+    }
+
+    /// 2nd-order Butterworth low-pass filter.
+    pub fn lowpass(cutoff_hz: f32, q: f32, sample_rate: f32) -> Self {
+        let w0 = 2.0 * PI * cutoff_hz / sample_rate;
+        let alpha = sin_f32(w0) / (2.0 * q);
+        let cos_w0 = cos_f32(w0);
+
+        let a0 = 1.0 + alpha;
+        let b0 = ((1.0 - cos_w0) * 0.5) / a0;
+        let b1 = (1.0 - cos_w0) / a0;
+        let b2 = ((1.0 - cos_w0) * 0.5) / a0;
+        let a1 = (-2.0 * cos_w0) / a0;
+        let a2 = (1.0 - alpha) / a0;
+
+        Self {
+            b0, b1, b2, a1, a2,
+            z1_l: 0.0, z2_l: 0.0,
+            z1_r: 0.0, z2_r: 0.0,
+        }
+    }
+
+    /// 2nd-order Butterworth high-pass filter.
+    pub fn highpass(cutoff_hz: f32, q: f32, sample_rate: f32) -> Self {
+        let w0 = 2.0 * PI * cutoff_hz / sample_rate;
+        let alpha = sin_f32(w0) / (2.0 * q);
+        let cos_w0 = cos_f32(w0);
+
+        let a0 = 1.0 + alpha;
+        let b0 = ((1.0 + cos_w0) * 0.5) / a0;
+        let b1 = (-(1.0 + cos_w0)) / a0;
+        let b2 = ((1.0 + cos_w0) * 0.5) / a0;
+        let a1 = (-2.0 * cos_w0) / a0;
+        let a2 = (1.0 - alpha) / a0;
+
+        Self {
+            b0, b1, b2, a1, a2,
+            z1_l: 0.0, z2_l: 0.0,
+            z1_r: 0.0, z2_r: 0.0,
+        }
+    }
+
+    /// 2nd-order constant peak gain bandpass filter.
+    pub fn bandpass(center_hz: f32, q: f32, sample_rate: f32) -> Self {
+        let w0 = 2.0 * PI * center_hz / sample_rate;
+        let alpha = sin_f32(w0) / (2.0 * q);
+        let cos_w0 = cos_f32(w0);
+
+        let a0 = 1.0 + alpha;
+        let b0 = alpha / a0;
+        let b1 = 0.0;
+        let b2 = (-alpha) / a0;
+        let a1 = (-2.0 * cos_w0) / a0;
+        let a2 = (1.0 - alpha) / a0;
+
+        Self {
+            b0, b1, b2, a1, a2,
+            z1_l: 0.0, z2_l: 0.0,
+            z1_r: 0.0, z2_r: 0.0,
+        }
+    }
+
+    /// Process stereo sample frame using Direct Form II Transposed structure.
+    #[inline]
+    pub fn process_stereo(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let out_l = self.b0 * in_l + self.z1_l;
+        self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
+        self.z2_l = self.b2 * in_l - self.a2 * out_l;
+
+        let out_r = self.b0 * in_r + self.z1_r;
+        self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
+        self.z2_r = self.b2 * in_r - self.a2 * out_r;
+
+        (out_l, out_r)
+    }
+
+    /// Reset internal filter state delays.
+    pub fn reset(&mut self) {
+        self.z1_l = 0.0;
+        self.z2_l = 0.0;
+        self.z1_r = 0.0;
+        self.z2_r = 0.0;
+    }
+}
+
+/// Psychoacoustic Bass Booster with missing fundamental harmonic synthesis.
+///
+/// Handheld micro-speakers physically cannot reproduce acoustic frequencies below ~80-100Hz.
+/// This module synthesizes upper harmonics (2nd, 3rd, 4th) in the 140-300Hz passband.
+/// The human brain reconstructs the missing fundamental pitch, creating the perception of
+/// deep sub-bass without driving the micro-speaker diaphragms into destructive excursion.
+#[derive(Debug, Clone)]
+pub struct HarmonicBassBooster {
+    /// Crossover low-pass filter to extract sub-bass (< 100 Hz).
+    sub_lowpass: DspBiquadFilter,
+    /// High-pass filter to relieve micro-speaker cones from inaudible sub-bass (< 75 Hz).
+    speaker_highpass: DspBiquadFilter,
+    /// Bandpass resonator shaping synthesized harmonics (centered around 180 Hz).
+    harmonic_bandpass: DspBiquadFilter,
+    /// 2nd harmonic blend factor (octave above).
+    pub h2_weight: f32,
+    /// 3rd harmonic blend factor (octave + fifth).
+    pub h3_weight: f32,
+    /// 4th harmonic blend factor (two octaves).
+    pub h4_weight: f32,
+    /// Master harmonic injection gain.
+    pub harmonic_gain: f32,
+    /// DC offset blocker state for left and right channels.
+    dc_prev_in_l: f32,
+    dc_prev_out_l: f32,
+    dc_prev_in_r: f32,
+    dc_prev_out_r: f32,
+    /// Total processed harmonic frames.
+    total_processed_frames: u64,
+}
+
+impl HarmonicBassBooster {
+    pub fn new(sample_rate: f32) -> Self {
+        Self {
+            sub_lowpass: DspBiquadFilter::lowpass(105.0, 0.7071, sample_rate),
+            speaker_highpass: DspBiquadFilter::highpass(75.0, 0.7071, sample_rate),
+            harmonic_bandpass: DspBiquadFilter::bandpass(180.0, 1.2, sample_rate),
+            h2_weight: 0.60,
+            h3_weight: 0.30,
+            h4_weight: 0.10,
+            harmonic_gain: 1.25,
+            dc_prev_in_l: 0.0,
+            dc_prev_out_l: 0.0,
+            dc_prev_in_r: 0.0,
+            dc_prev_out_r: 0.0,
+            total_processed_frames: 0,
+        }
+    }
+
+    /// Synthesize upper harmonics from isolated sub-bass signal using Chebyshev polynomials.
+    fn synthesize_harmonics_channel(&mut self, sub: f32, is_right: bool) -> f32 {
+        // Normalize and soft-saturate to prevent runaway
+        let x = if sub > 1.0 { 1.0 } else if sub < -1.0 { -1.0 } else { sub };
+        let x2 = x * x;
+
+        // 2nd harmonic: T2(x) = 2x^2 - 1
+        let h2 = 2.0 * x2 - 1.0;
+        // 3rd harmonic: T3(x) = 4x^3 - 3x
+        let h3 = 4.0 * (x2 * x) - 3.0 * x;
+        // 4th harmonic: T4(x) = 8x^4 - 8x^2 + 1
+        let h4 = 8.0 * (x2 * x2) - 8.0 * x2 + 1.0;
+
+        let raw_harm = self.h2_weight * h2 + self.h3_weight * h3 + self.h4_weight * h4;
+
+        // DC Blocker filter: y[n] = x[n] - x[n-1] + R * y[n-1], with R = 0.995
+        let r_dc = 0.995f32;
+        if is_right {
+            let out_r = raw_harm - self.dc_prev_in_r + r_dc * self.dc_prev_out_r;
+            self.dc_prev_in_r = raw_harm;
+            self.dc_prev_out_r = out_r;
+            out_r
+        } else {
+            let out_l = raw_harm - self.dc_prev_in_l + r_dc * self.dc_prev_out_l;
+            self.dc_prev_in_l = raw_harm;
+            self.dc_prev_out_l = out_l;
+            out_l
+        }
+    }
+
+    /// Process a stereo frame through the psychoacoustic harmonic bass pipeline.
+    pub fn process_stereo_frame(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        // 1. Extract sub-bass below 105 Hz
+        let (sub_l, sub_r) = self.sub_lowpass.process_stereo(in_l, in_r);
+
+        // 2. Synthesize upper harmonics from sub-bass
+        let harm_raw_l = self.synthesize_harmonics_channel(sub_l, false);
+        let harm_raw_r = self.synthesize_harmonics_channel(sub_r, true);
+
+        // 3. Filter synthesized harmonics through resonant acoustic bandpass
+        let (harm_filtered_l, harm_filtered_r) = self.harmonic_bandpass.process_stereo(harm_raw_l, harm_raw_r);
+
+        // 4. Clean program material with highpass filter to protect micro-speaker diaphragm
+        let (clean_prog_l, clean_prog_r) = self.speaker_highpass.process_stereo(in_l, in_r);
+
+        self.total_processed_frames += 1;
+
+        // 5. Combine cleaned program audio with synthesized acoustic harmonics
+        let out_l = clean_prog_l + harm_filtered_l * self.harmonic_gain;
+        let out_r = clean_prog_r + harm_filtered_r * self.harmonic_gain;
+
+        (out_l, out_r)
+    }
+
+    pub fn total_processed_frames(&self) -> u64 {
+        self.total_processed_frames
+    }
+}
+
+/// Verification test for psychoacoustic bass booster and harmonic synthesizer.
+pub fn verify_psychoacoustic_harmonic_bass_booster() -> bool {
+    let mut booster = HarmonicBassBooster::new(AUDIO_SAMPLE_RATE);
+
+    // 1. Feed pure 50 Hz sub-bass sine wave
+    // Frequency = 50 Hz, at 48kHz sample rate -> omega = 2*pi*50 / 48000
+    let f0 = 50.0;
+    let w = 2.0 * PI * f0 / AUDIO_SAMPLE_RATE;
+
+    let mut peak_harm_output: f32 = 0.0;
+    let mut sum_out_dc: f32 = 0.0;
+    let test_samples = 1920; // 2 full cycles of 50 Hz (40 ms)
+
+    for n in 0..test_samples {
+        let t = n as f32;
+        let input_sample = sin_f32(w * t) * 0.7; // -3 dBFS 50Hz tone
+
+        let (out_l, out_r) = booster.process_stereo_frame(input_sample, input_sample);
+        let abs_val = abs_f32(out_l);
+        if abs_val > peak_harm_output {
+            peak_harm_output = abs_val;
+        }
+        if n >= 960 {
+            sum_out_dc += out_l;
+        }
+
+        // Stereo symmetry check
+        if abs_f32(out_l - out_r) > 0.001 {
+            return false;
+        }
+    }
+
+    // Must generate substantial harmonic energy in the audible band (> 0.2 amplitude)
+    if peak_harm_output < 0.20 {
+        return false;
+    }
+
+    // DC blocker verification: DC mean over settled full cycle must be nearly zero (< 0.01)
+    let mean_dc = abs_f32(sum_out_dc / 960.0);
+    if mean_dc > 0.01 {
+        return false;
+    }
+
+    if booster.total_processed_frames() != test_samples as u64 {
+        return false;
+    }
+
+    true
+}
+
+
