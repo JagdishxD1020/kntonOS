@@ -913,3 +913,214 @@ pub fn verify_speaker_excursion_thermal_governor() -> bool {
 }
 
 
+
+// ============================================================================
+// Feature 4: Audio DSP Dynamics Pipeline Integration & Speaker Profiles
+// ============================================================================
+
+/// Operational preset profile for handheld audio output transducers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandheldSpeakerProfile {
+    /// Standard dual integrated micro-speakers (Steam Deck, ROG Ally, Legion Go).
+    HandheldIntegratedSpeakers,
+    /// High-fidelity acoustic bass-reflex chamber (OLED models).
+    HandheldOledBassReflex,
+    /// Maximum loudness and dialog intelligibility for loud outdoor environments.
+    ExtremeOutdoorGaming,
+    /// 3.5mm jack / USB-C DAC headphones (bypasses cone protection, direct bass).
+    HeadphonesBypass,
+}
+
+/// Integrated Audio DSP Dynamics Engine.
+///
+/// Chains psychoacoustic bass synthesis, soft-knee lookahead dynamic range compression,
+/// and transducer excursion/thermal protection into a low-latency, zero-copy pipeline.
+#[derive(Debug, Clone)]
+pub struct AudioDspDynamicsEngine {
+    pub profile: HandheldSpeakerProfile,
+    pub bass_booster: HarmonicBassBooster,
+    pub compressor: LookaheadSoftKneeCompressor,
+    pub governor: SpeakerExcursionThermalGovernor,
+    pub master_volume: f32,
+    pub bypass_compressor: bool,
+    pub bypass_bass_boost: bool,
+    pub bypass_protection: bool,
+    pub total_processed_frames: u64,
+    pub peak_input_linear: f32,
+    pub peak_output_linear: f32,
+}
+
+impl AudioDspDynamicsEngine {
+    pub fn new(profile: HandheldSpeakerProfile, sample_rate: f32) -> Self {
+        let comp_params = match profile {
+            HandheldSpeakerProfile::HandheldIntegratedSpeakers => CompressorParams::handheld_default(),
+            HandheldSpeakerProfile::HandheldOledBassReflex => CompressorParams {
+                threshold_db: -16.0,
+                ratio: 3.5,
+                knee_width_db: 5.0,
+                attack_ms: 0.30,
+                release_ms: 60.0,
+                makeup_gain_db: 2.5,
+                ceiling_db: -0.5,
+            },
+            HandheldSpeakerProfile::ExtremeOutdoorGaming => CompressorParams {
+                threshold_db: -24.0,
+                ratio: 6.0,
+                knee_width_db: 8.0,
+                attack_ms: 0.15,
+                release_ms: 35.0,
+                makeup_gain_db: 5.0,
+                ceiling_db: -0.2,
+            },
+            HandheldSpeakerProfile::HeadphonesBypass => CompressorParams {
+                threshold_db: -12.0,
+                ratio: 2.0,
+                knee_width_db: 4.0,
+                attack_ms: 0.50,
+                release_ms: 100.0,
+                makeup_gain_db: 1.0,
+                ceiling_db: -0.1,
+            },
+        };
+
+        let physical_profile = MicroSpeakerPhysicalProfile::steam_deck_rog_ally_profile();
+
+        let mut booster = HarmonicBassBooster::new(sample_rate);
+        if profile == HandheldSpeakerProfile::HandheldOledBassReflex {
+            booster.harmonic_gain = 1.45;
+        }
+
+        Self {
+            profile,
+            bass_booster: booster,
+            compressor: LookaheadSoftKneeCompressor::new(comp_params, sample_rate),
+            governor: SpeakerExcursionThermalGovernor::new(physical_profile, sample_rate),
+            master_volume: 1.0,
+            bypass_compressor: false,
+            bypass_bass_boost: profile == HandheldSpeakerProfile::HeadphonesBypass,
+            bypass_protection: profile == HandheldSpeakerProfile::HeadphonesBypass,
+            total_processed_frames: 0,
+            peak_input_linear: 0.0,
+            peak_output_linear: 0.0,
+        }
+    }
+
+    /// Set operating speaker profile and reconfigure DSP stages.
+    pub fn set_profile(&mut self, profile: HandheldSpeakerProfile, sample_rate: f32) {
+        *self = Self::new(profile, sample_rate);
+    }
+
+    /// Process a single stereo frame through the entire DSP dynamics chain.
+    #[inline]
+    pub fn process_stereo_frame(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        // Track input peak
+        let in_peak = max_f32(abs_f32(in_l), abs_f32(in_r));
+        if in_peak > self.peak_input_linear {
+            self.peak_input_linear = in_peak;
+        }
+
+        // Stage 1: Psychoacoustic Harmonic Bass Booster
+        let (bass_l, bass_r) = if self.bypass_bass_boost {
+            (in_l, in_r)
+        } else {
+            self.bass_booster.process_stereo_frame(in_l, in_r)
+        };
+
+        // Stage 2: Lookahead Peak Limiter & Soft-Knee Dynamic Range Compressor
+        let (comp_l, comp_r) = if self.bypass_compressor {
+            (bass_l, bass_r)
+        } else {
+            self.compressor.process_stereo_frame(bass_l, bass_r)
+        };
+
+        // Stage 3: Transducer Excursion & Thermal Protection Governor
+        let (gov_l, gov_r) = if self.bypass_protection {
+            (comp_l, comp_r)
+        } else {
+            self.governor.process_stereo_frame(comp_l, comp_r)
+        };
+
+        // Stage 4: Master output scaling
+        let out_l = gov_l * self.master_volume;
+        let out_r = gov_r * self.master_volume;
+
+        // Track output peak
+        let out_peak = max_f32(abs_f32(out_l), abs_f32(out_r));
+        if out_peak > self.peak_output_linear {
+            self.peak_output_linear = out_peak;
+        }
+
+        self.total_processed_frames += 1;
+        (out_l, out_r)
+    }
+
+    /// In-place processing of an interleaved stereo PCM buffer [L0, R0, L1, R1, ...].
+    pub fn process_interleaved_buffer(&mut self, buffer: &mut [f32]) {
+        let frame_count = buffer.len() / 2;
+        let mut i = 0;
+        while i < frame_count {
+            let idx = i * 2;
+            let (out_l, out_r) = self.process_stereo_frame(buffer[idx], buffer[idx + 1]);
+            buffer[idx] = out_l;
+            buffer[idx + 1] = out_r;
+            i += 1;
+        }
+    }
+}
+
+/// Verification test for audio DSP dynamics pipeline integration and speaker profiles.
+pub fn verify_dsp_dynamics_pipeline_integration() -> bool {
+    let mut engine = AudioDspDynamicsEngine::new(HandheldSpeakerProfile::HandheldIntegratedSpeakers, AUDIO_SAMPLE_RATE);
+
+    // 1. Initial state check
+    if engine.profile != HandheldSpeakerProfile::HandheldIntegratedSpeakers {
+        return false;
+    }
+    if engine.total_processed_frames != 0 {
+        return false;
+    }
+
+    // 2. Interleaved buffer processing test
+    let mut stereo_buffer = [0.0f32; 128]; // 64 stereo frames
+    for i in 0..64 {
+        let t = i as f32;
+        stereo_buffer[i * 2] = sin_f32(t * 0.1) * 0.5;
+        stereo_buffer[i * 2 + 1] = cos_f32(t * 0.1) * 0.5;
+    }
+
+    engine.process_interleaved_buffer(&mut stereo_buffer);
+    if engine.total_processed_frames != 64 {
+        return false;
+    }
+    if engine.peak_input_linear <= 0.0 || engine.peak_output_linear <= 0.0 {
+        return false;
+    }
+
+    // 3. Profile switching verification
+    engine.set_profile(HandheldSpeakerProfile::HeadphonesBypass, AUDIO_SAMPLE_RATE);
+    if engine.profile != HandheldSpeakerProfile::HeadphonesBypass {
+        return false;
+    }
+    if !engine.bypass_protection || !engine.bypass_bass_boost {
+        return false;
+    }
+
+    // Process a headphone frame
+    let (hp_l, hp_r) = engine.process_stereo_frame(0.2, 0.2);
+    if abs_f32(hp_l - hp_r) > 0.001 {
+        return false;
+    }
+
+    // Switch to Outdoor profile
+    engine.set_profile(HandheldSpeakerProfile::ExtremeOutdoorGaming, AUDIO_SAMPLE_RATE);
+    if engine.profile != HandheldSpeakerProfile::ExtremeOutdoorGaming {
+        return false;
+    }
+    if engine.bypass_protection || engine.bypass_bass_boost {
+        return false;
+    }
+
+    true
+}
+
+
