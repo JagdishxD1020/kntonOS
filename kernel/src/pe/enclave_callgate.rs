@@ -82,3 +82,75 @@ impl EnclaveCallGate {
         (frame.untrusted_rip, frame.untrusted_rsp, frame.untrusted_rbp)
     }
 }
+
+pub const STATUS_ENCLAVE_VIOLATION: u32 = 0xC000_04A2;
+pub const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
+pub const EXCEPTION_SINGLE_STEP: u32 = 0x8000_0004;
+
+/// Enclave hardware exception virtualization disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnclaveExceptionDisposition {
+    HandledByEnclave { resume_rip: u64 },
+    CloakedDebugTrap { resume_rip: u64 },
+    EscalateFatalViolation,
+}
+
+/// Enclave Hardware Exception Virtualization Handler.
+pub struct EnclaveExceptionHandler {
+    pub cloaking_enabled: AtomicBool,
+    pub exception_handler_rva: AtomicUsize,
+}
+
+impl EnclaveExceptionHandler {
+    pub const fn new() -> Self {
+        Self {
+            cloaking_enabled: AtomicBool::new(true),
+            exception_handler_rva: AtomicUsize::new(0),
+        }
+    }
+
+    /// Set internal enclave exception handler address.
+    pub fn set_enclave_handler(&self, handler_rva: usize) {
+        self.exception_handler_rva.store(handler_rva, Ordering::Release);
+    }
+
+    /// Virtualize an exception occurring inside enclave execution boundaries.
+    pub fn virtualize_enclave_exception(
+        &self,
+        exception_code: u32,
+        fault_rip: u64,
+        enclave_base: u64,
+        enclave_size: u64,
+    ) -> EnclaveExceptionDisposition {
+        // Check if fault occurred within enclave code bounds
+        if fault_rip < enclave_base || fault_rip >= enclave_base + enclave_size {
+            return EnclaveExceptionDisposition::EscalateFatalViolation;
+        }
+
+        // Anti-debug exception cloaking: conceal INT3 and single-step traps from external debuggers
+        if self.cloaking_enabled.load(Ordering::Acquire) {
+            if exception_code == EXCEPTION_BREAKPOINT {
+                // Cloak INT3: skip 1-byte opcode
+                return EnclaveExceptionDisposition::CloakedDebugTrap {
+                    resume_rip: fault_rip + 1,
+                };
+            } else if exception_code == EXCEPTION_SINGLE_STEP {
+                // Cloak TF: resume without debugger dispatch
+                return EnclaveExceptionDisposition::CloakedDebugTrap {
+                    resume_rip: fault_rip,
+                };
+            }
+        }
+
+        let handler = self.exception_handler_rva.load(Ordering::Acquire);
+        if handler != 0 {
+            EnclaveExceptionDisposition::HandledByEnclave {
+                resume_rip: handler as u64,
+            }
+        } else {
+            EnclaveExceptionDisposition::EscalateFatalViolation
+        }
+    }
+}
+
+pub static ENCLAVE_EXCEPTION_HANDLER: EnclaveExceptionHandler = EnclaveExceptionHandler::new();
