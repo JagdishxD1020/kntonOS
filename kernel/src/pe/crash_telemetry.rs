@@ -79,3 +79,76 @@ impl DynamicExceptionRouter {
 }
 
 pub static EXCEPTION_ROUTER: DynamicExceptionRouter = DynamicExceptionRouter::new();
+
+/// Minidump stream signature ("MDMP").
+pub const MINIDUMP_SIGNATURE: u32 = 0x504D444D;
+pub const MINIDUMP_VERSION: u32 = 0x0000_A793;
+
+/// In-memory Minidump Stream Header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinidumpHeader {
+    pub signature: u32,
+    pub version: u32,
+    pub number_of_streams: u32,
+    pub stream_directory_rva: u32,
+    pub check_sum: u32,
+    pub time_date_stamp: u32,
+    pub flags: u64,
+}
+
+/// Minidump Stack Backtrace Frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MinidumpStackFrame {
+    pub instruction_offset: u64,
+    pub return_offset: u64,
+    pub frame_offset: u64,
+    pub stack_offset: u64,
+}
+
+/// Encoded Minidump Stream Record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedMinidump {
+    pub header: MinidumpHeader,
+    pub exception_record: CapturedExceptionContext,
+    pub stack_backtrace: Vec<MinidumpStackFrame>,
+    pub memory_dump_bytes: Vec<u8>,
+}
+
+/// In-Memory Minidump Stream Encoder.
+pub struct MinidumpStreamEncoder;
+
+impl MinidumpStreamEncoder {
+    /// Encode a captured crash context and stack memory range into an in-memory Minidump stream.
+    pub fn encode_minidump(
+        ctx: &CapturedExceptionContext,
+        stack_memory: &[u8],
+    ) -> EncodedMinidump {
+        let header = MinidumpHeader {
+            signature: MINIDUMP_SIGNATURE,
+            version: MINIDUMP_VERSION,
+            number_of_streams: 3, // ExceptionStream, ThreadListStream, MemoryListStream
+            stream_directory_rva: 0x20,
+            check_sum: 0,
+            time_date_stamp: 0x6723_0000,
+            flags: 0x0002_0000, // MiniDumpNormal
+        };
+
+        let mut backtrace = Vec::new();
+        // Construct frame 0 from faulting registers
+        backtrace.push(MinidumpStackFrame {
+            instruction_offset: ctx.rip,
+            return_offset: ctx.rip.saturating_add(4),
+            frame_offset: ctx.rbp,
+            stack_offset: ctx.rsp,
+        });
+
+        EncodedMinidump {
+            header,
+            exception_record: *ctx,
+            stack_backtrace: backtrace,
+            memory_dump_bytes: stack_memory.to_vec(),
+        }
+    }
+}
