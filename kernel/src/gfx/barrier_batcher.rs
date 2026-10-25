@@ -569,3 +569,67 @@ impl EnhancedBarrierMapper {
         self.mapped_barriers.len()
     }
 }
+
+// Command Queue barrier batch executor statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BarrierBatchMetrics {
+    pub total_batches_submitted: u64,
+    pub total_immediate_barriers: u64,
+    pub total_split_begins: u64,
+    pub total_split_ends: u64,
+    pub total_redundant_eliminated: u64,
+}
+
+// Command Queue barrier batch coordinator engine.
+#[derive(Debug)]
+pub struct D3d12BarrierBatchCoordinator {
+    pub split_gen: DynamicSplitBarrierGenerator,
+    pub elimination_gov: BarrierEliminationGovernor,
+    pub mapper: EnhancedBarrierMapper,
+    pub metrics: BarrierBatchMetrics,
+}
+
+impl D3d12BarrierBatchCoordinator {
+    pub fn new() -> Self {
+        Self {
+            split_gen: DynamicSplitBarrierGenerator::new(),
+            elimination_gov: BarrierEliminationGovernor::new(),
+            mapper: EnhancedBarrierMapper::new(),
+            metrics: BarrierBatchMetrics::default(),
+        }
+    }
+
+    // Submits an immediate barrier batch with automatic redundancy elimination.
+    pub fn submit_barrier_batch(&mut self, batch: BarrierBatch) -> usize {
+        let count = batch.count();
+        let filtered = self.elimination_gov.filter_batch(batch);
+        let eliminated = count - filtered.count();
+        self.metrics.total_redundant_eliminated += eliminated as u64;
+
+        let mapped = self.mapper.map_batch(&filtered);
+        self.metrics.total_batches_submitted += 1;
+        self.metrics.total_immediate_barriers += mapped as u64;
+        mapped
+    }
+
+    // Begins an asynchronous split barrier with latency hiding.
+    pub fn submit_begin_barrier(&mut self, batch: BarrierBatch) -> u64 {
+        let count = batch.count();
+        let filtered = self.elimination_gov.filter_batch(batch);
+        let eliminated = count - filtered.count();
+        self.metrics.total_redundant_eliminated += eliminated as u64;
+
+        let token = self.split_gen.create_split_pair(filtered);
+        self.metrics.total_split_begins += 1;
+        token
+    }
+
+    // Completes an asynchronous split barrier transition.
+    pub fn submit_end_barrier(&mut self, token: u64) -> bool {
+        let retired = self.split_gen.retire_pair(token);
+        if retired {
+            self.metrics.total_split_ends += 1;
+        }
+        retired
+    }
+}
