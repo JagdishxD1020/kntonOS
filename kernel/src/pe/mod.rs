@@ -106,6 +106,7 @@ pub use enclave_attest::test_win32_enclave_attest_subsystem;
 pub use etw_stream::test_win32_etw_stream_subsystem;
 pub use threadpool_steal::test_win32_threadpool_steal_subsystem;
 pub use wait_on_address::test_win32_wait_on_address_subsystem;
+pub use enclave_callgate::test_win32_enclave_callgate_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
