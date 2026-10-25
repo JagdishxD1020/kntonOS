@@ -461,3 +461,111 @@ impl BarrierEliminationGovernor {
         }
     }
 }
+
+// Classification of enhanced barrier types.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnhancedBarrierKind {
+    Global = 0,
+    Buffer = 1,
+    Texture = 2,
+}
+
+// Unified barrier descriptor tagged with enhanced barrier type and hardware pipeline flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnifiedBarrierDesc {
+    pub kind: EnhancedBarrierKind,
+    pub sync_before: BarrierPipelineStageFlags,
+    pub sync_after: BarrierPipelineStageFlags,
+    pub access_before: BarrierMemoryAccessFlags,
+    pub access_after: BarrierMemoryAccessFlags,
+    pub resource_id: u64,
+    pub layout_before: BatchBarrierLayout,
+    pub layout_after: BatchBarrierLayout,
+}
+
+impl UnifiedBarrierDesc {
+    pub fn from_global(g: &BatchedGlobalBarrier) -> Self {
+        Self {
+            kind: EnhancedBarrierKind::Global,
+            sync_before: g.sync_before,
+            sync_after: g.sync_after,
+            access_before: g.access_before,
+            access_after: g.access_after,
+            resource_id: 0,
+            layout_before: BatchBarrierLayout::Undefined,
+            layout_after: BatchBarrierLayout::Undefined,
+        }
+    }
+
+    pub fn from_buffer(b: &BatchedBufferBarrier) -> Self {
+        Self {
+            kind: EnhancedBarrierKind::Buffer,
+            sync_before: b.sync_before,
+            sync_after: b.sync_after,
+            access_before: b.access_before,
+            access_after: b.access_after,
+            resource_id: b.buffer_id as u64,
+            layout_before: BatchBarrierLayout::Undefined,
+            layout_after: BatchBarrierLayout::Undefined,
+        }
+    }
+
+    pub fn from_texture(t: &BatchedTextureBarrier) -> Self {
+        Self {
+            kind: EnhancedBarrierKind::Texture,
+            sync_before: t.sync_before,
+            sync_after: t.sync_after,
+            access_before: t.access_before,
+            access_after: t.access_after,
+            resource_id: t.texture_id as u64,
+            layout_before: t.layout_before,
+            layout_after: t.layout_after,
+        }
+    }
+}
+
+// Enhanced barrier type mapper compiling heterogeneous batches to hardware barrier command packets.
+#[derive(Debug)]
+pub struct EnhancedBarrierMapper {
+    pub mapped_barriers: Vec<UnifiedBarrierDesc>,
+    pub global_count: usize,
+    pub buffer_count: usize,
+    pub texture_count: usize,
+}
+
+impl EnhancedBarrierMapper {
+    pub fn new() -> Self {
+        Self {
+            mapped_barriers: Vec::new(),
+            global_count: 0,
+            buffer_count: 0,
+            texture_count: 0,
+        }
+    }
+
+    // Maps a high-level barrier batch to unified hardware pipeline descriptors.
+    pub fn map_batch(&mut self, batch: &BarrierBatch) -> usize {
+        let initial_count = self.mapped_barriers.len();
+
+        for g in &batch.global_barriers {
+            self.mapped_barriers.push(UnifiedBarrierDesc::from_global(g));
+            self.global_count += 1;
+        }
+        for b in &batch.buffer_barriers {
+            self.mapped_barriers.push(UnifiedBarrierDesc::from_buffer(b));
+            self.buffer_count += 1;
+        }
+        for t in &batch.texture_barriers {
+            self.mapped_barriers.push(UnifiedBarrierDesc::from_texture(t));
+            self.texture_count += 1;
+        }
+
+        self.mapped_barriers.len() - initial_count
+    }
+
+    #[inline(always)]
+    pub fn total_mapped(&self) -> usize {
+        self.mapped_barriers.len()
+    }
+}
