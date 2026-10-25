@@ -562,6 +562,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_raytracing_bvh_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility BVH compaction & dynamic refit self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Barrier Batching & Elimination (TASK-KNT-294)
+    if !gfx::test_barrier_batcher_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility barrier batching & elimination self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
