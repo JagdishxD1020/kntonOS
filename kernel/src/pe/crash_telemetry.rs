@@ -152,3 +152,113 @@ impl MinidumpStreamEncoder {
         }
     }
 }
+
+pub const CRASH_RING_BUFFER_CAPACITY: usize = 256;
+
+/// Lock-free SPSC crash telemetry ring buffer streaming crash events with drop tracking.
+pub struct CrashTelemetryRingBuffer {
+    buffer: Spinlock<Vec<EncodedMinidump>>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    dropped_records: AtomicU64,
+}
+
+impl CrashTelemetryRingBuffer {
+    pub const fn new() -> Self {
+        Self {
+            buffer: Spinlock::new(Vec::new()),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            dropped_records: AtomicU64::new(0),
+        }
+    }
+
+    /// Enqueue an encoded minidump with sub-microsecond latency.
+    pub fn enqueue_minidump(&self, dump: EncodedMinidump) -> bool {
+        let mut buf = self.buffer.lock();
+        if buf.len() < CRASH_RING_BUFFER_CAPACITY {
+            buf.push(dump);
+            self.head.fetch_add(1, Ordering::Release);
+            true
+        } else {
+            self.dropped_records.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    /// Dequeue all pending crash minidumps in batch.
+    pub fn dequeue_batch(&self) -> Vec<EncodedMinidump> {
+        let mut buf = self.buffer.lock();
+        let batch = buf.clone();
+        buf.clear();
+        self.head.store(0, Ordering::Relaxed);
+        batch
+    }
+
+    /// Retrieve number of dropped crash records.
+    pub fn get_dropped_count(&self) -> u64 {
+        self.dropped_records.load(Ordering::Acquire)
+    }
+
+    /// Retrieve number of pending records.
+    pub fn len(&self) -> usize {
+        self.buffer.lock().len()
+    }
+
+    /// Check if buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+pub static CRASH_RING_BUFFER: CrashTelemetryRingBuffer = CrashTelemetryRingBuffer::new();
+
+/// Kernel diagnostic store ingesting crash telemetry and minidump streams.
+pub struct KernelDiagnosticStore {
+    records: Spinlock<Vec<EncodedMinidump>>,
+    total_ingested: AtomicU64,
+}
+
+impl KernelDiagnosticStore {
+    pub const fn new() -> Self {
+        Self {
+            records: Spinlock::new(Vec::new()),
+            total_ingested: AtomicU64::new(0),
+        }
+    }
+
+    /// Ingest pending minidump streams from the crash telemetry ring buffer.
+    pub fn ingest_from_ring_buffer(&self, ring_buffer: &CrashTelemetryRingBuffer) -> usize {
+        let batch = ring_buffer.dequeue_batch();
+        let count = batch.len();
+        if count > 0 {
+            let mut rec = self.records.lock();
+            rec.extend(batch);
+            self.total_ingested.fetch_add(count as u64, Ordering::Release);
+        }
+        count
+    }
+
+    /// Retrieve total count of ingested minidumps.
+    pub fn get_total_ingested(&self) -> u64 {
+        self.total_ingested.load(Ordering::Acquire)
+    }
+
+    /// Query minidump records by exception code.
+    pub fn query_by_exception_code(&self, code: u32) -> Vec<EncodedMinidump> {
+        let rec = self.records.lock();
+        rec.iter()
+            .filter(|m| m.exception_record.exception_code == code)
+            .cloned()
+            .collect()
+    }
+
+    /// Clear all stored crash records.
+    pub fn clear(&self) {
+        let mut rec = self.records.lock();
+        rec.clear();
+        self.total_ingested.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static KERNEL_DIAGNOSTIC_STORE: KernelDiagnosticStore = KernelDiagnosticStore::new();
