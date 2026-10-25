@@ -1124,3 +1124,35 @@ pub fn verify_dsp_dynamics_pipeline_integration() -> bool {
 }
 
 
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Audio DSP Dynamic Range Compressor & Psychoacoustic Bass Booster Engine.
+pub fn test_audio_dsp_dynamics_subsystem() -> bool {
+    crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS] Initiating Audio DSP Dynamics & Psychoacoustic Bass self-test...\r\n");
+
+    if !verify_lookahead_soft_knee_compressor() {
+        crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS-FAIL] Lookahead soft-knee compressor verification failed\r\n");
+        return false;
+    }
+
+    if !verify_psychoacoustic_harmonic_bass_booster() {
+        crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS-FAIL] Psychoacoustic harmonic bass booster verification failed\r\n");
+        return false;
+    }
+
+    if !verify_speaker_excursion_thermal_governor() {
+        crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS-FAIL] Speaker excursion and thermal governor verification failed\r\n");
+        return false;
+    }
+
+    if !verify_dsp_dynamics_pipeline_integration() {
+        crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS-FAIL] DSP dynamics pipeline integration verification failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-AUDIO-DSP-DYNAMICS-PASS] Handheld audio DSP dynamics compressor and psychoacoustic bass booster operational\r\n");
+    true
+}
