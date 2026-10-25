@@ -633,3 +633,100 @@ impl D3d12BarrierBatchCoordinator {
         retired
     }
 }
+
+// Verification self-test suite for D3D12 Agility Command Queue Barrier Batching & Elimination Engine.
+pub fn test_barrier_batcher_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 barrier batching & elimination engine...\r\n");
+
+    let mut coordinator = D3d12BarrierBatchCoordinator::new();
+
+    // 1. Register textures for layout tracking.
+    coordinator.elimination_gov.register_texture(100, 1, 1, BatchBarrierLayout::Common);
+    coordinator.elimination_gov.register_texture(101, 1, 1, BatchBarrierLayout::RenderTarget);
+
+    // 2. Test heterogeneous barrier batch submission.
+    let mut batch1 = BarrierBatch::new();
+    batch1.global_barriers.push(BatchedGlobalBarrier {
+        sync_before: BarrierPipelineStageFlags::COMPUTE,
+        sync_after: BarrierPipelineStageFlags::PIXEL_SHADING,
+        access_before: BarrierMemoryAccessFlags::UNORDERED_ACCESS,
+        access_after: BarrierMemoryAccessFlags::SHADER_RESOURCE,
+    });
+    batch1.buffer_barriers.push(BatchedBufferBarrier {
+        buffer_id: 1,
+        sync_before: BarrierPipelineStageFlags::COPY,
+        sync_after: BarrierPipelineStageFlags::VERTEX_SHADING,
+        access_before: BarrierMemoryAccessFlags::COPY_DEST,
+        access_after: BarrierMemoryAccessFlags::VERTEX_BUFFER,
+        offset: 0,
+        size: 1024,
+    });
+    batch1.texture_barriers.push(BatchedTextureBarrier {
+        texture_id: 100,
+        sync_before: BarrierPipelineStageFlags::ALL_SHADING,
+        sync_after: BarrierPipelineStageFlags::RENDER_TARGET,
+        access_before: BarrierMemoryAccessFlags::COMMON,
+        access_after: BarrierMemoryAccessFlags::RENDER_TARGET,
+        layout_before: BatchBarrierLayout::Common,
+        layout_after: BatchBarrierLayout::RenderTarget,
+        subresources: BatchSubresourceRange::all(),
+        discard_contents: false,
+    });
+
+    let submitted = coordinator.submit_barrier_batch(batch1);
+    if submitted != 3 {
+        return false;
+    }
+
+    // 3. Test redundant barrier elimination governor.
+    let mut batch_redundant = BarrierBatch::new();
+    batch_redundant.texture_barriers.push(BatchedTextureBarrier {
+        texture_id: 100,
+        sync_before: BarrierPipelineStageFlags::RENDER_TARGET,
+        sync_after: BarrierPipelineStageFlags::RENDER_TARGET,
+        access_before: BarrierMemoryAccessFlags::RENDER_TARGET,
+        access_after: BarrierMemoryAccessFlags::RENDER_TARGET,
+        layout_before: BatchBarrierLayout::RenderTarget,
+        layout_after: BatchBarrierLayout::RenderTarget,
+        subresources: BatchSubresourceRange::all(),
+        discard_contents: false,
+    });
+
+    let submitted_redundant = coordinator.submit_barrier_batch(batch_redundant);
+    if submitted_redundant != 0 || coordinator.metrics.total_redundant_eliminated != 1 {
+        return false;
+    }
+
+    // 4. Test dynamic split-barrier generation (BeginBarrier and EndBarrier pairs).
+    let mut batch_split = BarrierBatch::new();
+    batch_split.texture_barriers.push(BatchedTextureBarrier {
+        texture_id: 101,
+        sync_before: BarrierPipelineStageFlags::RENDER_TARGET,
+        sync_after: BarrierPipelineStageFlags::ALL_SHADING,
+        access_before: BarrierMemoryAccessFlags::RENDER_TARGET,
+        access_after: BarrierMemoryAccessFlags::SHADER_RESOURCE,
+        layout_before: BatchBarrierLayout::RenderTarget,
+        layout_after: BatchBarrierLayout::ShaderResource,
+        subresources: BatchSubresourceRange::all(),
+        discard_contents: false,
+    });
+
+    let token = coordinator.submit_begin_barrier(batch_split);
+    if token == 0 {
+        return false;
+    }
+
+    if !coordinator.submit_end_barrier(token) {
+        return false;
+    }
+
+    // Retiring already retired token must fail.
+    if coordinator.submit_end_barrier(token) {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-BARRIER-BATCH-PASS] Direct3D 12 barrier batching and elimination engine verified\r\n");
+
+    true
+}
