@@ -66,6 +66,7 @@ pub mod pipeline_library;
 pub mod sampler_tessellation;
 pub mod raytracing_bvh;
 pub mod barrier_batcher;
+pub mod depth_bounds_optimizer;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -132,6 +133,7 @@ pub use pipeline_library::*;
 pub use sampler_tessellation::*;
 pub use raytracing_bvh::*;
 pub use barrier_batcher::*;
+pub use depth_bounds_optimizer::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
