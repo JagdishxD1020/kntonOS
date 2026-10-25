@@ -262,3 +262,90 @@ impl KernelDiagnosticStore {
 }
 
 pub static KERNEL_DIAGNOSTIC_STORE: KernelDiagnosticStore = KernelDiagnosticStore::new();
+
+/// Comprehensive self-test for Win32 Dynamic Exception Routing & Minidump Crash Telemetry Ring Buffer.
+pub fn test_win32_crash_telemetry_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-CRASH-TELEMETRY] Initializing Win32 Crash Telemetry Subsystem self-test...\r\n");
+
+    // 1. Verify Fatal Crash Codes & Dynamic Exception Router
+    if !DynamicExceptionRouter::is_fatal_crash_code(EXCEPTION_ACCESS_VIOLATION)
+        || !DynamicExceptionRouter::is_fatal_crash_code(EXCEPTION_ILLEGAL_INSTRUCTION)
+        || !DynamicExceptionRouter::is_fatal_crash_code(EXCEPTION_STACK_BUFFER_OVERRUN)
+    {
+        crate::serial_write_str("[KNT-TEST-ERR] Fatal crash code classification mismatch\r\n");
+        return false;
+    }
+
+    let initial_count = EXCEPTION_ROUTER.get_capture_count();
+    let ctx = CapturedExceptionContext {
+        exception_code: EXCEPTION_ACCESS_VIOLATION,
+        exception_flags: 1, // EXCEPTION_NONCONTINUABLE
+        fault_address: 0x0000_7FFF_DEAD_BEEFu64,
+        thread_id: 2048,
+        process_id: 100,
+        timestamp_tsc: 987654321,
+        rip: 0x0000_7FFF_0040_1000,
+        rsp: 0x0000_00A0_1000_8000,
+        rbp: 0x0000_00A0_1000_8020,
+        rax: 0x11,
+        rbx: 0x22,
+        rcx: 0x33,
+        rdx: 0x44,
+    };
+
+    EXCEPTION_ROUTER.capture_exception(ctx);
+    if EXCEPTION_ROUTER.get_capture_count() != initial_count + 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Dynamic exception capture count mismatch\r\n");
+        return false;
+    }
+
+    // 2. Verify Minidump Stream Encoder
+    let mock_stack_mem = [0x55u8; 128];
+    let minidump = MinidumpStreamEncoder::encode_minidump(&ctx, &mock_stack_mem);
+
+    if minidump.header.signature != MINIDUMP_SIGNATURE || minidump.header.version != MINIDUMP_VERSION {
+        crate::serial_write_str("[KNT-TEST-ERR] Minidump signature or version header mismatch\r\n");
+        return false;
+    }
+
+    if minidump.stack_backtrace.is_empty()
+        || minidump.stack_backtrace[0].instruction_offset != ctx.rip
+        || minidump.stack_backtrace[0].stack_offset != ctx.rsp
+    {
+        crate::serial_write_str("[KNT-TEST-ERR] Minidump stack backtrace frame mismatch\r\n");
+        return false;
+    }
+
+    if minidump.memory_dump_bytes.len() != 128 || minidump.memory_dump_bytes[0] != 0x55 {
+        crate::serial_write_str("[KNT-TEST-ERR] Minidump memory dump payload mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify SPSC Crash Telemetry Ring Buffer & Kernel Diagnostic Store
+    let enq_res = CRASH_RING_BUFFER.enqueue_minidump(minidump);
+    if !enq_res || CRASH_RING_BUFFER.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] SPSC ring buffer enqueue failed\r\n");
+        return false;
+    }
+
+    let initial_store_count = KERNEL_DIAGNOSTIC_STORE.get_total_ingested();
+    let ingested = KERNEL_DIAGNOSTIC_STORE.ingest_from_ring_buffer(&CRASH_RING_BUFFER);
+    if ingested != 1 || !CRASH_RING_BUFFER.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] Diagnostic store ingestion or buffer clear failed\r\n");
+        return false;
+    }
+
+    if KERNEL_DIAGNOSTIC_STORE.get_total_ingested() != initial_store_count + 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Diagnostic store total count mismatch\r\n");
+        return false;
+    }
+
+    let queried = KERNEL_DIAGNOSTIC_STORE.query_by_exception_code(EXCEPTION_ACCESS_VIOLATION);
+    if queried.is_empty() || queried.last().unwrap().exception_record.fault_address != 0x0000_7FFF_DEAD_BEEF {
+        crate::serial_write_str("[KNT-TEST-ERR] Diagnostic store queried record mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-CRASH-TELEMETRY-PASS] Win32 Dynamic Exception Routing & Minidump Telemetry verified\r\n");
+    true
+}
