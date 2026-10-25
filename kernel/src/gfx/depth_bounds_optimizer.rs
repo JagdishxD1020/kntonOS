@@ -139,3 +139,68 @@ impl DepthStencilDiscardOptimizer {
         }
     }
 }
+
+
+// Frustum near and far plane bounds representation for projection matrices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewFrustumDepthRange {
+    pub near_z: f32,
+    pub far_z: f32,
+}
+
+impl ViewFrustumDepthRange {
+    pub const fn new(near_z: f32, far_z: f32) -> Self {
+        Self { near_z, far_z }
+    }
+}
+
+// Dynamic depth bounds test calculation with camera view frustum tightening.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DynamicDepthBoundsCalculator {
+    pub min_depth: f32,
+    pub max_depth: f32,
+    pub active_draw_cluster_min_z: f32,
+    pub active_draw_cluster_max_z: f32,
+    pub bounds_tightened: bool,
+}
+
+impl DynamicDepthBoundsCalculator {
+    pub fn new() -> Self {
+        Self {
+            min_depth: 0.0,
+            max_depth: 1.0,
+            active_draw_cluster_min_z: 0.0,
+            active_draw_cluster_max_z: 1.0,
+            bounds_tightened: false,
+        }
+    }
+
+    // Projects a view-space cluster [cluster_near, cluster_far] into normalized device coordinates [0.0, 1.0].
+    pub fn calculate_tightened_bounds(&mut self, frustum: ViewFrustumDepthRange, cluster_near: f32, cluster_far: f32) -> (f32, f32) {
+        if frustum.far_z <= frustum.near_z || cluster_far < cluster_near {
+            return (0.0, 1.0);
+        }
+
+        // Standard D3D12 linear projection mapping: z_ndc = (z_view - near) / (far - near)
+        let depth_span = frustum.far_z - frustum.near_z;
+        let clamped_near = if cluster_near < frustum.near_z { frustum.near_z } else { cluster_near };
+        let clamped_far = if cluster_far > frustum.far_z { frustum.far_z } else { cluster_far };
+
+        let norm_min = (clamped_near - frustum.near_z) / depth_span;
+        let norm_max = (clamped_far - frustum.near_z) / depth_span;
+
+        self.min_depth = if norm_min < 0.0 { 0.0 } else if norm_min > 1.0 { 1.0 } else { norm_min };
+        self.max_depth = if norm_max < 0.0 { 0.0 } else if norm_max > 1.0 { 1.0 } else { norm_max };
+        self.active_draw_cluster_min_z = cluster_near;
+        self.active_draw_cluster_max_z = cluster_far;
+        self.bounds_tightened = self.min_depth > 0.0 || self.max_depth < 1.0;
+
+        (self.min_depth, self.max_depth)
+    }
+
+    // Evaluates whether a candidate depth falls within active tightened bounds.
+    #[inline(always)]
+    pub fn test_depth_value(&self, z_ndc: f32) -> bool {
+        z_ndc >= self.min_depth && z_ndc <= self.max_depth
+    }
+}
