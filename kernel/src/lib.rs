@@ -1128,6 +1128,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Handheld audio dynamic resampler and spatial panner self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Audio DSP Dynamic Range Compressor & Psychoacoustic Bass Booster Engine (TASK-KNT-292)
+    if !audio::test_audio_dsp_dynamics_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld audio DSP dynamics compressor and psychoacoustic bass booster self-test failed!\r\n");
+    }
+
     // Initialize and verify Hardware RNG & ChaCha20 Cryptographic Entropy Pool
     crypto::init_kernel_rng();
     if !crypto::test_crypto_rng_subsystem() {

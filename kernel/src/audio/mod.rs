@@ -21,6 +21,9 @@ pub mod voice_beamformer;
 pub mod spatial_resampler;
 pub use spatial_resampler::*;
 
+pub mod dsp_dynamics;
+pub use dsp_dynamics::*;
+
 pub use occlusion::test_audio_occlusion_subsystem;
 pub use vad::test_audio_vad_subsystem;
 pub use xaudio2::test_xaudio2_service_subsystem;
