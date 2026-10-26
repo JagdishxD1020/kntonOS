@@ -595,3 +595,232 @@ pub fn verify_cycle_degradation_and_swelling_prevention() -> bool {
 }
 
 
+
+// ============================================================================
+// Feature 4: Fast Charge Balance Manager Pipeline Integration
+// ============================================================================
+
+/// Charging operational state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastChargeState {
+    /// No charger attached or charge complete.
+    Idle,
+    /// High-rate Multi-Step Constant Current (MSCC) charging active.
+    FastChargeMSCC,
+    /// Stepped current tapering active due to high SoC or warm temperature.
+    Tapering,
+    /// Constant Voltage (CV) saturation phase with voltage clamp.
+    ConstantVoltageAbsorption,
+    /// Only bypass cell bleeding active (charging inhibited or complete).
+    BalanceOnly,
+    /// Critical thermal protection cutoff (extreme cold or overheating).
+    ThermalInhibit,
+    /// Battery pack fully charged (CV termination current reached).
+    FullChargeComplete,
+}
+
+/// Real-time pack sensor inputs for the charge manager.
+#[derive(Debug, Clone, Copy)]
+pub struct PackTelemetry {
+    pub cell1_mv: u16,
+    pub cell2_mv: u16,
+    pub cell1_temp_c: i8,
+    pub cell2_temp_c: i8,
+    pub actual_charge_current_ma: u16,
+    pub soc_percent: u8,
+}
+
+/// Output command dispatched to PMIC and USB-PD EPR buck-boost charger.
+#[derive(Debug, Clone, Copy)]
+pub struct FastChargeCommand {
+    pub charge_enabled: bool,
+    pub cell_target_voltage_mv: u16,
+    pub pack_target_voltage_mv: u32,
+    pub target_current_ma: u16,
+    pub balance_mode: CellBalanceMode,
+    pub thermal_zone: ChargeThermalZone,
+    pub state: FastChargeState,
+}
+
+/// Integrated Fast Charge Balance & Degradation Manager.
+#[derive(Debug, Clone)]
+pub struct FastChargeBalanceManager {
+    pub balance_governor: DualCellBalanceGovernor,
+    pub taper_governor: FastChargeTaperGovernor,
+    pub degradation_compensator: CycleDegradationCompensator,
+    pub degradation_profile: BatteryDegradationProfile,
+    pub current_state: FastChargeState,
+    pub cv_absorption_ticks: u32,
+    pub total_ticks: u64,
+}
+
+impl FastChargeBalanceManager {
+    pub const fn new(degradation_profile: BatteryDegradationProfile) -> Self {
+        Self {
+            balance_governor: DualCellBalanceGovernor::new(),
+            taper_governor: FastChargeTaperGovernor::new(degradation_profile.design_capacity_mah),
+            degradation_compensator: CycleDegradationCompensator::new(),
+            degradation_profile,
+            current_state: FastChargeState::Idle,
+            cv_absorption_ticks: 0,
+            total_ticks: 0,
+        }
+    }
+
+    /// Process a telemetry tick and calculate real-time PMIC and balancing commands.
+    pub fn tick(&mut self, telemetry: &PackTelemetry) -> FastChargeCommand {
+        self.total_ticks += 1;
+
+        // 1. Worst-case cell temperature across dual-pack
+        let max_temp_c = if telemetry.cell1_temp_c > telemetry.cell2_temp_c {
+            telemetry.cell1_temp_c
+        } else {
+            telemetry.cell2_temp_c
+        };
+
+        // 2. Cell drift balancing update
+        let cell_telem = CellTelemetry::new(telemetry.cell1_mv, telemetry.cell2_mv);
+        let balance_mode = self.balance_governor.update(&cell_telem);
+
+        // 3. Degradation compensator: compute safe float voltage limit per cell
+        let safe_cutoff_mv = self.degradation_compensator.calculate_safe_cutoff_voltage_mv(&self.degradation_profile);
+        let cv_term_ma = self.degradation_compensator.calculate_cv_termination_ma(&self.degradation_profile);
+
+        // 4. Stepped current tapering based on SoC, temperature, and ESR
+        let (target_current_ma, thermal_zone) = self.taper_governor.calculate_target_current(
+            telemetry.soc_percent,
+            max_temp_c,
+            self.degradation_profile.esr_milliohms,
+        );
+
+        let max_cell_mv = if telemetry.cell1_mv > telemetry.cell2_mv {
+            telemetry.cell1_mv
+        } else {
+            telemetry.cell2_mv
+        };
+
+        // 5. State machine evaluation
+        let (charge_enabled, final_current_ma, state) = match thermal_zone {
+            ChargeThermalZone::ColdInhibit | ChargeThermalZone::HotCutoff => {
+                self.cv_absorption_ticks = 0;
+                (false, 0, FastChargeState::ThermalInhibit)
+            }
+            _ => {
+                // If maximum cell has hit or exceeded the safe float cutoff voltage
+                if max_cell_mv >= safe_cutoff_mv {
+                    self.cv_absorption_ticks += 1;
+
+                    // Check for charge termination condition
+                    if telemetry.actual_charge_current_ma <= cv_term_ma && telemetry.soc_percent >= 98 {
+                        (false, 0, FastChargeState::FullChargeComplete)
+                    } else {
+                        // Taper current in CV mode (decaying toward termination)
+                        let cv_current = target_current_ma.min(1500);
+                        (true, cv_current, FastChargeState::ConstantVoltageAbsorption)
+                    }
+                } else if telemetry.soc_percent >= 85 || thermal_zone == ChargeThermalZone::WarmTaper {
+                    self.cv_absorption_ticks = 0;
+                    (true, target_current_ma, FastChargeState::Tapering)
+                } else {
+                    self.cv_absorption_ticks = 0;
+                    (true, target_current_ma, FastChargeState::FastChargeMSCC)
+                }
+            }
+        };
+
+        self.current_state = state;
+
+        FastChargeCommand {
+            charge_enabled,
+            cell_target_voltage_mv: safe_cutoff_mv,
+            pack_target_voltage_mv: (safe_cutoff_mv as u32) * 2,
+            target_current_ma: final_current_ma,
+            balance_mode,
+            thermal_zone,
+            state,
+        }
+    }
+}
+
+/// Verification test for fast charge balance manager pipeline integration.
+pub fn verify_fast_charge_balance_manager_integration() -> bool {
+    let profile = BatteryDegradationProfile::new(100, 4900, 5000, 26);
+    let mut manager = FastChargeBalanceManager::new(profile);
+
+    // 1. Nominal Fast Charging: 30% SoC, 4000/4005 mV, 28 C -> FastChargeMSCC, 5000 mA, Inactive balance
+    let t1 = PackTelemetry {
+        cell1_mv: 4000,
+        cell2_mv: 4005,
+        cell1_temp_c: 28,
+        cell2_temp_c: 29,
+        actual_charge_current_ma: 4950,
+        soc_percent: 30,
+    };
+    let cmd1 = manager.tick(&t1);
+    if !cmd1.charge_enabled || cmd1.state != FastChargeState::FastChargeMSCC || cmd1.target_current_ma != 5000 {
+        return false;
+    }
+    if cmd1.balance_mode != CellBalanceMode::Inactive {
+        return false;
+    }
+
+    // 2. High-rate charge with drift: 4180/4155 mV (delta 25 mV) -> BleedCell1 active during fast charge
+    let t2 = PackTelemetry {
+        cell1_mv: 4180,
+        cell2_mv: 4155,
+        cell1_temp_c: 32,
+        cell2_temp_c: 31,
+        actual_charge_current_ma: 4800,
+        soc_percent: 65,
+    };
+    let cmd2 = manager.tick(&t2);
+    if cmd2.balance_mode != CellBalanceMode::BleedCell1 {
+        return false;
+    }
+
+    // 3. Constant Voltage Absorption: Cell 1 reaches 4350 mV safe cutoff -> CV absorption state
+    let t3 = PackTelemetry {
+        cell1_mv: 4350,
+        cell2_mv: 4345,
+        cell1_temp_c: 35,
+        cell2_temp_c: 34,
+        actual_charge_current_ma: 1200,
+        soc_percent: 94,
+    };
+    let cmd3 = manager.tick(&t3);
+    if cmd3.state != FastChargeState::ConstantVoltageAbsorption || cmd3.target_current_ma > 1500 {
+        return false;
+    }
+
+    // 4. Full charge termination: current drops below 250 mA at 99% SoC -> FullChargeComplete
+    let t4 = PackTelemetry {
+        cell1_mv: 4350,
+        cell2_mv: 4348,
+        cell1_temp_c: 33,
+        cell2_temp_c: 32,
+        actual_charge_current_ma: 180,
+        soc_percent: 99,
+    };
+    let cmd4 = manager.tick(&t4);
+    if cmd4.charge_enabled || cmd4.state != FastChargeState::FullChargeComplete || cmd4.target_current_ma != 0 {
+        return false;
+    }
+
+    // 5. Thermal safety cutoff test: Sudden overheating to 58 C -> ThermalInhibit, 0 mA
+    let t5 = PackTelemetry {
+        cell1_mv: 4200,
+        cell2_mv: 4200,
+        cell1_temp_c: 58,
+        cell2_temp_c: 56,
+        actual_charge_current_ma: 3000,
+        soc_percent: 70,
+    };
+    let cmd5 = manager.tick(&t5);
+    if cmd5.charge_enabled || cmd5.state != FastChargeState::ThermalInhibit || cmd5.target_current_ma != 0 {
+        return false;
+    }
+
+    true
+}
+
+
