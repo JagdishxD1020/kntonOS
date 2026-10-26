@@ -110,3 +110,44 @@ impl DirectFiberDescriptor {
         }
     }
 }
+
+pub const FIBER_GUARD_PAGE_SIZE: usize = 4096;
+
+/// Stack Alignment & Guard Page Overflow Error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberStackFault {
+    MisalignedRsp(u64),
+    GuardPageOverflow { rsp: u64, stack_limit: u64 },
+    StackUnderflow { rsp: u64, stack_base: u64 },
+}
+
+/// Validates 16-byte SSE/AVX user stack alignment and checks for guard page violation.
+pub struct FiberStackValidator;
+
+impl FiberStackValidator {
+    /// Check whether the fiber RSP has 16-byte alignment required by SSE/AVX operations.
+    #[inline]
+    pub fn is_16byte_aligned(rsp: u64) -> bool {
+        (rsp & 0x0F) == 0
+    }
+
+    /// Validate stack bounds: ensure RSP is within [stack_limit, stack_base] and properly aligned.
+    pub fn validate_stack_bounds(rsp: u64, stack_base: usize, stack_limit: usize) -> Result<(), FiberStackFault> {
+        if !Self::is_16byte_aligned(rsp) {
+            return Err(FiberStackFault::MisalignedRsp(rsp));
+        }
+
+        let limit = stack_limit as u64;
+        let base = stack_base as u64;
+
+        if rsp < limit {
+            return Err(FiberStackFault::GuardPageOverflow { rsp, stack_limit: limit });
+        }
+
+        if rsp > base {
+            return Err(FiberStackFault::StackUnderflow { rsp, stack_base: base });
+        }
+
+        Ok(())
+    }
+}
