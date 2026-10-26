@@ -361,3 +361,78 @@ impl D3d12DepthBoundsOptimizerEngine {
         pass
     }
 }
+
+// Verification self-test suite for D3D12 Agility Dynamic Depth/Stencil and Depth Bounds Optimizer.
+pub fn test_depth_bounds_optimizer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 depth bounds optimizer engine...\r\n");
+
+    let mut engine = D3d12DepthBoundsOptimizerEngine::new();
+
+    // 1. Verify subpass depth/stencil discard and clear suppression.
+    let discard_att = SubpassDepthStencilAttachment::new(
+        200,
+        SubpassAttachmentLoadOp::Discard,
+        SubpassAttachmentStoreOp::Discard,
+        SubpassAttachmentLoadOp::Clear,
+        SubpassAttachmentStoreOp::Store,
+        SubpassDiscardFlags::DISCARD_DEPTH,
+    );
+
+    let surface_bytes = 1920 * 1080 * 4;
+    engine.optimize_subpass_targets(&discard_att, surface_bytes);
+
+    if engine.discard_optimizer.depth_clears_skipped != 1 {
+        return false;
+    }
+    if engine.discard_optimizer.depth_stores_skipped != 1 {
+        return false;
+    }
+    if engine.discard_optimizer.memory_bandwidth_saved_bytes == 0 {
+        return false;
+    }
+
+    // 2. Verify dynamic depth bounds calculation with view frustum tightening.
+    let frustum = ViewFrustumDepthRange::new(1.0, 100.0);
+    let (min_d, max_d) = engine.configure_depth_bounds(frustum, 20.0, 60.0);
+
+    // Expected: norm_min = (20 - 1) / 99 = 19/99 ~= 0.1919, norm_max = (60 - 1) / 99 = 59/99 ~= 0.5959
+    if min_d <= 0.0 || max_d >= 1.0 || min_d >= max_d {
+        return false;
+    }
+    if !engine.bounds_calculator.bounds_tightened {
+        return false;
+    }
+
+    // 3. Verify draw call bounds culling and fragment depth tests.
+    // Inside cluster [0.25, 0.45] -> should pass
+    if !engine.evaluate_draw_cluster(0.25, 0.45) {
+        return false;
+    }
+    // Behind cluster [0.70, 0.90] -> should be culled
+    if engine.evaluate_draw_cluster(0.70, 0.90) {
+        return false;
+    }
+    if engine.metrics.draws_bounds_culled != 1 {
+        return false;
+    }
+
+    // 4. Verify stencil reference dynamic masking and early-Z reject.
+    engine.stencil_optimizer.set_stencil_ref(0x80, 0xF0, DynamicStencilComparison::Equal);
+
+    // Fragment matching mask 0x80 (e.g. 0x85 & 0xF0 == 0x80) -> Pass
+    if !engine.evaluate_fragment_stencil(0x85) {
+        return false;
+    }
+    // Fragment mismatching mask 0x80 (e.g. 0x10 & 0xF0 == 0x10) -> Culled
+    if engine.evaluate_fragment_stencil(0x10) {
+        return false;
+    }
+    if engine.metrics.fragments_early_z_culled != 1 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-DEPTH-OPTIMIZER-PASS] Direct3D 12 depth bounds optimizer engine verified\r\n");
+
+    true
+}
