@@ -119,3 +119,65 @@ impl CircularQueryHeapAllocator {
         self.capacity - self.active_count
     }
 }
+
+
+// Result of an asynchronous occlusion query readback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryReadbackStatus {
+    Ready(u64),
+    Pending(u64),
+    NotAllocated,
+}
+
+// GPU timeline fence synchronization and non-blocking query result readback governor.
+#[derive(Debug)]
+pub struct NonBlockingQueryReadbackGovernor {
+    pub current_timeline_fence: u64,
+    pub total_readback_queries: u64,
+    pub immediate_hits: u64,
+    pub pending_stalls_avoided: u64,
+}
+
+impl NonBlockingQueryReadbackGovernor {
+    pub fn new() -> Self {
+        Self {
+            current_timeline_fence: 0,
+            total_readback_queries: 0,
+            immediate_hits: 0,
+            pending_stalls_avoided: 0,
+        }
+    }
+
+    // Updates latest signal value from GPU timeline fence.
+    #[inline(always)]
+    pub fn signal_fence(&mut self, fence_val: u64) {
+        if fence_val > self.current_timeline_fence {
+            self.current_timeline_fence = fence_val;
+        }
+    }
+
+    // Checks whether query slot is ready without blocking CPU thread.
+    pub fn poll_query_result(&mut self, slot: &OcclusionQuerySlot) -> QueryReadbackStatus {
+        self.total_readback_queries += 1;
+        if slot.state == QuerySlotState::Free {
+            return QueryReadbackStatus::NotAllocated;
+        }
+
+        if slot.fence_value <= self.current_timeline_fence && slot.state == QuerySlotState::Resolved {
+            self.immediate_hits += 1;
+            QueryReadbackStatus::Ready(slot.samples_passed)
+        } else {
+            self.pending_stalls_avoided += 1;
+            QueryReadbackStatus::Pending(slot.fence_value)
+        }
+    }
+
+    #[inline(always)]
+    pub fn hit_ratio_percentage(&self) -> u32 {
+        if self.total_readback_queries == 0 {
+            0
+        } else {
+            ((self.immediate_hits * 100) / self.total_readback_queries) as u32
+        }
+    }
+}
