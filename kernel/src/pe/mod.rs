@@ -55,6 +55,7 @@ pub mod threadpool_steal;
 pub mod wait_on_address;
 pub mod enclave_callgate;
 pub mod crash_telemetry;
+pub mod direct_fiber_switch;
 
 pub use header::*;
 pub use ntdll::*;
