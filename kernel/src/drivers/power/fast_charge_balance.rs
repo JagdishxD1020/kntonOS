@@ -214,3 +214,205 @@ pub fn verify_dual_cell_drift_balancing() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Dynamic Fast Charge Stepped Current Tapering (ESR & Thermals)
+// ============================================================================
+
+/// JEITA battery temperature safety zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeThermalZone {
+    /// T < 0 C: Extreme cold; charging prohibited to avoid lithium dendrite plating.
+    ColdInhibit,
+    /// 0 C <= T < 10 C: Cold temperature; restricted trickle charge (<= 1000 mA).
+    ColdTrickle,
+    /// 10 C <= T < 45 C: Optimal temperature range; full fast-charge capability.
+    NormalFast,
+    /// 45 C <= T < 55 C: Elevated temperature; stepped current tapering and voltage de-rating.
+    WarmTaper,
+    /// T >= 55 C: Critical thermal threshold; immediate charging cutoff to prevent thermal runaway.
+    HotCutoff,
+}
+
+/// Dynamic Fast Charge Stepped Current Taper Governor.
+///
+/// Implements Multi-Step Constant Current (MSCC) charging profiles modulated by
+/// real-time internal cell resistance (ESR) and multi-point NTC thermistor telemetry.
+#[derive(Debug, Clone)]
+pub struct FastChargeTaperGovernor {
+    /// Maximum allowed cell internal joule heating budget in milliwatts (e.g. 800 mW).
+    pub max_internal_heat_mw: u32,
+    /// Design capacity in milliampere-hours (e.g. 5000 mAh).
+    pub design_capacity_mah: u16,
+    /// Total current reduction events due to thermal or ESR throttling.
+    pub thermal_taper_events: u64,
+    pub esr_taper_events: u64,
+}
+
+impl FastChargeTaperGovernor {
+    pub const fn new(design_capacity_mah: u16) -> Self {
+        Self {
+            max_internal_heat_mw: 800,
+            design_capacity_mah,
+            thermal_taper_events: 0,
+            esr_taper_events: 0,
+        }
+    }
+
+    /// Classify cell temperature into standard JEITA thermal safety zone.
+    pub const fn classify_thermal_zone(temp_c: i8) -> ChargeThermalZone {
+        if temp_c < 0 {
+            ChargeThermalZone::ColdInhibit
+        } else if temp_c < 10 {
+            ChargeThermalZone::ColdTrickle
+        } else if temp_c < 45 {
+            ChargeThermalZone::NormalFast
+        } else if temp_c < 55 {
+            ChargeThermalZone::WarmTaper
+        } else {
+            ChargeThermalZone::HotCutoff
+        }
+    }
+
+    /// Compute baseline Multi-Step Constant Current (MSCC) stage from State of Charge (SoC).
+    pub const fn mscc_base_current_ma(&self, soc_percent: u8) -> u16 {
+        if soc_percent < 50 {
+            // Stage 1: Peak fast charge (1.0C = 5000 mA)
+            self.design_capacity_mah
+        } else if soc_percent < 70 {
+            // Stage 2: High charge (0.8C = 4000 mA)
+            (self.design_capacity_mah * 8) / 10
+        } else if soc_percent < 85 {
+            // Stage 3: Medium charge (0.6C = 3000 mA)
+            (self.design_capacity_mah * 6) / 10
+        } else if soc_percent < 95 {
+            // Stage 4: Taper stage (0.4C = 2000 mA)
+            (self.design_capacity_mah * 4) / 10
+        } else {
+            // Stage 5: CV transition trickle (0.2C = 1000 mA)
+            (self.design_capacity_mah * 2) / 10
+        }
+    }
+
+    /// Calculate maximum safe charging current governed by ESR joule heating limit:
+    /// P = I^2 * R_esr  =>  I_max = sqrt(P_max / R_esr)
+    pub fn esr_current_limit_ma(&self, esr_milliohms: u16) -> u16 {
+        if esr_milliohms == 0 {
+            return self.design_capacity_mah;
+        }
+
+        // P_mw = 800 mW, R_ohm = esr_milliohms / 1000
+        // I_A^2 = 0.8 / (esr / 1000) = 800 / esr
+        // I_mA^2 = 800_000_000 / esr
+        let val = 800_000_000u64 / (esr_milliohms as u64);
+        // Integer square root
+        let mut x = val;
+        let mut y = (x + 1) / 2;
+        while y < x {
+            x = y;
+            y = (x + val / x) / 2;
+        }
+        let max_current_ma = x as u16;
+
+        if max_current_ma < 500 {
+            500
+        } else if max_current_ma > self.design_capacity_mah {
+            self.design_capacity_mah
+        } else {
+            max_current_ma
+        }
+    }
+
+    /// Calculate target charging current and active thermal zone for current operating conditions.
+    pub fn calculate_target_current(
+        &mut self,
+        soc_percent: u8,
+        cell_temp_c: i8,
+        esr_milliohms: u16,
+    ) -> (u16, ChargeThermalZone) {
+        let zone = Self::classify_thermal_zone(cell_temp_c);
+
+        // 1. Thermal zone gating
+        let thermal_max_ma = match zone {
+            ChargeThermalZone::ColdInhibit | ChargeThermalZone::HotCutoff => 0,
+            ChargeThermalZone::ColdTrickle => 1000,
+            ChargeThermalZone::NormalFast => self.design_capacity_mah,
+            ChargeThermalZone::WarmTaper => 2000,
+        };
+
+        if thermal_max_ma == 0 {
+            self.thermal_taper_events += 1;
+            return (0, zone);
+        }
+
+        // 2. Base MSCC current from SoC
+        let base_ma = self.mscc_base_current_ma(soc_percent);
+
+        // 3. ESR degradation limit
+        let esr_limit_ma = self.esr_current_limit_ma(esr_milliohms);
+
+        let mut target_ma = base_ma;
+
+        // Apply thermal clamp
+        if target_ma > thermal_max_ma {
+            target_ma = thermal_max_ma;
+            self.thermal_taper_events += 1;
+        }
+
+        // Apply ESR clamp
+        if target_ma > esr_limit_ma {
+            target_ma = esr_limit_ma;
+            self.esr_taper_events += 1;
+        }
+
+        (target_ma, zone)
+    }
+}
+
+/// Verification test for dynamic fast charge stepped current tapering governed by ESR and thermals.
+pub fn verify_fast_charge_esr_and_thermal_tapering() -> bool {
+    let mut governor = FastChargeTaperGovernor::new(5000);
+
+    // 1. Optimal conditions: 25 C, 25 mOhm ESR, 30% SoC -> full peak 5000 mA
+    let (cur1, zone1) = governor.calculate_target_current(30, 25, 25);
+    if cur1 != 5000 || zone1 != ChargeThermalZone::NormalFast {
+        return false;
+    }
+
+    // 2. High SoC stepped tapering: 25 C, 25 mOhm, 75% SoC -> 3000 mA
+    let (cur2, zone2) = governor.calculate_target_current(75, 25, 25);
+    if cur2 != 3000 || zone2 != ChargeThermalZone::NormalFast {
+        return false;
+    }
+
+    // 3. High ESR cell degradation: 80 mOhm ESR, 30% SoC -> clamped by ESR (sqrt(800M / 80) = 3162 mA)
+    let (cur3, _) = governor.calculate_target_current(30, 25, 80);
+    if cur3 > 3200 || cur3 < 3100 {
+        return false;
+    }
+    if governor.esr_taper_events == 0 {
+        return false;
+    }
+
+    // 4. Elevated temperature: 48 C (WarmTaper) -> capped at 2000 mA
+    let (cur4, zone4) = governor.calculate_target_current(30, 48, 25);
+    if cur4 != 2000 || zone4 != ChargeThermalZone::WarmTaper {
+        return false;
+    }
+
+    // 5. Critical hot temperature: 58 C (HotCutoff) -> 0 mA cutoff
+    let (cur5, zone5) = governor.calculate_target_current(30, 58, 25);
+    if cur5 != 0 || zone5 != ChargeThermalZone::HotCutoff {
+        return false;
+    }
+
+    // 6. Freezing temperature: -5 C (ColdInhibit) -> 0 mA cutoff
+    let (cur6, zone6) = governor.calculate_target_current(30, -5, 25);
+    if cur6 != 0 || zone6 != ChargeThermalZone::ColdInhibit {
+        return false;
+    }
+
+    true
+}
+
+
