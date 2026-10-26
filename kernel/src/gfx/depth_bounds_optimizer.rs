@@ -204,3 +204,98 @@ impl DynamicDepthBoundsCalculator {
         z_ndc >= self.min_depth && z_ndc <= self.max_depth
     }
 }
+
+// Stencil test comparison functions.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DynamicStencilComparison {
+    #[default]
+    Always = 0,
+    Never = 1,
+    Equal = 2,
+    NotEqual = 3,
+    Less = 4,
+    LessEqual = 5,
+    Greater = 6,
+    GreaterEqual = 7,
+}
+
+// Stencil dynamic reference value and bitmask descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicStencilMaskState {
+    pub reference_value: u8,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub comparison_func: DynamicStencilComparison,
+    pub early_z_reject_enabled: bool,
+}
+
+impl Default for DynamicStencilMaskState {
+    fn default() -> Self {
+        Self {
+            reference_value: 0,
+            read_mask: 0xFF,
+            write_mask: 0xFF,
+            comparison_func: DynamicStencilComparison::Always,
+            early_z_reject_enabled: false,
+        }
+    }
+}
+
+// Stencil reference value dynamic masking and early-Z reject optimizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StencilEarlyZRejectOptimizer {
+    pub mask_state: DynamicStencilMaskState,
+    pub total_tests: u64,
+    pub rejected_fragments: u64,
+}
+
+impl StencilEarlyZRejectOptimizer {
+    pub fn new(mask_state: DynamicStencilMaskState) -> Self {
+        Self {
+            mask_state,
+            total_tests: 0,
+            rejected_fragments: 0,
+        }
+    }
+
+    // Configures active dynamic stencil reference and masking.
+    pub fn set_stencil_ref(&mut self, reference: u8, read_mask: u8, comp: DynamicStencilComparison) {
+        self.mask_state.reference_value = reference;
+        self.mask_state.read_mask = read_mask;
+        self.mask_state.comparison_func = comp;
+        self.mask_state.early_z_reject_enabled = comp != DynamicStencilComparison::Always;
+    }
+
+    // Evaluates a fragment's stencil buffer value against the masked reference.
+    pub fn test_fragment_stencil(&mut self, buffer_stencil: u8) -> bool {
+        self.total_tests += 1;
+        let ref_val = self.mask_state.reference_value & self.mask_state.read_mask;
+        let buf_val = buffer_stencil & self.mask_state.read_mask;
+
+        let pass = match self.mask_state.comparison_func {
+            DynamicStencilComparison::Always => true,
+            DynamicStencilComparison::Never => false,
+            DynamicStencilComparison::Equal => ref_val == buf_val,
+            DynamicStencilComparison::NotEqual => ref_val != buf_val,
+            DynamicStencilComparison::Less => ref_val < buf_val,
+            DynamicStencilComparison::LessEqual => ref_val <= buf_val,
+            DynamicStencilComparison::Greater => ref_val > buf_val,
+            DynamicStencilComparison::GreaterEqual => ref_val >= buf_val,
+        };
+
+        if !pass {
+            self.rejected_fragments += 1;
+        }
+        pass
+    }
+
+    #[inline(always)]
+    pub fn reject_percentage(&self) -> u32 {
+        if self.total_tests == 0 {
+            0
+        } else {
+            ((self.rejected_fragments * 100) / self.total_tests) as u32
+        }
+    }
+}
