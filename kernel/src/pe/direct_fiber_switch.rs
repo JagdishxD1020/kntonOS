@@ -289,3 +289,146 @@ impl DirectFiberSwitchEngine {
 }
 
 pub static DIRECT_FIBER_ENGINE: DirectFiberSwitchEngine = DirectFiberSwitchEngine::new();
+
+/// Comprehensive self-test suite for Win32 Direct Fiber Switch & State Machine Subsystem.
+pub fn test_win32_direct_fiber_switch_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-FIBER-SWITCH] Initializing Win32 Direct Fiber Switch Subsystem self-test...\r\n");
+
+    // 1. Verify 5-stage Fiber State Machine Transitions
+    let mut fiber = DirectFiberDescriptor::new(
+        1001,
+        0,
+        0x0000_7FFF_1000_8000,
+        0x0000_7FFF_1000_0000,
+        0x0000_0040_1000,
+    );
+
+    if fiber.state != FiberState::Created {
+        crate::serial_write_str("[KNT-TEST-ERR] Initial fiber state is not Created\r\n");
+        return false;
+    }
+
+    if fiber.transition_to(FiberState::Ready).is_err() || fiber.state != FiberState::Ready {
+        crate::serial_write_str("[KNT-TEST-ERR] Transition to Ready failed\r\n");
+        return false;
+    }
+
+    if fiber.transition_to(FiberState::Running).is_err() || fiber.state != FiberState::Running {
+        crate::serial_write_str("[KNT-TEST-ERR] Transition to Running failed\r\n");
+        return false;
+    }
+
+    if fiber.transition_to(FiberState::Waiting).is_err() || fiber.state != FiberState::Waiting {
+        crate::serial_write_str("[KNT-TEST-ERR] Transition to Waiting failed\r\n");
+        return false;
+    }
+
+    if fiber.transition_to(FiberState::Ready).is_err() || fiber.state != FiberState::Ready {
+        crate::serial_write_str("[KNT-TEST-ERR] Transition from Waiting to Ready failed\r\n");
+        return false;
+    }
+
+    // Invalid transition check: Ready -> Waiting must fail
+    if fiber.transition_to(FiberState::Waiting).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Illegal transition Ready -> Waiting succeeded\r\n");
+        return false;
+    }
+
+    // 2. Verify 16-byte SSE/AVX Stack Alignment & Guard Page Overflow Validator
+    let valid_rsp = 0x0000_7FFF_1000_8000u64;
+    let misaligned_rsp = 0x0000_7FFF_1000_8008u64;
+    let stack_base = 0x0000_7FFF_1000_8000usize;
+    let stack_limit = 0x0000_7FFF_1000_0000usize;
+
+    if !FiberStackValidator::is_16byte_aligned(valid_rsp) {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid 16-byte aligned RSP failed alignment check\r\n");
+        return false;
+    }
+
+    if FiberStackValidator::is_16byte_aligned(misaligned_rsp) {
+        crate::serial_write_str("[KNT-TEST-ERR] Misaligned RSP passed alignment check\r\n");
+        return false;
+    }
+
+    let overflow_rsp = 0x0000_7FFF_0FFF_F000u64; // Below stack limit
+    match FiberStackValidator::validate_stack_bounds(overflow_rsp, stack_base, stack_limit) {
+        Err(FiberStackFault::GuardPageOverflow { .. }) => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Guard page overflow not detected\r\n");
+            return false;
+        }
+    }
+
+    // 3. Verify Fiber RunList FIFO Queue
+    let runlist = FiberRunList::new();
+    runlist.push_ready(201);
+    runlist.push_ready(202);
+    if runlist.len() != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Runlist length mismatch\r\n");
+        return false;
+    }
+    if runlist.pop_ready() != Some(201) || runlist.pop_ready() != Some(202) {
+        crate::serial_write_str("[KNT-TEST-ERR] Runlist FIFO order mismatch\r\n");
+        return false;
+    }
+    if !runlist.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] Runlist should be empty\r\n");
+        return false;
+    }
+
+    // 4. Verify Direct Fiber Switch Engine
+    let f1 = DirectFiberDescriptor::new(
+        301,
+        0,
+        0x0000_7FFF_3000_8000,
+        0x0000_7FFF_3000_0000,
+        0x0000_0040_3000,
+    );
+    let f2 = DirectFiberDescriptor::new(
+        302,
+        0,
+        0x0000_7FFF_4000_8000,
+        0x0000_7FFF_4000_0000,
+        0x0000_0040_4000,
+    );
+
+    if DIRECT_FIBER_ENGINE.register_fiber(f1).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to register fiber 301\r\n");
+        return false;
+    }
+    if DIRECT_FIBER_ENGINE.register_fiber(f2).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to register fiber 302\r\n");
+        return false;
+    }
+
+    let initial_switches = DIRECT_FIBER_ENGINE.get_total_switches();
+
+    // Switch to Fiber 301
+    let sw1 = DIRECT_FIBER_ENGINE.switch_to_fiber_direct(301);
+    if sw1 != Ok((0, 301)) || DIRECT_FIBER_ENGINE.get_active_fiber_id() != 301 {
+        crate::serial_write_str("[KNT-TEST-ERR] Direct switch to fiber 301 failed\r\n");
+        return false;
+    }
+
+    // Switch directly from Fiber 301 to Fiber 302
+    let sw2 = DIRECT_FIBER_ENGINE.switch_to_fiber_direct(302);
+    if sw2 != Ok((301, 302)) || DIRECT_FIBER_ENGINE.get_active_fiber_id() != 302 {
+        crate::serial_write_str("[KNT-TEST-ERR] Direct switch from fiber 301 to 302 failed\r\n");
+        return false;
+    }
+
+    if DIRECT_FIBER_ENGINE.get_total_switches() != initial_switches + 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total switches count mismatch\r\n");
+        return false;
+    }
+
+    let f1_desc = DIRECT_FIBER_ENGINE.get_fiber(301).unwrap();
+    let f2_desc = DIRECT_FIBER_ENGINE.get_fiber(302).unwrap();
+    if f1_desc.state != FiberState::Ready || f2_desc.state != FiberState::Running {
+        crate::serial_write_str("[KNT-TEST-ERR] Fiber states after direct switch mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-FIBER-SWITCH-PASS] Win32 Direct Fiber Context Switch & State Machine verified\r\n");
+    true
+}
