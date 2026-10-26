@@ -1323,6 +1323,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_enclave_callgate_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Enclave Call Gate subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Dynamic Exception Routing & Minidump Crash Telemetry Ring Buffer (TASK-KNT-295)
+    if !pe::test_win32_crash_telemetry_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Crash Telemetry subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
