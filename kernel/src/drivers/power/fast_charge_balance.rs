@@ -824,3 +824,35 @@ pub fn verify_fast_charge_balance_manager_integration() -> bool {
 }
 
 
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld Dual-Cell Fast Charge Balance & Impedance Degradation Compensator.
+pub fn test_fast_charge_balance_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER-FAST-CHARGE] Initiating dual-cell fast charge balance & degradation self-test...\r\n");
+
+    if !verify_dual_cell_drift_balancing() {
+        crate::serial_write_str("[KNT-POWER-FAST-CHARGE-FAIL] Dual-cell drift balancing verification failed\r\n");
+        return false;
+    }
+
+    if !verify_fast_charge_esr_and_thermal_tapering() {
+        crate::serial_write_str("[KNT-POWER-FAST-CHARGE-FAIL] Fast charge ESR and thermal tapering verification failed\r\n");
+        return false;
+    }
+
+    if !verify_cycle_degradation_and_swelling_prevention() {
+        crate::serial_write_str("[KNT-POWER-FAST-CHARGE-FAIL] Cycle degradation and swelling prevention verification failed\r\n");
+        return false;
+    }
+
+    if !verify_fast_charge_balance_manager_integration() {
+        crate::serial_write_str("[KNT-POWER-FAST-CHARGE-FAIL] Fast charge balance manager integration verification failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-FAST-CHARGE-PASS] Handheld dual-cell fast charge balance and degradation compensator operational\r\n");
+    true
+}

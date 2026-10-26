@@ -992,6 +992,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Fan tachometer and anti-resonance governor self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld Power & Battery: Dynamic Fast Charge Dual-Cell Balance & Impedance Degradation Compensator (TASK-KNT-296)
+    if !drivers::power::test_fast_charge_balance_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld dynamic fast charge dual-cell balance self-test failed!\r\n");
+    }
+
     // Initialize and verify Handheld PC Multi-Zone Thermocouple & Peltier Active Cooler Module (TASK-KNT-119)
     if !drivers::thermal::test_peltier_active_cooler_subsystem() {
         serial_write_str("[KNT-PANIC] Peltier active cooler and thermocouple subsystem self-test failed!\r\n");
