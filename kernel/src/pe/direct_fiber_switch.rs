@@ -151,3 +151,141 @@ impl FiberStackValidator {
         Ok(())
     }
 }
+
+pub const FIBER_RUNLIST_CAPACITY: usize = 256;
+
+/// Lock-free runlist for ready fibers waiting for game loop job worker execution.
+pub struct FiberRunList {
+    queue: Spinlock<Vec<u64>>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+impl FiberRunList {
+    pub const fn new() -> Self {
+        Self {
+            queue: Spinlock::new(Vec::new()),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Push a fiber ID into ready runlist.
+    pub fn push_ready(&self, fiber_id: u64) -> bool {
+        let mut q = self.queue.lock();
+        if q.len() < FIBER_RUNLIST_CAPACITY {
+            q.push(fiber_id);
+            self.head.fetch_add(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pop next ready fiber ID for direct scheduling.
+    pub fn pop_ready(&self) -> Option<u64> {
+        let mut q = self.queue.lock();
+        if q.is_empty() {
+            None
+        } else {
+            self.tail.fetch_add(1, Ordering::Release);
+            Some(q.remove(0))
+        }
+    }
+
+    /// Return count of pending ready fibers.
+    pub fn len(&self) -> usize {
+        self.queue.lock().len()
+    }
+
+    /// Check if runlist is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Direct Low-Latency Fiber Switch Engine bypassing OS thread scheduler traps.
+pub struct DirectFiberSwitchEngine {
+    fibers: Spinlock<BTreeMap<u64, DirectFiberDescriptor>>,
+    active_fiber_id: AtomicU64,
+    total_switches: AtomicU64,
+    runlist: FiberRunList,
+}
+
+impl DirectFiberSwitchEngine {
+    pub const fn new() -> Self {
+        Self {
+            fibers: Spinlock::new(BTreeMap::new()),
+            active_fiber_id: AtomicU64::new(0),
+            total_switches: AtomicU64::new(0),
+            runlist: FiberRunList::new(),
+        }
+    }
+
+    /// Register a new fiber in the engine.
+    pub fn register_fiber(&self, mut desc: DirectFiberDescriptor) -> Result<(), &'static str> {
+        FiberStackValidator::validate_stack_bounds(
+            desc.context.rsp,
+            desc.stack_base,
+            desc.stack_limit,
+        ).map_err(|_| "Invalid initial fiber stack bounds or alignment")?;
+
+        let _ = desc.transition_to(FiberState::Ready);
+        let id = desc.fiber_id;
+        let mut map = self.fibers.lock();
+        map.insert(id, desc);
+        self.runlist.push_ready(id);
+        Ok(())
+    }
+
+    /// Perform a direct cooperative fiber switch from current to target fiber without OS kernel traps.
+    pub fn switch_to_fiber_direct(&self, target_id: u64) -> Result<(u64, u64), &'static str> {
+        let mut map = self.fibers.lock();
+
+        let current_id = self.active_fiber_id.load(Ordering::Acquire);
+        if current_id != 0 {
+            if let Some(curr) = map.get_mut(&current_id) {
+                if curr.state == FiberState::Running {
+                    let _ = curr.transition_to(FiberState::Ready);
+                }
+            }
+        }
+
+        let target = map.get_mut(&target_id).ok_or("Target fiber not found")?;
+        FiberStackValidator::validate_stack_bounds(
+            target.context.rsp,
+            target.stack_base,
+            target.stack_limit,
+        ).map_err(|_| "Target fiber stack violation or alignment error")?;
+
+        target.transition_to(FiberState::Running)?;
+        target.switch_count += 1;
+
+        self.active_fiber_id.store(target_id, Ordering::Release);
+        self.total_switches.fetch_add(1, Ordering::Relaxed);
+
+        Ok((current_id, target_id))
+    }
+
+    /// Get current active fiber ID.
+    pub fn get_active_fiber_id(&self) -> u64 {
+        self.active_fiber_id.load(Ordering::Acquire)
+    }
+
+    /// Get total direct fiber switches executed.
+    pub fn get_total_switches(&self) -> u64 {
+        self.total_switches.load(Ordering::Acquire)
+    }
+
+    /// Access runlist.
+    pub fn runlist(&self) -> &FiberRunList {
+        &self.runlist
+    }
+
+    /// Retrieve fiber descriptor.
+    pub fn get_fiber(&self, fiber_id: u64) -> Option<DirectFiberDescriptor> {
+        self.fibers.lock().get(&fiber_id).cloned()
+    }
+}
+
+pub static DIRECT_FIBER_ENGINE: DirectFiberSwitchEngine = DirectFiberSwitchEngine::new();
