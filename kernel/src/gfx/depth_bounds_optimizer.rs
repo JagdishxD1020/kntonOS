@@ -299,3 +299,65 @@ impl StencilEarlyZRejectOptimizer {
         }
     }
 }
+
+// Combined runtime execution metrics for depth/stencil and bounds optimization passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DepthOptimizerMetrics {
+    pub total_draws_evaluated: u64,
+    pub draws_bounds_culled: u64,
+    pub fragments_early_z_culled: u64,
+    pub bandwidth_saved_megabytes: u64,
+}
+
+// Integrated Direct3D 12 Agility Dynamic Depth/Stencil and Depth Bounds Optimizer Engine.
+#[derive(Debug)]
+pub struct D3d12DepthBoundsOptimizerEngine {
+    pub discard_optimizer: DepthStencilDiscardOptimizer,
+    pub bounds_calculator: DynamicDepthBoundsCalculator,
+    pub stencil_optimizer: StencilEarlyZRejectOptimizer,
+    pub metrics: DepthOptimizerMetrics,
+}
+
+impl D3d12DepthBoundsOptimizerEngine {
+    pub fn new() -> Self {
+        Self {
+            discard_optimizer: DepthStencilDiscardOptimizer::new(),
+            bounds_calculator: DynamicDepthBoundsCalculator::new(),
+            stencil_optimizer: StencilEarlyZRejectOptimizer::default(),
+            metrics: DepthOptimizerMetrics::default(),
+        }
+    }
+
+    // Evaluates a subpass render target setup for memory discard opportunities.
+    pub fn optimize_subpass_targets(&mut self, attachment: &SubpassDepthStencilAttachment, surface_bytes: u64) {
+        self.discard_optimizer.evaluate_attachment(attachment, surface_bytes);
+        self.metrics.bandwidth_saved_megabytes = self.discard_optimizer.memory_bandwidth_saved_bytes / (1024 * 1024);
+    }
+
+    // Configures dynamic depth bounds for an active camera frustum and geometry cluster.
+    pub fn configure_depth_bounds(&mut self, frustum: ViewFrustumDepthRange, cluster_near: f32, cluster_far: f32) -> (f32, f32) {
+        self.bounds_calculator.calculate_tightened_bounds(frustum, cluster_near, cluster_far)
+    }
+
+    // Evaluates draw call bounds rejection against tightened depth bounds.
+    pub fn evaluate_draw_cluster(&mut self, cluster_min_z: f32, cluster_max_z: f32) -> bool {
+        self.metrics.total_draws_evaluated += 1;
+        // If cluster is entirely in front of or behind the tightened bounds, cull the draw
+        let can_cull = cluster_max_z < self.bounds_calculator.min_depth || cluster_min_z > self.bounds_calculator.max_depth;
+        if can_cull {
+            self.metrics.draws_bounds_culled += 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    // Evaluates fragment stencil against early-Z reject mask.
+    pub fn evaluate_fragment_stencil(&mut self, buffer_stencil: u8) -> bool {
+        let pass = self.stencil_optimizer.test_fragment_stencil(buffer_stencil);
+        if !pass {
+            self.metrics.fragments_early_z_culled += 1;
+        }
+        pass
+    }
+}
