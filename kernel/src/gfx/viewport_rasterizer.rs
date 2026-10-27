@@ -305,3 +305,65 @@ impl ViewportVrsCombiner {
         resolved
     }
 }
+
+// Coordinator metrics for dynamic viewport and precision rasterizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ViewportRasterizerMetrics {
+    pub total_draw_viewports_bound: u64,
+    pub total_viewport_flushes_saved: u64,
+    pub total_conservative_pixels: u64,
+    pub total_vrs_overrides_applied: u64,
+}
+
+// Integrated Direct3D 12 Agility Viewport, Conservative & Precision Rasterizer Governor.
+#[derive(Debug)]
+pub struct D3d12ViewportRasterizerGovernor {
+    pub state_cache: DynamicViewportStateCache,
+    pub conservative_gov: ConservativeRasterTier3Governor,
+    pub vrs_combiner: ViewportVrsCombiner,
+    pub metrics: ViewportRasterizerMetrics,
+}
+
+impl D3d12ViewportRasterizerGovernor {
+    pub fn new(conservative: bool, default_vrs: ViewportShadingRate) -> Self {
+        Self {
+            state_cache: DynamicViewportStateCache::new(),
+            conservative_gov: ConservativeRasterTier3Governor::new(conservative),
+            vrs_combiner: ViewportVrsCombiner::new(default_vrs, ViewportRateCombiner::Override),
+            metrics: ViewportRasterizerMetrics::default(),
+        }
+    }
+
+    // Dynamic viewport assignment with redundant flush suppression.
+    pub fn bind_viewports(&mut self, viewports: &[D3d12DynamicViewport]) -> bool {
+        self.metrics.total_draw_viewports_bound += 1;
+        let changed = self.state_cache.set_viewports(viewports);
+        if !changed {
+            self.metrics.total_viewport_flushes_saved += 1;
+        }
+        changed
+    }
+
+    // Dynamic scissor rect assignment with redundant flush suppression.
+    pub fn bind_scissor_rects(&mut self, scissors: &[D3d12DynamicScissorRect]) -> bool {
+        self.state_cache.set_scissor_rects(scissors)
+    }
+
+    // Evaluates conservative sub-pixel coverage for triangle.
+    pub fn rasterize_pixel_conservative(&mut self, tri: &TriangleRasterDesc, px: f32, py: f32) -> (bool, u16) {
+        let (covered, mask) = self.conservative_gov.evaluate_pixel_coverage(tri, px, py);
+        if covered {
+            self.metrics.total_conservative_pixels += 1;
+        }
+        (covered, mask)
+    }
+
+    // Resolves coarse shading rate for tile within active viewport.
+    pub fn resolve_tile_shading_rate(&mut self, tile_rate: ViewportShadingRate) -> ViewportShadingRate {
+        let resolved = self.vrs_combiner.combine_shading_rate(tile_rate);
+        if resolved != tile_rate {
+            self.metrics.total_vrs_overrides_applied += 1;
+        }
+        resolved
+    }
+}
