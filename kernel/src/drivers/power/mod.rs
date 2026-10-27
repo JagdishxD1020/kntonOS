@@ -27,6 +27,9 @@ pub use cooling_pump::*;
 pub use dual_battery::*;
 pub use fan_resonance::*;
 
+pub mod fast_charge_balance;
+pub use fast_charge_balance::*;
+
 /// Verification self-test suite for Handheld PC Dual-Battery Balance Manager & USB-PD 3.1 Extended Power Profile Engine.
 pub fn test_dual_battery_balance_subsystem() -> bool {
     crate::serial_write_str("[KNT-POWER] Testing dual-battery balance manager & USB-PD 3.1 EPR engine...\r\n");
