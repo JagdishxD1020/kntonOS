@@ -201,3 +201,83 @@ impl EvictionImmunityManager {
 }
 
 pub static EVICTION_IMMUNITY_MGR: EvictionImmunityManager = EvictionImmunityManager::new();
+
+pub const MEMORY_PRESSURE_TRIM_THRESHOLD_PERCENT: u32 = 85;
+
+/// Background Working Set Trimming Daemon activating when memory pressure exceeds 85%.
+pub struct WorkingSetTrimmingDaemon {
+    memory_pressure_percent: AtomicU32,
+    clock_pro: TwoHandedClockPro,
+    total_trimmed_pages: AtomicU64,
+    total_trim_cycles: AtomicU64,
+}
+
+impl WorkingSetTrimmingDaemon {
+    pub const fn new(max_hot_pages: usize) -> Self {
+        Self {
+            memory_pressure_percent: AtomicU32::new(0),
+            clock_pro: TwoHandedClockPro::new(max_hot_pages),
+            total_trimmed_pages: AtomicU64::new(0),
+            total_trim_cycles: AtomicU64::new(0),
+        }
+    }
+
+    /// Update current physical memory pressure level (0-100%).
+    pub fn update_memory_pressure(&self, percent: u32) {
+        self.memory_pressure_percent.store(percent, Ordering::Release);
+    }
+
+    /// Check if current memory pressure exceeds 85% activation threshold.
+    pub fn is_pressure_critical(&self) -> bool {
+        self.memory_pressure_percent.load(Ordering::Acquire) >= MEMORY_PRESSURE_TRIM_THRESHOLD_PERCENT
+    }
+
+    /// Access underlying Clock-Pro policy engine.
+    pub fn clock_pro(&self) -> &TwoHandedClockPro {
+        &self.clock_pro
+    }
+
+    /// Run background working set trimming cycle if memory pressure is critical.
+    pub fn run_trimming_cycle(&self, target_eviction_count: usize) -> usize {
+        if !self.is_pressure_critical() {
+            return 0;
+        }
+
+        self.total_trim_cycles.fetch_add(1, Ordering::Relaxed);
+        let mut evicted_count = 0;
+
+        for _ in 0..target_eviction_count {
+            match self.clock_pro.select_page_for_eviction() {
+                Some(page) => {
+                    // Check anti-cheat eviction immunity
+                    if EVICTION_IMMUNITY_MGR.is_address_immune(page.process_id, page.virtual_address) {
+                        // Re-insert as hot page to avoid eviction loop
+                        let mut protected_page = page;
+                        protected_page.page_type = ClockPageType::Hot;
+                        protected_page.immunity_flags = EVICTION_IMMUNITY_ANTI_CHEAT_GUARD;
+                        self.clock_pro.add_page(protected_page);
+                        continue;
+                    }
+
+                    evicted_count += 1;
+                    self.total_trimmed_pages.fetch_add(1, Ordering::Relaxed);
+                }
+                None => break,
+            }
+        }
+
+        evicted_count
+    }
+
+    /// Retrieve total count of trimmed/evicted pages.
+    pub fn get_total_trimmed_pages(&self) -> u64 {
+        self.total_trimmed_pages.load(Ordering::Acquire)
+    }
+
+    /// Retrieve total trimming cycles run.
+    pub fn get_total_trim_cycles(&self) -> u64 {
+        self.total_trim_cycles.load(Ordering::Acquire)
+    }
+}
+
+pub static WORKING_SET_TRIMMER: WorkingSetTrimmingDaemon = WorkingSetTrimmingDaemon::new(1024);
