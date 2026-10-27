@@ -181,3 +181,73 @@ impl NonBlockingQueryReadbackGovernor {
         }
     }
 }
+
+// Batched resolve command descriptor representing a single ResolveQueryData call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolveQueryCommand {
+    pub start_slot_index: u32,
+    pub num_queries: u32,
+    pub destination_buffer_offset: u64,
+}
+
+// Asynchronous query resolve engine batching ResolveQueryData commands across draw boundaries.
+#[derive(Debug)]
+pub struct AsyncQueryResolveEngine {
+    pub batched_commands: Vec<ResolveQueryCommand>,
+    pub max_batch_size: u32,
+    pub total_resolves_dispatched: u64,
+    pub total_queries_resolved: u64,
+}
+
+impl AsyncQueryResolveEngine {
+    pub fn new(max_batch_size: u32) -> Self {
+        Self {
+            batched_commands: Vec::new(),
+            max_batch_size,
+            total_resolves_dispatched: 0,
+            total_queries_resolved: 0,
+        }
+    }
+
+    // Enqueues a query slot for resolution, coalescing contiguous ranges.
+    pub fn enqueue_query_for_resolve(&mut self, slot_idx: u32, buffer_offset: u64) {
+        if let Some(last) = self.batched_commands.last_mut() {
+            let next_slot = last.start_slot_index + last.num_queries;
+            let next_offset = last.destination_buffer_offset + (last.num_queries as u64) * 8;
+            if next_slot == slot_idx && next_offset == buffer_offset && last.num_queries < self.max_batch_size {
+                last.num_queries += 1;
+                return;
+            }
+        }
+
+        self.batched_commands.push(ResolveQueryCommand {
+            start_slot_index: slot_idx,
+            num_queries: 1,
+            destination_buffer_offset: buffer_offset,
+        });
+    }
+
+    // Flushes all pending resolve commands and marks resolved query slots in the allocator.
+    pub fn flush_resolve_batches(&mut self, allocator: &mut CircularQueryHeapAllocator) -> usize {
+        let count = self.batched_commands.len();
+        for cmd in &self.batched_commands {
+            for q in 0..cmd.num_queries {
+                let idx = (cmd.start_slot_index + q) as usize;
+                if idx < allocator.slots.len() {
+                    let slot = &mut allocator.slots[idx];
+                    slot.state = QuerySlotState::Resolved;
+                    // Standard queries return mock sample count, binary queries return 0 or 1
+                    slot.samples_passed = match slot.query_type {
+                        OcclusionQueryType::Standard => 1024,
+                        OcclusionQueryType::Binary => 1,
+                    };
+                    self.total_queries_resolved += 1;
+                }
+            }
+            self.total_resolves_dispatched += 1;
+        }
+
+        self.batched_commands.clear();
+        count
+    }
+}
