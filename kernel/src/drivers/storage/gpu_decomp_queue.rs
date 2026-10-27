@@ -437,3 +437,220 @@ pub fn verify_hardware_copy_engine_and_vblank_pacing() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Real-Time Decompression Meter & I/O Priority Governor
+// ============================================================================
+
+/// DirectStorage I/O request priority class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IoRequestPriority {
+    /// Low priority background asset streaming (audio banks, distant skybox).
+    LowBackgroundBulk = 0,
+    /// Medium priority open-world terrain chunk streaming.
+    MediumWorldStream = 1,
+    /// High priority mipmap preloading for near-field camera motion.
+    HighMipmapPreload = 2,
+    /// Immediate frame-critical asset needed for current/next display frame.
+    ImmediateFrameCritical = 3,
+}
+
+/// Rolling window telemetry for DirectStorage GDeflate decompression throughput.
+#[derive(Debug, Clone)]
+pub struct DecompThroughputMeter {
+    pub sample_bytes: [u32; 16],
+    pub sample_duration_us: [u32; 16],
+    pub sample_head: usize,
+    pub sample_count: usize,
+    pub total_decompressed_bytes: u64,
+    pub total_decompression_time_us: u64,
+}
+
+impl DecompThroughputMeter {
+    pub const fn new() -> Self {
+        Self {
+            sample_bytes: [0; 16],
+            sample_duration_us: [0; 16],
+            sample_head: 0,
+            sample_count: 0,
+            total_decompressed_bytes: 0,
+            total_decompression_time_us: 0,
+        }
+    }
+
+    /// Record a completed decompression tile sample.
+    pub fn record_sample(&mut self, bytes: u32, duration_us: u32) {
+        if duration_us == 0 {
+            return;
+        }
+
+        self.sample_bytes[self.sample_head] = bytes;
+        self.sample_duration_us[self.sample_head] = duration_us;
+        self.sample_head = (self.sample_head + 1) % 16;
+        if self.sample_count < 16 {
+            self.sample_count += 1;
+        }
+
+        self.total_decompressed_bytes += bytes as u64;
+        self.total_decompression_time_us += duration_us as u64;
+    }
+
+    /// Calculate smoothed rolling throughput in Megabytes per second (MB/s).
+    pub fn rolling_throughput_mb_s(&self) -> u32 {
+        if self.sample_count == 0 {
+            return 0;
+        }
+
+        let mut sum_bytes: u64 = 0;
+        let mut sum_us: u64 = 0;
+        let mut i = 0;
+        while i < self.sample_count {
+            sum_bytes += self.sample_bytes[i] as u64;
+            sum_us += self.sample_duration_us[i] as u64;
+            i += 1;
+        }
+
+        if sum_us == 0 {
+            return 0;
+        }
+
+        // Throughput = (sum_bytes / sum_us) * 1_000_000 bytes/sec => / 1_000_000 = MB/s
+        (sum_bytes / sum_us) as u32
+    }
+
+    /// Calculate average decompression latency per tile in microseconds.
+    pub fn average_latency_us(&self) -> u32 {
+        if self.sample_count == 0 {
+            0
+        } else {
+            let mut sum_us: u64 = 0;
+            let mut i = 0;
+            while i < self.sample_count {
+                sum_us += self.sample_duration_us[i] as u64;
+                i += 1;
+            }
+            (sum_us / self.sample_count as u64) as u32
+        }
+    }
+}
+
+/// Governor preventing frame starvation by enforcing strict priority scheduling and aging anti-starvation.
+#[derive(Debug, Clone)]
+pub struct IoPriorityGovernor {
+    /// Starvation aging threshold in microseconds (e.g. 100 ms).
+    pub aging_threshold_us: u64,
+    /// Total priority promotion events to prevent starvation.
+    pub total_starvation_promotions: u64,
+    /// Total critical frame assets served without deadline miss.
+    pub critical_frames_served: u64,
+}
+
+impl IoPriorityGovernor {
+    pub const fn new() -> Self {
+        Self {
+            aging_threshold_us: 100_000, // 100 ms
+            total_starvation_promotions: 0,
+            critical_frames_served: 0,
+        }
+    }
+
+    /// Evaluate whether a queued entry should be promoted due to aging.
+    pub fn evaluate_aging(&mut self, priority: IoRequestPriority, queued_duration_us: u64) -> IoRequestPriority {
+        if queued_duration_us >= self.aging_threshold_us {
+            self.total_starvation_promotions += 1;
+            match priority {
+                IoRequestPriority::LowBackgroundBulk => IoRequestPriority::MediumWorldStream,
+                IoRequestPriority::MediumWorldStream => IoRequestPriority::HighMipmapPreload,
+                IoRequestPriority::HighMipmapPreload => IoRequestPriority::ImmediateFrameCritical,
+                IoRequestPriority::ImmediateFrameCritical => IoRequestPriority::ImmediateFrameCritical,
+            }
+        } else {
+            priority
+        }
+    }
+
+    /// Select the highest priority request index from candidate requests.
+    pub fn pick_highest_priority(
+        &mut self,
+        candidates: &[(usize, IoRequestPriority, u64)], // (index, priority, age_us)
+    ) -> Option<usize> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut best_idx = candidates[0].0;
+        let mut best_eff_prio = self.evaluate_aging(candidates[0].1, candidates[0].2);
+
+        for &(idx, prio, age_us) in candidates.iter().skip(1) {
+            let eff_prio = self.evaluate_aging(prio, age_us);
+            if eff_prio > best_eff_prio {
+                best_eff_prio = eff_prio;
+                best_idx = idx;
+            }
+        }
+
+        if best_eff_prio == IoRequestPriority::ImmediateFrameCritical {
+            self.critical_frames_served += 1;
+        }
+
+        Some(best_idx)
+    }
+}
+
+/// Verification test for real-time decompression throughput meter and I/O priority governor.
+pub fn verify_decomp_throughput_meter_and_priority_governor() -> bool {
+    let mut meter = DecompThroughputMeter::new();
+    let mut governor = IoPriorityGovernor::new();
+
+    // 1. Throughput meter verification: simulate 16 tiles of 64 KiB GDeflate decompressions taking 16 us each
+    // 65536 bytes / 16 us = 4096 bytes/us = 4096 MB/s (~4.1 GB/s)
+    for _ in 0..16 {
+        meter.record_sample(65536, 16);
+    }
+
+    let tp = meter.rolling_throughput_mb_s();
+    if tp != 4096 {
+        return false;
+    }
+    if meter.average_latency_us() != 16 {
+        return false;
+    }
+
+    // 2. Priority selection test
+    let candidates = [
+        (0, IoRequestPriority::LowBackgroundBulk, 10_000),      // Low, age 10ms
+        (1, IoRequestPriority::HighMipmapPreload, 20_000),      // High, age 20ms
+        (2, IoRequestPriority::MediumWorldStream, 15_000),     // Medium, age 15ms
+    ];
+
+    let selected = governor.pick_highest_priority(&candidates);
+    if selected != Some(1) {
+        // Must choose HighMipmapPreload (index 1)
+        return false;
+    }
+
+    // 3. Starvation avoidance promotion test: aged Low request (120 ms >= 100 ms threshold)
+    let aged_prio = governor.evaluate_aging(IoRequestPriority::LowBackgroundBulk, 120_000);
+    if aged_prio != IoRequestPriority::MediumWorldStream {
+        return false;
+    }
+    if governor.total_starvation_promotions == 0 {
+        return false;
+    }
+
+    // 4. Critical frame priority selection
+    let candidates_crit = [
+        (0, IoRequestPriority::HighMipmapPreload, 50_000),
+        (1, IoRequestPriority::ImmediateFrameCritical, 5_000),
+    ];
+    let selected_crit = governor.pick_highest_priority(&candidates_crit);
+    if selected_crit != Some(1) {
+        return false;
+    }
+    if governor.critical_frames_served == 0 {
+        return false;
+    }
+
+    true
+}
