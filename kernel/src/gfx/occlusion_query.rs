@@ -317,3 +317,62 @@ impl D3d12OcclusionQueryStreamer {
         recycled
     }
 }
+
+// Verification self-test suite for D3D12 Agility Dynamic Occlusion Query Streamer Engine.
+pub fn test_occlusion_query_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 dynamic occlusion query streamer engine...\r\n");
+
+    let mut streamer = D3d12OcclusionQueryStreamer::new(16, 8);
+
+    // 1. Verify standard and binary occlusion query slot allocation.
+    let slot0 = match streamer.begin_occlusion_query(OcclusionQueryType::Standard, 10) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let slot1 = match streamer.begin_occlusion_query(OcclusionQueryType::Binary, 10) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    if slot0 != 0 || slot1 != 1 {
+        return false;
+    }
+    if streamer.allocator.active_count != 2 {
+        return false;
+    }
+
+    // 2. Verify non-blocking readback governor when queries are still pending.
+    match streamer.poll_result(slot0) {
+        QueryReadbackStatus::Pending(fence) => {
+            if fence != 10 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 3. Verify batched query resolve engine.
+    streamer.queue_query_resolve(slot0, 0);
+    streamer.queue_query_resolve(slot1, 8);
+    let flushed = streamer.flush_resolves();
+    if flushed != 1 {
+        return false;
+    }
+    if streamer.allocator.slots[0].state != QuerySlotState::Resolved {
+        return false;
+    }
+
+    // 4. Advance timeline fence and verify non-blocking readback hits and recycling.
+    let recycled = streamer.advance_timeline(10);
+    if recycled != 2 {
+        return false;
+    }
+    if streamer.allocator.active_count != 0 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-OCCLUSION-QUERY-PASS] Direct3D 12 occlusion query streamer engine verified\r\n");
+
+    true
+}
