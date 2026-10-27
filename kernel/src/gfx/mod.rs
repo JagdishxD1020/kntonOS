@@ -68,6 +68,7 @@ pub mod raytracing_bvh;
 pub mod barrier_batcher;
 pub mod depth_bounds_optimizer;
 pub mod occlusion_query;
+pub mod viewport_rasterizer;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -136,6 +137,7 @@ pub use raytracing_bvh::*;
 pub use barrier_batcher::*;
 pub use depth_bounds_optimizer::*;
 pub use occlusion_query::*;
+pub use viewport_rasterizer::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
