@@ -209,3 +209,99 @@ impl ConservativeRasterTier3Governor {
         (touches_any, sample_mask)
     }
 }
+
+// Variable Rate Shading coarse pixel dimensions.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportShadingRate {
+    #[default]
+    Rate1x1 = 0,
+    Rate1x2 = 1,
+    Rate2x1 = 2,
+    Rate2x2 = 3,
+    Rate2x4 = 4,
+    Rate4x2 = 5,
+    Rate4x4 = 6,
+}
+
+impl ViewportShadingRate {
+    #[inline(always)]
+    pub const fn pixel_area(&self) -> u32 {
+        match self {
+            Self::Rate1x1 => 1,
+            Self::Rate1x2 | Self::Rate2x1 => 2,
+            Self::Rate2x2 => 4,
+            Self::Rate2x4 | Self::Rate4x2 => 8,
+            Self::Rate4x4 => 16,
+        }
+    }
+}
+
+// VRS shading rate combiners matching D3D12_SHADING_RATE_COMBINER.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportRateCombiner {
+    #[default]
+    Passthrough = 0,
+    Override = 1,
+    Min = 2,
+    Max = 3,
+    Sum = 4,
+}
+
+// Variable Rate Shading (VRS) Tier 2 tile combiner with viewport-level overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ViewportVrsCombiner {
+    pub viewport_override_rate: ViewportShadingRate,
+    pub combiner: ViewportRateCombiner,
+    pub total_tiles_evaluated: u64,
+    pub total_shading_rate_reductions: u64,
+}
+
+impl ViewportVrsCombiner {
+    pub fn new(rate: ViewportShadingRate, combiner: ViewportRateCombiner) -> Self {
+        Self {
+            viewport_override_rate: rate,
+            combiner,
+            total_tiles_evaluated: 0,
+            total_shading_rate_reductions: 0,
+        }
+    }
+
+    // Combines tile-level shading rate image sample with viewport override rate.
+    pub fn combine_shading_rate(&mut self, tile_rate: ViewportShadingRate) -> ViewportShadingRate {
+        self.total_tiles_evaluated += 1;
+        let ov = self.viewport_override_rate;
+
+        let resolved = match self.combiner {
+            ViewportRateCombiner::Passthrough => tile_rate,
+            ViewportRateCombiner::Override => ov,
+            ViewportRateCombiner::Min => {
+                if ov.pixel_area() < tile_rate.pixel_area() { ov } else { tile_rate }
+            }
+            ViewportRateCombiner::Max => {
+                if ov.pixel_area() > tile_rate.pixel_area() { ov } else { tile_rate }
+            }
+            ViewportRateCombiner::Sum => {
+                let combined_area = ov.pixel_area() * tile_rate.pixel_area();
+                if combined_area >= 16 {
+                    ViewportShadingRate::Rate4x4
+                } else if combined_area >= 8 {
+                    ViewportShadingRate::Rate4x2
+                } else if combined_area >= 4 {
+                    ViewportShadingRate::Rate2x2
+                } else if combined_area >= 2 {
+                    ViewportShadingRate::Rate2x1
+                } else {
+                    ViewportShadingRate::Rate1x1
+                }
+            }
+        };
+
+        if resolved.pixel_area() > 1 {
+            self.total_shading_rate_reductions += 1;
+        }
+
+        resolved
+    }
+}
