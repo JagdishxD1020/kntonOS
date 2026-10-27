@@ -137,3 +137,67 @@ impl TwoHandedClockPro {
         self.pages.lock().len()
     }
 }
+
+pub const EVICTION_IMMUNITY_NONE: u32 = 0x0000;
+pub const EVICTION_IMMUNITY_SIGNED_BINARY: u32 = 0x0001;
+pub const EVICTION_IMMUNITY_ENCRYPTED_SECTION: u32 = 0x0002;
+pub const EVICTION_IMMUNITY_HOOK_TRAMPOLINE: u32 = 0x0004;
+pub const EVICTION_IMMUNITY_ANTI_CHEAT_GUARD: u32 = 0x0008;
+
+/// Memory section eviction immunity descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionImmunityDescriptor {
+    pub process_id: u32,
+    pub section_base: u64,
+    pub section_size: usize,
+    pub immunity_flags: u32,
+}
+
+/// Anti-cheat memory protection governor enforcing page eviction immunity.
+pub struct EvictionImmunityManager {
+    protected_sections: Spinlock<Vec<SectionImmunityDescriptor>>,
+    total_evictions_blocked: AtomicU64,
+}
+
+impl EvictionImmunityManager {
+    pub const fn new() -> Self {
+        Self {
+            protected_sections: Spinlock::new(Vec::new()),
+            total_evictions_blocked: AtomicU64::new(0),
+        }
+    }
+
+    /// Register an immune memory section (signed executable, encrypted region, hook trampoline).
+    pub fn register_immune_section(&self, desc: SectionImmunityDescriptor) {
+        self.protected_sections.lock().push(desc);
+    }
+
+    /// Check if a virtual address has active eviction immunity.
+    pub fn is_address_immune(&self, process_id: u32, vaddr: u64) -> bool {
+        let list = self.protected_sections.lock();
+        for sec in list.iter() {
+            if sec.process_id == process_id
+                && vaddr >= sec.section_base
+                && vaddr < sec.section_base + sec.section_size as u64
+                && sec.immunity_flags != 0
+            {
+                self.total_evictions_blocked.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Retrieve total number of page evictions blocked by anti-cheat immunity.
+    pub fn get_blocked_evictions_count(&self) -> u64 {
+        self.total_evictions_blocked.load(Ordering::Acquire)
+    }
+
+    /// Clear all registered immune sections.
+    pub fn clear(&self) {
+        self.protected_sections.lock().clear();
+        self.total_evictions_blocked.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static EVICTION_IMMUNITY_MGR: EvictionImmunityManager = EvictionImmunityManager::new();
