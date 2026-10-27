@@ -654,3 +654,231 @@ pub fn verify_decomp_throughput_meter_and_priority_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: DirectStorage GPU Decompression Orchestrator Pipeline
+// ============================================================================
+
+/// Action determined by the orchestrator tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrchestratorAction {
+    /// No action required (idle or queues full).
+    Idle,
+    /// Dispatched NVMe read request for compressed tile.
+    DispatchedNvmeRead { request_id: u64, bytes: u32 },
+    /// Staged compressed tile dispatched to GPU compute queue for GDeflate decompression.
+    DispatchedGpuCompute { request_id: u64 },
+    /// DMA transfer deferred due to active display scanout bandwidth conservation.
+    DeferredForVBlank,
+}
+
+/// Integrated DirectStorage 1.2 GPU Decompression & Hardware Copy Orchestrator.
+#[derive(Debug, Clone)]
+pub struct DirectStorageGpuOrchestrator {
+    pub staging_queue: GDeflateStagingQueue,
+    pub dma_coordinator: HardwareCopyEngineCoordinator,
+    pub throughput_meter: DecompThroughputMeter,
+    pub priority_governor: IoPriorityGovernor,
+    pub request_priorities: [IoRequestPriority; MAX_STAGING_QUEUE_ENTRIES],
+    pub total_pipeline_dispatches: u64,
+}
+
+impl DirectStorageGpuOrchestrator {
+    pub const fn new() -> Self {
+        Self {
+            staging_queue: GDeflateStagingQueue::new(),
+            dma_coordinator: HardwareCopyEngineCoordinator::new(),
+            throughput_meter: DecompThroughputMeter::new(),
+            priority_governor: IoPriorityGovernor::new(),
+            request_priorities: [IoRequestPriority::MediumWorldStream; MAX_STAGING_QUEUE_ENTRIES],
+            total_pipeline_dispatches: 0,
+        }
+    }
+
+    /// Submit a high-speed game asset streaming request.
+    pub fn submit_request(
+        &mut self,
+        asset_id: u32,
+        lba: u64,
+        sectors: u32,
+        comp_phys: u64,
+        dest_vram: u64,
+        comp_bytes: u32,
+        uncomp_bytes: u32,
+        priority: IoRequestPriority,
+        time_us: u64,
+    ) -> Option<u64> {
+        let req_id = self.staging_queue.enqueue(
+            asset_id, lba, sectors, comp_phys, dest_vram, comp_bytes, uncomp_bytes, time_us,
+        )?;
+
+        // Record priority for this slot
+        for (i, entry) in self.staging_queue.entries.iter().enumerate() {
+            if entry.state == GDeflateStageState::Queued && entry.request_id == req_id {
+                self.request_priorities[i] = priority;
+                break;
+            }
+        }
+
+        Some(req_id)
+    }
+
+    /// Progress the storage-to-VRAM streaming pipeline by one scheduling tick.
+    pub fn orchestrate_tick(
+        &mut self,
+        current_time_us: u64,
+        is_vblank: bool,
+        bus_utilization_pct: u8,
+    ) -> OrchestratorAction {
+        self.dma_coordinator.update_pacing_mode(bus_utilization_pct, is_vblank);
+
+        // 1. First priority: Check if any GpuStaged entry can be dispatched to GPU GDeflate compute
+        for entry in self.staging_queue.entries.iter_mut() {
+            if entry.state == GDeflateStageState::GpuStaged {
+                entry.state = GDeflateStageState::Decompressing;
+                self.total_pipeline_dispatches += 1;
+                return OrchestratorAction::DispatchedGpuCompute {
+                    request_id: entry.request_id,
+                };
+            }
+        }
+
+        // 2. Second priority: Select highest-priority Queued request for NVMe DMA fetching
+        let mut candidates: [(usize, IoRequestPriority, u64); MAX_STAGING_QUEUE_ENTRIES] =
+            [(0, IoRequestPriority::LowBackgroundBulk, 0); MAX_STAGING_QUEUE_ENTRIES];
+        let mut candidate_count = 0;
+
+        for (i, entry) in self.staging_queue.entries.iter().enumerate() {
+            if entry.state == GDeflateStageState::Queued {
+                let age = if current_time_us > entry.submission_timestamp_us {
+                    current_time_us - entry.submission_timestamp_us
+                } else {
+                    0
+                };
+                candidates[candidate_count] = (i, self.request_priorities[i], age);
+                candidate_count += 1;
+            }
+        }
+
+        if candidate_count == 0 {
+            return OrchestratorAction::Idle;
+        }
+
+        if let Some(best_entry_idx) = self
+            .priority_governor
+            .pick_highest_priority(&candidates[0..candidate_count])
+        {
+            let entry = &self.staging_queue.entries[best_entry_idx];
+            let req_id = entry.request_id;
+            let comp_bytes = entry.compressed_bytes;
+
+            // Check if hardware DMA engine permits transfer now or defers for VBLANK
+            let (allowed, slice_size) = self.dma_coordinator.can_dispatch_dma(comp_bytes, is_vblank);
+
+            if allowed {
+                self.staging_queue.entries[best_entry_idx].state = GDeflateStageState::NvmeInFlight;
+                self.dma_coordinator.record_dma_transfer(slice_size);
+                self.total_pipeline_dispatches += 1;
+                return OrchestratorAction::DispatchedNvmeRead {
+                    request_id: req_id,
+                    bytes: slice_size,
+                };
+            } else {
+                return OrchestratorAction::DeferredForVBlank;
+            }
+        }
+
+        OrchestratorAction::Idle
+    }
+
+    /// Complete a GPU decompression tile, update throughput metrics, and retire request.
+    pub fn complete_tile(&mut self, request_id: u64, completion_time_us: u64) -> bool {
+        let start_time = self
+            .staging_queue
+            .find_entry_mut(request_id)
+            .map(|e| e.submission_timestamp_us)
+            .unwrap_or(completion_time_us);
+
+        let duration = if completion_time_us > start_time {
+            (completion_time_us - start_time) as u32
+        } else {
+            1
+        };
+
+        if let Some(uncomp_bytes) = self
+            .staging_queue
+            .on_gpu_decomp_complete(request_id, completion_time_us)
+        {
+            self.throughput_meter.record_sample(uncomp_bytes, duration);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Verification test for DirectStorage GPU decompression orchestrator pipeline.
+pub fn verify_gpu_decomp_orchestrator_pipeline() -> bool {
+    let mut orchestrator = DirectStorageGpuOrchestrator::new();
+
+    // 1. Submit two streaming tiles: one background, one immediate frame critical
+    let req_bg = orchestrator.submit_request(
+        201, 1000, 64, 0x1_0000_0000, 0xE_0000_0000, 32768, 65536,
+        IoRequestPriority::LowBackgroundBulk, 10_000,
+    );
+    let req_crit = orchestrator.submit_request(
+        202, 2000, 64, 0x1_0001_0000, 0xE_0001_0000, 32768, 65536,
+        IoRequestPriority::ImmediateFrameCritical, 10_005,
+    );
+
+    if req_bg.is_none() || req_crit.is_none() {
+        return false;
+    }
+    let req_crit_id = req_crit.unwrap();
+
+    // 2. Tick during active scanout with high bus load (85% bus load, not in VBLANK)
+    // Priority governor selects critical request, but DMA coordinator defers because of active scanout contention
+    let act1 = orchestrator.orchestrate_tick(10_010, false, 85);
+    if act1 != OrchestratorAction::DeferredForVBlank {
+        return false;
+    }
+
+    // 3. VBLANK interrupt arrives (is_vblank = true): critical request dispatched first!
+    let act2 = orchestrator.orchestrate_tick(10_015, true, 85);
+    match act2 {
+        OrchestratorAction::DispatchedNvmeRead { request_id, bytes } => {
+            if request_id != req_crit_id || bytes != 32768 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 4. Simulate NVMe DMA read completion for critical tile
+    if !orchestrator.staging_queue.on_nvme_transfer_complete(req_crit_id) {
+        return false;
+    }
+
+    // 5. Next tick dispatches GpuStaged tile to GPU GDeflate compute
+    let act3 = orchestrator.orchestrate_tick(10_020, false, 50);
+    match act3 {
+        OrchestratorAction::DispatchedGpuCompute { request_id } => {
+            if request_id != req_crit_id {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 6. Complete GPU decompression tile
+    if !orchestrator.complete_tile(req_crit_id, 10_036) {
+        return false;
+    }
+
+    if orchestrator.throughput_meter.total_decompressed_bytes != 65536 {
+        return false;
+    }
+
+    true
+}
