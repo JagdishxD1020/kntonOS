@@ -267,3 +267,173 @@ pub fn verify_gdeflate_staging_queue_and_nvme_ring() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Hardware Copy Engine & DMA Queue Coordinator with VBLANK Pacing
+// ============================================================================
+
+/// Pacing mode governing hardware copy engine DMA submissions to eliminate display scanout contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmaPacingMode {
+    /// Bus utilization < 60%: Unrestricted DMA transfer batches.
+    Unconstrained,
+    /// Bus utilization 60% - 80%: Sliced transfers (64 KiB max) during active scanout.
+    ScanoutPaced,
+    /// Bus utilization > 80%: Bulk DMA transfers deferred to Vertical Blanking Intervals (VBLANK).
+    VBlankBurstOnly,
+    /// Bus utilization > 92%: Immediate DMA pause to prevent display FIFO underrun and frame drop.
+    EmergencyThrottled,
+}
+
+/// Sliced DMA copy descriptor for hardware copy engines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DmaTransferSlice {
+    pub slice_id: u64,
+    pub source_phys: u64,
+    pub dest_phys: u64,
+    pub bytes_to_copy: u32,
+    pub bytes_copied: u32,
+    pub is_complete: bool,
+}
+
+/// Hardware Copy Engine and DMA Queue Submission Coordinator.
+#[derive(Debug, Clone)]
+pub struct HardwareCopyEngineCoordinator {
+    pub pacing_mode: DmaPacingMode,
+    pub max_slice_bytes: u32,
+    pub vblank_burst_max_bytes: u32,
+    pub total_slices_dispatched: u64,
+    pub vblank_bursts_executed: u64,
+    pub active_scanout_throttles: u64,
+    pub total_dma_bytes_transferred: u64,
+}
+
+impl HardwareCopyEngineCoordinator {
+    pub const fn new() -> Self {
+        Self {
+            pacing_mode: DmaPacingMode::Unconstrained,
+            max_slice_bytes: 65536, // 64 KiB slice
+            vblank_burst_max_bytes: 524288, // 512 KiB burst
+            total_slices_dispatched: 0,
+            vblank_bursts_executed: 0,
+            active_scanout_throttles: 0,
+            total_dma_bytes_transferred: 0,
+        }
+    }
+
+    /// Update pacing mode based on current PCIe/memory fabric load and display scanout state.
+    pub fn update_pacing_mode(&mut self, bus_utilization_pct: u8, _is_vblank: bool) -> DmaPacingMode {
+        self.pacing_mode = if bus_utilization_pct >= 92 {
+            DmaPacingMode::EmergencyThrottled
+        } else if bus_utilization_pct >= 80 {
+            DmaPacingMode::VBlankBurstOnly
+        } else if bus_utilization_pct >= 60 {
+            DmaPacingMode::ScanoutPaced
+        } else {
+            DmaPacingMode::Unconstrained
+        };
+
+        self.pacing_mode
+    }
+
+    /// Determine whether a DMA transfer slice can be dispatched immediately or must wait for VBLANK.
+    ///
+    /// Returns `(allowed: bool, slice_bytes: u32)`.
+    pub fn can_dispatch_dma(&mut self, transfer_bytes: u32, is_vblank: bool) -> (bool, u32) {
+        match self.pacing_mode {
+            DmaPacingMode::EmergencyThrottled => {
+                self.active_scanout_throttles += 1;
+                (false, 0)
+            }
+            DmaPacingMode::VBlankBurstOnly => {
+                if is_vblank {
+                    let burst_size = transfer_bytes.min(self.vblank_burst_max_bytes);
+                    self.vblank_bursts_executed += 1;
+                    (true, burst_size)
+                } else {
+                    self.active_scanout_throttles += 1;
+                    (false, 0)
+                }
+            }
+            DmaPacingMode::ScanoutPaced => {
+                if is_vblank {
+                    let burst_size = transfer_bytes.min(self.vblank_burst_max_bytes);
+                    self.vblank_bursts_executed += 1;
+                    (true, burst_size)
+                } else {
+                    let slice = transfer_bytes.min(self.max_slice_bytes);
+                    (true, slice)
+                }
+            }
+            DmaPacingMode::Unconstrained => {
+                let slice = transfer_bytes.min(self.vblank_burst_max_bytes);
+                (true, slice)
+            }
+        }
+    }
+
+    /// Record completed DMA slice transfer telemetry.
+    pub fn record_dma_transfer(&mut self, bytes_transferred: u32) {
+        self.total_slices_dispatched += 1;
+        self.total_dma_bytes_transferred += bytes_transferred as u64;
+    }
+}
+
+/// Verification test for hardware copy engine and DMA coordinator with display VBLANK pacing.
+pub fn verify_hardware_copy_engine_and_vblank_pacing() -> bool {
+    let mut coordinator = HardwareCopyEngineCoordinator::new();
+
+    // 1. Initial unconstrained state (45% bus utilization)
+    let mode1 = coordinator.update_pacing_mode(45, false);
+    if mode1 != DmaPacingMode::Unconstrained {
+        return false;
+    }
+    let (allow1, size1) = coordinator.can_dispatch_dma(131072, false);
+    if !allow1 || size1 != 131072 {
+        return false;
+    }
+    coordinator.record_dma_transfer(size1);
+
+    // 2. High bus utilization during active scanout (85% bus load, not in VBLANK)
+    // Must prevent display memory underrun by deferring DMA to VBLANK
+    let mode2 = coordinator.update_pacing_mode(85, false);
+    if mode2 != DmaPacingMode::VBlankBurstOnly {
+        return false;
+    }
+    let (allow2, _) = coordinator.can_dispatch_dma(262144, false);
+    if allow2 {
+        // Must NOT allow DMA while scanout is active at 85% bus load
+        return false;
+    }
+    if coordinator.active_scanout_throttles == 0 {
+        return false;
+    }
+
+    // 3. VBLANK interrupt arrives (is_vblank = true): burst transfer allowed
+    let (allow3, size3) = coordinator.can_dispatch_dma(262144, true);
+    if !allow3 || size3 != 262144 {
+        return false;
+    }
+    if coordinator.vblank_bursts_executed != 1 {
+        return false;
+    }
+    coordinator.record_dma_transfer(size3);
+
+    // 4. Moderate bus load (70%): sliced transfers during scanout
+    coordinator.update_pacing_mode(70, false);
+    let (allow4, size4) = coordinator.can_dispatch_dma(262144, false);
+    if !allow4 || size4 != 65536 {
+        // Must slice to 64 KiB
+        return false;
+    }
+
+    // 5. Emergency throttling (>92% bus saturation): total pause
+    coordinator.update_pacing_mode(95, true);
+    let (allow5, _) = coordinator.can_dispatch_dma(65536, true);
+    if allow5 {
+        return false;
+    }
+
+    true
+}
