@@ -110,6 +110,7 @@ pub use threadpool_steal::test_win32_threadpool_steal_subsystem;
 pub use wait_on_address::test_win32_wait_on_address_subsystem;
 pub use enclave_callgate::test_win32_enclave_callgate_subsystem;
 pub use crash_telemetry::test_win32_crash_telemetry_subsystem;
+pub use direct_fiber_switch::test_win32_direct_fiber_switch_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
