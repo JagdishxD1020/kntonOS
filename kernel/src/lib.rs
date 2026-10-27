@@ -1331,6 +1331,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_crash_telemetry_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Crash Telemetry subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Direct Fiber Context Switch & State Machine (TASK-KNT-298)
+    if !pe::test_win32_direct_fiber_switch_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Direct Fiber Switch subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
