@@ -251,3 +251,69 @@ impl AsyncQueryResolveEngine {
         count
     }
 }
+
+// Coordinator statistics for occlusion query streamer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OcclusionStreamerMetrics {
+    pub total_queries_allocated: u64,
+    pub total_resolves_flushed: u64,
+    pub total_readbacks_polled: u64,
+    pub total_queries_recycled: u64,
+}
+
+// Integrated Direct3D 12 Agility Dynamic Occlusion Query Streamer Engine.
+#[derive(Debug)]
+pub struct D3d12OcclusionQueryStreamer {
+    pub allocator: CircularQueryHeapAllocator,
+    pub readback_governor: NonBlockingQueryReadbackGovernor,
+    pub resolve_engine: AsyncQueryResolveEngine,
+    pub metrics: OcclusionStreamerMetrics,
+}
+
+impl D3d12OcclusionQueryStreamer {
+    pub fn new(capacity: u32, max_resolve_batch: u32) -> Self {
+        Self {
+            allocator: CircularQueryHeapAllocator::new(capacity),
+            readback_governor: NonBlockingQueryReadbackGovernor::new(),
+            resolve_engine: AsyncQueryResolveEngine::new(max_resolve_batch),
+            metrics: OcclusionStreamerMetrics::default(),
+        }
+    }
+
+    // Begins an occlusion query slot associated with a draw call.
+    pub fn begin_occlusion_query(&mut self, query_type: OcclusionQueryType, fence_tag: u64) -> Result<u32, &'static str> {
+        let slot = self.allocator.allocate_query(query_type, fence_tag)?;
+        self.metrics.total_queries_allocated += 1;
+        Ok(slot)
+    }
+
+    // Queues slot for asynchronous resolution into GPU buffer.
+    pub fn queue_query_resolve(&mut self, slot_idx: u32, buffer_offset: u64) {
+        self.resolve_engine.enqueue_query_for_resolve(slot_idx, buffer_offset);
+    }
+
+    // Flushes all pending resolve batches.
+    pub fn flush_resolves(&mut self) -> usize {
+        let count = self.resolve_engine.flush_resolve_batches(&mut self.allocator);
+        self.metrics.total_resolves_flushed += count as u64;
+        count
+    }
+
+    // Non-blocking poll of query result.
+    pub fn poll_result(&mut self, slot_idx: u32) -> QueryReadbackStatus {
+        self.metrics.total_readbacks_polled += 1;
+        if (slot_idx as usize) < self.allocator.slots.len() {
+            self.readback_governor.poll_query_result(&self.allocator.slots[slot_idx as usize])
+        } else {
+            QueryReadbackStatus::NotAllocated
+        }
+    }
+
+    // Recycles completed queries based on timeline fence value.
+    pub fn advance_timeline(&mut self, fence_value: u64) -> u32 {
+        self.readback_governor.signal_fence(fence_value);
+        let recycled = self.allocator.advance_tail_with_fence(fence_value);
+        self.metrics.total_queries_recycled += recycled as u64;
+        recycled
+    }
+}
