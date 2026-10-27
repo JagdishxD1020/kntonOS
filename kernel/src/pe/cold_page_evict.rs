@@ -281,3 +281,102 @@ impl WorkingSetTrimmingDaemon {
 }
 
 pub static WORKING_SET_TRIMMER: WorkingSetTrimmingDaemon = WorkingSetTrimmingDaemon::new(1024);
+
+/// Comprehensive self-test suite for Win32 Working Set Trimming & Clock-Pro Eviction Engine.
+pub fn test_win32_cold_page_evict_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-PAGE-EVICT] Initializing Win32 Working Set Page Trimming & Eviction self-test...\r\n");
+
+    // 1. Verify Two-Handed Clock-Pro Page Replacement Policy
+    let clock = TwoHandedClockPro::new(16);
+    let mut p1 = ClockPageDescriptor::new(0x0000_0001_0000_1000, 10, false);
+    p1.referenced = false; // Cold, unreferenced page
+    let p2 = ClockPageDescriptor::new(0x0000_0001_0000_2000, 10, true); // Hot page
+
+    clock.add_page(p1);
+    clock.add_page(p2);
+
+    if clock.resident_count() != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Clock-Pro initial resident count mismatch\r\n");
+        return false;
+    }
+
+    // Evict cold page
+    let evicted = clock.select_page_for_eviction();
+    match evicted {
+        Some(ev) => {
+            if ev.virtual_address != 0x0000_0001_0000_1000 {
+                crate::serial_write_str("[KNT-TEST-ERR] Clock-Pro did not evict expected unreferenced cold page\r\n");
+                return false;
+            }
+        }
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Clock-Pro failed to evict page\r\n");
+            return false;
+        }
+    }
+
+    if clock.resident_count() != 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Clock-Pro resident count after eviction mismatch\r\n");
+        return false;
+    }
+
+    // 2. Verify Anti-Cheat Eviction Immunity
+    let protected_sec = SectionImmunityDescriptor {
+        process_id: 42,
+        section_base: 0x0000_0000_0040_0000,
+        section_size: 64 * 1024,
+        immunity_flags: EVICTION_IMMUNITY_SIGNED_BINARY | EVICTION_IMMUNITY_HOOK_TRAMPOLINE,
+    };
+    EVICTION_IMMUNITY_MGR.register_immune_section(protected_sec);
+
+    if !EVICTION_IMMUNITY_MGR.is_address_immune(42, 0x0000_0000_0040_2000) {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat section immunity check failed for signed binary\r\n");
+        return false;
+    }
+
+    if EVICTION_IMMUNITY_MGR.is_address_immune(42, 0x0000_7FFF_1000_0000) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unprotected address incorrectly reported immune\r\n");
+        return false;
+    }
+
+    // 3. Verify Background Working Set Trimming Daemon & 85% Pressure Threshold
+    WORKING_SET_TRIMMER.update_memory_pressure(70);
+    if WORKING_SET_TRIMMER.is_pressure_critical() {
+        crate::serial_write_str("[KNT-TEST-ERR] Trimmer reported critical pressure below 85%\r\n");
+        return false;
+    }
+
+    // Running trimming below threshold should evict 0 pages
+    let low_pressure_evictions = WORKING_SET_TRIMMER.run_trimming_cycle(5);
+    if low_pressure_evictions != 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Trimmer executed evictions below critical threshold\r\n");
+        return false;
+    }
+
+    // Add pages to trimmer clock
+    let mut trim_p1 = ClockPageDescriptor::new(0x0000_7FFF_8000_0000, 42, false);
+    trim_p1.referenced = false; // Normal cold page
+    let mut trim_p2 = ClockPageDescriptor::new(0x0000_0000_0040_4000, 42, false);
+    trim_p2.referenced = false; // Cold page located inside protected signed section
+
+    WORKING_SET_TRIMMER.clock_pro().add_page(trim_p1);
+    WORKING_SET_TRIMMER.clock_pro().add_page(trim_p2);
+
+    // Trigger critical memory pressure (90% > 85%)
+    WORKING_SET_TRIMMER.update_memory_pressure(90);
+    if !WORKING_SET_TRIMMER.is_pressure_critical() {
+        crate::serial_write_str("[KNT-TEST-ERR] Trimmer failed to detect critical pressure at 90%\r\n");
+        return false;
+    }
+
+    let initial_trimmed = WORKING_SET_TRIMMER.get_total_trimmed_pages();
+    let trimmed = WORKING_SET_TRIMMER.run_trimming_cycle(2);
+
+    if trimmed == 0 || WORKING_SET_TRIMMER.get_total_trimmed_pages() != initial_trimmed + (trimmed as u64) {
+        crate::serial_write_str("[KNT-TEST-ERR] Trimming cycle failed to evict candidate pages\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-PAGE-EVICT-PASS] Win32 Working Set Page Trimming & Clock-Pro Eviction verified\r\n");
+    true
+}
