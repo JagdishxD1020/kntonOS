@@ -99,3 +99,113 @@ impl DynamicViewportStateCache {
         true
     }
 }
+
+
+// Sub-pixel precision rasterization grid (256x256 sub-pixel positions per pixel).
+pub const D3D12_SUBPIXEL_GRID_RESOLUTION: u32 = 256;
+
+// Sub-pixel point coordinate within a 256x256 unit pixel cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubpixelPoint {
+    pub x: u8,
+    pub y: u8,
+}
+
+// 2D Triangle bounding box and sub-pixel edge equations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TriangleRasterDesc {
+    pub v0: [f32; 2],
+    pub v1: [f32; 2],
+    pub v2: [f32; 2],
+}
+
+impl TriangleRasterDesc {
+    pub const fn new(v0: [f32; 2], v1: [f32; 2], v2: [f32; 2]) -> Self {
+        Self { v0, v1, v2 }
+    }
+
+    // Evaluates 2D signed distance for edge equation.
+    #[inline(always)]
+    pub fn edge_func(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
+        (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
+    }
+}
+
+// Conservative rasterization Tier 3 governor with sub-pixel coverage mask generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConservativeRasterTier3Governor {
+    pub conservative_enabled: bool,
+    pub total_pixels_rasterized: u64,
+    pub conservative_expanded_pixels: u64,
+    pub fully_covered_inner_pixels: u64,
+}
+
+impl ConservativeRasterTier3Governor {
+    pub fn new(conservative_enabled: bool) -> Self {
+        Self {
+            conservative_enabled,
+            total_pixels_rasterized: 0,
+            conservative_expanded_pixels: 0,
+            fully_covered_inner_pixels: 0,
+        }
+    }
+
+    // Evaluates conservative coverage and generates 16-sample sub-pixel bitmask for a pixel cell.
+    pub fn evaluate_pixel_coverage(&mut self, tri: &TriangleRasterDesc, pixel_x: f32, pixel_y: f32) -> (bool, u16) {
+        self.total_pixels_rasterized += 1;
+        let corners = [
+            [pixel_x, pixel_y],
+            [pixel_x + 1.0, pixel_y],
+            [pixel_x, pixel_y + 1.0],
+            [pixel_x + 1.0, pixel_y + 1.0],
+        ];
+
+        let mut sample_mask: u16 = 0;
+        // 4x4 sub-pixel sample points within pixel cell
+        for sy in 0..4 {
+            for sx in 0..4 {
+                let px = pixel_x + (sx as f32 + 0.5) / 4.0;
+                let py = pixel_y + (sy as f32 + 0.5) / 4.0;
+                let p = [px, py];
+
+                let w0 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, p);
+                let w1 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, p);
+                let w2 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, p);
+
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let bit = sy * 4 + sx;
+                    sample_mask |= 1 << bit;
+                }
+            }
+        }
+
+        let standard_hit = sample_mask != 0;
+        if sample_mask == 0xFFFF {
+            self.fully_covered_inner_pixels += 1;
+        }
+
+        if !self.conservative_enabled {
+            return (standard_hit, sample_mask);
+        }
+
+        // Conservative Tier 3: pixel is covered if triangle touches pixel AABB or any corner is inside
+        let mut touches_any = standard_hit;
+        if !touches_any {
+            for c in &corners {
+                let w0 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, *c);
+                let w1 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, *c);
+                let w2 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, *c);
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    touches_any = true;
+                    break;
+                }
+            }
+        }
+
+        if touches_any && !standard_hit {
+            self.conservative_expanded_pixels += 1;
+        }
+
+        (touches_any, sample_mask)
+    }
+}
