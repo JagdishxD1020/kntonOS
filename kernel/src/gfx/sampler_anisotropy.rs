@@ -322,3 +322,91 @@ impl D3d12DynamicSamplerGovernor {
         Ok(slot)
     }
 }
+
+// Verification self-test suite for D3D12 Agility Dynamic Sampler LOD Bias & Anisotropy Governor.
+pub fn test_sampler_anisotropy_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 dynamic sampler LOD bias & anisotropy governor...\r\n");
+
+    let mut governor = D3d12DynamicSamplerGovernor::new(2.5, 16, 64);
+
+    // 1. Normal state: no thermal pressure, no bandwidth saturation.
+    let normal_perf = GpuPerformanceState::new(16.0, 16.6, 65.0, 85.0);
+    let normal_bw = MemoryBandwidthState::new(0.50, 0.85);
+    let angle_flat = SurfaceViewAngle::new(20.0);
+
+    let slot0 = match governor.resolve_tuned_sampler(DynamicFilterType::Anisotropic, angle_flat, &normal_perf, &normal_bw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if slot0 != 0 {
+        return false;
+    }
+    if governor.lod_governor.current_injected_bias != 0.0 {
+        return false;
+    }
+    if governor.aniso_governor.active_anisotropy_level != 1 {
+        return false;
+    }
+
+    // 2. High grazing angle (75 deg) with no BW pressure -> Anisotropy should be 16x.
+    let angle_steep = SurfaceViewAngle::new(80.0);
+    let slot1 = match governor.resolve_tuned_sampler(DynamicFilterType::Anisotropic, angle_steep, &normal_perf, &normal_bw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if slot1 != 1 {
+        return false;
+    }
+    if governor.aniso_governor.active_anisotropy_level != 16 {
+        return false;
+    }
+
+    // 3. High grazing angle under memory bandwidth saturation -> Anisotropy should be throttled to 8x.
+    let saturated_bw = MemoryBandwidthState::new(0.92, 0.85);
+    let slot2 = match governor.resolve_tuned_sampler(DynamicFilterType::Anisotropic, angle_steep, &normal_perf, &saturated_bw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if slot2 != 2 {
+        return false;
+    }
+    if governor.aniso_governor.active_anisotropy_level != 8 {
+        return false;
+    }
+    if governor.metrics.total_anisotropy_throttles != 1 {
+        return false;
+    }
+
+    // 4. Heavy load / thermal throttle -> LOD bias injection active.
+    let heavy_perf = GpuPerformanceState::new(25.0, 16.6, 84.0, 85.0);
+    let slot3 = match governor.resolve_tuned_sampler(DynamicFilterType::Linear, angle_flat, &heavy_perf, &normal_bw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if slot3 != 3 {
+        return false;
+    }
+    if governor.lod_governor.current_injected_bias <= 0.0 {
+        return false;
+    }
+    if governor.metrics.total_lod_biases_injected != 1 {
+        return false;
+    }
+
+    // 5. Deduplication hit: request same parameters as slot0.
+    let slot0_reuse = match governor.resolve_tuned_sampler(DynamicFilterType::Anisotropic, angle_flat, &normal_perf, &normal_bw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if slot0_reuse != slot0 {
+        return false;
+    }
+    if governor.descriptor_optimizer.deduplication_hits != 1 {
+        return false;
+    }
+
+    // 6. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-SAMPLER-ANISO-PASS] Direct3D 12 dynamic sampler LOD bias and anisotropy governor verified\r\n");
+
+    true
+}
