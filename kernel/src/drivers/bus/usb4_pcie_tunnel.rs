@@ -499,3 +499,154 @@ pub fn verify_pcie_dma_hotplug_arbiter_and_link_retraining() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Bandwidth Credit-Based QoS Governor (DisplayPort & PCIe)
+// ============================================================================
+
+pub const BYTES_PER_QOS_CREDIT: u32 = 128;
+pub const EPOCHS_PER_SECOND: u32 = 8000; // 125 us micro-frame epoch
+
+/// Bandwidth Credit-Based Quality of Service (QoS) Governor.
+///
+/// Prevents high-bandwidth eGPU DMA / NVMe storage traffic from starving isochronous
+/// DisplayPort video streams on shared 40Gbps USB4 / Thunderbolt 4 links.
+#[derive(Debug, Clone)]
+pub struct BandwidthCreditQosGovernor {
+    pub total_link_mbps: u32,
+    pub dp_reserved_mbps: u32,
+    pub dp_credits_per_epoch: u32,
+    pub pcie_credits_per_epoch: u32,
+    pub dp_credits_remaining: u32,
+    pub pcie_credits_remaining: u32,
+    pub borrowed_dp_credits_by_pcie: u32,
+    pub total_epochs_replenished: u64,
+    pub pcie_throttled_events: u64,
+    pub dp_starvation_prevented_events: u64,
+}
+
+impl BandwidthCreditQosGovernor {
+    pub fn new(total_link_mbps: u32, dp_reserved_mbps: u32) -> Self {
+        let clamped_dp = dp_reserved_mbps.min(total_link_mbps * 80 / 100);
+        let pcie_mbps = total_link_mbps - clamped_dp;
+
+        // Convert Mbps to credits per 125us epoch
+        // Credits/sec = (Mbps * 1_000_000) / (8 * 128)
+        // Credits/epoch = Credits/sec / 8000 = (Mbps * 1000) / 1024
+        let dp_credits = (clamped_dp * 1000) / 1024;
+        let pcie_credits = (pcie_mbps * 1000) / 1024;
+
+        Self {
+            total_link_mbps,
+            dp_reserved_mbps: clamped_dp,
+            dp_credits_per_epoch: dp_credits,
+            pcie_credits_per_epoch: pcie_credits,
+            dp_credits_remaining: dp_credits,
+            pcie_credits_remaining: pcie_credits,
+            borrowed_dp_credits_by_pcie: 0,
+            total_epochs_replenished: 0,
+            pcie_throttled_events: 0,
+            dp_starvation_prevented_events: 0,
+        }
+    }
+
+    /// Replenish credit pools at each 125 us micro-frame epoch boundary.
+    pub fn replenish_epoch(&mut self) {
+        self.dp_credits_remaining = self.dp_credits_per_epoch;
+        self.pcie_credits_remaining = self.pcie_credits_per_epoch;
+        self.borrowed_dp_credits_by_pcie = 0;
+        self.total_epochs_replenished += 1;
+    }
+
+    /// Request credit authorization for an isochronous DisplayPort video transport packet.
+    pub fn authorize_dp_transmission(&mut self, bytes: u32) -> bool {
+        let credits_needed = (bytes + BYTES_PER_QOS_CREDIT - 1) / BYTES_PER_QOS_CREDIT;
+        if self.dp_credits_remaining >= credits_needed {
+            self.dp_credits_remaining -= credits_needed;
+            true
+        } else {
+            // Under unexpected DP burst, grant from emergency link margin
+            self.dp_starvation_prevented_events += 1;
+            self.dp_credits_remaining = 0;
+            true
+        }
+    }
+
+    /// Request credit authorization for tunneled PCIe DMA / eGPU traffic.
+    pub fn authorize_pcie_transmission(&mut self, bytes: u32, is_high_priority: bool) -> bool {
+        let credits_needed = (bytes + BYTES_PER_QOS_CREDIT - 1) / BYTES_PER_QOS_CREDIT;
+
+        // 1. Primary allocation from PCIe credit pool
+        if self.pcie_credits_remaining >= credits_needed {
+            self.pcie_credits_remaining -= credits_needed;
+            return true;
+        }
+
+        // 2. Secondary allocation: High-priority PCIe can borrow idle DP credits if available
+        if is_high_priority && self.dp_credits_remaining > credits_needed * 2 {
+            let borrow = credits_needed;
+            self.dp_credits_remaining -= borrow;
+            self.borrowed_dp_credits_by_pcie += borrow;
+            return true;
+        }
+
+        // 3. Throttle PCIe to protect DisplayPort real-time stream
+        self.pcie_throttled_events += 1;
+        false
+    }
+}
+
+/// Verification test for bandwidth credit-based QoS governor.
+pub fn verify_credit_based_qos_governor() -> bool {
+    let mut qos = BandwidthCreditQosGovernor::new(40000, 21600); // 40 Gbps link, 21.6 Gbps DP reservation
+
+    // 1. Verify initial credit distribution
+    if qos.dp_credits_per_epoch == 0 || qos.pcie_credits_per_epoch == 0 {
+        return false;
+    }
+    // DP should have ~21093 credits, PCIe ~17968 credits
+    if qos.dp_credits_per_epoch <= qos.pcie_credits_per_epoch {
+        return false;
+    }
+
+    // 2. DisplayPort traffic consumption
+    let dp_packet_bytes = 1024; // 8 credits
+    let allowed_dp = qos.authorize_dp_transmission(dp_packet_bytes);
+    if !allowed_dp || qos.dp_credits_remaining != qos.dp_credits_per_epoch - 8 {
+        return false;
+    }
+
+    // 3. Exhaust PCIe credits to test throttling protection
+    // Drain PCIe credits
+    qos.pcie_credits_remaining = 10;
+    // Request 2048 bytes = 16 credits (> 10 available) with low priority
+    let low_prio_allowed = qos.authorize_pcie_transmission(2048, false);
+    if low_prio_allowed {
+        // Must be throttled to prevent DP starvation
+        return false;
+    }
+    if qos.pcie_throttled_events == 0 {
+        return false;
+    }
+
+    // 4. High-priority PCIe request can borrow from abundant DP pool
+    let high_prio_allowed = qos.authorize_pcie_transmission(512, true); // 4 credits
+    if !high_prio_allowed || qos.borrowed_dp_credits_by_pcie != 4 {
+        return false;
+    }
+
+    // 5. Epoch replenishment reset
+    qos.replenish_epoch();
+    if qos.dp_credits_remaining != qos.dp_credits_per_epoch {
+        return false;
+    }
+    if qos.pcie_credits_remaining != qos.pcie_credits_per_epoch {
+        return false;
+    }
+    if qos.borrowed_dp_credits_by_pcie != 0 {
+        return false;
+    }
+
+    true
+}
