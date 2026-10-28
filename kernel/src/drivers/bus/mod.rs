@@ -10,6 +10,9 @@ pub use egpu_manager::*;
 pub use pcie_health::*;
 pub use usb_billboard::*;
 
+pub mod usb4_pcie_tunnel;
+pub use usb4_pcie_tunnel::*;
+
 /// Verification self-test suite for Handheld PC USB4/Thunderbolt 4 Dynamic PCIe Tunneling & eGPU Governor.
 pub fn test_usb4_egpu_governor_subsystem() -> bool {
     crate::serial_write_str("[KNT-BUS] Testing USB4/Thunderbolt 4 dynamic PCIe tunneling & eGPU governor...\r\n");
