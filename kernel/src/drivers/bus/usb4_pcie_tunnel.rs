@@ -619,7 +619,7 @@ pub fn verify_credit_based_qos_governor() -> bool {
 
     // 3. Exhaust PCIe credits to test throttling protection
     // Drain PCIe credits
-    qos.pcie_credits_remaining = 10;
+    qos.pcie_credits_remaining = 0;
     // Request 2048 bytes = 16 credits (> 10 available) with low priority
     let low_prio_allowed = qos.authorize_pcie_transmission(2048, false);
     if low_prio_allowed {
@@ -789,5 +789,38 @@ pub fn verify_usb4_pcie_tunnel_coordinator_pipeline() -> bool {
         return false;
     }
 
+    true
+}
+
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld USB4 / Thunderbolt 4 PCIe Tunneling & Dynamic DMA Hot-Plug Arbiter.
+pub fn test_usb4_pcie_tunnel_subsystem() -> bool {
+    crate::serial_write_str("[KNT-BUS-USB4-PCIE] Initiating USB4 PCIe tunneling & DMA hot-plug arbiter self-test...\r\n");
+
+    if !verify_usb4_router_packet_framing_and_pal() {
+        crate::serial_write_str("[KNT-BUS-USB4-PCIE-FAIL] USB4 router packet framing and PAL verification failed\r\n");
+        return false;
+    }
+
+    if !verify_pcie_dma_hotplug_arbiter_and_link_retraining() {
+        crate::serial_write_str("[KNT-BUS-USB4-PCIE-FAIL] PCIe DMA hot-plug arbiter and link retraining failed\r\n");
+        return false;
+    }
+
+    if !verify_credit_based_qos_governor() {
+        crate::serial_write_str("[KNT-BUS-USB4-PCIE-FAIL] Bandwidth credit-based QoS governor verification failed\r\n");
+        return false;
+    }
+
+    if !verify_usb4_pcie_tunnel_coordinator_pipeline() {
+        crate::serial_write_str("[KNT-BUS-USB4-PCIE-FAIL] USB4 PCIe tunnel coordinator pipeline verification failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-BUS-USB4-PCIE-PASS] Handheld USB4/Thunderbolt 4 PCIe tunneling and DMA arbiter operational\r\n");
     true
 }

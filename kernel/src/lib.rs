@@ -1034,6 +1034,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] USB-C Billboard and DP Alt Mode driver self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld USB4 / Thunderbolt 4 PCIe Tunneling & Dynamic DMA Hot-Plug Arbiter (TASK-KNT-305)
+    if !drivers::bus::test_usb4_pcie_tunnel_subsystem() {
+        serial_write_str("[KNT-PANIC] USB4 PCIe tunneling and DMA hot-plug arbiter self-test failed!\r\n");
+    }
+
     // Initialize and verify USB Mass Storage Class (MSC) Bulk-Only Transport (BOT) Driver
     if !drivers::usb::test_usb_msc_subsystem() {
         serial_write_str("[KNT-PANIC] USB MSC BOT storage subsystem self-test failed!\r\n");
