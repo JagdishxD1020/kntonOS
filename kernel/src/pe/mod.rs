@@ -57,6 +57,7 @@ pub mod enclave_callgate;
 pub mod crash_telemetry;
 pub mod direct_fiber_switch;
 pub mod cold_page_evict;
+pub mod prefault_cluster;
 
 pub use header::*;
 pub use ntdll::*;
