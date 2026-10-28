@@ -257,3 +257,94 @@ impl SpeculativePrefaultGuard {
 }
 
 pub static PREFAULT_GUARD: SpeculativePrefaultGuard = SpeculativePrefaultGuard::new();
+
+/// Comprehensive self-test suite for Win32 Page Fault Clustering & Heuristic Prefetch Engine.
+pub fn test_win32_prefault_cluster_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-PREFAULT] Initializing Win32 Page Fault Clustering & Prefetch self-test...\r\n");
+
+    // 1. Verify Dynamic Page Fault Clustering into 64KB coalesced allocation
+    let fault_addr = 0x0000_0000_0040_2100u64;
+    let cluster = CLUSTER_ENGINE.record_fault_and_cluster(55, fault_addr, false);
+
+    if cluster.base_page_address != 0x0000_0000_0040_0000 {
+        crate::serial_write_str("[KNT-TEST-ERR] Clustered allocation base address mismatch\r\n");
+        return false;
+    }
+
+    if cluster.page_count != MAX_CLUSTER_PAGES || cluster.total_bytes != CLUSTER_WINDOW_BYTES {
+        crate::serial_write_str("[KNT-TEST-ERR] Clustered page count or byte size mismatch\r\n");
+        return false;
+    }
+
+    if CLUSTER_ENGINE.get_total_clustered() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total clustered allocation count was zero\r\n");
+        return false;
+    }
+
+    // 2. Verify Heuristic Pre-Fault Prefetcher & Stride Prediction
+    HEURISTIC_PREFETCHER.record_branch(0x0000_0040_1050, 0x0000_0040_1000); // Backward loop
+    HEURISTIC_PREFETCHER.update_stride(55, 0x0000_0040_0000);
+    HEURISTIC_PREFETCHER.update_stride(55, 0x0000_0040_1000);
+
+    let predicted = HEURISTIC_PREFETCHER.predict_prefetch_pages(55, 0x0000_0040_1000, 3);
+    if predicted.len() != 3
+        || predicted[0] != 0x0000_0040_2000
+        || predicted[1] != 0x0000_0040_3000
+        || predicted[2] != 0x0000_0040_4000
+    {
+        crate::serial_write_str("[KNT-TEST-ERR] Stride-predicted prefetch addresses mismatch\r\n");
+        return false;
+    }
+
+    if HEURISTIC_PREFETCHER.get_total_prefetches() < 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total prefetches count mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify Anti-Tampering Speculative Pre-Fault Guard & Page Permissions
+    PREFAULT_GUARD.register_page_protection(0x0000_0040_2000, PREFAULT_PAGE_EXECUTE_READ);
+    PREFAULT_GUARD.register_page_protection(0x0000_0040_5000, PREFAULT_PAGE_GUARD);
+    PREFAULT_GUARD.register_page_protection(0x0000_0040_6000, PREFAULT_PAGE_NOACCESS);
+    PREFAULT_GUARD.register_page_protection(0x0000_0040_7000, PREFAULT_PAGE_READWRITE);
+
+    // Valid executable page -> Allowed
+    if PREFAULT_GUARD.validate_speculative_prefault(0x0000_0040_2000, true) != PrefaultValidationResult::Allowed {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid executable page incorrectly blocked\r\n");
+        return false;
+    }
+
+    // Guard page -> BlockedGuardPage
+    match PREFAULT_GUARD.validate_speculative_prefault(0x0000_0040_5000, true) {
+        PrefaultValidationResult::BlockedGuardPage(p) if p == 0x0000_0040_5000 => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Guard page pre-fault was not blocked\r\n");
+            return false;
+        }
+    }
+
+    // No-access page -> BlockedNoAccess
+    match PREFAULT_GUARD.validate_speculative_prefault(0x0000_0040_6000, true) {
+        PrefaultValidationResult::BlockedNoAccess(p) if p == 0x0000_0040_6000 => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] No-access page pre-fault was not blocked\r\n");
+            return false;
+        }
+    }
+
+    // Non-executable page when executable required -> BlockedNonExecutable
+    match PREFAULT_GUARD.validate_speculative_prefault(0x0000_0040_7000, true) {
+        PrefaultValidationResult::BlockedNonExecutable(p) if p == 0x0000_0040_7000 => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Non-executable page pre-fault was not blocked\r\n");
+            return false;
+        }
+    }
+
+    if PREFAULT_GUARD.get_total_blocked() < 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Blocked pre-fault counter mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-PREFAULT-PASS] Win32 Page Fault Clustering & Heuristic Prefetch verified\r\n");
+    true
+}
