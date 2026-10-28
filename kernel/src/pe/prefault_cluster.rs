@@ -188,3 +188,72 @@ impl HeuristicPrefetcher {
 }
 
 pub static HEURISTIC_PREFETCHER: HeuristicPrefetcher = HeuristicPrefetcher::new();
+
+pub const PREFAULT_PAGE_NOACCESS: u32 = 0x01;
+pub const PREFAULT_PAGE_READONLY: u32 = 0x02;
+pub const PREFAULT_PAGE_READWRITE: u32 = 0x04;
+pub const PREFAULT_PAGE_EXECUTE: u32 = 0x10;
+pub const PREFAULT_PAGE_EXECUTE_READ: u32 = 0x20;
+pub const PREFAULT_PAGE_GUARD: u32 = 0x100;
+
+/// Speculative pre-fault validation outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefaultValidationResult {
+    Allowed,
+    BlockedGuardPage(u64),
+    BlockedNonExecutable(u64),
+    BlockedNoAccess(u64),
+}
+
+/// Anti-tampering memory guard preventing speculative pre-faulting into guarded or non-executable pages.
+pub struct SpeculativePrefaultGuard {
+    protected_ranges: Spinlock<BTreeMap<u64, u32>>,
+    total_blocked: AtomicU64,
+}
+
+impl SpeculativePrefaultGuard {
+    pub const fn new() -> Self {
+        Self {
+            protected_ranges: Spinlock::new(BTreeMap::new()),
+            total_blocked: AtomicU64::new(0),
+        }
+    }
+
+    /// Register page protection attributes for anti-tamper checking.
+    pub fn register_page_protection(&self, page_base: u64, flags: u32) {
+        self.protected_ranges.lock().insert(page_base, flags);
+    }
+
+    /// Validate whether a candidate page can be speculatively pre-faulted.
+    pub fn validate_speculative_prefault(&self, page_base: u64, require_executable: bool) -> PrefaultValidationResult {
+        let ranges = self.protected_ranges.lock();
+        if let Some(&flags) = ranges.get(&page_base) {
+            if (flags & PREFAULT_PAGE_GUARD) != 0 {
+                self.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return PrefaultValidationResult::BlockedGuardPage(page_base);
+            }
+            if (flags & PREFAULT_PAGE_NOACCESS) != 0 {
+                self.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return PrefaultValidationResult::BlockedNoAccess(page_base);
+            }
+            if require_executable && (flags & (PREFAULT_PAGE_EXECUTE | PREFAULT_PAGE_EXECUTE_READ)) == 0 {
+                self.total_blocked.fetch_add(1, Ordering::Relaxed);
+                return PrefaultValidationResult::BlockedNonExecutable(page_base);
+            }
+        }
+        PrefaultValidationResult::Allowed
+    }
+
+    /// Retrieve count of speculative pre-fault operations blocked.
+    pub fn get_total_blocked(&self) -> u64 {
+        self.total_blocked.load(Ordering::Acquire)
+    }
+
+    /// Clear all registered ranges.
+    pub fn clear(&self) {
+        self.protected_ranges.lock().clear();
+        self.total_blocked.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static PREFAULT_GUARD: SpeculativePrefaultGuard = SpeculativePrefaultGuard::new();
