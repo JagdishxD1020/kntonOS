@@ -256,3 +256,69 @@ impl SamplerDescriptorTableOptimizer {
         }
     }
 }
+
+// Runtime telemetry counters for dynamic sampler tuning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SamplerTuningMetrics {
+    pub total_draw_samplers_evaluated: u64,
+    pub total_lod_biases_injected: u64,
+    pub total_anisotropy_throttles: u64,
+    pub total_deduplication_reuses: u64,
+}
+
+// Integrated Direct3D 12 Agility Dynamic Sampler LOD Bias & Anisotropy Governor.
+#[derive(Debug)]
+pub struct D3d12DynamicSamplerGovernor {
+    pub lod_governor: DynamicLodBiasGovernor,
+    pub aniso_governor: DynamicAnisotropyGovernor,
+    pub descriptor_optimizer: SamplerDescriptorTableOptimizer,
+    pub metrics: SamplerTuningMetrics,
+}
+
+impl D3d12DynamicSamplerGovernor {
+    pub fn new(max_bias: f32, max_aniso: u32, heap_capacity: u32) -> Self {
+        Self {
+            lod_governor: DynamicLodBiasGovernor::new(max_bias),
+            aniso_governor: DynamicAnisotropyGovernor::new(max_aniso),
+            descriptor_optimizer: SamplerDescriptorTableOptimizer::new(heap_capacity),
+            metrics: SamplerTuningMetrics::default(),
+        }
+    }
+
+    // Resolves a dynamically tuned sampler descriptor for an upcoming draw call.
+    pub fn resolve_tuned_sampler(
+        &mut self,
+        filter: DynamicFilterType,
+        angle: SurfaceViewAngle,
+        perf: &GpuPerformanceState,
+        bw: &MemoryBandwidthState,
+    ) -> Result<u32, &'static str> {
+        self.metrics.total_draw_samplers_evaluated += 1;
+
+        // 1. Calculate dynamic LOD bias based on GPU thermal/frametime headroom
+        let lod_bias = self.lod_governor.calculate_injected_lod_bias(perf);
+        if lod_bias > 0.0 {
+            self.metrics.total_lod_biases_injected += 1;
+        }
+
+        // 2. Calculate dynamic anisotropy level adapting to grazing angle & memory bandwidth
+        let aniso = if filter == DynamicFilterType::Anisotropic {
+            let val = self.aniso_governor.calculate_anisotropy_level(angle, bw);
+            if bw.is_bandwidth_saturated() {
+                self.metrics.total_anisotropy_throttles += 1;
+            }
+            val
+        } else {
+            1
+        };
+
+        // 3. Deduplicate descriptor in heap
+        let key = SamplerDescriptorKey::new(filter, aniso, lod_bias);
+        let slot = self.descriptor_optimizer.get_or_create_sampler(key)?;
+        if self.descriptor_optimizer.deduplication_hits > self.metrics.total_deduplication_reuses {
+            self.metrics.total_deduplication_reuses = self.descriptor_optimizer.deduplication_hits;
+        }
+
+        Ok(slot)
+    }
+}
