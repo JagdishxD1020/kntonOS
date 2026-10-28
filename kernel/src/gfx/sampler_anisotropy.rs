@@ -81,3 +81,89 @@ impl DynamicLodBiasGovernor {
         self.base_lod_bias + self.current_injected_bias
     }
 }
+
+
+// Surface projection viewing angle in degrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceViewAngle {
+    pub grazing_angle_degrees: f32,
+}
+
+impl SurfaceViewAngle {
+    pub const fn new(degrees: f32) -> Self {
+        Self { grazing_angle_degrees: degrees }
+    }
+}
+
+// Memory bus bandwidth saturation state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemoryBandwidthState {
+    pub current_vram_bandwidth_utilization_ratio: f32,
+    pub max_sustainable_utilization_ratio: f32,
+}
+
+impl MemoryBandwidthState {
+    pub const fn new(current_util: f32, max_util: f32) -> Self {
+        Self {
+            current_vram_bandwidth_utilization_ratio: current_util,
+            max_sustainable_utilization_ratio: max_util,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_bandwidth_saturated(&self) -> bool {
+        self.current_vram_bandwidth_utilization_ratio >= self.max_sustainable_utilization_ratio
+    }
+}
+
+// Dynamic anisotropic filtering level governor (1x to 16x).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicAnisotropyGovernor {
+    pub max_permitted_anisotropy: u32,
+    pub active_anisotropy_level: u32,
+    pub total_anisotropy_evaluations: u64,
+    pub total_throttled_anisotropy_draws: u64,
+}
+
+impl DynamicAnisotropyGovernor {
+    pub fn new(max_aniso: u32) -> Self {
+        let max_val = max_aniso.clamp(1, 16);
+        Self {
+            max_permitted_anisotropy: max_val,
+            active_anisotropy_level: max_val,
+            total_anisotropy_evaluations: 0,
+            total_throttled_anisotropy_draws: 0,
+        }
+    }
+
+    // Evaluates optimal anisotropic level adapting to viewing angle and memory bandwidth pressure.
+    pub fn calculate_anisotropy_level(&mut self, angle: SurfaceViewAngle, bw: &MemoryBandwidthState) -> u32 {
+        self.total_anisotropy_evaluations += 1;
+
+        // Base anisotropy calculation from grazing angle: higher angles require higher aniso
+        let base_level = if angle.grazing_angle_degrees >= 75.0 {
+            16
+        } else if angle.grazing_angle_degrees >= 60.0 {
+            8
+        } else if angle.grazing_angle_degrees >= 45.0 {
+            4
+        } else if angle.grazing_angle_degrees >= 30.0 {
+            2
+        } else {
+            1
+        };
+
+        let clamped_base = base_level.min(self.max_permitted_anisotropy);
+
+        // If memory bus is saturated, throttle anisotropy by half to alleviate cache thrashing
+        let resolved = if bw.is_bandwidth_saturated() {
+            self.total_throttled_anisotropy_draws += 1;
+            (clamped_base / 2).max(1)
+        } else {
+            clamped_base
+        };
+
+        self.active_anisotropy_level = resolved;
+        resolved
+    }
+}
