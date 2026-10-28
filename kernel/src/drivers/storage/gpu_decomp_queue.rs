@@ -882,3 +882,36 @@ pub fn verify_gpu_decomp_orchestrator_pipeline() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive self-test suite for Handheld DirectStorage 1.2 GPU Decompression Queue & Hardware Copy Engine Orchestrator.
+pub fn test_gpu_decomp_queue_subsystem() -> bool {
+    crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP] Initiating DirectStorage 1.2 GPU decompression queue self-test...\r\n");
+
+    if !verify_gdeflate_staging_queue_and_nvme_ring() {
+        crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP-FAIL] GDeflate staging queue and NVMe ring verification failed\r\n");
+        return false;
+    }
+
+    if !verify_hardware_copy_engine_and_vblank_pacing() {
+        crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP-FAIL] Hardware copy engine and VBLANK pacing verification failed\r\n");
+        return false;
+    }
+
+    if !verify_decomp_throughput_meter_and_priority_governor() {
+        crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP-FAIL] Decompression throughput meter and priority governor verification failed\r\n");
+        return false;
+    }
+
+    if !verify_gpu_decomp_orchestrator_pipeline() {
+        crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP-FAIL] GPU decompression orchestrator pipeline verification failed\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-STORAGE-GPU-DECOMP-PASS] Handheld DirectStorage 1.2 GPU decompression queue and copy orchestrator operational\r\n");
+    true
+}

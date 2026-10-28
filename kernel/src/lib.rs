@@ -1055,6 +1055,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] DirectStorage 1.2 GPU decompression and NVMe multiplexer self-test failed!\r\n");
     }
 
+    // Initialize and verify Handheld DirectStorage 1.2 GPU Decompression Queue & Hardware Copy Engine Orchestrator (TASK-KNT-300)
+    if !drivers::storage::test_gpu_decomp_queue_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld DirectStorage 1.2 GPU decompression queue and copy orchestrator self-test failed!\r\n");
+    }
+
     // Initialize and verify Real-Time Audio Subsystem (Intel HDA / AC97 Codec & PCM Mixer)
     if !drivers::audio::test_audio_subsystem() {
         serial_write_str("[KNT-PANIC] Audio subsystem self-test failed!\r\n");
