@@ -127,7 +127,7 @@ impl TriangleRasterDesc {
     // Evaluates 2D signed distance for edge equation.
     #[inline(always)]
     pub fn edge_func(a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> f32 {
-        (c[0] - a[0]) * (b[1] - a[1]) - (c[1] - a[1]) * (b[0] - a[0])
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     }
 }
 
@@ -168,9 +168,9 @@ impl ConservativeRasterTier3Governor {
                 let py = pixel_y + (sy as f32 + 0.5) / 4.0;
                 let p = [px, py];
 
-                let w0 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, p);
-                let w1 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, p);
-                let w2 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, p);
+                let w0 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, p);
+                let w1 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, p);
+                let w2 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, p);
 
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                     let bit = sy * 4 + sx;
@@ -192,9 +192,9 @@ impl ConservativeRasterTier3Governor {
         let mut touches_any = standard_hit;
         if !touches_any {
             for c in &corners {
-                let w0 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, *c);
-                let w1 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, *c);
-                let w2 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, *c);
+                let w0 = TriangleRasterDesc::edge_func(tri.v0, tri.v1, *c);
+                let w1 = TriangleRasterDesc::edge_func(tri.v1, tri.v2, *c);
+                let w2 = TriangleRasterDesc::edge_func(tri.v2, tri.v0, *c);
                 if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
                     touches_any = true;
                     break;
@@ -366,4 +366,81 @@ impl D3d12ViewportRasterizerGovernor {
         }
         resolved
     }
+}
+
+// Verification self-test suite for D3D12 Agility Viewport & Precision Rasterizer Governor.
+pub fn test_viewport_rasterizer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 viewport & precision rasterizer governor...\r\n");
+
+    let mut governor = D3d12ViewportRasterizerGovernor::new(true, ViewportShadingRate::Rate2x2);
+
+    // 1. Verify dynamic viewport caching and redundant flush avoidance.
+    let vp1 = [
+        D3d12DynamicViewport {
+            top_left_x: 0.0,
+            top_left_y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        },
+    ];
+
+    let changed1 = governor.bind_viewports(&vp1);
+    if !changed1 {
+        return false;
+    }
+
+    // Identical viewport array must not trigger a state change.
+    let changed2 = governor.bind_viewports(&vp1);
+    if changed2 || governor.metrics.total_viewport_flushes_saved != 1 {
+        return false;
+    }
+
+    // 2. Verify conservative rasterization Tier 3 and sub-pixel coverage mask.
+    // Triangle spanning [0, 0] to [2, 2]
+    let tri = TriangleRasterDesc::new([0.0, 0.0], [2.0, 0.0], [0.0, 2.0]);
+    let (covered_inside, mask_inside) = governor.rasterize_pixel_conservative(&tri, 0.2, 0.2);
+    if !covered_inside || mask_inside == 0 {
+        return false;
+    }
+
+    // Triangle far outside [10, 10]
+    let (covered_outside, mask_outside) = governor.rasterize_pixel_conservative(&tri, 10.0, 10.0);
+    if covered_outside || mask_outside != 0 {
+        return false;
+    }
+
+    // 3. Verify Variable Rate Shading (VRS) Tier 2 tile combiner with viewport overrides.
+    let tile_rate = ViewportShadingRate::Rate1x1;
+    let resolved_rate = governor.resolve_tile_shading_rate(tile_rate);
+    if resolved_rate != ViewportShadingRate::Rate2x2 {
+        return false;
+    }
+    if governor.metrics.total_vrs_overrides_applied != 1 {
+        return false;
+    }
+
+    // 4. Verify scissor rect state caching.
+    let sc1 = [
+        D3d12DynamicScissorRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        },
+    ];
+    let sc_changed1 = governor.bind_scissor_rects(&sc1);
+    if !sc_changed1 {
+        return false;
+    }
+    let sc_changed2 = governor.bind_scissor_rects(&sc1);
+    if sc_changed2 {
+        return false;
+    }
+
+    // 5. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-VIEWPORT-RASTER-PASS] Direct3D 12 viewport & precision rasterizer governor verified\r\n");
+
+    true
 }
