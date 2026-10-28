@@ -13,6 +13,9 @@ pub mod sd_express;
 pub mod directstorage_decomp;
 pub use directstorage_decomp::*;
 
+pub mod gpu_decomp_queue;
+pub use gpu_decomp_queue::*;
+
 pub use uring::*;
 pub use nvme_hmb::*;
 pub use direct_storage::*;
