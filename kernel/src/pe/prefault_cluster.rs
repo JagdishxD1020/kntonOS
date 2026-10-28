@@ -86,3 +86,105 @@ impl PageFaultClusterEngine {
 }
 
 pub static CLUSTER_ENGINE: PageFaultClusterEngine = PageFaultClusterEngine::new();
+
+/// Execution branch trace descriptor for hot loop and branch prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchTraceEntry {
+    pub source_rip: u64,
+    pub target_rip: u64,
+    pub execution_count: u32,
+    pub is_backward_loop: bool,
+}
+
+/// Dynamic stride predictor tracking memory reference patterns per process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StridePattern {
+    pub last_page: u64,
+    pub stride_bytes: i64,
+    pub confidence: u8,
+}
+
+/// Heuristic Pre-Fault Prefetcher analyzing hot code loops and memory access strides.
+pub struct HeuristicPrefetcher {
+    branch_traces: Spinlock<BTreeMap<u64, BranchTraceEntry>>,
+    stride_trackers: Spinlock<BTreeMap<u32, StridePattern>>,
+    total_prefetches_predicted: AtomicU64,
+}
+
+impl HeuristicPrefetcher {
+    pub const fn new() -> Self {
+        Self {
+            branch_traces: Spinlock::new(BTreeMap::new()),
+            stride_trackers: Spinlock::new(BTreeMap::new()),
+            total_prefetches_predicted: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a branch execution and update loop hotness detection.
+    pub fn record_branch(&self, source_rip: u64, target_rip: u64) {
+        let mut traces = self.branch_traces.lock();
+        let is_backward = target_rip <= source_rip;
+        let entry = traces.entry(source_rip).or_insert(BranchTraceEntry {
+            source_rip,
+            target_rip,
+            execution_count: 0,
+            is_backward_loop: is_backward,
+        });
+        entry.execution_count = entry.execution_count.saturating_add(1);
+    }
+
+    /// Record memory page access to train stride pattern recognition.
+    pub fn update_stride(&self, process_id: u32, current_page: u64) {
+        let mut strides = self.stride_trackers.lock();
+        if let Some(pattern) = strides.get_mut(&process_id) {
+            let diff = (current_page as i64) - (pattern.last_page as i64);
+            if diff == pattern.stride_bytes {
+                pattern.confidence = pattern.confidence.saturating_add(1).min(10);
+            } else {
+                pattern.stride_bytes = diff;
+                pattern.confidence = 1;
+            }
+            pattern.last_page = current_page;
+        } else {
+            strides.insert(process_id, StridePattern {
+                last_page: current_page,
+                stride_bytes: PAGE_SIZE as i64,
+                confidence: 1,
+            });
+        }
+    }
+
+    /// Heuristically predict next virtual page addresses to speculative pre-fault.
+    pub fn predict_prefetch_pages(
+        &self,
+        process_id: u32,
+        current_page: u64,
+        lookahead_count: usize,
+    ) -> Vec<u64> {
+        let mut predicted = Vec::with_capacity(lookahead_count);
+        let stride = {
+            let strides = self.stride_trackers.lock();
+            strides.get(&process_id).map(|p| p.stride_bytes).unwrap_or(PAGE_SIZE as i64)
+        };
+
+        let mut next_page = current_page;
+        for _ in 0..lookahead_count {
+            if stride >= 0 {
+                next_page = next_page.saturating_add(stride as u64);
+            } else {
+                next_page = next_page.saturating_sub((-stride) as u64);
+            }
+            predicted.push(next_page);
+        }
+
+        self.total_prefetches_predicted.fetch_add(predicted.len() as u64, Ordering::Relaxed);
+        predicted
+    }
+
+    /// Retrieve count of speculative page prefetches predicted.
+    pub fn get_total_prefetches(&self) -> u64 {
+        self.total_prefetches_predicted.load(Ordering::Acquire)
+    }
+}
+
+pub static HEURISTIC_PREFETCHER: HeuristicPrefetcher = HeuristicPrefetcher::new();
