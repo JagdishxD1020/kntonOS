@@ -53,7 +53,7 @@ impl PcieTlpHeader {
 }
 
 /// USB4 Transport Layer Packet (TLP) carrying tunneled protocol payloads.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usb4TransportPacket {
     pub target_adapter_id: u8,
     pub hop_id: u16,
@@ -645,6 +645,147 @@ pub fn verify_credit_based_qos_governor() -> bool {
         return false;
     }
     if qos.borrowed_dp_credits_by_pcie != 0 {
+        return false;
+    }
+
+    true
+}
+
+
+// ============================================================================
+// Feature 4: Integrated USB4 PCIe Tunneling & eGPU Docking Coordinator
+// ============================================================================
+
+/// Integrated USB4 PCIe Tunneling & eGPU Docking Coordinator.
+#[derive(Debug, Clone)]
+pub struct Usb4PcieTunnelCoordinator {
+    pub pal: PcieProtocolAdapterLayer,
+    pub arbiter: PcieDmaHotPlugArbiter,
+    pub qos_governor: BandwidthCreditQosGovernor,
+    pub next_sequence_number: u8,
+    pub total_successful_transmissions: u64,
+}
+
+impl Usb4PcieTunnelCoordinator {
+    pub fn new(total_link_mbps: u32, dp_reserved_mbps: u32) -> Self {
+        Self {
+            pal: PcieProtocolAdapterLayer::new(),
+            arbiter: PcieDmaHotPlugArbiter::new(),
+            qos_governor: BandwidthCreditQosGovernor::new(total_link_mbps, dp_reserved_mbps),
+            next_sequence_number: 0,
+            total_successful_transmissions: 0,
+        }
+    }
+
+    /// Dock an external GPU station (e.g. PCIe Gen4 x4 via USB4 40Gbps).
+    pub fn dock_egpu(&mut self, generation: u8, lanes: u8) -> bool {
+        self.arbiter.on_hot_dock(generation, lanes)
+    }
+
+    /// Undock external GPU, handling surprise unplugs gracefully.
+    pub fn undock_egpu(&mut self, is_surprise: bool) {
+        if is_surprise {
+            self.arbiter.on_surprise_unplug();
+        } else {
+            self.arbiter.link_state = PcieTunnelLinkState::Disconnected;
+        }
+    }
+
+    /// Encapsulate, authorize QoS, and transmit a PCIe TLP to the eGPU.
+    pub fn transmit_pcie_tlp(
+        &mut self,
+        header: &PcieTlpHeader,
+        payload: &[u8],
+        is_high_priority: bool,
+    ) -> Result<Usb4TransportPacket, OutgoingTlpAction> {
+        let total_packet_bytes = (16 + payload.len()) as u32;
+
+        // 1. Bandwidth QoS authorization check
+        if !self.qos_governor.authorize_pcie_transmission(total_packet_bytes, is_high_priority) {
+            return Err(OutgoingTlpAction::BufferExhausted);
+        }
+
+        // 2. Encapsulate into USB4 Transport Packet via PAL
+        let seq = self.next_sequence_number;
+        self.next_sequence_number = (self.next_sequence_number + 1) % 16;
+
+        let pkt = self.pal.encapsulate_pcie_tlp(
+            header,
+            payload,
+            USB4_PCIE_TUNNEL_HOP_ID,
+            1, // PCIe Downstream Adapter ID
+            seq,
+        );
+
+        // 3. Hot-Plug Arbiter route & link state gating
+        let action = self.arbiter.submit_tlp(pkt);
+        match action {
+            OutgoingTlpAction::Transmitted => {
+                self.total_successful_transmissions += 1;
+                Ok(pkt)
+            }
+            other => Err(other),
+        }
+    }
+
+    /// Forward isochronous DisplayPort video data.
+    pub fn transmit_dp_stream(&mut self, bytes: u32) -> bool {
+        self.qos_governor.authorize_dp_transmission(bytes)
+    }
+
+    /// Process periodic micro-frame tick (125 us).
+    pub fn on_microframe_tick(&mut self) {
+        self.qos_governor.replenish_epoch();
+    }
+}
+
+/// Verification test for integrated USB4 PCIe tunneling and eGPU coordinator pipeline.
+pub fn verify_usb4_pcie_tunnel_coordinator_pipeline() -> bool {
+    let mut coordinator = Usb4PcieTunnelCoordinator::new(40000, 21600);
+
+    // 1. Initial state: disconnected -> transmits must fail gracefully
+    let tlp_hdr = PcieTlpHeader::new(PcieTlpType::MemoryRead64, 16, 0x0100, 1, 0xE000_0000);
+    let res_disc = coordinator.transmit_pcie_tlp(&tlp_hdr, &[], false);
+    if res_disc != Err(OutgoingTlpAction::DroppedQuarantined) {
+        return false;
+    }
+
+    // 2. Dock eGPU: Gen4 x4 connection established
+    if !coordinator.dock_egpu(4, 4) {
+        return false;
+    }
+    if coordinator.arbiter.link_state != PcieTunnelLinkState::DockedOperational {
+        return false;
+    }
+
+    // 3. Transmit PCIe TLP successfully
+    let test_data = [0xAAu8; 64];
+    let write_hdr = PcieTlpHeader::new(PcieTlpType::MemoryWrite64, 16, 0x0100, 2, 0xE000_1000);
+    let tx_res = coordinator.transmit_pcie_tlp(&write_hdr, &test_data, false);
+    if tx_res.is_err() || coordinator.total_successful_transmissions != 1 {
+        return false;
+    }
+
+    // 4. Link jitter causes temporary retrain
+    coordinator.arbiter.on_link_degrade();
+    let tx_during_retrain = coordinator.transmit_pcie_tlp(&write_hdr, &test_data, true);
+    if tx_during_retrain != Err(OutgoingTlpAction::BufferedForReplay) {
+        return false;
+    }
+
+    // 5. Retrain restores L0 link
+    let replayed = coordinator.arbiter.on_retrain_success();
+    if replayed != 1 || coordinator.arbiter.link_state != PcieTunnelLinkState::DockedOperational {
+        return false;
+    }
+
+    // 6. Surprise unplug during game
+    coordinator.undock_egpu(true);
+    if coordinator.arbiter.link_state != PcieTunnelLinkState::SurpriseUnplugQuarantine {
+        return false;
+    }
+    let tx_after_unplug = coordinator.transmit_pcie_tlp(&write_hdr, &test_data, false);
+    if tx_after_unplug != Err(OutgoingTlpAction::DroppedQuarantined) {
         return false;
     }
 
