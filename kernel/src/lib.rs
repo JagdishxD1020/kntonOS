@@ -1344,6 +1344,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_direct_fiber_switch_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Direct Fiber Switch subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Working Set Page Trimming, Page Replacement & Cold Eviction (TASK-KNT-301)
+    if !pe::test_win32_cold_page_evict_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Cold Page Eviction subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
