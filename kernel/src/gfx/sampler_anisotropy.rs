@@ -8,7 +8,7 @@ extern crate alloc;
 
 // Filter reduction and comparison modes.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DynamicFilterType {
     #[default]
     Point = 0,
@@ -165,5 +165,94 @@ impl DynamicAnisotropyGovernor {
 
         self.active_anisotropy_level = resolved;
         resolved
+    }
+}
+
+// Sampler descriptor configuration key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SamplerDescriptorKey {
+    pub filter: DynamicFilterType,
+    pub max_anisotropy: u32,
+    pub lod_bias_fixed_pt: i32, // Fixed point representation of LOD bias
+    pub address_u: u8,
+    pub address_v: u8,
+    pub address_w: u8,
+}
+
+impl SamplerDescriptorKey {
+    pub fn new(filter: DynamicFilterType, max_anisotropy: u32, lod_bias: f32) -> Self {
+        Self {
+            filter,
+            max_anisotropy,
+            lod_bias_fixed_pt: (lod_bias * 256.0) as i32,
+            address_u: 0,
+            address_v: 0,
+            address_w: 0,
+        }
+    }
+}
+
+// Allocated sampler descriptor slot in the heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamplerHeapSlot {
+    pub heap_index: u32,
+    pub key: SamplerDescriptorKey,
+    pub reference_count: u32,
+}
+
+// Sampler descriptor heap table deduplication and cache locality optimizer.
+#[derive(Debug)]
+pub struct SamplerDescriptorTableOptimizer {
+    pub heap_capacity: u32,
+    pub allocated_slots: alloc::vec::Vec<SamplerHeapSlot>,
+    pub total_lookup_requests: u64,
+    pub deduplication_hits: u64,
+}
+
+impl SamplerDescriptorTableOptimizer {
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            heap_capacity: capacity,
+            allocated_slots: alloc::vec::Vec::new(),
+            total_lookup_requests: 0,
+            deduplication_hits: 0,
+        }
+    }
+
+    // Finds an identical sampler descriptor slot or allocates a new deduplicated slot.
+    pub fn get_or_create_sampler(&mut self, key: SamplerDescriptorKey) -> Result<u32, &'static str> {
+        self.total_lookup_requests += 1;
+
+        // Check for existing identical descriptor (deduplication)
+        for slot in &mut self.allocated_slots {
+            if slot.key == key {
+                slot.reference_count += 1;
+                self.deduplication_hits += 1;
+                return Ok(slot.heap_index);
+            }
+        }
+
+        // Allocate new slot if capacity allows
+        if self.allocated_slots.len() as u32 >= self.heap_capacity {
+            return Err("Sampler descriptor heap full");
+        }
+
+        let new_index = self.allocated_slots.len() as u32;
+        self.allocated_slots.push(SamplerHeapSlot {
+            heap_index: new_index,
+            key,
+            reference_count: 1,
+        });
+
+        Ok(new_index)
+    }
+
+    #[inline(always)]
+    pub fn deduplication_ratio_percentage(&self) -> u32 {
+        if self.total_lookup_requests == 0 {
+            0
+        } else {
+            ((self.deduplication_hits * 100) / self.total_lookup_requests) as u32
+        }
     }
 }
