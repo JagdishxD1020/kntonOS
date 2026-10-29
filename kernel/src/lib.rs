@@ -1365,6 +1365,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_prefault_cluster_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Page Fault Clustering subsystem self-test failed!\r\n");
     }
+    // Verify Win32 Large Page Virtual Free & Region Compactor (TASK-KNT-306)
+    if !pe::test_win32_large_page_free_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 Large Page Virtual Free subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
