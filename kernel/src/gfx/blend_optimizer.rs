@@ -153,3 +153,57 @@ impl DynamicBlendStateHashCache {
         true
     }
 }
+
+
+// Alpha-to-coverage and independent render target blending optimization governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlphaToCoverageGovernor {
+    pub alpha_to_coverage_active: bool,
+    pub independent_blend_active: bool,
+    pub active_render_target_count: usize,
+    pub total_draw_evaluations: u64,
+    pub multisample_mask_generations: u64,
+}
+
+impl AlphaToCoverageGovernor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Configures state from active blend descriptor.
+    pub fn configure(&mut self, desc: &DynamicBlendStateDesc, active_rts: usize) {
+        self.alpha_to_coverage_active = desc.alpha_to_coverage_enable;
+        self.independent_blend_active = desc.independent_blend_enable;
+        self.active_render_target_count = active_rts.min(8);
+    }
+
+    // Computes 4-sample subpixel coverage mask from fragment alpha channel when alpha-to-coverage is enabled.
+    pub fn calculate_coverage_mask(&mut self, fragment_alpha: f32) -> u8 {
+        self.total_draw_evaluations += 1;
+        if !self.alpha_to_coverage_active {
+            return 0x0F; // Full coverage
+        }
+
+        self.multisample_mask_generations += 1;
+        let alpha_clamped = if fragment_alpha < 0.0 { 0.0 } else if fragment_alpha > 1.0 { 1.0 } else { fragment_alpha };
+
+        // D3D12 4xMSAA alpha-to-coverage threshold mapping
+        if alpha_clamped >= 0.875 {
+            0x0F
+        } else if alpha_clamped >= 0.625 {
+            0x07
+        } else if alpha_clamped >= 0.375 {
+            0x03
+        } else if alpha_clamped >= 0.125 {
+            0x01
+        } else {
+            0x00
+        }
+    }
+
+    // Checks if render target slot uses independent blend equations.
+    #[inline(always)]
+    pub fn is_slot_independent(&self, slot_idx: usize) -> bool {
+        self.independent_blend_active && slot_idx < self.active_render_target_count
+    }
+}
