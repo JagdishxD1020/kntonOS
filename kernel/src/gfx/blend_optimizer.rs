@@ -251,3 +251,57 @@ impl ColorWriteMaskBypassOptimizer {
         bypass_bitmask
     }
 }
+
+// Metrics tracker for dynamic blend optimizations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlendOptimizerMetrics {
+    pub total_blend_states_bound: u64,
+    pub total_rop_flushes_saved: u64,
+    pub total_alpha_to_coverage_passes: u64,
+    pub total_target_bypasses: u64,
+}
+
+// Integrated Direct3D 12 Agility Dynamic Blend State & Optimization Engine.
+#[derive(Debug)]
+pub struct D3d12BlendOptimizerEngine {
+    pub hash_cache: DynamicBlendStateHashCache,
+    pub a2c_governor: AlphaToCoverageGovernor,
+    pub bypass_optimizer: ColorWriteMaskBypassOptimizer,
+    pub metrics: BlendOptimizerMetrics,
+}
+
+impl D3d12BlendOptimizerEngine {
+    pub fn new() -> Self {
+        Self {
+            hash_cache: DynamicBlendStateHashCache::new(),
+            a2c_governor: AlphaToCoverageGovernor::new(),
+            bypass_optimizer: ColorWriteMaskBypassOptimizer::new(),
+            metrics: BlendOptimizerMetrics::default(),
+        }
+    }
+
+    // Evaluates dynamic blend state binding with hash cache deduplication.
+    pub fn set_blend_state(&mut self, desc: &DynamicBlendStateDesc, active_rts: usize) -> (bool, u8) {
+        self.metrics.total_blend_states_bound += 1;
+        self.a2c_governor.configure(desc, active_rts);
+
+        let state_changed = self.hash_cache.bind_blend_state(desc);
+        if !state_changed {
+            self.metrics.total_rop_flushes_saved += 1;
+        }
+
+        let bypass_mask = self.bypass_optimizer.evaluate_state_bypass_mask(desc, active_rts);
+        self.metrics.total_target_bypasses += bypass_mask.count_ones() as u64;
+
+        (state_changed, bypass_mask)
+    }
+
+    // Computes alpha-to-coverage subpixel mask.
+    pub fn resolve_alpha_coverage(&mut self, alpha: f32) -> u8 {
+        let mask = self.a2c_governor.calculate_coverage_mask(alpha);
+        if self.a2c_governor.alpha_to_coverage_active {
+            self.metrics.total_alpha_to_coverage_passes += 1;
+        }
+        mask
+    }
+}
