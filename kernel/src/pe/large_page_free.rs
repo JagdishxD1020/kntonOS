@@ -164,3 +164,51 @@ impl LargePageFreeEngine {
 }
 
 pub static LARGE_PAGE_FREE_ENGINE: LargePageFreeEngine = LargePageFreeEngine::new();
+
+/// Security purge policy for released physical pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSanitizationPolicy {
+    ImmediateZeroFill,
+    AntiDumpPurge,
+}
+
+/// Anti-cheat security sanitization engine zeroing released pages to defeat memory dump scraping.
+pub struct AntiCheatPageSanitizer {
+    total_sanitized_pages: AtomicU64,
+    total_bytes_cleared: AtomicU64,
+}
+
+impl AntiCheatPageSanitizer {
+    pub const fn new() -> Self {
+        Self {
+            total_sanitized_pages: AtomicU64::new(0),
+            total_bytes_cleared: AtomicU64::new(0),
+        }
+    }
+
+    /// Immediate in-place zero-fill sanitization of released memory buffer.
+    pub fn sanitize_released_buffer(&self, buffer: &mut [u8]) -> usize {
+        let len = buffer.len();
+        // Overwrite all bytes with zero
+        for b in buffer.iter_mut() {
+            *b = 0;
+        }
+
+        let pages = (len + PAGE_SIZE_4KB - 1) / PAGE_SIZE_4KB;
+        self.total_sanitized_pages.fetch_add(pages as u64, Ordering::Relaxed);
+        self.total_bytes_cleared.fetch_add(len as u64, Ordering::Relaxed);
+        len
+    }
+
+    /// Retrieve total pages purged and zeroed.
+    pub fn get_total_sanitized_pages(&self) -> u64 {
+        self.total_sanitized_pages.load(Ordering::Acquire)
+    }
+
+    /// Retrieve total bytes zeroed.
+    pub fn get_total_bytes_cleared(&self) -> u64 {
+        self.total_bytes_cleared.load(Ordering::Acquire)
+    }
+}
+
+pub static ANTI_CHEAT_SANITIZER: AntiCheatPageSanitizer = AntiCheatPageSanitizer::new();
