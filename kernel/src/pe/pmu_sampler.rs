@@ -179,3 +179,100 @@ impl PerCpuPmuRingManager {
 }
 
 pub static PER_CPU_PMU_MANAGER: PerCpuPmuRingManager = PerCpuPmuRingManager::new();
+
+/// Anomaly classification for anti-cheat profiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmuAnomalyType {
+    HypervisorTrapJitter { delta_cycles: u32, threshold: u32 },
+    HighBranchMispredictRatio { mispredicts: u64 },
+    L3CacheThrashing { misses: u64 },
+}
+
+/// Profile anomaly incident descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmuAnomalyReport {
+    pub rip: u64,
+    pub thread_id: u32,
+    pub anomaly_type: PmuAnomalyType,
+    pub timestamp_tsc: u64,
+}
+
+/// Anti-cheat profiling anomaly detector flagging hypervisor traps and code injection jitter.
+pub struct PmuAnomalyDetector {
+    hypervisor_jitter_threshold_cycles: AtomicU32,
+    detected_anomalies: Spinlock<Vec<PmuAnomalyReport>>,
+    total_anomalies_flagged: AtomicU64,
+}
+
+impl PmuAnomalyDetector {
+    pub const fn new(jitter_threshold: u32) -> Self {
+        Self {
+            hypervisor_jitter_threshold_cycles: AtomicU32::new(jitter_threshold),
+            detected_anomalies: Spinlock::new(Vec::new()),
+            total_anomalies_flagged: AtomicU64::new(0),
+        }
+    }
+
+    /// Set jitter cycle threshold for hypervisor VM-exit anomaly detection.
+    pub fn set_jitter_threshold(&self, threshold: u32) {
+        self.hypervisor_jitter_threshold_cycles.store(threshold, Ordering::Release);
+    }
+
+    /// Analyze a PMU sample record for execution timing and profiling anomalies.
+    pub fn evaluate_sample(&self, sample: &PmuSampleRecord) -> Option<PmuAnomalyReport> {
+        let threshold = self.hypervisor_jitter_threshold_cycles.load(Ordering::Acquire);
+
+        let anomaly = if sample.delta_cycles > threshold {
+            Some(PmuAnomalyType::HypervisorTrapJitter {
+                delta_cycles: sample.delta_cycles,
+                threshold,
+            })
+        } else {
+            match sample.event_type {
+                PmuEventType::BranchMispredicts if sample.counter_value > 2000 => {
+                    Some(PmuAnomalyType::HighBranchMispredictRatio {
+                        mispredicts: sample.counter_value,
+                    })
+                }
+                PmuEventType::L3CacheMisses if sample.counter_value > 5000 => {
+                    Some(PmuAnomalyType::L3CacheThrashing {
+                        misses: sample.counter_value,
+                    })
+                }
+                _ => None,
+            }
+        };
+
+        if let Some(anom) = anomaly {
+            let report = PmuAnomalyReport {
+                rip: sample.rip,
+                thread_id: sample.thread_id,
+                anomaly_type: anom,
+                timestamp_tsc: sample.timestamp_tsc,
+            };
+            self.detected_anomalies.lock().push(report);
+            self.total_anomalies_flagged.fetch_add(1, Ordering::Relaxed);
+            Some(report)
+        } else {
+            None
+        }
+    }
+
+    /// Retrieve count of flagged anomalies.
+    pub fn get_total_anomalies(&self) -> u64 {
+        self.total_anomalies_flagged.load(Ordering::Acquire)
+    }
+
+    /// Retrieve detected anomalies list.
+    pub fn get_anomalies(&self) -> Vec<PmuAnomalyReport> {
+        self.detected_anomalies.lock().clone()
+    }
+
+    /// Clear recorded anomalies.
+    pub fn clear(&self) {
+        self.detected_anomalies.lock().clear();
+        self.total_anomalies_flagged.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static PMU_ANOMALY_DETECTOR: PmuAnomalyDetector = PmuAnomalyDetector::new(5000);
