@@ -672,133 +672,328 @@ impl DepthStencilResolveEngine {
 
     }
 
+}
+
+
+
+// High Dynamic Range color sample representation with linear floating-point channels.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+
+pub struct HdrColorSample {
+
+    pub r: f32,
+
+    pub g: f32,
+
+    pub b: f32,
+
+    pub a: f32,
+
+}
+
+
+
+impl HdrColorSample {
+
+    // Construct linear HDR color sample.
+
+    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+
+        Self { r, g, b, a }
+
+    }
+
+
+
+    // Calculate perceived luminance using Rec.709 coefficients.
+
+    pub fn luminance(&self) -> f32 {
+
+        0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
+
+    }
+
+}
+
+
+
+// Tonemapping curve selection for high-contrast HDR MSAA resolve.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum HdrResolveToneMapMode {
+
+    // Standard Reinhard tone mapping weight: 1 / (1 + L).
+
+    Reinhard,
+
+    // Luminance-weighted exponential curve.
+
+    LuminanceWeighted,
+
+    // Direct unweighted linear average (fallback).
+
+    BoxFilter,
+
+}
+
+
+
+// HDR tone-mapped MSAA color resolve engine.
+
+// Eliminates chromatic fringing and dark rim artifacts at high-contrast specular edges.
+
+pub struct HdrMsaaColorResolver {
+
+    active_tonemap_mode: HdrResolveToneMapMode,
+
+    total_hdr_resolves: AtomicU64,
+
+}
+
+
+
+impl HdrMsaaColorResolver {
+
+    // Initialize HDR MSAA color resolver.
+
+    pub const fn new() -> Self {
+
+        Self {
+
+            active_tonemap_mode: HdrResolveToneMapMode::Reinhard,
+
+            total_hdr_resolves: AtomicU64::new(0),
+
+        }
+
+    }
+
+
+
+    // Set tone mapping curve mode.
+
+    pub fn set_tonemap_mode(&mut self, mode: HdrResolveToneMapMode) {
+
+        self.active_tonemap_mode = mode;
+
+    }
+
+
+
+    // Resolve multisampled HDR linear colors using tone-mapped sample weights.
+
+    pub fn resolve_hdr_samples(&self, samples: &[HdrColorSample]) -> HdrColorSample {
+
+        self.total_hdr_resolves.fetch_add(1, Ordering::Relaxed);
+
+        if samples.is_empty() {
+
+            return HdrColorSample::new(0.0, 0.0, 0.0, 0.0);
+
+        }
+
+        if samples.len() == 1 || self.active_tonemap_mode == HdrResolveToneMapMode::BoxFilter {
+
+            let mut r = 0.0f32;
+
+            let mut g = 0.0f32;
+
+            let mut b = 0.0f32;
+
+            let mut a = 0.0f32;
+
+            let mut i = 0;
+
+            while i < samples.len() {
+
+                r += samples[i].r;
+
+                g += samples[i].g;
+
+                b += samples[i].b;
+
+                a += samples[i].a;
+
+                i += 1;
+
+            }
+
+            let inv_n = 1.0 / (samples.len() as f32);
+
+            return HdrColorSample::new(r * inv_n, g * inv_n, b * inv_n, a * inv_n);
+
+        }
+
+
+
+        let mut weighted_r = 0.0f32;
+
+        let mut weighted_g = 0.0f32;
+
+        let mut weighted_b = 0.0f32;
+
+        let mut weighted_a = 0.0f32;
+
+        let mut total_weight = 0.0f32;
+
+
+
+        let mut i = 0;
+
+        while i < samples.len() {
+
+            let lum = samples[i].luminance();
+
+            let safe_lum = if lum < 0.0 { 0.0 } else { lum };
+
+            let w = match self.active_tonemap_mode {
+
+                HdrResolveToneMapMode::Reinhard => 1.0 / (1.0 + safe_lum),
+
+                HdrResolveToneMapMode::LuminanceWeighted => 1.0 / (1.0 + safe_lum * 0.5),
+
+                HdrResolveToneMapMode::BoxFilter => 1.0,
+
+            };
+
+            weighted_r += samples[i].r * w;
+
+            weighted_g += samples[i].g * w;
+
+            weighted_b += samples[i].b * w;
+
+            weighted_a += samples[i].a * w;
+
+            total_weight += w;
+
+            i += 1;
+
+        }
+
+
+
+        if total_weight <= 0.00001 {
+
+            return samples[0];
+
+        }
+
+        let inv_total_weight = 1.0 / total_weight;
+
+        let avg_r = weighted_r * inv_total_weight;
+
+        let avg_g = weighted_g * inv_total_weight;
+
+        let avg_b = weighted_b * inv_total_weight;
+
+        let avg_a = weighted_a * inv_total_weight;
+
+
+
+        // Inverse tonemap re-expansion to restore full HDR luminance range
+
+        let avg_lum = 0.2126 * avg_r + 0.7152 * avg_g + 0.0722 * avg_b;
+
+        let safe_avg_lum = if avg_lum < 0.0 { 0.0 } else { avg_lum };
+
+        let inv_scale = match self.active_tonemap_mode {
+
+            HdrResolveToneMapMode::Reinhard => {
+
+                if safe_avg_lum >= 0.999 { 100.0 } else { 1.0 / (1.0 - safe_avg_lum) }
+
+            }
+
+            _ => 1.0,
+
+        };
+
+
+
+        // Clamp extreme multipliers to prevent float overflows
+
+        let scale = if inv_scale < 1.0 { 1.0 } else if inv_scale > 10.0 { 10.0 } else { inv_scale };
+
+        HdrColorSample::new(avg_r * scale, avg_g * scale, avg_b * scale, avg_a)
+
+    }
+
+
+
+    // Total HDR color resolves performed.
+
+    pub fn total_hdr_resolves(&self) -> u64 {
+
+        self.total_hdr_resolves.load(Ordering::Relaxed)
+
+    }
+
 }
 
-// High Dynamic Range color sample representation with linear floating-point channels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HdrColorSample {
-    pub r: f32,
-    pub g: f32,
-    pub b: f32,
-    pub a: f32,
+// High-level governor orchestrating D3D12 hardware MSAA resolve operations,
+// programmable sample pattern management, fast depth/stencil filters, and HDR tonemapping.
+pub struct D3d12MsaaResolveGovernor {
+    optimizer: MsaaResolveSubpassOptimizer,
+    depth_stencil_engine: DepthStencilResolveEngine,
+    hdr_resolver: HdrMsaaColorResolver,
+    programmable_sample_positions_tier: u32,
 }
 
-impl HdrColorSample {
-    // Construct linear HDR color sample.
-    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-
-    // Calculate perceived luminance using Rec.709 coefficients.
-    pub fn luminance(&self) -> f32 {
-        0.2126 * self.r + 0.7152 * self.g + 0.0722 * self.b
-    }
-}
-
-// Tonemapping curve selection for high-contrast HDR MSAA resolve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HdrResolveToneMapMode {
-    // Standard Reinhard tone mapping weight: 1 / (1 + L).
-    Reinhard,
-    // Luminance-weighted exponential curve.
-    LuminanceWeighted,
-    // Direct unweighted linear average (fallback).
-    BoxFilter,
-}
-
-// HDR tone-mapped MSAA color resolve engine.
-// Eliminates chromatic fringing and dark rim artifacts at high-contrast specular edges.
-pub struct HdrMsaaColorResolver {
-    active_tonemap_mode: HdrResolveToneMapMode,
-    total_hdr_resolves: AtomicU64,
-}
-
-impl HdrMsaaColorResolver {
-    // Initialize HDR MSAA color resolver.
-    pub const fn new() -> Self {
+impl D3d12MsaaResolveGovernor {
+    // Initialize MSAA resolve governor with specified hardware tier.
+    pub const fn new(programmable_sample_positions_tier: u32) -> Self {
         Self {
-            active_tonemap_mode: HdrResolveToneMapMode::Reinhard,
-            total_hdr_resolves: AtomicU64::new(0),
+            optimizer: MsaaResolveSubpassOptimizer::new(),
+            depth_stencil_engine: DepthStencilResolveEngine::new(),
+            hdr_resolver: HdrMsaaColorResolver::new(),
+            programmable_sample_positions_tier,
         }
     }
 
-    // Set tone mapping curve mode.
-    pub fn set_tonemap_mode(&mut self, mode: HdrResolveToneMapMode) {
-        self.active_tonemap_mode = mode;
+    // Query programmable sample positions tier support (e.g. Tier 1 or Tier 2).
+    pub const fn programmable_tier(&self) -> u32 {
+        self.programmable_sample_positions_tier
     }
 
-    // Resolve multisampled HDR linear colors using tone-mapped sample weights.
-    pub fn resolve_hdr_samples(&self, samples: &[HdrColorSample]) -> HdrColorSample {
-        self.total_hdr_resolves.fetch_add(1, Ordering::Relaxed);
-        if samples.is_empty() {
-            return HdrColorSample::new(0.0, 0.0, 0.0, 0.0);
+    // Configure programmable sample positions for specified MSAA count.
+    pub fn configure_sample_pattern(&mut self, count: MsaaSampleCount, positions: &[SamplePosition]) -> bool {
+        if self.programmable_sample_positions_tier == 0 {
+            return false;
         }
-        if samples.len() == 1 || self.active_tonemap_mode == HdrResolveToneMapMode::BoxFilter {
-            let mut r = 0.0f32;
-            let mut g = 0.0f32;
-            let mut b = 0.0f32;
-            let mut a = 0.0f32;
-            let mut i = 0;
-            while i < samples.len() {
-                r += samples[i].r;
-                g += samples[i].g;
-                b += samples[i].b;
-                a += samples[i].a;
-                i += 1;
-            }
-            let inv_n = 1.0 / (samples.len() as f32);
-            return HdrColorSample::new(r * inv_n, g * inv_n, b * inv_n, a * inv_n);
-        }
-
-        let mut weighted_r = 0.0f32;
-        let mut weighted_g = 0.0f32;
-        let mut weighted_b = 0.0f32;
-        let mut weighted_a = 0.0f32;
-        let mut total_weight = 0.0f32;
-
-        let mut i = 0;
-        while i < samples.len() {
-            let lum = samples[i].luminance();
-            let safe_lum = if lum < 0.0 { 0.0 } else { lum };
-            let w = match self.active_tonemap_mode {
-                HdrResolveToneMapMode::Reinhard => 1.0 / (1.0 + safe_lum),
-                HdrResolveToneMapMode::LuminanceWeighted => 1.0 / (1.0 + safe_lum * 0.5),
-                HdrResolveToneMapMode::BoxFilter => 1.0,
-            };
-            weighted_r += samples[i].r * w;
-            weighted_g += samples[i].g * w;
-            weighted_b += samples[i].b * w;
-            weighted_a += samples[i].a * w;
-            total_weight += w;
-            i += 1;
-        }
-
-        if total_weight <= 0.00001 {
-            return samples[0];
-        }
-        let inv_total_weight = 1.0 / total_weight;
-        let avg_r = weighted_r * inv_total_weight;
-        let avg_g = weighted_g * inv_total_weight;
-        let avg_b = weighted_b * inv_total_weight;
-        let avg_a = weighted_a * inv_total_weight;
-
-        // Inverse tonemap re-expansion to restore full HDR luminance range
-        let avg_lum = 0.2126 * avg_r + 0.7152 * avg_g + 0.0722 * avg_b;
-        let safe_avg_lum = if avg_lum < 0.0 { 0.0 } else { avg_lum };
-        let inv_scale = match self.active_tonemap_mode {
-            HdrResolveToneMapMode::Reinhard => {
-                if safe_avg_lum >= 0.999 { 100.0 } else { 1.0 / (1.0 - safe_avg_lum) }
-            }
-            _ => 1.0,
-        };
-
-        // Clamp extreme multipliers to prevent float overflows
-        let scale = if inv_scale < 1.0 { 1.0 } else if inv_scale > 10.0 { 10.0 } else { inv_scale };
-        HdrColorSample::new(avg_r * scale, avg_g * scale, avg_b * scale, avg_a)
+        let pat = ProgrammableSamplePattern::custom(count, positions);
+        self.optimizer.set_custom_pattern(pat);
+        true
     }
 
-    // Total HDR color resolves performed.
-    pub fn total_hdr_resolves(&self) -> u64 {
-        self.total_hdr_resolves.load(Ordering::Relaxed)
+    // Reset sample pattern for specified MSAA count to hardware default.
+    pub fn reset_sample_pattern(&mut self, count: MsaaSampleCount) {
+        self.optimizer.reset_to_standard(count);
+    }
+
+    // Access sample pattern optimizer.
+    pub fn optimizer(&self) -> &MsaaResolveSubpassOptimizer {
+        &self.optimizer
+    }
+
+    // Access mutable optimizer.
+    pub fn optimizer_mut(&mut self) -> &mut MsaaResolveSubpassOptimizer {
+        &mut self.optimizer
+    }
+
+    // Access depth/stencil resolve engine.
+    pub fn depth_stencil_engine(&self) -> &DepthStencilResolveEngine {
+        &self.depth_stencil_engine
+    }
+
+    // Access HDR color resolver.
+    pub fn hdr_resolver(&self) -> &HdrMsaaColorResolver {
+        &self.hdr_resolver
+    }
+
+    // Access mutable HDR color resolver.
+    pub fn hdr_resolver_mut(&mut self) -> &mut HdrMsaaColorResolver {
+        &mut self.hdr_resolver
     }
 }
