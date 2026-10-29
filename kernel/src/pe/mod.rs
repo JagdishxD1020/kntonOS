@@ -118,6 +118,7 @@ pub use direct_fiber_switch::test_win32_direct_fiber_switch_subsystem;
 pub use cold_page_evict::test_win32_cold_page_evict_subsystem;
 pub use prefault_cluster::test_win32_prefault_cluster_subsystem;
 pub use large_page_free::test_win32_large_page_free_subsystem;
+pub use pmu_sampler::test_win32_pmu_sampler_subsystem;
 pub use loader::*;
 pub use image::*;
 pub use user_stack::*;
