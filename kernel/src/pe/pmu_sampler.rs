@@ -276,3 +276,107 @@ impl PmuAnomalyDetector {
 }
 
 pub static PMU_ANOMALY_DETECTOR: PmuAnomalyDetector = PmuAnomalyDetector::new(5000);
+
+/// Comprehensive self-test suite for Win32 PMU Event Telemetry Sampling & Anomaly Detector.
+pub fn test_win32_pmu_sampler_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-PMU-SAMPLER] Initializing Win32 PMU Sampler Subsystem self-test...\r\n");
+
+    // 1. Verify High-Frequency PMU Event Sampling Engine
+    let initial_samples = PMU_SAMPLING_ENGINE.get_total_samples();
+    let s1 = PMU_SAMPLING_ENGINE.sample_hardware_event(
+        100_000,
+        0x0000_0040_1000,
+        0,
+        1001,
+        PmuEventType::RetiredInstructions,
+        15_000,
+        80,
+    );
+
+    if s1.event_type != PmuEventType::RetiredInstructions || s1.rip != 0x0000_0040_1000 {
+        crate::serial_write_str("[KNT-TEST-ERR] PMU sample record fields mismatch\r\n");
+        return false;
+    }
+
+    if PMU_SAMPLING_ENGINE.get_total_samples() != initial_samples + 1 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total PMU samples counter mismatch\r\n");
+        return false;
+    }
+
+    // 2. Verify Per-CPU SPSC Hardware Event Telemetry Ring Buffer
+    let cpu_target = 2u32;
+    let s2 = PmuSampleRecord {
+        timestamp_tsc: 105_000,
+        rip: 0x0000_0040_2200,
+        cpu_id: cpu_target,
+        thread_id: 1002,
+        event_type: PmuEventType::BranchMispredicts,
+        counter_value: 450,
+        delta_cycles: 65,
+    };
+
+    if !PER_CPU_PMU_MANAGER.publish_sample(s2) {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to publish sample to per-CPU ring\r\n");
+        return false;
+    }
+
+    let ring = PER_CPU_PMU_MANAGER.get_or_create_ring(cpu_target);
+    if ring.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] CPU ring buffer should not be empty\r\n");
+        return false;
+    }
+
+    let drained = PER_CPU_PMU_MANAGER.drain_cpu_samples(cpu_target);
+    if drained.len() != 1 || drained[0].rip != 0x0000_0040_2200 {
+        crate::serial_write_str("[KNT-TEST-ERR] Drained batch sample mismatch\r\n");
+        return false;
+    }
+
+    if !ring.is_empty() {
+        crate::serial_write_str("[KNT-TEST-ERR] CPU ring buffer should be empty after drain\r\n");
+        return false;
+    }
+
+    // 3. Verify Anti-Cheat Anomaly Detection (Hypervisor Trap Jitter & Cache Thrashing)
+    // Normal sample -> no anomaly
+    if PMU_ANOMALY_DETECTOR.evaluate_sample(&s1).is_some() {
+        crate::serial_write_str("[KNT-TEST-ERR] Normal execution sample incorrectly flagged as anomaly\r\n");
+        return false;
+    }
+
+    // Jitter sample: 12,000 cycles (exceeds 5,000 cycle threshold)
+    let jitter_sample = PmuSampleRecord {
+        timestamp_tsc: 120_000,
+        rip: 0x0000_7FFF_DEAD_0000,
+        cpu_id: 0,
+        thread_id: 666,
+        event_type: PmuEventType::CpuCycles,
+        counter_value: 12_000,
+        delta_cycles: 12_000,
+    };
+
+    let anom = PMU_ANOMALY_DETECTOR.evaluate_sample(&jitter_sample);
+    match anom {
+        Some(rep) => {
+            match rep.anomaly_type {
+                PmuAnomalyType::HypervisorTrapJitter { delta_cycles, .. } if delta_cycles == 12_000 => {}
+                _ => {
+                    crate::serial_write_str("[KNT-TEST-ERR] Flagged anomaly type mismatch\r\n");
+                    return false;
+                }
+            }
+        }
+        None => {
+            crate::serial_write_str("[KNT-TEST-ERR] Hypervisor jitter anomaly was not flagged\r\n");
+            return false;
+        }
+    }
+
+    if PMU_ANOMALY_DETECTOR.get_total_anomalies() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Anomaly counter was zero\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-PMU-SAMPLER-PASS] Win32 PMU Telemetry Sampling & Anomaly Detector verified\r\n");
+    true
+}
