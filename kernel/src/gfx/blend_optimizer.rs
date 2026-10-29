@@ -305,3 +305,84 @@ impl D3d12BlendOptimizerEngine {
         mask
     }
 }
+
+// Verification self-test suite for D3D12 Agility Dynamic Blend State & Optimization Engine.
+pub fn test_blend_optimizer_subsystem() -> bool {
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 dynamic blend optimizer engine...\r\n");
+
+    let mut engine = D3d12BlendOptimizerEngine::new();
+
+    // 1. Verify dynamic blend state hashing and redundant flush avoidance.
+    let mut blend_state1 = DynamicBlendStateDesc::default();
+    blend_state1.render_targets[0].blend_enable = true;
+    blend_state1.render_targets[0].src_blend = DynamicBlendFactor::SrcAlpha;
+    blend_state1.render_targets[0].dest_blend = DynamicBlendFactor::InvSrcAlpha;
+
+    let (changed1, bypass1) = engine.set_blend_state(&blend_state1, 1);
+    if !changed1 || bypass1 != 0 {
+        return false;
+    }
+
+    // Identical state must not trigger hardware ROP flush.
+    let (changed2, _) = engine.set_blend_state(&blend_state1, 1);
+    if changed2 || engine.metrics.total_rop_flushes_saved != 1 {
+        return false;
+    }
+
+    // 2. Verify alpha-to-coverage subpixel mask calculation.
+    let mut blend_state2 = DynamicBlendStateDesc::default();
+    blend_state2.alpha_to_coverage_enable = true;
+    let (changed3, _) = engine.set_blend_state(&blend_state2, 1);
+    if !changed3 {
+        return false;
+    }
+
+    // High alpha (0.95) -> 4-sample full coverage 0x0F
+    let mask_high = engine.resolve_alpha_coverage(0.95);
+    if mask_high != 0x0F {
+        return false;
+    }
+
+    // Medium alpha (0.50) -> 2-sample coverage 0x03
+    let mask_med = engine.resolve_alpha_coverage(0.50);
+    if mask_med != 0x03 {
+        return false;
+    }
+
+    // Zero alpha (0.05) -> 0-sample coverage 0x00
+    let mask_zero = engine.resolve_alpha_coverage(0.05);
+    if mask_zero != 0x00 {
+        return false;
+    }
+
+    // 3. Verify color write mask bypass optimization.
+    let mut blend_state3 = DynamicBlendStateDesc::default();
+    blend_state3.independent_blend_enable = true;
+    // RT0: write mask ALL (normal)
+    blend_state3.render_targets[0].write_mask = D3D12_COLOR_WRITE_MASK_ALL;
+    // RT1: write mask 0 (complete ROP bypass)
+    blend_state3.render_targets[1].write_mask = 0;
+    // RT2: write mask RED only (partial write)
+    blend_state3.render_targets[2].write_mask = D3D12_COLOR_WRITE_MASK_RED;
+
+    let (changed4, bypass3) = engine.set_blend_state(&blend_state3, 3);
+    if !changed4 {
+        return false;
+    }
+
+    // Bit 1 should be set in bypass bitmask (RT1 has write_mask 0)
+    if bypass3 != (1 << 1) {
+        return false;
+    }
+    if engine.bypass_optimizer.rop_stages_bypassed != 1 {
+        return false;
+    }
+    if engine.bypass_optimizer.partial_writes_allowed != 1 {
+        return false;
+    }
+
+    // 4. Emit deterministic boot sentinel.
+    crate::serial_write_str("[KNT-D3D12-BLEND-OPTIMIZER-PASS] Direct3D 12 dynamic blend optimizer engine verified\r\n");
+
+    true
+}

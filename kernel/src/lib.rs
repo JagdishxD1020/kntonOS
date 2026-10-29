@@ -582,6 +582,10 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_sampler_anisotropy_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility dynamic sampler anisotropy self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Dynamic Blend State Hashing & Optimization (TASK-KNT-307)
+    if !gfx::test_blend_optimizer_subsystem() {
+        serial_write_str("[KNT-PANIC] Direct3D 12 agility blend optimizer self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
