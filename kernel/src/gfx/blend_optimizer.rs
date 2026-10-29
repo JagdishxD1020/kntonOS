@@ -207,3 +207,47 @@ impl AlphaToCoverageGovernor {
         self.independent_blend_active && slot_idx < self.active_render_target_count
     }
 }
+
+// Color write mask disable bypass optimizer skipping ROP blending stage when targets are masked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ColorWriteMaskBypassOptimizer {
+    pub total_slots_evaluated: u64,
+    pub rop_stages_bypassed: u64,
+    pub partial_writes_allowed: u64,
+}
+
+impl ColorWriteMaskBypassOptimizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // Evaluates whether blending calculations and ROP writes can be completely bypassed.
+    pub fn evaluate_slot_bypass(&mut self, rt: &DynamicRenderTargetBlendDesc) -> bool {
+        self.total_slots_evaluated += 1;
+
+        if rt.write_mask == 0 {
+            // All channels disabled (0): complete bypass of ROP blending and frame buffer writes
+            self.rop_stages_bypassed += 1;
+            true
+        } else {
+            if rt.write_mask != D3D12_COLOR_WRITE_MASK_ALL {
+                self.partial_writes_allowed += 1;
+            }
+            false
+        }
+    }
+
+    // Computes aggregate bypass mask for an entire blend state across active render targets.
+    pub fn evaluate_state_bypass_mask(&mut self, desc: &DynamicBlendStateDesc, active_rts: usize) -> u8 {
+        let mut bypass_bitmask: u8 = 0;
+        let count = active_rts.min(8);
+
+        for i in 0..count {
+            if self.evaluate_slot_bypass(&desc.render_targets[i]) {
+                bypass_bitmask |= 1 << i;
+            }
+        }
+
+        bypass_bitmask
+    }
+}
