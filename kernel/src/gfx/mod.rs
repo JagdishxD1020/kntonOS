@@ -70,6 +70,7 @@ pub mod depth_bounds_optimizer;
 pub mod occlusion_query;
 pub mod viewport_rasterizer;
 pub mod sampler_anisotropy;
+pub mod blend_optimizer;
 
 pub use cmdbuf::*;
 pub use compute::*;
@@ -140,6 +141,7 @@ pub use depth_bounds_optimizer::*;
 pub use occlusion_query::*;
 pub use viewport_rasterizer::*;
 pub use sampler_anisotropy::*;
+pub use blend_optimizer::*;
 
 /// Comprehensive verification self-test suite for Direct3D / Vulkan-Style Command Buffer
 /// Recording and Hardware Queue Submission Engine.
