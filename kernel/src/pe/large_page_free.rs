@@ -317,3 +317,76 @@ impl VirtualRegionCompactor {
 }
 
 pub static REGION_COMPACTOR: VirtualRegionCompactor = VirtualRegionCompactor::new();
+
+/// Comprehensive self-test suite for Win32 Large Page Virtual Free & Contiguous Region Compactor.
+pub fn test_win32_large_page_free_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-LARGE-FREE] Initializing Win32 Large Page Virtual Free self-test...\r\n");
+
+    // 1. Verify 2MB Large Page Allocation, Sub-Page Splitting & Unmap
+    let alloc_base = 0x0000_0001_0000_0000u64;
+    LARGE_PAGE_FREE_ENGINE.register_allocation(alloc_base, PAGE_SIZE_2MB, LargePageSize::Large2MB);
+
+    let split_target = 0x0000_0001_0000_1000u64;
+    let split_size = PAGE_SIZE_4KB;
+    let split_res = match LARGE_PAGE_FREE_ENGINE.free_or_split_large_page(split_target, split_size) {
+        Ok(res) => res,
+        Err(_) => {
+            crate::serial_write_str("[KNT-TEST-ERR] Large page partial split and unmap failed\r\n");
+            return false;
+        }
+    };
+
+    if split_res.unmapped_base != split_target || split_res.unmapped_size != split_size {
+        crate::serial_write_str("[KNT-TEST-ERR] Unmapped base or size mismatch\r\n");
+        return false;
+    }
+
+    if split_res.remaining_subpages.len() != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Expected 2 remaining subpage ranges after middle split\r\n");
+        return false;
+    }
+
+    if LARGE_PAGE_FREE_ENGINE.get_total_splits() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total splits counter was zero\r\n");
+        return false;
+    }
+
+    // 2. Verify Anti-Cheat Security Memory Zeroing on Release
+    let mut sensitive_buf = [0xA5u8; 256];
+    let sanitized_bytes = ANTI_CHEAT_SANITIZER.sanitize_released_buffer(&mut sensitive_buf);
+
+    if sanitized_bytes != 256 || !sensitive_buf.iter().all(|&b| b == 0) {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat buffer sanitization zeroing failed\r\n");
+        return false;
+    }
+
+    if ANTI_CHEAT_SANITIZER.get_total_bytes_cleared() < 256 {
+        crate::serial_write_str("[KNT-TEST-ERR] Sanitizer total bytes counter mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify Contiguous Virtual Region Compactor & Coalescing
+    REGION_COMPACTOR.register_free_hole(0x0000_7FFF_0000_0000, 64 * 1024);
+    REGION_COMPACTOR.register_free_hole(0x0000_7FFF_0001_0000, 64 * 1024); // Contiguous with hole 1
+    REGION_COMPACTOR.register_free_hole(0x0000_7FFF_0004_0000, 128 * 1024); // Disjoint hole
+
+    let report = REGION_COMPACTOR.compact_and_coalesce();
+
+    if report.initial_holes_count != 3 || report.coalesced_holes_count != 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Compactor coalesced hole count mismatch\r\n");
+        return false;
+    }
+
+    if report.max_contiguous_free_bytes != 128 * 1024 {
+        crate::serial_write_str("[KNT-TEST-ERR] Max contiguous free bytes calculation mismatch\r\n");
+        return false;
+    }
+
+    if REGION_COMPACTOR.get_total_compactions() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total compactions counter was zero\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-LARGE-FREE-PASS] Win32 Large Page Virtual Free & Region Compactor verified\r\n");
+    true
+}
