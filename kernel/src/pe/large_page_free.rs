@@ -212,3 +212,108 @@ impl AntiCheatPageSanitizer {
 }
 
 pub static ANTI_CHEAT_SANITIZER: AntiCheatPageSanitizer = AntiCheatPageSanitizer::new();
+
+/// Diagnostic compaction report on sparse virtual address space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactedRegionReport {
+    pub initial_holes_count: usize,
+    pub coalesced_holes_count: usize,
+    pub max_contiguous_free_bytes: usize,
+    pub fragmentation_index_percent: u32,
+}
+
+/// Contiguous virtual memory region compactor defragmenting sparse process address spaces.
+pub struct VirtualRegionCompactor {
+    free_holes: Spinlock<BTreeMap<u64, usize>>,
+    total_compactions: AtomicU64,
+}
+
+impl VirtualRegionCompactor {
+    pub const fn new() -> Self {
+        Self {
+            free_holes: Spinlock::new(BTreeMap::new()),
+            total_compactions: AtomicU64::new(0),
+        }
+    }
+
+    /// Register a freed address range into the hole map.
+    pub fn register_free_hole(&self, base_address: u64, size_bytes: usize) {
+        self.free_holes.lock().insert(base_address, size_bytes);
+    }
+
+    /// Coalesce adjacent free holes and defragment sparse regions.
+    pub fn compact_and_coalesce(&self) -> CompactedRegionReport {
+        let mut holes = self.free_holes.lock();
+        let initial_count = holes.len();
+
+        if initial_count <= 1 {
+            let max_contig = holes.values().copied().max().unwrap_or(0);
+            return CompactedRegionReport {
+                initial_holes_count: initial_count,
+                coalesced_holes_count: initial_count,
+                max_contiguous_free_bytes: max_contig,
+                fragmentation_index_percent: 0,
+            };
+        }
+
+        let mut merged: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut cur_base: Option<u64> = None;
+        let mut cur_size: usize = 0;
+
+        for (&base, &size) in holes.iter() {
+            match cur_base {
+                Some(b) => {
+                    if b + (cur_size as u64) == base {
+                        // Adjacent hole: coalesce into current
+                        cur_size += size;
+                    } else {
+                        // Disjoint hole: store previous and start new
+                        merged.insert(b, cur_size);
+                        cur_base = Some(base);
+                        cur_size = size;
+                    }
+                }
+                None => {
+                    cur_base = Some(base);
+                    cur_size = size;
+                }
+            }
+        }
+
+        if let Some(b) = cur_base {
+            merged.insert(b, cur_size);
+        }
+
+        let coalesced_count = merged.len();
+        let max_contig = merged.values().copied().max().unwrap_or(0);
+        let total_free: usize = merged.values().sum();
+        let frag_percent = if total_free > 0 {
+            100u32.saturating_sub(((max_contig as u64 * 100) / total_free as u64) as u32)
+        } else {
+            0
+        };
+
+        *holes = merged;
+        self.total_compactions.fetch_add(1, Ordering::Relaxed);
+
+        CompactedRegionReport {
+            initial_holes_count: initial_count,
+            coalesced_holes_count: coalesced_count,
+            max_contiguous_free_bytes: max_contig,
+            fragmentation_index_percent: frag_percent,
+        }
+    }
+
+    /// Retrieve total defragmentation passes completed.
+    pub fn get_total_compactions(&self) -> u64 {
+        self.total_compactions.load(Ordering::Acquire)
+    }
+
+    /// Clear all recorded holes.
+    pub fn clear(&self) {
+        self.free_holes.lock().clear();
+        self.total_compactions.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static REGION_COMPACTOR: VirtualRegionCompactor = VirtualRegionCompactor::new();
