@@ -100,3 +100,80 @@ impl SafeSehValidator {
 }
 
 pub static SAFE_SEH_VALIDATOR: SafeSehValidator = SafeSehValidator::new();
+
+/// Fault classification for stack pivoting and frame alignment violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackPivotFault {
+    RspMisaligned(u64),
+    RbpMisaligned(u64),
+    StackPivotDetected { rsp: u64, stack_limit: u64, stack_base: u64 },
+    InvertedFramePointers { rsp: u64, rbp: u64 },
+}
+
+/// Stack pivoting and ROP chain anomaly detection engine.
+pub struct StackPivotGuard {
+    total_frame_checks: AtomicU64,
+    total_pivots_blocked: AtomicU64,
+}
+
+impl StackPivotGuard {
+    pub const fn new() -> Self {
+        Self {
+            total_frame_checks: AtomicU64::new(0),
+            total_pivots_blocked: AtomicU64::new(0),
+        }
+    }
+
+    /// Verify thread stack frame registers during exception dispatch.
+    pub fn verify_exception_stack_frame(
+        &self,
+        rsp: u64,
+        rbp: u64,
+        stack_base: u64,
+        stack_limit: u64,
+    ) -> Result<(), StackPivotFault> {
+        self.total_frame_checks.fetch_add(1, Ordering::Relaxed);
+
+        // 1. Verify 16-byte RSP alignment
+        if (rsp & 0x0F) != 0 {
+            self.total_pivots_blocked.fetch_add(1, Ordering::Relaxed);
+            return Err(StackPivotFault::RspMisaligned(rsp));
+        }
+
+        // 2. Check for stack pivot (RSP outside legitimate thread stack bounds)
+        if rsp < stack_limit || rsp > stack_base {
+            self.total_pivots_blocked.fetch_add(1, Ordering::Relaxed);
+            return Err(StackPivotFault::StackPivotDetected {
+                rsp,
+                stack_limit,
+                stack_base,
+            });
+        }
+
+        // 3. Verify RBP frame pointer constraints if active
+        if rbp != 0 {
+            if (rbp & 0x0F) != 0 {
+                self.total_pivots_blocked.fetch_add(1, Ordering::Relaxed);
+                return Err(StackPivotFault::RbpMisaligned(rbp));
+            }
+            if rbp < rsp || rbp > stack_base {
+                self.total_pivots_blocked.fetch_add(1, Ordering::Relaxed);
+                return Err(StackPivotFault::InvertedFramePointers { rsp, rbp });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve count of frame validations performed.
+    pub fn get_total_frame_checks(&self) -> u64 {
+        self.total_frame_checks.load(Ordering::Acquire)
+    }
+
+    /// Retrieve count of blocked stack pivots.
+    pub fn get_total_pivots_blocked(&self) -> u64 {
+        self.total_pivots_blocked.load(Ordering::Acquire)
+    }
+}
+
+pub static STACK_PIVOT_GUARD: StackPivotGuard = StackPivotGuard::new();
