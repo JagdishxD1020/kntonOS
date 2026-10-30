@@ -1382,6 +1382,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_pmu_sampler_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 PMU Sampler subsystem self-test failed!\r\n");
     }
+    // Verify Win32 SafeSEH Validation & Stack Pivoting Guard (TASK-KNT-310)
+    if !pe::test_win32_safe_seh_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 SafeSEH Guard subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
