@@ -1378,6 +1378,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_large_page_free_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Large Page Virtual Free subsystem self-test failed!\r\n");
     }
+    // Verify Win32 PMU Telemetry Sampling & Anomaly Detector (TASK-KNT-308)
+    if !pe::test_win32_pmu_sampler_subsystem() {
+        serial_write_str("[KNT-PANIC] Win32 PMU Sampler subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
