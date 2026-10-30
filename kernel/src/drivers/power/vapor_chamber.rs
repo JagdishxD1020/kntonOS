@@ -610,3 +610,250 @@ pub fn verify_peltier_tec_current_governor() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Emergency Thermal Runaway Throttling Preventing SoC Hot Spots
+// ============================================================================
+
+/// Multi-stage thermal throttle severity levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThermalThrottleStage {
+    /// Stage 0: Nominal operation, no thermal throttling active.
+    Nominal = 0,
+    /// Stage 1: Soft TDP cap (24W), fan curve pre-emptive ramp (+25%).
+    ModerateSoftCap = 1,
+    /// Stage 2: Heavy TDP reduction (16W), maximum fan boost (100%), GPU clock clamp.
+    AggressiveThrottle = 2,
+    /// Stage 3: Emergency PROCHOT# assertion, TDP clamped to minimum (7W), TEC reverse-dump protection.
+    CriticalEmergency = 3,
+    /// Stage 4: Catastrophic thermal trip latch (> 105°C), immediate power-off required.
+    HardwareTrip = 4,
+}
+
+/// Emergency thermal runaway detector and multi-stage throttle governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmergencyThermalThrottler {
+    /// Current throttle stage.
+    pub current_stage: ThermalThrottleStage,
+    /// Target APU TDP limit in Watts enforced by throttler.
+    pub enforced_tdp_watts: u32,
+    /// Hardware PROCHOT# assertion status.
+    pub prochot_asserted: bool,
+    /// TEC reverse-dump suppression active (TEC forced off because heatsink is heat-soaked).
+    pub tec_reverse_dump_suppressed: bool,
+    /// Fan boost duty cycle in basis points (0 to 10,000).
+    pub emergency_fan_boost_basis_points: u16,
+    /// Timestamp when temperature fell below current recovery threshold.
+    pub recovery_timer_ms: u64,
+    /// Total number of emergency thermal runaway throttle events.
+    pub throttle_events_count: u32,
+}
+
+impl EmergencyThermalThrottler {
+    /// Nominal full-power gaming TDP in Watts (30W).
+    pub const NOMINAL_TDP_WATTS: u32 = 30;
+    /// Stage 1 soft-cap TDP in Watts (24W).
+    pub const STAGE1_TDP_WATTS: u32 = 24;
+    /// Stage 2 aggressive throttle TDP in Watts (16W).
+    pub const STAGE2_TDP_WATTS: u32 = 16;
+    /// Stage 3 emergency PROCHOT# TDP in Watts (7W).
+    pub const STAGE3_TDP_WATTS: u32 = 7;
+
+    /// Stage 1 trigger temperature (86°C = 86,000 mC).
+    pub const STAGE1_TRIGGER_TEMP_MC: i32 = 86 * MILLIDEG_SCALE;
+    /// Stage 2 trigger temperature (92°C = 92,000 mC).
+    pub const STAGE2_TRIGGER_TEMP_MC: i32 = 92 * MILLIDEG_SCALE;
+    /// Stage 3 critical PROCHOT trigger temperature (98°C = 98,000 mC).
+    pub const STAGE3_TRIGGER_TEMP_MC: i32 = 98 * MILLIDEG_SCALE;
+    /// Stage 4 catastrophic trip temperature (105°C = 105,000 mC).
+    pub const STAGE4_TRIP_TEMP_MC: i32 = 105 * MILLIDEG_SCALE;
+
+    /// Maximum permissible chassis skin temperature for user grip comfort (48°C = 48,000 mC).
+    pub const MAX_SAFE_SKIN_TEMP_MC: i32 = 48 * MILLIDEG_SCALE;
+    /// Maximum permissible condenser/heatsink temperature before TEC reverse heat dumps (85°C = 85,000 mC).
+    pub const MAX_CONDENSER_TEMP_FOR_TEC_MC: i32 = 85 * MILLIDEG_SCALE;
+
+    /// Hysteresis dwell duration in milliseconds required before down-throttling (500 ms).
+    pub const HYSTERESIS_DWELL_MS: u64 = 500;
+
+    /// Initializes emergency thermal throttler in nominal unthrottled state.
+    pub const fn new() -> Self {
+        Self {
+            current_stage: ThermalThrottleStage::Nominal,
+            enforced_tdp_watts: Self::NOMINAL_TDP_WATTS,
+            prochot_asserted: false,
+            tec_reverse_dump_suppressed: false,
+            emergency_fan_boost_basis_points: 0,
+            recovery_timer_ms: 0,
+            throttle_events_count: 0,
+        }
+    }
+
+    /// Evaluates thermal runaway conditions and updates throttling posture.
+    pub fn evaluate_thermal_runaway(
+        &mut self,
+        soc_temp_mc: i32,
+        condenser_temp_mc: i32,
+        skin_temp_mc: i32,
+        phase_state: VaporChamberPhaseState,
+        slew_rate_mc_s: i32,
+        timestamp_ms: u64,
+    ) {
+        // 1. Check for heatsink heat-soak: if condenser >= 85°C, TEC cannot reject heat; shut it off
+        self.tec_reverse_dump_suppressed = condenser_temp_mc >= Self::MAX_CONDENSER_TEMP_FOR_TEC_MC;
+
+        // 2. Determine target raw throttle stage based on thermal indicators
+        let mut target_stage = ThermalThrottleStage::Nominal;
+
+        if soc_temp_mc >= Self::STAGE4_TRIP_TEMP_MC {
+            target_stage = ThermalThrottleStage::HardwareTrip;
+        } else if soc_temp_mc >= Self::STAGE3_TRIGGER_TEMP_MC
+            || phase_state == VaporChamberPhaseState::CriticalDryout
+        {
+            target_stage = ThermalThrottleStage::CriticalEmergency;
+        } else if soc_temp_mc >= Self::STAGE2_TRIGGER_TEMP_MC
+            || skin_temp_mc >= Self::MAX_SAFE_SKIN_TEMP_MC
+            || slew_rate_mc_s >= 3500 // > 3.5°C/s rapid temperature surge
+            || phase_state == VaporChamberPhaseState::CapillaryDryoutWarning
+        {
+            target_stage = ThermalThrottleStage::AggressiveThrottle;
+        } else if soc_temp_mc >= Self::STAGE1_TRIGGER_TEMP_MC || skin_temp_mc >= 44 * MILLIDEG_SCALE {
+            target_stage = ThermalThrottleStage::ModerateSoftCap;
+        }
+
+        // 3. Fast Up-Throttle / Hysteresis Down-Throttle Logic
+        if target_stage > self.current_stage {
+            // Immediate up-throttle (< 100ms response to thermal spike)
+            self.current_stage = target_stage;
+            self.recovery_timer_ms = timestamp_ms;
+            self.throttle_events_count += 1;
+        } else if target_stage < self.current_stage {
+            // Down-throttle requires sustained cooldown for at least HYSTERESIS_DWELL_MS
+            if timestamp_ms.saturating_sub(self.recovery_timer_ms) >= Self::HYSTERESIS_DWELL_MS {
+                self.current_stage = target_stage;
+                self.recovery_timer_ms = timestamp_ms;
+            }
+        } else {
+            // Maintained in current stage
+            self.recovery_timer_ms = timestamp_ms;
+        }
+
+        // 4. Enforce stage-specific hardware parameters
+        match self.current_stage {
+            ThermalThrottleStage::Nominal => {
+                self.enforced_tdp_watts = Self::NOMINAL_TDP_WATTS;
+                self.prochot_asserted = false;
+                self.emergency_fan_boost_basis_points = 0;
+            }
+            ThermalThrottleStage::ModerateSoftCap => {
+                self.enforced_tdp_watts = Self::STAGE1_TDP_WATTS;
+                self.prochot_asserted = false;
+                self.emergency_fan_boost_basis_points = 2500; // +25% fan duty
+            }
+            ThermalThrottleStage::AggressiveThrottle => {
+                self.enforced_tdp_watts = Self::STAGE2_TDP_WATTS;
+                self.prochot_asserted = false;
+                self.emergency_fan_boost_basis_points = 10000; // 100% max fan duty
+            }
+            ThermalThrottleStage::CriticalEmergency | ThermalThrottleStage::HardwareTrip => {
+                self.enforced_tdp_watts = Self::STAGE3_TDP_WATTS;
+                self.prochot_asserted = true; // Assert PROCHOT# pin
+                self.emergency_fan_boost_basis_points = 10000; // 100% max fan duty
+            }
+        }
+    }
+}
+
+/// Verification test for emergency thermal runaway throttling.
+pub fn verify_emergency_thermal_runaway_throttling() -> bool {
+    let mut throttler = EmergencyThermalThrottler::new();
+
+    // 1. Initial nominal state
+    if throttler.current_stage != ThermalThrottleStage::Nominal || throttler.enforced_tdp_watts != 30 {
+        return false;
+    }
+
+    // 2. Moderate thermal load: 88°C SoC (triggers Stage 1: Soft Cap)
+    throttler.evaluate_thermal_runaway(
+        88 * MILLIDEG_SCALE,
+        65 * MILLIDEG_SCALE,
+        40 * MILLIDEG_SCALE,
+        VaporChamberPhaseState::SaturatedHighConductance,
+        500,
+        100,
+    );
+    if throttler.current_stage != ThermalThrottleStage::ModerateSoftCap || throttler.enforced_tdp_watts != 24 {
+        return false;
+    }
+    if throttler.prochot_asserted {
+        return false;
+    }
+
+    // 3. Fast thermal spike: 94°C SoC or rapid slew (triggers Stage 2: Aggressive Throttle)
+    throttler.evaluate_thermal_runaway(
+        94 * MILLIDEG_SCALE,
+        72 * MILLIDEG_SCALE,
+        42 * MILLIDEG_SCALE,
+        VaporChamberPhaseState::CapillaryDryoutWarning,
+        4000,
+        200,
+    );
+    if throttler.current_stage != ThermalThrottleStage::AggressiveThrottle || throttler.enforced_tdp_watts != 16 {
+        return false;
+    }
+    if throttler.emergency_fan_boost_basis_points != 10000 {
+        return false;
+    }
+
+    // 4. Critical dryout runaway: 99°C SoC and CriticalDryout (triggers Stage 3: PROCHOT# assertion)
+    throttler.evaluate_thermal_runaway(
+        99 * MILLIDEG_SCALE,
+        86 * MILLIDEG_SCALE, // Heat sink heat-soaked >= 85°C
+        45 * MILLIDEG_SCALE,
+        VaporChamberPhaseState::CriticalDryout,
+        5000,
+        300,
+    );
+    if throttler.current_stage != ThermalThrottleStage::CriticalEmergency || throttler.enforced_tdp_watts != 7 {
+        return false;
+    }
+    if !throttler.prochot_asserted {
+        return false;
+    }
+    if !throttler.tec_reverse_dump_suppressed {
+        return false;
+    }
+
+    // 5. Test Hysteresis recovery: temperature drops back to 70°C at t=400ms (< 500ms dwell)
+    throttler.evaluate_thermal_runaway(
+        70 * MILLIDEG_SCALE,
+        60 * MILLIDEG_SCALE,
+        38 * MILLIDEG_SCALE,
+        VaporChamberPhaseState::EvaporationActive,
+        -1000,
+        400, // 400ms - only 100ms since critical event
+    );
+    // Should NOT down-throttle yet due to hysteresis lock
+    if throttler.current_stage != ThermalThrottleStage::CriticalEmergency {
+        return false;
+    }
+
+    // 6. After dwell time passes at t=1000ms (> 500ms dwell), down-throttles cleanly
+    throttler.evaluate_thermal_runaway(
+        70 * MILLIDEG_SCALE,
+        60 * MILLIDEG_SCALE,
+        38 * MILLIDEG_SCALE,
+        VaporChamberPhaseState::EvaporationActive,
+        0,
+        1000,
+    );
+    if throttler.current_stage != ThermalThrottleStage::Nominal || throttler.enforced_tdp_watts != 30 {
+        return false;
+    }
+    if throttler.prochot_asserted {
+        return false;
+    }
+
+    true
+}
