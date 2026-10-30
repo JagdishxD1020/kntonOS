@@ -38,7 +38,7 @@ pub enum D3D12_DESCRIPTOR_RANGE_TYPE {
 
 /// Hardware shader pipeline visibility for root signature parameters.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum D3D12_SHADER_VISIBILITY {
     All = 0,
     Vertex = 1,
@@ -1439,6 +1439,258 @@ impl RootDescriptorTableDeduplicator {
     pub fn dedup_hits(&self) -> u64 {
 
         self.dedup_hits
+
+    }
+
+}
+
+
+
+// Texture filter mode for static samplers embedded into root signature.
+
+#[repr(u32)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum D3d12StaticFilter {
+
+    MinMagMipPoint = 0,
+
+    MinMagPointMipLinear = 1,
+
+    MinPointMagLinearMipPoint = 2,
+
+    MinPointMagMipLinear = 3,
+
+    MinLinearMagMipPoint = 4,
+
+    MinLinearMagPointMipLinear = 5,
+
+    MinMagLinearMipPoint = 6,
+
+    MinMagMipLinear = 7,
+
+    Anisotropic = 8,
+
+}
+
+
+
+// Texture addressing mode for static samplers.
+
+#[repr(u32)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum D3d12StaticTextureAddressMode {
+
+    Wrap = 1,
+
+    Mirror = 2,
+
+    Clamp = 3,
+
+    Border = 4,
+
+    MirrorOnce = 5,
+
+}
+
+
+
+// Static sampler descriptor embedded directly in root signature.
+
+// Eliminates CPU descriptor heap allocation and binding overhead at runtime.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub struct D3d12StaticSamplerDesc {
+
+    pub filter: D3d12StaticFilter,
+
+    pub address_u: D3d12StaticTextureAddressMode,
+
+    pub address_v: D3d12StaticTextureAddressMode,
+
+    pub address_w: D3d12StaticTextureAddressMode,
+
+    pub mip_lod_bias_fixed: i16,
+
+    pub max_anisotropy: u8,
+
+    pub shader_register: u32,
+
+    pub register_space: u32,
+
+    pub shader_visibility: D3D12_SHADER_VISIBILITY,
+
+}
+
+
+
+impl D3d12StaticSamplerDesc {
+
+    // Construct new static sampler descriptor.
+
+    pub const fn new(
+
+        filter: D3d12StaticFilter,
+
+        address: D3d12StaticTextureAddressMode,
+
+        shader_register: u32,
+
+        register_space: u32,
+
+        shader_visibility: D3D12_SHADER_VISIBILITY,
+
+    ) -> Self {
+
+        Self {
+
+            filter,
+
+            address_u: address,
+
+            address_v: address,
+
+            address_w: address,
+
+            mip_lod_bias_fixed: 0,
+
+            max_anisotropy: 16,
+
+            shader_register,
+
+            register_space,
+
+            shader_visibility,
+
+        }
+
+    }
+
+}
+
+
+
+// Optimizer managing static sampler register table indexing.
+
+// Bypasses runtime descriptor heap allocations entirely.
+
+#[derive(Debug, Default)]
+
+pub struct StaticSamplerTableOptimizer {
+
+    samplers: Vec<D3d12StaticSamplerDesc>,
+
+    bypassed_descriptor_allocations: u64,
+
+}
+
+
+
+impl StaticSamplerTableOptimizer {
+
+    // Construct new empty static sampler optimizer.
+
+    pub fn new() -> Self {
+
+        Self {
+
+            samplers: Vec::new(),
+
+            bypassed_descriptor_allocations: 0,
+
+        }
+
+    }
+
+
+
+    // Register a static sampler in the root signature static sampler table.
+
+    pub fn add_static_sampler(&mut self, sampler: D3d12StaticSamplerDesc) -> Result<u32, &'static str> {
+
+        // Direct3D 12 limits static samplers to maximum 2032 samplers per root signature
+
+        if self.samplers.len() >= 2032 {
+
+            return Err("Maximum static samplers limit (2032) reached");
+
+        }
+
+        for s in &self.samplers {
+
+            if s.shader_register == sampler.shader_register
+
+                && s.register_space == sampler.register_space
+
+                && s.shader_visibility == sampler.shader_visibility
+
+            {
+
+                return Err("Static sampler register conflict in same register space and visibility");
+
+            }
+
+        }
+
+        let index = self.samplers.len() as u32;
+
+        self.samplers.push(sampler);
+
+        Ok(index)
+
+    }
+
+
+
+    // Lookup static sampler by register and space, bypassing descriptor heap allocation.
+
+    pub fn lookup_static_sampler(
+
+        &mut self,
+
+        shader_register: u32,
+
+        register_space: u32,
+
+    ) -> Option<&D3d12StaticSamplerDesc> {
+
+        for s in &self.samplers {
+
+            if s.shader_register == shader_register && s.register_space == register_space {
+
+                self.bypassed_descriptor_allocations = self.bypassed_descriptor_allocations.saturating_add(1);
+
+                return Some(s);
+
+            }
+
+        }
+
+        None
+
+    }
+
+
+
+    // Count of registered static samplers.
+
+    pub fn len(&self) -> usize {
+
+        self.samplers.len()
+
+    }
+
+
+
+    // Number of runtime descriptor allocations bypassed by static samplers.
+
+    pub fn bypassed_allocations(&self) -> u64 {
+
+        self.bypassed_descriptor_allocations
 
     }
 
