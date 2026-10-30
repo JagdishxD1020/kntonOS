@@ -1696,75 +1696,144 @@ impl StaticSamplerTableOptimizer {
 
 }
 
-
-// Unified Direct3D 12 Agility Dynamic Root Signature 1.2 Serialization & Static Sampler Table Governor.
-pub struct D3d12RootSignature12Governor {
-    local_binding_cache: LocalRootBindingCache,
-    table_deduplicator: RootDescriptorTableDeduplicator,
-    static_samplers: StaticSamplerTableOptimizer,
-    serialized_bytecode: Vec<u8>,
-    active_flags: u32,
-    active_params: Vec<RootParameter12Desc>,
-}
-
-impl D3d12RootSignature12Governor {
-    // Construct new Root Signature 1.2 governor.
-    pub fn new() -> Self {
-        Self {
-            local_binding_cache: LocalRootBindingCache::new(),
-            table_deduplicator: RootDescriptorTableDeduplicator::new(),
-            static_samplers: StaticSamplerTableOptimizer::new(),
-            serialized_bytecode: Vec::new(),
-            active_flags: 0,
-            active_params: Vec::new(),
-        }
-    }
-
-    // Set and serialize root signature parameters and configuration flags.
-    pub fn configure_signature(&mut self, flags: u32, params: &[RootParameter12Desc]) {
-        self.active_flags = flags;
-        self.active_params = params.to_vec();
-        RootSignature12Serializer::serialize(flags, params, &mut self.serialized_bytecode);
-    }
-
-    // Deserialize bytecode into active layout.
-    pub fn load_bytecode(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
-        let (flags, params) = RootSignature12Serializer::deserialize(bytes)?;
-        self.active_flags = flags;
-        self.active_params = params;
-        self.serialized_bytecode = bytes.to_vec();
-        Ok(())
-    }
-
-    // Access local root binding cache.
-    pub fn local_binding_cache_mut(&mut self) -> &mut LocalRootBindingCache {
-        &mut self.local_binding_cache
-    }
-
-    // Access table deduplicator.
-    pub fn table_deduplicator_mut(&mut self) -> &mut RootDescriptorTableDeduplicator {
-        &mut self.table_deduplicator
-    }
-
-    // Access static sampler optimizer.
-    pub fn static_samplers_mut(&mut self) -> &mut StaticSamplerTableOptimizer {
-        &mut self.static_samplers
-    }
-
-    // Retrieve serialized bytecode slice.
-    pub fn bytecode(&self) -> &[u8] {
-        &self.serialized_bytecode
-    }
-
-    // Total DWORD cost of active parameters.
-    pub fn total_dwords(&self) -> u32 {
-        let mut sum = 0;
-        for p in &self.active_params {
-            sum += p.dword_cost();
-        }
-        sum
-    }
-}
+
+
+// Unified Direct3D 12 Agility Dynamic Root Signature 1.2 Serialization & Static Sampler Table Governor.
+
+pub struct D3d12RootSignature12Governor {
+
+    local_binding_cache: LocalRootBindingCache,
+
+    table_deduplicator: RootDescriptorTableDeduplicator,
+
+    static_samplers: StaticSamplerTableOptimizer,
+
+    serialized_bytecode: Vec<u8>,
+
+    active_flags: u32,
+
+    active_params: Vec<RootParameter12Desc>,
+
+}
+
+
+
+impl D3d12RootSignature12Governor {
+
+    // Construct new Root Signature 1.2 governor.
+
+    pub fn new() -> Self {
+
+        Self {
+
+            local_binding_cache: LocalRootBindingCache::new(),
+
+            table_deduplicator: RootDescriptorTableDeduplicator::new(),
+
+            static_samplers: StaticSamplerTableOptimizer::new(),
+
+            serialized_bytecode: Vec::new(),
+
+            active_flags: 0,
+
+            active_params: Vec::new(),
+
+        }
+
+    }
+
+
+
+    // Set and serialize root signature parameters and configuration flags.
+
+    pub fn configure_signature(&mut self, flags: u32, params: &[RootParameter12Desc]) {
+
+        self.active_flags = flags;
+
+        self.active_params = params.to_vec();
+
+        RootSignature12Serializer::serialize(flags, params, &mut self.serialized_bytecode);
+
+    }
+
+
+
+    // Deserialize bytecode into active layout.
+
+    pub fn load_bytecode(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+
+        let (flags, params) = RootSignature12Serializer::deserialize(bytes)?;
+
+        self.active_flags = flags;
+
+        self.active_params = params;
+
+        self.serialized_bytecode = bytes.to_vec();
+
+        Ok(())
+
+    }
+
+
+
+    // Access local root binding cache.
+
+    pub fn local_binding_cache_mut(&mut self) -> &mut LocalRootBindingCache {
+
+        &mut self.local_binding_cache
+
+    }
+
+
+
+    // Access table deduplicator.
+
+    pub fn table_deduplicator_mut(&mut self) -> &mut RootDescriptorTableDeduplicator {
+
+        &mut self.table_deduplicator
+
+    }
+
+
+
+    // Access static sampler optimizer.
+
+    pub fn static_samplers_mut(&mut self) -> &mut StaticSamplerTableOptimizer {
+
+        &mut self.static_samplers
+
+    }
+
+
+
+    // Retrieve serialized bytecode slice.
+
+    pub fn bytecode(&self) -> &[u8] {
+
+        &self.serialized_bytecode
+
+    }
+
+
+
+    // Total DWORD cost of active parameters.
+
+    pub fn total_dwords(&self) -> u32 {
+
+        let mut sum = 0;
+
+        for p in &self.active_params {
+
+            sum += p.dword_cost();
+
+        }
+
+        sum
+
+    }
+
+}
+
 pub fn test_root_signature_subsystem() -> bool {
     crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Root Signature & Descriptor Heap Binding Table...\r\n");
 
@@ -1949,6 +2018,62 @@ pub fn test_root_signature_subsystem() -> bool {
     }
     crate::serial_write_str("  * Centralized root signature cache deduplication verified\r\n");
 
+    // 6. Verify Direct3D 12 Agility Dynamic Root Signature 1.2 Serialization & Deserialization
+    let mut gov = D3d12RootSignature12Governor::new();
+    let p_desc = alloc::vec![
+        RootParameter12Desc::descriptor_table(D3D12_SHADER_VISIBILITY::Pixel, 8),
+        RootParameter12Desc::constants(D3D12_SHADER_VISIBILITY::Vertex, 0, 0, 4),
+        RootParameter12Desc::cbv(D3D12_SHADER_VISIBILITY::All, 1, 0),
+        RootParameter12Desc::srv(D3D12_SHADER_VISIBILITY::Pixel, 0, 1),
+    ];
+    gov.configure_signature(0x1, &p_desc);
+    assert_eq!(gov.total_dwords(), 1 + 4 + 2 + 2); // 9 DWORDs
+
+    let bytecode = gov.bytecode().to_vec();
+    let mut gov2 = D3d12RootSignature12Governor::new();
+    assert!(gov2.load_bytecode(&bytecode).is_ok());
+    assert_eq!(gov2.total_dwords(), 9);
+    crate::serial_write_str("  * Direct3D 12 Root Signature 1.2 bytecode serialization and deserialization verified\r\n");
+
+    // 7. Verify Descriptor Table Deduplication and Local Root Signature Binding Cache
+    let (offset1, dedup1) = gov.table_deduplicator_mut().deduplicate_table(0xAABB_CCDD, 64);
+    assert!(!dedup1);
+    assert_eq!(offset1, 64);
+    let (offset2, dedup2) = gov.table_deduplicator_mut().deduplicate_table(0xAABB_CCDD, 128);
+    assert!(dedup2);
+    assert_eq!(offset2, 64);
+    assert_eq!(gov.table_deduplicator_mut().dedup_hits(), 1);
+
+    let shader_id = [0x5Au8; 32];
+    let (stride1, cached1) = gov.local_binding_cache_mut().get_or_register(1, &shader_id, 24);
+    assert!(!cached1);
+    assert_eq!(stride1, 64); // (32 + 24 = 56) -> aligned to 64
+    let (stride2, cached2) = gov.local_binding_cache_mut().get_or_register(1, &shader_id, 24);
+    assert!(cached2);
+    assert_eq!(stride2, 64);
+    let (l_hits, l_misses) = gov.local_binding_cache_mut().stats();
+    assert_eq!(l_hits, 1);
+    assert_eq!(l_misses, 1);
+    crate::serial_write_str("  * Descriptor table deduplication and local root signature binding cache verified\r\n");
+
+    // 8. Verify Static Sampler Register Table Indexing bypassing heap allocations
+    let static_s = D3d12StaticSamplerDesc::new(
+        D3d12StaticFilter::Anisotropic,
+        D3d12StaticTextureAddressMode::Wrap,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY::Pixel,
+    );
+    assert!(gov.static_samplers_mut().add_static_sampler(static_s).is_ok());
+    assert_eq!(gov.static_samplers_mut().len(), 1);
+
+    let looked_up = gov.static_samplers_mut().lookup_static_sampler(0, 0);
+    assert!(looked_up.is_some());
+    assert_eq!(looked_up.unwrap().filter, D3d12StaticFilter::Anisotropic);
+    assert_eq!(gov.static_samplers_mut().bypassed_allocations(), 1);
+    crate::serial_write_str("  * Static sampler register table indexing bypassing heap allocations verified\r\n");
+
+    crate::serial_write_str("[KNT-D3D12-ROOT-SIG-PASS] Direct3D 12 Agility Dynamic Root Signature 1.2 & Static Samplers verified\r\n");
     crate::serial_write_str("[KNT-ROOT-SIG-PASS] Direct3D 12 root signature and descriptor heap binding verified\r\n");
     true
 }
