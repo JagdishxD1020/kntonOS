@@ -838,6 +838,195 @@ impl RootSignatureCache {
 }
 
 /// Comprehensive verification self-test suite for Direct3D 12 Root Signature & Descriptor Heap Binding Table Engine.
+
+// --- Direct3D 12 Agility Dynamic Root Signature Version 1.2 Serialization & Deserialization Engine ---
+
+// Binary bytecode chunk header identifying serialized D3D12 root signature.
+pub const D3D12_ROOT_SIGNATURE_MAGIC_RTS0: u32 = 0x30535452; // 'RTS0' in little endian
+
+// Root parameter type codes encoded into serialized binary bytecode.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum D3d12SerializedParamType {
+    DescriptorTable = 0,
+    Constants32Bit = 1,
+    Cbv = 2,
+    Srv = 3,
+    Uav = 4,
+}
+
+// Deserialized or serialized root parameter item for Root Signature 1.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootParameter12Desc {
+    pub param_type: D3d12SerializedParamType,
+    pub shader_visibility: D3D12_SHADER_VISIBILITY,
+    pub shader_register: u32,
+    pub register_space: u32,
+    pub num_32bit_values: u32,
+    pub descriptor_count: u32,
+}
+
+impl RootParameter12Desc {
+    // Construct 32-bit root constants parameter.
+    pub const fn constants(vis: D3D12_SHADER_VISIBILITY, reg: u32, space: u32, count: u32) -> Self {
+        Self {
+            param_type: D3d12SerializedParamType::Constants32Bit,
+            shader_visibility: vis,
+            shader_register: reg,
+            register_space: space,
+            num_32bit_values: count,
+            descriptor_count: 0,
+        }
+    }
+
+    // Construct root CBV descriptor.
+    pub const fn cbv(vis: D3D12_SHADER_VISIBILITY, reg: u32, space: u32) -> Self {
+        Self {
+            param_type: D3d12SerializedParamType::Cbv,
+            shader_visibility: vis,
+            shader_register: reg,
+            register_space: space,
+            num_32bit_values: 0,
+            descriptor_count: 0,
+        }
+    }
+
+    // Construct root SRV descriptor.
+    pub const fn srv(vis: D3D12_SHADER_VISIBILITY, reg: u32, space: u32) -> Self {
+        Self {
+            param_type: D3d12SerializedParamType::Srv,
+            shader_visibility: vis,
+            shader_register: reg,
+            register_space: space,
+            num_32bit_values: 0,
+            descriptor_count: 0,
+        }
+    }
+
+    // Construct root UAV descriptor.
+    pub const fn uav(vis: D3D12_SHADER_VISIBILITY, reg: u32, space: u32) -> Self {
+        Self {
+            param_type: D3d12SerializedParamType::Uav,
+            shader_visibility: vis,
+            shader_register: reg,
+            register_space: space,
+            num_32bit_values: 0,
+            descriptor_count: 0,
+        }
+    }
+
+    // Construct root descriptor table parameter.
+    pub const fn descriptor_table(vis: D3D12_SHADER_VISIBILITY, num_descriptors: u32) -> Self {
+        Self {
+            param_type: D3d12SerializedParamType::DescriptorTable,
+            shader_visibility: vis,
+            shader_register: 0,
+            register_space: 0,
+            num_32bit_values: 0,
+            descriptor_count: num_descriptors,
+        }
+    }
+
+    // Compute hardware DWORD cost for this parameter.
+    pub const fn dword_cost(&self) -> u32 {
+        match self.param_type {
+            D3d12SerializedParamType::DescriptorTable => 1,
+            D3d12SerializedParamType::Constants32Bit => self.num_32bit_values,
+            D3d12SerializedParamType::Cbv
+            | D3d12SerializedParamType::Srv
+            | D3d12SerializedParamType::Uav => 2,
+        }
+    }
+}
+
+// Bytecode serializer and deserializer for Root Signature Version 1.2.
+pub struct RootSignature12Serializer;
+
+impl RootSignature12Serializer {
+    // Serialize root signature parameters into compact D3D12 bytecode stream.
+    pub fn serialize(flags: u32, params: &[RootParameter12Desc], output: &mut Vec<u8>) {
+        output.clear();
+        output.extend_from_slice(&D3D12_ROOT_SIGNATURE_MAGIC_RTS0.to_le_bytes());
+        output.extend_from_slice(&0x3u32.to_le_bytes()); // Version 1.2
+        output.extend_from_slice(&flags.to_le_bytes());
+        output.extend_from_slice(&(params.len() as u32).to_le_bytes());
+
+        for p in params {
+            output.extend_from_slice(&(p.param_type as u32).to_le_bytes());
+            output.extend_from_slice(&(p.shader_visibility as u32).to_le_bytes());
+            output.extend_from_slice(&p.shader_register.to_le_bytes());
+            output.extend_from_slice(&p.register_space.to_le_bytes());
+            output.extend_from_slice(&p.num_32bit_values.to_le_bytes());
+            output.extend_from_slice(&p.descriptor_count.to_le_bytes());
+        }
+    }
+
+    // Deserialize bytecode stream into root parameter layout.
+    pub fn deserialize(bytes: &[u8]) -> Result<(u32, Vec<RootParameter12Desc>), &'static str> {
+        if bytes.len() < 16 {
+            return Err("Bytecode smaller than minimum D3D12 root signature header");
+        }
+        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if magic != D3D12_ROOT_SIGNATURE_MAGIC_RTS0 {
+            return Err("Invalid root signature RTS0 magic header");
+        }
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if version != 3 && version != 2 && version != 1 {
+            return Err("Unsupported root signature version in bytecode");
+        }
+        let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let param_count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+
+        let expected_len = 16 + param_count * 24;
+        if bytes.len() < expected_len {
+            return Err("Bytecode truncated or corrupted for specified parameter count");
+        }
+
+        let mut params = Vec::with_capacity(param_count);
+        let mut offset = 16;
+        for _ in 0..param_count {
+            let ptype_raw = u32::from_le_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]);
+            let vis_raw = u32::from_le_bytes([bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7]]);
+            let reg = u32::from_le_bytes([bytes[offset+8], bytes[offset+9], bytes[offset+10], bytes[offset+11]]);
+            let space = u32::from_le_bytes([bytes[offset+12], bytes[offset+13], bytes[offset+14], bytes[offset+15]]);
+            let num_vals = u32::from_le_bytes([bytes[offset+16], bytes[offset+17], bytes[offset+18], bytes[offset+19]]);
+            let desc_cnt = u32::from_le_bytes([bytes[offset+20], bytes[offset+21], bytes[offset+22], bytes[offset+23]]);
+
+            let param_type = match ptype_raw {
+                0 => D3d12SerializedParamType::DescriptorTable,
+                1 => D3d12SerializedParamType::Constants32Bit,
+                2 => D3d12SerializedParamType::Cbv,
+                3 => D3d12SerializedParamType::Srv,
+                4 => D3d12SerializedParamType::Uav,
+                _ => return Err("Unknown root parameter type in bytecode"),
+            };
+
+            let shader_visibility = match vis_raw {
+                0 => D3D12_SHADER_VISIBILITY::All,
+                1 => D3D12_SHADER_VISIBILITY::Vertex,
+                2 => D3D12_SHADER_VISIBILITY::Hull,
+                3 => D3D12_SHADER_VISIBILITY::Domain,
+                4 => D3D12_SHADER_VISIBILITY::Geometry,
+                5 => D3D12_SHADER_VISIBILITY::Pixel,
+                6 => D3D12_SHADER_VISIBILITY::Amplification,
+                7 => D3D12_SHADER_VISIBILITY::Mesh,
+                _ => return Err("Invalid shader visibility enumeration in bytecode"),
+            };
+
+            params.push(RootParameter12Desc {
+                param_type,
+                shader_visibility,
+                shader_register: reg,
+                register_space: space,
+                num_32bit_values: num_vals,
+                descriptor_count: desc_cnt,
+            });
+            offset += 24;
+        }
+
+        Ok((flags, params))
+    }
+}
 pub fn test_root_signature_subsystem() -> bool {
     crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Root Signature & Descriptor Heap Binding Table...\r\n");
 
