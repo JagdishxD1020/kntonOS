@@ -60,6 +60,7 @@ pub mod cold_page_evict;
 pub mod prefault_cluster;
 pub mod large_page_free;
 pub mod pmu_sampler;
+pub mod safe_seh_guard;
 
 pub use header::*;
 pub use ntdll::*;
