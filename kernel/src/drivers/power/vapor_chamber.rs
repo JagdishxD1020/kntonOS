@@ -1051,3 +1051,36 @@ pub fn verify_vapor_chamber_coordinator_pipeline() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Comprehensive Subsystem Self-Test Suite and kmain Integration
+// ============================================================================
+
+/// Comprehensive verification self-test suite for Handheld Peltier Active Cooling and Phase-Change Vapor Chamber Governor.
+pub fn test_vapor_chamber_subsystem() -> bool {
+    crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER] Initiating Peltier active cooling & vapor chamber governor self-test...\r\n");
+
+    if !verify_vapor_chamber_sensor_fusion_and_phase_tracking() {
+        crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER-FAIL] Vapor chamber sensor fusion & phase tracking verification failed!\r\n");
+        return false;
+    }
+
+    if !verify_peltier_tec_current_governor() {
+        crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER-FAIL] Peltier TEC PWM current governor verification failed!\r\n");
+        return false;
+    }
+
+    if !verify_emergency_thermal_runaway_throttling() {
+        crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER-FAIL] Emergency thermal runaway throttling verification failed!\r\n");
+        return false;
+    }
+
+    if !verify_vapor_chamber_coordinator_pipeline() {
+        crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER-FAIL] Vapor chamber coordinator pipeline verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-POWER-VAPOR-CHAMBER-PASS] Handheld Peltier active cooling and vapor chamber governor operational\r\n");
+    true
+}
