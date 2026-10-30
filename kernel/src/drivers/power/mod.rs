@@ -56,3 +56,6 @@ pub fn test_dual_battery_balance_subsystem() -> bool {
     crate::serial_write_str("[KNT-POWER-BATTERY-BALANCE-PASS] Dual-battery balance manager and fast USB-PD 3.1 EPR engine verified\r\n");
     true
 }
+
+pub mod vapor_chamber;
+pub use vapor_chamber::*;
