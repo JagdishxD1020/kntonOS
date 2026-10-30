@@ -257,3 +257,116 @@ impl AntiTamperExceptionFilter {
 }
 
 pub static ANTI_TAMPER_FILTER: AntiTamperExceptionFilter = AntiTamperExceptionFilter::new();
+
+/// Comprehensive self-test suite for Win32 SafeSEH Target Validation & Stack Pivot Guard.
+pub fn test_win32_safe_seh_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-SAFE-SEH] Initializing Win32 SafeSEH Subsystem self-test...\r\n");
+
+    // 1. Verify SafeSEH Table Registration & Target Validation
+    let image_base = 0x0000_0000_0040_0000u64;
+    let image_size = 0x0002_0000usize; // 128 KB
+    SAFE_SEH_VALIDATOR.register_image(image_base, image_size, true);
+
+    let valid_handler = 0x0000_0000_0040_1500u64;
+    let unregistered_handler = 0x0000_0000_0040_1900u64;
+    let foreign_handler = 0x0000_7FFF_1111_0000u64;
+
+    SAFE_SEH_VALIDATOR.register_safe_handler(valid_handler);
+
+    if SAFE_SEH_VALIDATOR.validate_handler_target(valid_handler).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid registered SafeSEH handler failed validation\r\n");
+        return false;
+    }
+
+    if SAFE_SEH_VALIDATOR.validate_handler_target(unregistered_handler).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Unregistered handler within SafeSEH module was allowed\r\n");
+        return false;
+    }
+
+    if SAFE_SEH_VALIDATOR.validate_handler_target(foreign_handler).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Foreign handler outside image boundaries was allowed\r\n");
+        return false;
+    }
+
+    if SAFE_SEH_VALIDATOR.get_total_blocked() < 2 {
+        crate::serial_write_str("[KNT-TEST-ERR] Blocked SafeSEH violations count mismatch\r\n");
+        return false;
+    }
+
+    // 2. Verify Stack Pivoting & ROP Chain Frame Alignment Guard
+    let stack_base = 0x0000_7FFF_8000_8000u64;
+    let stack_limit = 0x0000_7FFF_8000_0000u64;
+
+    let valid_rsp = 0x0000_7FFF_8000_2000u64;
+    let valid_rbp = 0x0000_7FFF_8000_2020u64;
+
+    if STACK_PIVOT_GUARD.verify_exception_stack_frame(valid_rsp, valid_rbp, stack_base, stack_limit).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid stack frame failed alignment verification\r\n");
+        return false;
+    }
+
+    // Misaligned RSP
+    let misaligned_rsp = 0x0000_7FFF_8000_2007u64;
+    match STACK_PIVOT_GUARD.verify_exception_stack_frame(misaligned_rsp, valid_rbp, stack_base, stack_limit) {
+        Err(StackPivotFault::RspMisaligned(_)) => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Misaligned RSP not detected\r\n");
+            return false;
+        }
+    }
+
+    // Stack pivot into heap
+    let pivoted_rsp = 0x0000_0000_1000_0000u64;
+    match STACK_PIVOT_GUARD.verify_exception_stack_frame(pivoted_rsp, 0, stack_base, stack_limit) {
+        Err(StackPivotFault::StackPivotDetected { .. }) => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Stack pivot outside bounds not detected\r\n");
+            return false;
+        }
+    }
+
+    // Inverted RBP
+    let inverted_rbp = 0x0000_7FFF_8000_1000u64; // Below RSP
+    match STACK_PIVOT_GUARD.verify_exception_stack_frame(valid_rsp, inverted_rbp, stack_base, stack_limit) {
+        Err(StackPivotFault::InvertedFramePointers { .. }) => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Inverted RBP frame pointer not detected\r\n");
+            return false;
+        }
+    }
+
+    if STACK_PIVOT_GUARD.get_total_pivots_blocked() < 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Blocked stack pivots counter mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify Anti-Tampering Exception Filter & Debugger Trap Cloaking
+    let bp_action = ANTI_TAMPER_FILTER.filter_exception(STATUS_BREAKPOINT, 0x0000_0040_1000, 0);
+    match bp_action {
+        FilterAction::CloakDebuggerTrap { resume_rip } if resume_rip == 0x0000_0040_1001 => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Breakpoint exception was not cloaked\r\n");
+            return false;
+        }
+    }
+
+    let hook_entry = 0x0000_0040_3000u64;
+    ANTI_TAMPER_FILTER.protect_hook_target(hook_entry);
+
+    let hijack_action = ANTI_TAMPER_FILTER.filter_exception(0xC000_0005, hook_entry, foreign_handler);
+    match hijack_action {
+        FilterAction::BlockMaliciousHook { .. } => {}
+        _ => {
+            crate::serial_write_str("[KNT-TEST-ERR] Malicious SEH hook redirection was not blocked\r\n");
+            return false;
+        }
+    }
+
+    if ANTI_TAMPER_FILTER.get_cloaked_traps() == 0 || ANTI_TAMPER_FILTER.get_thwarted_hooks() == 0 {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-tamper filter counters mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-SAFE-SEH-PASS] Win32 SafeSEH Validation & Stack Pivoting Guard verified\r\n");
+    true
+}
