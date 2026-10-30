@@ -43,7 +43,8 @@ pub mod shading_rate_image;
 pub mod descriptor_suballocator;
 pub mod async_compute;
 
-pub mod vrs_combiners;
+pub mod vrs_combiners;
+
 pub mod residency_manager;
 pub mod root_signature_v1_2;
 pub mod work_graphs_allocator;
@@ -114,7 +115,8 @@ pub use shading_rate_image::*;
 pub use descriptor_suballocator::*;
 pub use async_compute::*;
 
-pub use vrs_combiners::*;
+pub use vrs_combiners::*;
+
 pub use residency_manager::*;
 pub use root_signature_v1_2::*;
 pub use work_graphs_allocator::*;
@@ -832,3 +834,6 @@ pub fn test_work_graphs_subsystem() -> bool {
     true
 }
 
+
+pub mod msaa_resolve;
+pub use msaa_resolve::*;
