@@ -177,3 +177,83 @@ impl StackPivotGuard {
 }
 
 pub static STACK_PIVOT_GUARD: StackPivotGuard = StackPivotGuard::new();
+
+pub const STATUS_BREAKPOINT: u32 = 0x8000_0003;
+pub const STATUS_SINGLE_STEP: u32 = 0x8000_0004;
+
+/// Exception filter verdict for anti-tamper and debugger protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterAction {
+    ForwardToHandler,
+    CloakDebuggerTrap { resume_rip: u64 },
+    BlockMaliciousHook { reason: &'static str },
+}
+
+/// Anti-tampering exception filter preventing hook redirection and debugger detection traps.
+pub struct AntiTamperExceptionFilter {
+    protected_hooks: Spinlock<BTreeSet<u64>>,
+    debugger_traps_cloaked: AtomicU64,
+    malicious_hooks_thwarted: AtomicU64,
+}
+
+impl AntiTamperExceptionFilter {
+    pub const fn new() -> Self {
+        Self {
+            protected_hooks: Spinlock::new(BTreeSet::new()),
+            debugger_traps_cloaked: AtomicU64::new(0),
+            malicious_hooks_thwarted: AtomicU64::new(0),
+        }
+    }
+
+    /// Protect a function entry address against SEH hook hijacking.
+    pub fn protect_hook_target(&self, rip: u64) {
+        self.protected_hooks.lock().insert(rip);
+    }
+
+    /// Filter an exception and determine anti-tampering disposition.
+    pub fn filter_exception(
+        &self,
+        exception_code: u32,
+        fault_rip: u64,
+        target_handler: u64,
+    ) -> FilterAction {
+        // Virtualize debugger traps (INT3 / single step)
+        if exception_code == STATUS_BREAKPOINT || exception_code == STATUS_SINGLE_STEP {
+            self.debugger_traps_cloaked.fetch_add(1, Ordering::Relaxed);
+            return FilterAction::CloakDebuggerTrap {
+                resume_rip: fault_rip.saturating_add(1),
+            };
+        }
+
+        // Prevent hook hijacking on protected sensitive game hooks
+        if self.protected_hooks.lock().contains(&fault_rip) {
+            if SAFE_SEH_VALIDATOR.validate_handler_target(target_handler).is_err() {
+                self.malicious_hooks_thwarted.fetch_add(1, Ordering::Relaxed);
+                return FilterAction::BlockMaliciousHook {
+                    reason: "Unauthorized SEH redirection on protected game hook",
+                };
+            }
+        }
+
+        FilterAction::ForwardToHandler
+    }
+
+    /// Retrieve count of cloaked debugger traps.
+    pub fn get_cloaked_traps(&self) -> u64 {
+        self.debugger_traps_cloaked.load(Ordering::Acquire)
+    }
+
+    /// Retrieve count of thwarted hook hijackings.
+    pub fn get_thwarted_hooks(&self) -> u64 {
+        self.malicious_hooks_thwarted.load(Ordering::Acquire)
+    }
+
+    /// Clear protected hook list.
+    pub fn clear(&self) {
+        self.protected_hooks.lock().clear();
+        self.debugger_traps_cloaked.store(0, Ordering::Relaxed);
+        self.malicious_hooks_thwarted.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static ANTI_TAMPER_FILTER: AntiTamperExceptionFilter = AntiTamperExceptionFilter::new();
