@@ -857,3 +857,197 @@ pub fn verify_emergency_thermal_runaway_throttling() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Coordinated Vapor Chamber & Peltier Active Cooling Pipeline
+// ============================================================================
+
+/// Coordinated thermal control command dispatched to power and platform EC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandheldThermalCommand {
+    /// APU TDP limit in Watts to program into CPPC / RAPL MSRs.
+    pub target_tdp_watts: u32,
+    /// TEC PWM duty cycle in basis points (0 to 10,000).
+    pub tec_pwm_duty_basis_points: u16,
+    /// Supplemental fan boost duty cycle in basis points (0 to 10,000).
+    pub emergency_fan_boost_basis_points: u16,
+    /// Hardware PROCHOT# assertion status.
+    pub prochot_asserted: bool,
+    /// Current vapor chamber phase state.
+    pub phase_state: VaporChamberPhaseState,
+    /// Active thermal throttle stage.
+    pub throttle_stage: ThermalThrottleStage,
+}
+
+/// Unified coordinator orchestrating vapor chamber sensor fusion, Peltier TEC, and thermal runaway protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandheldVaporChamberCoordinator {
+    /// Multi-point sensor fusion and phase-change tracker.
+    pub sensor_fusion: VaporChamberSensorFusion,
+    /// Peltier TEC PWM current governor.
+    pub peltier_tec: PeltierTecGovernor,
+    /// Emergency thermal runaway detector and multi-stage throttler.
+    pub throttler: EmergencyThermalThrottler,
+    /// Total coordination cycles processed.
+    pub cycles_processed: u64,
+}
+
+impl HandheldVaporChamberCoordinator {
+    /// Initializes unified vapor chamber coordinator.
+    pub const fn new() -> Self {
+        Self {
+            sensor_fusion: VaporChamberSensorFusion::new(),
+            peltier_tec: PeltierTecGovernor::new(),
+            throttler: EmergencyThermalThrottler::new(),
+            cycles_processed: 0,
+        }
+    }
+
+    /// Executes an end-to-end thermal control loop step.
+    pub fn coordinate_thermal_cycle(
+        &mut self,
+        raw_readings: &[i32; SENSOR_CHANNEL_COUNT],
+        relative_humidity_pct: u8,
+        battery_soc_pct: u8,
+        power_source: HandheldPowerSource,
+        timestamp_ms: u64,
+        dt_ms: u32,
+    ) -> HandheldThermalCommand {
+        self.cycles_processed += 1;
+
+        // 1. Ingest telemetry into sensor fusion
+        let current_tdp = self.throttler.enforced_tdp_watts;
+        self.sensor_fusion.update_telemetry(raw_readings, timestamp_ms, current_tdp);
+
+        let soc_temp = self.sensor_fusion.get_temperature(ThermalSensorLocation::SocDie);
+        let condenser_temp = self.sensor_fusion.get_temperature(ThermalSensorLocation::CondenserFin);
+        let skin_temp = self.sensor_fusion.get_temperature(ThermalSensorLocation::ChassisSkin);
+        let ambient_temp = self.sensor_fusion.get_temperature(ThermalSensorLocation::AmbientIntake);
+        let slew_rate = self.sensor_fusion.sensors[ThermalSensorLocation::SocDie as usize].slew_rate_mc_s;
+
+        // 2. Evaluate thermal runaway and throttling requirements
+        self.throttler.evaluate_thermal_runaway(
+            soc_temp,
+            condenser_temp,
+            skin_temp,
+            self.sensor_fusion.phase_state,
+            slew_rate,
+            timestamp_ms,
+        );
+
+        // 3. Update Peltier TEC governor
+        self.peltier_tec.update_governor(
+            soc_temp,
+            ambient_temp,
+            relative_humidity_pct,
+            battery_soc_pct,
+            power_source,
+            dt_ms,
+        );
+
+        // 4. If throttler detects heatsink heat-soak (condenser >= 85°C), suppress TEC to prevent reverse heat dumping!
+        let effective_tec_duty = if self.throttler.tec_reverse_dump_suppressed {
+            0
+        } else {
+            self.peltier_tec.pwm_duty_basis_points
+        };
+
+        HandheldThermalCommand {
+            target_tdp_watts: self.throttler.enforced_tdp_watts,
+            tec_pwm_duty_basis_points: effective_tec_duty,
+            emergency_fan_boost_basis_points: self.throttler.emergency_fan_boost_basis_points,
+            prochot_asserted: self.throttler.prochot_asserted,
+            phase_state: self.sensor_fusion.phase_state,
+            throttle_stage: self.throttler.current_stage,
+        }
+    }
+}
+
+/// Verification test for vapor chamber coordinator pipeline.
+pub fn verify_vapor_chamber_coordinator_pipeline() -> bool {
+    let mut coordinator = HandheldVaporChamberCoordinator::new();
+
+    // 1. Nominal cold boot at 25°C
+    let room_sensors = [
+        25 * MILLIDEG_SCALE,
+        25 * MILLIDEG_SCALE,
+        25 * MILLIDEG_SCALE,
+        25 * MILLIDEG_SCALE,
+        22 * MILLIDEG_SCALE,
+        24 * MILLIDEG_SCALE,
+    ];
+    let cmd = coordinator.coordinate_thermal_cycle(
+        &room_sensors,
+        50,
+        90,
+        HandheldPowerSource::BatteryDischarging,
+        100,
+        100,
+    );
+    if cmd.target_tdp_watts != 30 || cmd.throttle_stage != ThermalThrottleStage::Nominal {
+        return false;
+    }
+    if cmd.prochot_asserted || cmd.tec_pwm_duty_basis_points != 0 {
+        return false;
+    }
+
+    // 2. High gaming load on AC power: SoC 82°C
+    let gaming_sensors = [
+        82 * MILLIDEG_SCALE,
+        78 * MILLIDEG_SCALE,
+        68 * MILLIDEG_SCALE,
+        41 * MILLIDEG_SCALE,
+        25 * MILLIDEG_SCALE,
+        35 * MILLIDEG_SCALE,
+    ];
+    for i in 2..=8 {
+        coordinator.coordinate_thermal_cycle(
+            &gaming_sensors,
+            50,
+            100,
+            HandheldPowerSource::AcConnected,
+            i * 100,
+            100,
+        );
+    }
+    let cmd_gaming = coordinator.coordinate_thermal_cycle(
+        &gaming_sensors,
+        50,
+        100,
+        HandheldPowerSource::AcConnected,
+        900,
+        100,
+    );
+    // On AC power at 82°C, TEC enters Turbo (90% duty = 9000 basis points)
+    if cmd_gaming.tec_pwm_duty_basis_points == 0 {
+        return false;
+    }
+
+    // 3. Simulated condenser heat-soak (condenser fin surges to 88°C >= 85°C):
+    // TEC reverse dump protection must immediately shut off TEC duty!
+    let heat_soaked_sensors = [
+        95 * MILLIDEG_SCALE,
+        92 * MILLIDEG_SCALE,
+        88 * MILLIDEG_SCALE, // condenser >= 85°C
+        47 * MILLIDEG_SCALE,
+        26 * MILLIDEG_SCALE,
+        40 * MILLIDEG_SCALE,
+    ];
+    let cmd_soaked = coordinator.coordinate_thermal_cycle(
+        &heat_soaked_sensors,
+        50,
+        100,
+        HandheldPowerSource::AcConnected,
+        1000,
+        100,
+    );
+    if cmd_soaked.tec_pwm_duty_basis_points != 0 {
+        return false; // TEC must be suppressed!
+    }
+    if cmd_soaked.target_tdp_watts >= 30 {
+        return false; // Throttling must be active!
+    }
+
+    true
+}
