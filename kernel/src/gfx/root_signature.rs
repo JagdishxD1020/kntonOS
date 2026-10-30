@@ -1696,6 +1696,75 @@ impl StaticSamplerTableOptimizer {
 
 }
 
+
+// Unified Direct3D 12 Agility Dynamic Root Signature 1.2 Serialization & Static Sampler Table Governor.
+pub struct D3d12RootSignature12Governor {
+    local_binding_cache: LocalRootBindingCache,
+    table_deduplicator: RootDescriptorTableDeduplicator,
+    static_samplers: StaticSamplerTableOptimizer,
+    serialized_bytecode: Vec<u8>,
+    active_flags: u32,
+    active_params: Vec<RootParameter12Desc>,
+}
+
+impl D3d12RootSignature12Governor {
+    // Construct new Root Signature 1.2 governor.
+    pub fn new() -> Self {
+        Self {
+            local_binding_cache: LocalRootBindingCache::new(),
+            table_deduplicator: RootDescriptorTableDeduplicator::new(),
+            static_samplers: StaticSamplerTableOptimizer::new(),
+            serialized_bytecode: Vec::new(),
+            active_flags: 0,
+            active_params: Vec::new(),
+        }
+    }
+
+    // Set and serialize root signature parameters and configuration flags.
+    pub fn configure_signature(&mut self, flags: u32, params: &[RootParameter12Desc]) {
+        self.active_flags = flags;
+        self.active_params = params.to_vec();
+        RootSignature12Serializer::serialize(flags, params, &mut self.serialized_bytecode);
+    }
+
+    // Deserialize bytecode into active layout.
+    pub fn load_bytecode(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        let (flags, params) = RootSignature12Serializer::deserialize(bytes)?;
+        self.active_flags = flags;
+        self.active_params = params;
+        self.serialized_bytecode = bytes.to_vec();
+        Ok(())
+    }
+
+    // Access local root binding cache.
+    pub fn local_binding_cache_mut(&mut self) -> &mut LocalRootBindingCache {
+        &mut self.local_binding_cache
+    }
+
+    // Access table deduplicator.
+    pub fn table_deduplicator_mut(&mut self) -> &mut RootDescriptorTableDeduplicator {
+        &mut self.table_deduplicator
+    }
+
+    // Access static sampler optimizer.
+    pub fn static_samplers_mut(&mut self) -> &mut StaticSamplerTableOptimizer {
+        &mut self.static_samplers
+    }
+
+    // Retrieve serialized bytecode slice.
+    pub fn bytecode(&self) -> &[u8] {
+        &self.serialized_bytecode
+    }
+
+    // Total DWORD cost of active parameters.
+    pub fn total_dwords(&self) -> u32 {
+        let mut sum = 0;
+        for p in &self.active_params {
+            sum += p.dword_cost();
+        }
+        sum
+    }
+}
 pub fn test_root_signature_subsystem() -> bool {
     crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Root Signature & Descriptor Heap Binding Table...\r\n");
 
