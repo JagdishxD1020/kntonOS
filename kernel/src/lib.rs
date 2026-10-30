@@ -586,6 +586,8 @@ pub extern "C" fn kmain() -> ! {
     if !gfx::test_blend_optimizer_subsystem() {
         serial_write_str("[KNT-PANIC] Direct3D 12 agility blend optimizer self-test failed!\r\n");
     }
+    // Initialize and verify Direct3D 12 Agility Dynamic Multisample Anti-Aliasing (MSAA) Resolve Governor (TASK-KNT-309)
+    gfx::test_msaa_resolve_subsystem();
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {

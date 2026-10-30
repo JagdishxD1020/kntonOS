@@ -930,70 +930,279 @@ impl HdrMsaaColorResolver {
 
     }
 
-}
-
-// High-level governor orchestrating D3D12 hardware MSAA resolve operations,
-// programmable sample pattern management, fast depth/stencil filters, and HDR tonemapping.
-pub struct D3d12MsaaResolveGovernor {
-    optimizer: MsaaResolveSubpassOptimizer,
-    depth_stencil_engine: DepthStencilResolveEngine,
-    hdr_resolver: HdrMsaaColorResolver,
-    programmable_sample_positions_tier: u32,
-}
-
-impl D3d12MsaaResolveGovernor {
-    // Initialize MSAA resolve governor with specified hardware tier.
-    pub const fn new(programmable_sample_positions_tier: u32) -> Self {
-        Self {
-            optimizer: MsaaResolveSubpassOptimizer::new(),
-            depth_stencil_engine: DepthStencilResolveEngine::new(),
-            hdr_resolver: HdrMsaaColorResolver::new(),
-            programmable_sample_positions_tier,
-        }
-    }
-
-    // Query programmable sample positions tier support (e.g. Tier 1 or Tier 2).
-    pub const fn programmable_tier(&self) -> u32 {
-        self.programmable_sample_positions_tier
-    }
-
-    // Configure programmable sample positions for specified MSAA count.
-    pub fn configure_sample_pattern(&mut self, count: MsaaSampleCount, positions: &[SamplePosition]) -> bool {
-        if self.programmable_sample_positions_tier == 0 {
-            return false;
-        }
-        let pat = ProgrammableSamplePattern::custom(count, positions);
-        self.optimizer.set_custom_pattern(pat);
-        true
-    }
-
-    // Reset sample pattern for specified MSAA count to hardware default.
-    pub fn reset_sample_pattern(&mut self, count: MsaaSampleCount) {
-        self.optimizer.reset_to_standard(count);
-    }
-
-    // Access sample pattern optimizer.
-    pub fn optimizer(&self) -> &MsaaResolveSubpassOptimizer {
-        &self.optimizer
-    }
-
-    // Access mutable optimizer.
-    pub fn optimizer_mut(&mut self) -> &mut MsaaResolveSubpassOptimizer {
-        &mut self.optimizer
-    }
-
-    // Access depth/stencil resolve engine.
-    pub fn depth_stencil_engine(&self) -> &DepthStencilResolveEngine {
-        &self.depth_stencil_engine
-    }
-
-    // Access HDR color resolver.
-    pub fn hdr_resolver(&self) -> &HdrMsaaColorResolver {
-        &self.hdr_resolver
-    }
-
-    // Access mutable HDR color resolver.
-    pub fn hdr_resolver_mut(&mut self) -> &mut HdrMsaaColorResolver {
-        &mut self.hdr_resolver
-    }
-}
+}
+
+
+
+// High-level governor orchestrating D3D12 hardware MSAA resolve operations,
+
+// programmable sample pattern management, fast depth/stencil filters, and HDR tonemapping.
+
+pub struct D3d12MsaaResolveGovernor {
+
+    optimizer: MsaaResolveSubpassOptimizer,
+
+    depth_stencil_engine: DepthStencilResolveEngine,
+
+    hdr_resolver: HdrMsaaColorResolver,
+
+    programmable_sample_positions_tier: u32,
+
+}
+
+
+
+impl D3d12MsaaResolveGovernor {
+
+    // Initialize MSAA resolve governor with specified hardware tier.
+
+    pub const fn new(programmable_sample_positions_tier: u32) -> Self {
+
+        Self {
+
+            optimizer: MsaaResolveSubpassOptimizer::new(),
+
+            depth_stencil_engine: DepthStencilResolveEngine::new(),
+
+            hdr_resolver: HdrMsaaColorResolver::new(),
+
+            programmable_sample_positions_tier,
+
+        }
+
+    }
+
+
+
+    // Query programmable sample positions tier support (e.g. Tier 1 or Tier 2).
+
+    pub const fn programmable_tier(&self) -> u32 {
+
+        self.programmable_sample_positions_tier
+
+    }
+
+
+
+    // Configure programmable sample positions for specified MSAA count.
+
+    pub fn configure_sample_pattern(&mut self, count: MsaaSampleCount, positions: &[SamplePosition]) -> bool {
+
+        if self.programmable_sample_positions_tier == 0 {
+
+            return false;
+
+        }
+
+        let pat = ProgrammableSamplePattern::custom(count, positions);
+
+        self.optimizer.set_custom_pattern(pat);
+
+        true
+
+    }
+
+
+
+    // Reset sample pattern for specified MSAA count to hardware default.
+
+    pub fn reset_sample_pattern(&mut self, count: MsaaSampleCount) {
+
+        self.optimizer.reset_to_standard(count);
+
+    }
+
+
+
+    // Access sample pattern optimizer.
+
+    pub fn optimizer(&self) -> &MsaaResolveSubpassOptimizer {
+
+        &self.optimizer
+
+    }
+
+
+
+    // Access mutable optimizer.
+
+    pub fn optimizer_mut(&mut self) -> &mut MsaaResolveSubpassOptimizer {
+
+        &mut self.optimizer
+
+    }
+
+
+
+    // Access depth/stencil resolve engine.
+
+    pub fn depth_stencil_engine(&self) -> &DepthStencilResolveEngine {
+
+        &self.depth_stencil_engine
+
+    }
+
+
+
+    // Access HDR color resolver.
+
+    pub fn hdr_resolver(&self) -> &HdrMsaaColorResolver {
+
+        &self.hdr_resolver
+
+    }
+
+
+
+    // Access mutable HDR color resolver.
+
+    pub fn hdr_resolver_mut(&mut self) -> &mut HdrMsaaColorResolver {
+
+        &mut self.hdr_resolver
+
+    }
+
+}
+
+
+
+// Run comprehensive self-test suite validating dynamic MSAA resolve and sample pattern governor.
+
+pub fn test_msaa_resolve_subsystem() {
+
+    crate::serial_write_str("[KNT-GFX] Testing Direct3D 12 Agility Dynamic MSAA Resolve Governor...\r\n");
+
+
+
+    let mut gov = D3d12MsaaResolveGovernor::new(2);
+
+    assert_eq!(gov.programmable_tier(), 2);
+
+
+
+    // 1. Verify standard sample counts & default pattern locations
+
+    let pat2x = gov.optimizer().get_pattern(MsaaSampleCount::Count2x);
+
+    assert_eq!(pat2x.sample_count, MsaaSampleCount::Count2x);
+
+    assert!(!pat2x.is_custom);
+
+    assert_eq!(pat2x.positions[0], SamplePosition::new(4, 4));
+
+    assert_eq!(pat2x.positions[1], SamplePosition::new(-4, -4));
+
+
+
+    let pat4x = gov.optimizer().get_pattern(MsaaSampleCount::Count4x);
+
+    assert_eq!(pat4x.sample_count, MsaaSampleCount::Count4x);
+
+    assert_eq!(pat4x.positions[0], SamplePosition::new(-2, -6));
+
+    assert_eq!(pat4x.positions[1], SamplePosition::new(6, -2));
+
+
+
+    let pat8x = gov.optimizer().get_pattern(MsaaSampleCount::Count8x);
+
+    assert_eq!(pat8x.sample_count, MsaaSampleCount::Count8x);
+
+    assert_eq!(pat8x.positions[0], SamplePosition::new(1, -3));
+
+
+
+    // 2. Verify custom programmable sample position overrides
+
+    let custom_locs = [SamplePosition::new(-7, -7), SamplePosition::new(7, 7)];
+
+    assert!(gov.configure_sample_pattern(MsaaSampleCount::Count2x, &custom_locs));
+
+    let custom_p2 = gov.optimizer().get_pattern(MsaaSampleCount::Count2x);
+
+    assert!(custom_p2.is_custom);
+
+    assert_eq!(custom_p2.positions[0], SamplePosition::new(-7, -7));
+
+    assert_eq!(custom_p2.positions[1], SamplePosition::new(7, 7));
+
+    gov.reset_sample_pattern(MsaaSampleCount::Count2x);
+
+    assert!(!gov.optimizer().get_pattern(MsaaSampleCount::Count2x).is_custom);
+
+
+
+    // 3. Verify resolve bounding rectangle calculations
+
+    let rect = ResolveRect::new(100, 200, 1920, 1080);
+
+    assert_eq!(rect.width(), 1820);
+
+    assert_eq!(rect.height(), 880);
+
+    gov.optimizer().record_resolve();
+
+    assert_eq!(gov.optimizer().total_resolves(), 1);
+
+
+
+    // 4. Verify Depth/Stencil resolve filters (Min, Max, Average, SampleZero)
+
+    let depth_samples = [0.85f32, 0.42f32, 0.99f32, 0.12f32];
+
+    let d_min = gov.depth_stencil_engine().resolve_depth(&depth_samples, DepthResolveFilter::Min);
+
+    assert!((d_min - 0.12).abs() < 1e-5);
+
+    let d_max = gov.depth_stencil_engine().resolve_depth(&depth_samples, DepthResolveFilter::Max);
+
+    assert!((d_max - 0.99).abs() < 1e-5);
+
+    let d_avg = gov.depth_stencil_engine().resolve_depth(&depth_samples, DepthResolveFilter::Average);
+
+    let expected_avg = (0.85 + 0.42 + 0.99 + 0.12) / 4.0;
+
+    assert!((d_avg - expected_avg).abs() < 1e-5);
+
+    let d_z = gov.depth_stencil_engine().resolve_depth(&depth_samples, DepthResolveFilter::SampleZero);
+
+    assert!((d_z - 0.85).abs() < 1e-5);
+
+
+
+    let stencil_samples = [10u8, 255u8, 5u8, 128u8];
+
+    assert_eq!(gov.depth_stencil_engine().resolve_stencil(&stencil_samples, StencilResolveFilter::Min), 5);
+
+    assert_eq!(gov.depth_stencil_engine().resolve_stencil(&stencil_samples, StencilResolveFilter::Max), 255);
+
+    assert_eq!(gov.depth_stencil_engine().resolve_stencil(&stencil_samples, StencilResolveFilter::SampleZero), 10);
+
+
+
+    // 5. Verify HDR tone-mapped MSAA color resolve
+
+    let hdr_samples = [
+
+        HdrColorSample::new(10.0, 10.0, 10.0, 1.0),
+
+        HdrColorSample::new(0.1, 0.1, 0.1, 1.0),
+
+        HdrColorSample::new(0.0, 0.0, 0.0, 1.0),
+
+        HdrColorSample::new(0.0, 0.0, 0.0, 1.0),
+
+    ];
+
+    let resolved_hdr = gov.hdr_resolver().resolve_hdr_samples(&hdr_samples);
+
+    assert!(resolved_hdr.r > 0.0 && resolved_hdr.r <= 10.0);
+
+    assert_eq!(gov.hdr_resolver().total_hdr_resolves(), 1);
+
+
+
+    crate::serial_write_str("[KNT-D3D12-MSAA-RESOLVE-PASS] Direct3D 12 Agility Dynamic MSAA Resolve Subsystem verified\r\n");
+
+}
+
