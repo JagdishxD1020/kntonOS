@@ -312,3 +312,117 @@ impl CfiAntiCheatTrap {
 }
 
 pub static CFI_ANTI_CHEAT_TRAP: CfiAntiCheatTrap = CfiAntiCheatTrap::new();
+
+/// Comprehensive self-test suite for Win32 CFI Forward-Edge Verification & Dynamic Vector Unwind.
+pub fn test_win32_cfi_unwind_subsystem() -> bool {
+    crate::serial_write_str("[KNT-WIN32-CFI-UNWIND] Initializing Win32 CFI Unwind Subsystem self-test...\r\n");
+
+    // 1. Verify CFI Bitmap Registration and Forward-Edge Indirect Call Verification
+    let mod_base = 0x0000_0000_0040_0000u64;
+    let mod_size = 0x0002_0000usize; // 128 KB
+    let cfi_lookup = CFI_VERIFIER.register_module_cfi(mod_base, mod_size);
+
+    let valid_func = 0x0000_0000_0040_1000u64;
+    let valid_func2 = 0x0000_0000_0040_2000u64;
+    let unaligned_target = 0x0000_0000_0040_1004u64;
+    let unregistered_target = 0x0000_0000_0040_1020u64;
+    let foreign_target = 0x0000_7FFF_8888_0000u64;
+
+    if cfi_lookup.mark_valid_target(valid_func).is_err() || cfi_lookup.mark_valid_target(valid_func2).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Failed to mark valid CFI targets\r\n");
+        return false;
+    }
+
+    if CFI_VERIFIER.verify_indirect_call(valid_func) != CfiCheckResult::ValidTarget {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid target rejected by CFI verifier\r\n");
+        return false;
+    }
+
+    if CFI_VERIFIER.verify_indirect_call(unaligned_target) != CfiCheckResult::UnalignedTarget(unaligned_target) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unaligned target not identified\r\n");
+        return false;
+    }
+
+    if CFI_VERIFIER.verify_indirect_call(unregistered_target) != CfiCheckResult::InvalidTarget(unregistered_target) {
+        crate::serial_write_str("[KNT-TEST-ERR] Unregistered target was not flagged as invalid\r\n");
+        return false;
+    }
+
+    if CFI_VERIFIER.verify_indirect_call(foreign_target) != CfiCheckResult::InvalidTarget(foreign_target) {
+        crate::serial_write_str("[KNT-TEST-ERR] Foreign address was not flagged as invalid\r\n");
+        return false;
+    }
+
+    // 2. Verify Dynamic SEH Vector Unwinder with Non-Volatile Register Recovery
+    let mut mock_stack = [0u8; 64];
+    // Offset 0: rbx = 0x1111_1111_2222_2222
+    mock_stack[0..8].copy_from_slice(&0x1111_1111_2222_2222u64.to_le_bytes());
+    // Offset 8: rbp = 0x3333_3333_4444_4444
+    mock_stack[8..16].copy_from_slice(&0x3333_3333_4444_4444u64.to_le_bytes());
+    // Offset 16: r12 = 0x5555_5555_6666_6666
+    mock_stack[16..24].copy_from_slice(&0x5555_5555_6666_6666u64.to_le_bytes());
+    // Offset 24: r15 = 0x7777_7777_8888_8888
+    mock_stack[24..32].copy_from_slice(&0x7777_7777_8888_8888u64.to_le_bytes());
+
+    let mut ctx = NonVolatileContext {
+        rip: 0x0040_5000,
+        rsp: 0x0000_7FFF_1000_0000,
+        ..Default::default()
+    };
+
+    let unwind_ops = [
+        UnwindRegisterOp::RestoreRbx { stack_offset: 0 },
+        UnwindRegisterOp::RestoreRbp { stack_offset: 8 },
+        UnwindRegisterOp::RestoreR12 { stack_offset: 16 },
+        UnwindRegisterOp::RestoreR15 { stack_offset: 24 },
+        UnwindRegisterOp::DeallocStack { size: 32 },
+    ];
+
+    let caller_ret = 0x0040_1000u64;
+    if SehVectorUnwinder::unwind_frame_step(&mut ctx, &mock_stack, &unwind_ops, caller_ret).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Frame unwind step execution failed\r\n");
+        return false;
+    }
+
+    if ctx.rbx != 0x1111_1111_2222_2222
+        || ctx.rbp != 0x3333_3333_4444_4444
+        || ctx.r12 != 0x5555_5555_6666_6666
+        || ctx.r15 != 0x7777_7777_8888_8888
+        || ctx.rsp != 0x0000_7FFF_1000_0020
+        || ctx.rip != caller_ret
+    {
+        crate::serial_write_str("[KNT-TEST-ERR] Non-volatile register recovery value mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify Anti-Cheat Traps for CFI Tampering and Forged Exception Records
+    if CFI_ANTI_CHEAT_TRAP.verify_call_or_trap(valid_func).is_err() {
+        crate::serial_write_str("[KNT-TEST-ERR] Valid call was incorrectly trapped\r\n");
+        return false;
+    }
+
+    if CFI_ANTI_CHEAT_TRAP.verify_call_or_trap(unregistered_target).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Untrusted indirect call was not trapped\r\n");
+        return false;
+    }
+
+    // Forged record with misaligned address
+    if CFI_ANTI_CHEAT_TRAP.verify_exception_record_or_trap(0x1003, valid_func).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Misaligned exception record was not trapped\r\n");
+        return false;
+    }
+
+    // Forged record with invalid handler target
+    if CFI_ANTI_CHEAT_TRAP.verify_exception_record_or_trap(0x1008, unregistered_target).is_ok() {
+        crate::serial_write_str("[KNT-TEST-ERR] Forged handler target was not trapped\r\n");
+        return false;
+    }
+
+    if CFI_ANTI_CHEAT_TRAP.get_total_traps() < 3 {
+        crate::serial_write_str("[KNT-TEST-ERR] Anti-cheat trap incident counter mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-WIN32-CFI-UNWIND-PASS] Win32 CFI Forward-Edge Verifier & Vector Unwinder verified\r\n");
+    true
+}
