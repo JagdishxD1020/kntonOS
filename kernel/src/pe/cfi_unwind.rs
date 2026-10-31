@@ -145,3 +145,90 @@ impl CfiTargetVerifier {
 }
 
 pub static CFI_VERIFIER: CfiTargetVerifier = CfiTargetVerifier::new();
+
+/// Saved non-volatile machine register state for SEH unwinding.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NonVolatileContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+}
+
+/// Dynamic stack unwind operation descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnwindRegisterOp {
+    RestoreRbx { stack_offset: u32 },
+    RestoreRbp { stack_offset: u32 },
+    RestoreRdi { stack_offset: u32 },
+    RestoreRsi { stack_offset: u32 },
+    RestoreR12 { stack_offset: u32 },
+    RestoreR13 { stack_offset: u32 },
+    RestoreR14 { stack_offset: u32 },
+    RestoreR15 { stack_offset: u32 },
+    DeallocStack { size: u32 },
+}
+
+/// Dynamic SEH Vector Unwinder recovering non-volatile machine registers.
+pub struct SehVectorUnwinder;
+
+impl SehVectorUnwinder {
+    /// Unwind a stack frame and recover non-volatile register states.
+    pub fn unwind_frame_step(
+        ctx: &mut NonVolatileContext,
+        stack_memory: &[u8],
+        unwind_ops: &[UnwindRegisterOp],
+        return_address: u64,
+    ) -> Result<(), &'static str> {
+        for op in unwind_ops {
+            match *op {
+                UnwindRegisterOp::RestoreRbx { stack_offset } => {
+                    ctx.rbx = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreRbp { stack_offset } => {
+                    ctx.rbp = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreRdi { stack_offset } => {
+                    ctx.rdi = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreRsi { stack_offset } => {
+                    ctx.rsi = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreR12 { stack_offset } => {
+                    ctx.r12 = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreR13 { stack_offset } => {
+                    ctx.r13 = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreR14 { stack_offset } => {
+                    ctx.r14 = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::RestoreR15 { stack_offset } => {
+                    ctx.r15 = Self::read_u64_from_stack(stack_memory, stack_offset as usize)?;
+                }
+                UnwindRegisterOp::DeallocStack { size } => {
+                    ctx.rsp = ctx.rsp.saturating_add(size as u64);
+                }
+            }
+        }
+        ctx.rip = return_address;
+        Ok(())
+    }
+
+    fn read_u64_from_stack(stack: &[u8], offset: usize) -> Result<u64, &'static str> {
+        if offset + 8 <= stack.len() {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&stack[offset..offset + 8]);
+            Ok(u64::from_le_bytes(bytes))
+        } else {
+            Err("Stack read out of bounds")
+        }
+    }
+}
