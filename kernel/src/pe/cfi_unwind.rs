@@ -232,3 +232,83 @@ impl SehVectorUnwinder {
         }
     }
 }
+
+/// Anti-cheat violation classification for CFI and SEH tampering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CfiTamperTrapType {
+    IndirectCallTamper { target_addr: u64 },
+    ForgedExceptionRecord { record_addr: u64, reason: &'static str },
+}
+
+/// Anti-cheat trap detecting CFI indirect call tampering and forged exception registration records.
+pub struct CfiAntiCheatTrap {
+    incidents: Spinlock<Vec<CfiTamperTrapType>>,
+    total_traps: AtomicU64,
+}
+
+impl CfiAntiCheatTrap {
+    pub const fn new() -> Self {
+        Self {
+            incidents: Spinlock::new(Vec::new()),
+            total_traps: AtomicU64::new(0),
+        }
+    }
+
+    /// Verify an indirect call destination against forward-edge CFI policies and raise trap on tampering.
+    pub fn verify_call_or_trap(&self, target_address: u64) -> Result<(), CfiTamperTrapType> {
+        match CFI_VERIFIER.verify_indirect_call(target_address) {
+            CfiCheckResult::ValidTarget => Ok(()),
+            _ => {
+                let trap = CfiTamperTrapType::IndirectCallTamper { target_addr: target_address };
+                self.incidents.lock().push(trap.clone());
+                self.total_traps.fetch_add(1, Ordering::Relaxed);
+                Err(trap)
+            }
+        }
+    }
+
+    /// Verify SEH exception registration record integrity against memory forging and unmapped pointers.
+    pub fn verify_exception_record_or_trap(
+        &self,
+        record_addr: u64,
+        handler_addr: u64,
+    ) -> Result<(), CfiTamperTrapType> {
+        // Record address must be 8-byte aligned and non-null
+        if record_addr == 0 || (record_addr & 0x07) != 0 {
+            let trap = CfiTamperTrapType::ForgedExceptionRecord {
+                record_addr,
+                reason: "Unaligned or null exception record address",
+            };
+            self.incidents.lock().push(trap.clone());
+            self.total_traps.fetch_add(1, Ordering::Relaxed);
+            return Err(trap);
+        }
+
+        // Handler address must be valid forward-edge CFI target
+        match CFI_VERIFIER.verify_indirect_call(handler_addr) {
+            CfiCheckResult::ValidTarget => Ok(()),
+            _ => {
+                let trap = CfiTamperTrapType::ForgedExceptionRecord {
+                    record_addr,
+                    reason: "Exception handler target failed CFI validation",
+                };
+                self.incidents.lock().push(trap.clone());
+                self.total_traps.fetch_add(1, Ordering::Relaxed);
+                Err(trap)
+            }
+        }
+    }
+
+    /// Retrieve total anti-cheat traps triggered.
+    pub fn get_total_traps(&self) -> u64 {
+        self.total_traps.load(Ordering::Acquire)
+    }
+
+    /// Clear all incident history.
+    pub fn clear(&self) {
+        self.incidents.lock().clear();
+        self.total_traps.store(0, Ordering::Relaxed);
+    }
+}
+
+pub static CFI_ANTI_CHEAT_TRAP: CfiAntiCheatTrap = CfiAntiCheatTrap::new();
