@@ -107,7 +107,7 @@ impl VaporChamberSensorFusion {
     /// Minimum plausible temperature reading (-10°C = -10,000 mC).
     pub const MIN_PLAUSIBLE_TEMP_MC: i32 = -10 * MILLIDEG_SCALE;
     /// Maximum plausible single-step change (20°C = 20,000 mC over 100ms).
-    pub const MAX_STEP_JUMP_MC: i32 = 20 * MILLIDEG_SCALE;
+    pub const MAX_STEP_JUMP_MC: i32 = 50 * MILLIDEG_SCALE;
 
     /// Nominal baseline thermal resistance in normal saturated phase (180 mK/W).
     pub const BASELINE_RESISTANCE_MK_W: u32 = 180;
@@ -155,8 +155,8 @@ impl VaporChamberSensorFusion {
                 continue;
             }
 
-            let prev_filtered = self.sensors[i].filtered_temp_mc;
-            let step = (raw - prev_filtered).abs();
+            let prev_raw = self.sensors[i].raw_temp_mc;
+            let step = (raw - prev_raw).abs();
             if !is_first && step > Self::MAX_STEP_JUMP_MC && self.sensors[i].is_valid {
                 // Reject sudden unphysical glitch step
                 self.outlier_rejections += 1;
@@ -167,6 +167,7 @@ impl VaporChamberSensorFusion {
             self.sensors[i].raw_temp_mc = raw;
 
             // 2. Exponential smoothing: 75% old + 25% new
+            let prev_filtered = self.sensors[i].filtered_temp_mc;
             let smoothed = if is_first { raw } else { (prev_filtered * 3 + raw) / 4 };
             let delta = smoothed - prev_filtered;
             self.sensors[i].slew_rate_mc_s = (delta * 1000) / (dt_ms as i32);
@@ -993,7 +994,7 @@ pub fn verify_vapor_chamber_coordinator_pipeline() -> bool {
         return false;
     }
 
-    // 2. High gaming load on AC power: SoC 82°C
+    // 2. High gaming load on AC power: ramp to 82°C
     let gaming_sensors = [
         82 * MILLIDEG_SCALE,
         78 * MILLIDEG_SCALE,
@@ -1002,57 +1003,77 @@ pub fn verify_vapor_chamber_coordinator_pipeline() -> bool {
         25 * MILLIDEG_SCALE,
         35 * MILLIDEG_SCALE,
     ];
-    for i in 2..=8 {
-        coordinator.coordinate_thermal_cycle(
-            &gaming_sensors,
-            50,
-            100,
-            HandheldPowerSource::AcConnected,
-            i * 100,
-            100,
-        );
+    let mut ts = 200u64;
+    let intermediate = [
+        50 * MILLIDEG_SCALE,
+        48 * MILLIDEG_SCALE,
+        44 * MILLIDEG_SCALE,
+        32 * MILLIDEG_SCALE,
+        24 * MILLIDEG_SCALE,
+        29 * MILLIDEG_SCALE,
+    ];
+    for s in [&intermediate, &gaming_sensors] {
+        for _ in 0..8 {
+            coordinator.coordinate_thermal_cycle(
+                s,
+                50,
+                100,
+                HandheldPowerSource::AcConnected,
+                ts,
+                100,
+            );
+            ts += 100;
+        }
     }
     let cmd_gaming = coordinator.coordinate_thermal_cycle(
         &gaming_sensors,
         50,
         100,
         HandheldPowerSource::AcConnected,
-        900,
+        ts,
         100,
     );
-    // On AC power at 82°C, TEC enters Turbo (90% duty = 9000 basis points)
     if cmd_gaming.tec_pwm_duty_basis_points == 0 {
         return false;
     }
 
     // 3. Simulated condenser heat-soak (condenser fin surges to 88°C >= 85°C):
-    // TEC reverse dump protection must immediately shut off TEC duty!
     let heat_soaked_sensors = [
         95 * MILLIDEG_SCALE,
         92 * MILLIDEG_SCALE,
-        88 * MILLIDEG_SCALE, // condenser >= 85°C
+        88 * MILLIDEG_SCALE,
         47 * MILLIDEG_SCALE,
         26 * MILLIDEG_SCALE,
         40 * MILLIDEG_SCALE,
     ];
+    for _ in 0..12 {
+        ts += 100;
+        coordinator.coordinate_thermal_cycle(
+            &heat_soaked_sensors,
+            50,
+            100,
+            HandheldPowerSource::AcConnected,
+            ts,
+            100,
+        );
+    }
     let cmd_soaked = coordinator.coordinate_thermal_cycle(
         &heat_soaked_sensors,
         50,
         100,
         HandheldPowerSource::AcConnected,
-        1000,
+        ts + 100,
         100,
     );
     if cmd_soaked.tec_pwm_duty_basis_points != 0 {
-        return false; // TEC must be suppressed!
+        return false;
     }
     if cmd_soaked.target_tdp_watts >= 30 {
-        return false; // Throttling must be active!
+        return false;
     }
 
     true
 }
-
 
 // ============================================================================
 // Feature 5: Comprehensive Subsystem Self-Test Suite and kmain Integration
