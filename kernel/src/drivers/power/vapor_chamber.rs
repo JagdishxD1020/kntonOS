@@ -141,6 +141,7 @@ impl VaporChamberSensorFusion {
         } else {
             100 // Default 100ms interval
         };
+        let is_first = self.last_update_ms == 0;
         self.last_update_ms = timestamp_ms;
 
         // Process each sensor channel with outlier filtering and exponential smoothing
@@ -156,7 +157,7 @@ impl VaporChamberSensorFusion {
 
             let prev_filtered = self.sensors[i].filtered_temp_mc;
             let step = (raw - prev_filtered).abs();
-            if step > Self::MAX_STEP_JUMP_MC && self.sensors[i].is_valid {
+            if !is_first && step > Self::MAX_STEP_JUMP_MC && self.sensors[i].is_valid {
                 // Reject sudden unphysical glitch step
                 self.outlier_rejections += 1;
                 continue;
@@ -166,7 +167,7 @@ impl VaporChamberSensorFusion {
             self.sensors[i].raw_temp_mc = raw;
 
             // 2. Exponential smoothing: 75% old + 25% new
-            let smoothed = (prev_filtered * 3 + raw) / 4;
+            let smoothed = if is_first { raw } else { (prev_filtered * 3 + raw) / 4 };
             let delta = smoothed - prev_filtered;
             self.sensors[i].slew_rate_mc_s = (delta * 1000) / (dt_ms as i32);
             self.sensors[i].filtered_temp_mc = smoothed;
@@ -202,7 +203,7 @@ impl VaporChamberSensorFusion {
         }
 
         // Capillary limit warning: SoC > 88°C or evaporator > 82°C with rising resistance
-        if soc_temp_mc >= 88 * MILLIDEG_SCALE || evap_temp_mc >= 82 * MILLIDEG_SCALE || self.effective_thermal_resistance_mk_w > 500 {
+        if (soc_temp_mc >= 88 * MILLIDEG_SCALE || evap_temp_mc >= 82 * MILLIDEG_SCALE) && self.effective_thermal_resistance_mk_w > 500 {
             return VaporChamberPhaseState::CapillaryDryoutWarning;
         }
 
