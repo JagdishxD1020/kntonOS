@@ -158,3 +158,173 @@ pub fn verify_battery_charge_governor() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: Handheld TDP Thermal Profiles & Dynamic Governor State Machine
+// ============================================================================
+
+/// Handheld thermal and package power profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TdpProfile {
+    /// Quiet Profile: 7W PL1 sustained / 10W PL2 burst (extended battery life & silent fan).
+    Quiet,
+    /// Balanced Profile: 15W PL1 sustained / 20W PL2 burst (optimal handheld gaming balance).
+    Balanced,
+    /// Turbo Profile: 28W PL1 sustained / 35W PL2 burst (docked / high-framerate performance).
+    Turbo,
+    /// Custom user-selected sustained power in Watts (clamped between 4W and 35W).
+    Custom(u32),
+}
+
+impl TdpProfile {
+    /// Returns default sustained power limit (PL1) in Watts.
+    pub const fn pl1_watts(&self) -> u32 {
+        match self {
+            Self::Quiet => 7,
+            Self::Balanced => 15,
+            Self::Turbo => 28,
+            Self::Custom(w) => {
+                if *w < 4 {
+                    4
+                } else if *w > 35 {
+                    35
+                } else {
+                    *w
+                }
+            }
+        }
+    }
+
+    /// Returns default short burst power limit (PL2) in Watts.
+    pub const fn pl2_watts(&self) -> u32 {
+        match self {
+            Self::Quiet => 10,
+            Self::Balanced => 20,
+            Self::Turbo => 35,
+            Self::Custom(_) => {
+                let sustained = self.pl1_watts();
+                let burst = sustained + 5;
+                if burst > 40 { 40 } else { burst }
+            }
+        }
+    }
+}
+
+/// Dynamic TDP governor state machine coordinating power envelopes.
+#[derive(Debug, Clone, Copy)]
+pub struct TdpGovernor {
+    /// Currently requested user profile.
+    pub requested_profile: TdpProfile,
+    /// Currently effective active profile after power source & thermal constraints.
+    pub effective_profile: TdpProfile,
+    /// Active sustained package power limit in Watts (PL1).
+    pub active_pl1_watts: u32,
+    /// Active short burst power limit in Watts (PL2).
+    pub active_pl2_watts: u32,
+    /// Short burst time window in milliseconds (Tau).
+    pub burst_duration_ms: u32,
+    /// External AC power connected.
+    pub on_ac_power: bool,
+    /// Current battery State of Charge percentage.
+    pub battery_soc_pct: u8,
+    /// Flag indicating low battery power-saving override is active.
+    pub low_battery_throttled: bool,
+}
+
+impl TdpGovernor {
+    /// Initializes TDP governor with Balanced 15W default profile.
+    pub const fn new() -> Self {
+        Self {
+            requested_profile: TdpProfile::Balanced,
+            effective_profile: TdpProfile::Balanced,
+            active_pl1_watts: 15,
+            active_pl2_watts: 20,
+            burst_duration_ms: 28000, // 28s Tau standard
+            on_ac_power: false,
+            battery_soc_pct: 100,
+            low_battery_throttled: false,
+        }
+    }
+
+    /// Changes requested TDP profile and recalculates active power limits.
+    pub fn set_profile(&mut self, profile: TdpProfile) {
+        self.requested_profile = profile;
+        self.update_effective_limits();
+    }
+
+    /// Evaluates power supply telemetry and adjusts constraints.
+    pub fn evaluate_power_source(&mut self, on_ac: bool, soc_pct: u8) {
+        self.on_ac_power = on_ac;
+        self.battery_soc_pct = soc_pct;
+        self.update_effective_limits();
+    }
+
+    /// Recalculates effective PL1 and PL2 based on power rules.
+    fn update_effective_limits(&mut self) {
+        // Battery protection rules:
+        // When running on battery with low capacity (<= 20%), clamp Turbo down to Balanced
+        // If critical (<= 10%), clamp down to Quiet to prevent cell undervoltage cutoff.
+        if !self.on_ac_power && self.battery_soc_pct <= 10 {
+            self.effective_profile = TdpProfile::Quiet;
+            self.low_battery_throttled = true;
+        } else if !self.on_ac_power && self.battery_soc_pct <= 20 && self.requested_profile == TdpProfile::Turbo {
+            self.effective_profile = TdpProfile::Balanced;
+            self.low_battery_throttled = true;
+        } else {
+            self.effective_profile = self.requested_profile;
+            self.low_battery_throttled = false;
+        }
+
+        self.active_pl1_watts = self.effective_profile.pl1_watts();
+        self.active_pl2_watts = self.effective_profile.pl2_watts();
+    }
+}
+
+/// Verification test for handheld TDP profiles and dynamic governor.
+pub fn verify_tdp_governor() -> bool {
+    let mut gov = TdpGovernor::new();
+
+    // 1. Initial Balanced profile checks
+    if gov.effective_profile != TdpProfile::Balanced || gov.active_pl1_watts != 15 || gov.active_pl2_watts != 20 {
+        return false;
+    }
+
+    // 2. Select Turbo profile while connected to AC
+    gov.evaluate_power_source(true, 90);
+    gov.set_profile(TdpProfile::Turbo);
+    if gov.effective_profile != TdpProfile::Turbo || gov.active_pl1_watts != 28 || gov.active_pl2_watts != 35 {
+        return false;
+    }
+
+    // 3. Unplug AC, battery drops to 18% -> governor must throttle Turbo down to Balanced 15W
+    gov.evaluate_power_source(false, 18);
+    if gov.effective_profile != TdpProfile::Balanced || gov.active_pl1_watts != 15 || !gov.low_battery_throttled {
+        return false;
+    }
+
+    // 4. Battery drops to 8% -> governor must force Quiet 7W to prevent brownout
+    gov.evaluate_power_source(false, 8);
+    if gov.effective_profile != TdpProfile::Quiet || gov.active_pl1_watts != 7 || !gov.low_battery_throttled {
+        return false;
+    }
+
+    // 5. Plug AC back in -> governor restores requested Turbo profile
+    gov.evaluate_power_source(true, 8);
+    if gov.effective_profile != TdpProfile::Turbo || gov.active_pl1_watts != 28 || gov.low_battery_throttled {
+        return false;
+    }
+
+    // 6. Test Custom profile clamping
+    gov.set_profile(TdpProfile::Custom(50)); // Request 50W (over max 35W)
+    if gov.active_pl1_watts != 35 {
+        return false;
+    }
+
+    gov.set_profile(TdpProfile::Custom(2)); // Request 2W (under min 4W)
+    if gov.active_pl1_watts != 4 {
+        return false;
+    }
+
+    true
+}
+
