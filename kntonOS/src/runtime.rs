@@ -76,3 +76,111 @@ pub fn verify_user_runtime() -> bool {
 
     true
 }
+
+/// Comprehensive verification self-test for User-Mode Memory Allocator & Dynamic Syscall Stubs.
+pub fn verify_usermode_allocator_subsystem() -> bool {
+    // 1. TEB Pointer Validation Checks
+    let valid_teb = 0x0000_7FFF_FFFF_0000u64;
+    let stack_base = 0x0000_7FFF_FFFF_8000u64;
+    let stack_limit = 0x0000_7FFF_FFF0_0000u64;
+    if !validate_teb_pointer(valid_teb, stack_base, stack_limit) {
+        return false;
+    }
+    if validate_teb_pointer(0, stack_base, stack_limit) {
+        return false;
+    }
+    if validate_teb_pointer(valid_teb | 0x03, stack_base, stack_limit) {
+        return false;
+    }
+    if validate_teb_pointer(valid_teb, stack_limit, stack_base) {
+        return false;
+    }
+
+    // 2. Dynamic Syscall Wrappers
+    if sys_yield() != STATUS_SUCCESS {
+        return false;
+    }
+    if get_yield_count() == 0 {
+        return false;
+    }
+    if sys_spawn(0x0000_0000_0040_1000, 16384) != STATUS_SUCCESS {
+        return false;
+    }
+    if sys_spawn(0, 100) == STATUS_SUCCESS {
+        return false;
+    }
+
+    // 3. User-Mode Buddy & Slab Allocator Direct Operations
+    let mut alloc = UserBuddySlabAllocator::new();
+    let arena_ptr = unsafe { sys_alloc(65536, 0) };
+    if arena_ptr.is_null() {
+        return false;
+    }
+    unsafe {
+        alloc.init(arena_ptr, 65536);
+    }
+
+    let p32 = unsafe { alloc.allocate(32, 8) };
+    let p64 = unsafe { alloc.allocate(64, 8) };
+    let p128 = unsafe { alloc.allocate(128, 16) };
+    let p1024 = unsafe { alloc.allocate(1024, 16) };
+
+    if p32.is_none() || p64.is_none() || p128.is_none() || p1024.is_none() {
+        return false;
+    }
+
+    let (ptr32, ptr64, ptr128, ptr1024) = (p32.unwrap(), p64.unwrap(), p128.unwrap(), p1024.unwrap());
+    unsafe {
+        ptr32.write_volatile(0xAA);
+        ptr64.write_volatile(0xBB);
+        ptr128.write_volatile(0xCC);
+        ptr1024.write_volatile(0xDD);
+
+        if ptr32.read_volatile() != 0xAA
+            || ptr64.read_volatile() != 0xBB
+            || ptr128.read_volatile() != 0xCC
+            || ptr1024.read_volatile() != 0xDD
+        {
+            return false;
+        }
+
+        alloc.deallocate(ptr32, 32, 8);
+        alloc.deallocate(ptr64, 64, 8);
+        alloc.deallocate(ptr128, 128, 16);
+        alloc.deallocate(ptr1024, 1024, 16);
+    }
+
+    // Test multi-page allocation
+    let p8k = unsafe { alloc.allocate(8192, 4096) };
+    if p8k.is_none() {
+        return false;
+    }
+    let ptr8k = p8k.unwrap();
+    unsafe {
+        ptr8k.write_volatile(0xEE);
+        if ptr8k.read_volatile() != 0xEE {
+            return false;
+        }
+        alloc.deallocate(ptr8k, 8192, 4096);
+    }
+
+    // 4. UserGlobalAlloc via core::alloc::GlobalAlloc
+    let layout = core::alloc::Layout::from_size_align(256, 16).ok();
+    if layout.is_none() {
+        return false;
+    }
+    let l = layout.unwrap();
+    let gptr = unsafe { core::alloc::GlobalAlloc::alloc(&USER_GLOBAL_ALLOCATOR, l) };
+    if gptr.is_null() {
+        return false;
+    }
+    unsafe {
+        gptr.write_volatile(0x42);
+        if gptr.read_volatile() != 0x42 {
+            return false;
+        }
+        core::alloc::GlobalAlloc::dealloc(&USER_GLOBAL_ALLOCATOR, gptr, l);
+    }
+
+    true
+}
