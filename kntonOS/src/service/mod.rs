@@ -39,6 +39,9 @@ pub use backlight_daemon::*;
 pub mod motion_daemon;
 pub use motion_daemon::*;
 
+pub mod battery_manager;
+pub use battery_manager::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
