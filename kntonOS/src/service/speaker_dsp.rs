@@ -269,3 +269,196 @@ impl StereoCrosstalkCanceller {
         }
     }
 }
+
+
+/// Steam Deck Smart Amplifier Excursion and Thermal Protection Subsystem.
+/// Emulates hardware DSP protection loop found in Cirrus Logic CS35L41 smart boosted amps.
+
+pub const SPEAKER_XMAX_MICRONS: u32 = 450; // 0.45 mm maximum linear cone displacement
+pub const SPEAKER_THERMAL_LIMIT_CELSIUS: u16 = 105;
+pub const SPEAKER_THERMAL_WARN_CELSIUS: u16 = 90;
+pub const SPEAKER_NOMINAL_IMPEDANCE_OHMS: u32 = 4;
+
+/// Feed-forward mechanical excursion limiter preventing driver bottoming out.
+#[derive(Debug, Clone)]
+pub struct ExcursionLimiter {
+    pub max_excursion_um: u32,
+    pub current_gain_q8: u16, // 256 = 1.0 (0 dB attenuation)
+    pub peak_detected_um: u32,
+    is_active: bool,
+}
+
+impl ExcursionLimiter {
+    pub const fn new() -> Self {
+        Self {
+            max_excursion_um: SPEAKER_XMAX_MICRONS,
+            current_gain_q8: 256,
+            peak_detected_um: 0,
+            is_active: true,
+        }
+    }
+
+    /// Process a stereo block and limit peak amplitude if estimated displacement exceeds Xmax.
+    pub fn process_frame(&mut self, left: &mut [i16], right: &mut [i16]) {
+        if !self.is_active {
+            return;
+        }
+
+        let len = left.len().min(right.len());
+        let mut frame_peak: i32 = 0;
+
+        for i in 0..len {
+            let l_abs = (left[i] as i32).abs();
+            let r_abs = (right[i] as i32).abs();
+            if l_abs > frame_peak {
+                frame_peak = l_abs;
+            }
+            if r_abs > frame_peak {
+                frame_peak = r_abs;
+            }
+        }
+
+        // Estimate physical cone excursion in micrometers:
+        // Full scale 32767 peak maps to ~480 microns displacement at resonance
+        let estimated_um = ((frame_peak as u64 * 480) / 32768) as u32;
+        self.peak_detected_um = estimated_um;
+
+        // Target gain calculation:
+        // If estimated excursion > max_excursion, compress gain = (max_excursion * 256) / estimated
+        let target_gain_q8 = if estimated_um > self.max_excursion_um && estimated_um > 0 {
+            ((self.max_excursion_um as u64 * 256) / estimated_um as u64) as u16
+        } else {
+            256
+        };
+
+        // Asymmetric attack/release envelope follower:
+        // Fast attack (1ms): jump immediately down to target
+        // Smooth release (30ms): recover back up slowly
+        if target_gain_q8 < self.current_gain_q8 {
+            self.current_gain_q8 = target_gain_q8;
+        } else if self.current_gain_q8 < 256 {
+            // Smooth release increment
+            let step = 4u16; // gradual recovery
+            self.current_gain_q8 = (self.current_gain_q8 + step).min(256);
+        }
+
+        // Apply gain attenuation if limiting
+        if self.current_gain_q8 < 256 {
+            let g = self.current_gain_q8 as i32;
+            for i in 0..len {
+                let l = ((left[i] as i32) * g) >> 8;
+                let r = ((right[i] as i32) * g) >> 8;
+                left[i] = l as i16;
+                right[i] = r as i16;
+            }
+        }
+    }
+}
+
+/// Voice-coil lumped thermal model tracking Joule heating and heat dissipation.
+#[derive(Debug, Clone)]
+pub struct VoiceCoilThermalProtector {
+    current_temp_q8: u32, // Fixed point Q8 Celsius (25°C = 6400)
+    ambient_temp_celsius: i16,
+    thermal_resistance_q8: u16, // Thermal resistance Rth in °C/W (scaled Q8)
+    thermal_time_constant_ms: u32,
+    protection_gain_q8: u16,
+    is_throttling: bool,
+}
+
+impl VoiceCoilThermalProtector {
+    pub const fn new() -> Self {
+        Self {
+            current_temp_q8: 25 << 8, // 25°C ambient initial
+            ambient_temp_celsius: 25,
+            thermal_resistance_q8: 512, // 2.0 °C / Watt
+            thermal_time_constant_ms: 2500, // 2.5 second thermal mass
+            protection_gain_q8: 256,
+            is_throttling: false,
+        }
+    }
+
+    pub fn current_temperature_celsius(&self) -> u32 {
+        self.current_temp_q8 >> 8
+    }
+
+    pub fn is_protecting(&self) -> bool {
+        self.is_throttling
+    }
+
+    pub fn protection_gain(&self) -> u16 {
+        self.protection_gain_q8
+    }
+
+    /// Update thermal state from audio frame power and elapsed time.
+    pub fn process_frame(&mut self, left: &mut [i16], right: &mut [i16], delta_ms: u32) {
+        let len = left.len().min(right.len());
+        if len == 0 || delta_ms == 0 {
+            return;
+        }
+
+        // Calculate electrical signal power (RMS voltage squared / R_speaker)
+        let mut sum_sq: u64 = 0;
+        for i in 0..len {
+            let l = left[i] as i64;
+            let r = right[i] as i64;
+            sum_sq += (l * l + r * r) as u64;
+        }
+        let mean_sq = sum_sq / (len as u64 * 2);
+        // Normalized power in milliwatts: full scale 32767 RMS is ~1.8W into 4 Ohms
+        let power_mw = ((mean_sq * 1800) / (32768 * 32768)) as u32;
+
+        // Differential thermal step:
+        // dT = (P * Rth - (T - T_ambient)) * dt / Tau
+        let ambient_q8 = (self.ambient_temp_celsius as u32) << 8;
+        let p_in_watts_q8 = (power_mw * 256) / 1000;
+        let delta_t_rise_q8 = (p_in_watts_q8 * (self.thermal_resistance_q8 as u32)) >> 8;
+
+        let delta_t_dissipate_q8 = if self.current_temp_q8 > ambient_q8 {
+            self.current_temp_q8 - ambient_q8
+        } else {
+            0
+        };
+
+        let net_dt_q8 = (delta_t_rise_q8 as i64) - (delta_t_dissipate_q8 as i64);
+        let temp_step = (net_dt_q8 * (delta_ms as i64)) / (self.thermal_time_constant_ms as i64);
+
+        let new_temp = (self.current_temp_q8 as i64) + temp_step;
+        self.current_temp_q8 = if new_temp < ambient_q8 as i64 {
+            ambient_q8
+        } else {
+            new_temp as u32
+        };
+
+        let temp_c = self.current_temperature_celsius();
+
+        // Thermal governance:
+        // Below 90°C: 0 dB attenuation (gain = 256)
+        // 90°C to 105°C: progressive soft attenuation down to -6 dB (gain = 128)
+        // Above 105°C: hard safety clamp -12 dB (gain = 64)
+        if temp_c >= (SPEAKER_THERMAL_LIMIT_CELSIUS as u32) {
+            self.protection_gain_q8 = 64; // -12 dB
+            self.is_throttling = true;
+        } else if temp_c >= (SPEAKER_THERMAL_WARN_CELSIUS as u32) {
+            let over_c = temp_c - (SPEAKER_THERMAL_WARN_CELSIUS as u32);
+            let span_c = (SPEAKER_THERMAL_LIMIT_CELSIUS - SPEAKER_THERMAL_WARN_CELSIUS) as u32;
+            let ratio = (over_c * 128) / span_c; // 0 to 128
+            self.protection_gain_q8 = 256 - (ratio as u16);
+            self.is_throttling = true;
+        } else {
+            self.protection_gain_q8 = 256;
+            self.is_throttling = false;
+        }
+
+        // Apply thermal protection attenuation
+        if self.protection_gain_q8 < 256 {
+            let g = self.protection_gain_q8 as i32;
+            for i in 0..len {
+                let l = ((left[i] as i32) * g) >> 8;
+                let r = ((right[i] as i32) * g) >> 8;
+                left[i] = l as i16;
+                right[i] = r as i16;
+            }
+        }
+    }
+}
