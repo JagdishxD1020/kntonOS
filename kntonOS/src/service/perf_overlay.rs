@@ -184,3 +184,190 @@ impl PerfOverlayRenderer {
         self.level = self.level.next();
     }
 }
+
+// Telemetry state of a single APU CPU core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuCoreTelemetry {
+    pub core_id: u8,
+    pub clock_mhz: u16,
+    pub load_pct: u8,
+    pub temp_c: u8,
+}
+
+impl CpuCoreTelemetry {
+    // Construct default CPU core metrics.
+    pub const fn new(core_id: u8) -> Self {
+        Self {
+            core_id,
+            clock_mhz: 2400,
+            load_pct: 0,
+            temp_c: 45,
+        }
+    }
+}
+
+// GPU shader core and VRAM hardware metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuTelemetry {
+    pub clock_mhz: u16,
+    pub shader_load_pct: u8,
+    pub vram_used_mb: u16,
+    pub vram_total_mb: u16,
+    pub temp_c: u8,
+}
+
+impl GpuTelemetry {
+    // Construct default GPU telemetry descriptor.
+    pub const fn new() -> Self {
+        Self {
+            clock_mhz: 1600,
+            shader_load_pct: 0,
+            vram_used_mb: 512,
+            vram_total_mb: 8192,
+            temp_c: 50,
+        }
+    }
+}
+
+// Cooling fan acoustic and rotational velocity metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanTelemetry {
+    pub current_rpm: u16,
+    pub target_rpm: u16,
+    pub pwm_pct: u8,
+}
+
+impl FanTelemetry {
+    // Construct default fan telemetry descriptor.
+    pub const fn new() -> Self {
+        Self {
+            current_rpm: 2800,
+            target_rpm: 2800,
+            pwm_pct: 40,
+        }
+    }
+}
+
+// Battery fuel gauge and real-time power discharge telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryTelemetry {
+    pub charge_pct: u8,
+    pub discharge_rate_mw: u32,
+    pub voltage_mv: u16,
+    pub remaining_time_minutes: u16,
+}
+
+impl BatteryTelemetry {
+    // Construct default battery telemetry descriptor.
+    pub const fn new() -> Self {
+        Self {
+            charge_pct: 85,
+            discharge_rate_mw: 15000,
+            voltage_mv: 7600,
+            remaining_time_minutes: 180,
+        }
+    }
+}
+
+// Combined real-time hardware telemetry snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardwareTelemetry {
+    pub cpu_cores: [CpuCoreTelemetry; 4],
+    pub gpu: GpuTelemetry,
+    pub fan: FanTelemetry,
+    pub battery: BatteryTelemetry,
+    pub target_tdp_watts: u8,
+}
+
+impl HardwareTelemetry {
+    // Construct initial hardware telemetry state snapshot.
+    pub const fn new() -> Self {
+        Self {
+            cpu_cores: [
+                CpuCoreTelemetry::new(0),
+                CpuCoreTelemetry::new(1),
+                CpuCoreTelemetry::new(2),
+                CpuCoreTelemetry::new(3),
+            ],
+            gpu: GpuTelemetry::new(),
+            fan: FanTelemetry::new(),
+            battery: BatteryTelemetry::new(),
+            target_tdp_watts: 15,
+        }
+    }
+
+    // Compute average CPU load across all APU cores.
+    pub fn average_cpu_load(&self) -> u8 {
+        let total: u16 = self.cpu_cores.iter().map(|c| c.load_pct as u16).sum();
+        (total / 4) as u8
+    }
+
+    // Compute VRAM utilization percentage.
+    pub fn vram_usage_pct(&self) -> u8 {
+        if self.gpu.vram_total_mb == 0 {
+            0
+        } else {
+            ((self.gpu.vram_used_mb as u32 * 100) / self.gpu.vram_total_mb as u32) as u8
+        }
+    }
+}
+
+// Central hardware telemetry collector polling APU and battery controller.
+pub struct HardwareTelemetryCollector {
+    current: HardwareTelemetry,
+}
+
+impl HardwareTelemetryCollector {
+    // Construct collector initialized with baseline hardware metrics.
+    pub const fn new() -> Self {
+        Self {
+            current: HardwareTelemetry::new(),
+        }
+    }
+
+    // Update telemetry state for a specific CPU core.
+    pub fn update_cpu_core(&mut self, core_id: usize, clock_mhz: u16, load_pct: u8, temp_c: u8) {
+        if core_id < 4 {
+            self.current.cpu_cores[core_id].clock_mhz = clock_mhz;
+            self.current.cpu_cores[core_id].load_pct = load_pct.min(100);
+            self.current.cpu_cores[core_id].temp_c = temp_c;
+        }
+    }
+
+    // Update GPU clock, shader utilization and VRAM consumption.
+    pub fn update_gpu(&mut self, clock_mhz: u16, load_pct: u8, vram_mb: u16, temp_c: u8) {
+        self.current.gpu.clock_mhz = clock_mhz;
+        self.current.gpu.shader_load_pct = load_pct.min(100);
+        self.current.gpu.vram_used_mb = vram_mb.min(self.current.gpu.vram_total_mb);
+        self.current.gpu.temp_c = temp_c;
+    }
+
+    // Update cooling fan rotational speed and PWM duty cycle.
+    pub fn update_fan(&mut self, current_rpm: u16, pwm_pct: u8) {
+        self.current.fan.current_rpm = current_rpm;
+        self.current.fan.pwm_pct = pwm_pct.min(100);
+    }
+
+    // Update battery fuel gauge status and power consumption.
+    pub fn update_battery(&mut self, charge_pct: u8, discharge_rate_mw: u32, voltage_mv: u16) {
+        self.current.battery.charge_pct = charge_pct.min(100);
+        self.current.battery.discharge_rate_mw = discharge_rate_mw;
+        self.current.battery.voltage_mv = voltage_mv;
+        if discharge_rate_mw > 0 {
+            // 40,000 mWh battery capacity approximation for Steam Deck
+            let remaining_mwh = charge_pct as u32 * 400;
+            self.current.battery.remaining_time_minutes = ((remaining_mwh * 60) / discharge_rate_mw).min(600) as u16;
+        }
+    }
+
+    // Update APU thermal design power limit.
+    pub fn set_tdp(&mut self, tdp_watts: u8) {
+        self.current.target_tdp_watts = tdp_watts.clamp(5, 30);
+    }
+
+    // Retrieve active telemetry snapshot.
+    pub fn snapshot(&self) -> HardwareTelemetry {
+        self.current
+    }
+}
+
