@@ -464,3 +464,252 @@ impl SmoothBacklightInterpolator {
         ((nits as u64 * max_pwm_duty as u64) / max_nits as u64) as u32
     }
 }
+
+
+/// Standard daylight D65 white point reference temperature.
+pub const CCT_DAYLIGHT_D65: u32 = 6500;
+/// Default warm white night mode temperature.
+pub const CCT_WARM_NIGHT_DEFAULT: u32 = 3500;
+/// Minimum supported warm temperature (deep amber / candlelight).
+pub const CCT_MIN_KELVIN: u32 = 2000;
+/// Maximum supported correlated color temperature.
+pub const CCT_MAX_KELVIN: u32 = 6500;
+
+/// Normalized RGB channel gains in Q8 fixed-point (256 = 1.0x unity gain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RgbColorGain {
+    pub r_q8: u16,
+    pub g_q8: u16,
+    pub b_q8: u16,
+}
+
+impl RgbColorGain {
+    pub const fn unity() -> Self {
+        Self {
+            r_q8: 256,
+            g_q8: 256,
+            b_q8: 256,
+        }
+    }
+
+    /// Calculate blue attenuation percentage relative to daylight (0% to 100% blue reduction).
+    pub fn blue_reduction_pct(&self) -> u8 {
+        if self.b_q8 >= 256 {
+            0
+        } else {
+            let reduced = 256 - self.b_q8;
+            ((reduced as u32 * 100) / 256) as u8
+        }
+    }
+}
+
+/// 3x3 Color Correction Matrix (CCM / CTM) for display hardware DRM KMS pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColorTransformMatrix3x3 {
+    pub matrix_q8: [[u16; 3]; 3],
+}
+
+impl ColorTransformMatrix3x3 {
+    pub const fn identity() -> Self {
+        Self {
+            matrix_q8: [
+                [256, 0, 0],
+                [0, 256, 0],
+                [0, 0, 256],
+            ],
+        }
+    }
+
+    pub fn from_rgb_gain(gain: RgbColorGain) -> Self {
+        Self {
+            matrix_q8: [
+                [gain.r_q8, 0, 0],
+                [0, gain.g_q8, 0],
+                [0, 0, gain.b_q8],
+            ],
+        }
+    }
+}
+
+/// Operating policy for night mode blue-light filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NightModePolicy {
+    /// Night mode disabled (always 6500K daylight).
+    Disabled,
+    /// Manually locked to custom Kelvin target.
+    Manual,
+    /// Scheduled activation by local time minute of day (0 to 1439).
+    Scheduled { start_minute: u16, end_minute: u16 },
+    /// Automatically engage warm white when ambient lux drops below threshold.
+    AmbientLuxGuided { trigger_lux: u32 },
+}
+
+/// Governor coordinating CCT color temperature Kelvin warm white shift and blue light filter.
+#[derive(Debug, Clone)]
+pub struct NightModeGovernor {
+    current_cct_q8: u32, // Fixed-point Q8 Kelvin for ultra-smooth ramp
+    target_cct: u32,
+    policy: NightModePolicy,
+    configured_warm_target: u32,
+    transition_speed_kelvin_per_sec: u32,
+    is_active: bool,
+}
+
+impl NightModeGovernor {
+    pub const fn new() -> Self {
+        Self {
+            current_cct_q8: CCT_DAYLIGHT_D65 << 8,
+            target_cct: CCT_DAYLIGHT_D65,
+            policy: NightModePolicy::Disabled,
+            configured_warm_target: CCT_WARM_NIGHT_DEFAULT,
+            transition_speed_kelvin_per_sec: 150, // 150 Kelvin/s transition rate
+            is_active: false,
+        }
+    }
+
+    pub fn set_policy(&mut self, policy: NightModePolicy) {
+        self.policy = policy;
+    }
+
+    pub fn set_warm_target(&mut self, kelvin: u32) {
+        let clamped = if kelvin < CCT_MIN_KELVIN {
+            CCT_MIN_KELVIN
+        } else if kelvin > CCT_MAX_KELVIN {
+            CCT_MAX_KELVIN
+        } else {
+            kelvin
+        };
+        self.configured_warm_target = clamped;
+    }
+
+    pub fn current_cct(&self) -> u32 {
+        self.current_cct_q8 >> 8
+    }
+
+    pub fn target_cct(&self) -> u32 {
+        self.target_cct
+    }
+
+    pub fn is_night_mode_active(&self) -> bool {
+        self.is_active
+    }
+
+    /// Evaluate current policy against clock minute and ambient lux.
+    pub fn update_policy_state(&mut self, current_minute_of_day: u16, ambient_lux: u32) {
+        let should_activate = match self.policy {
+            NightModePolicy::Disabled => false,
+            NightModePolicy::Manual => true,
+            NightModePolicy::Scheduled { start_minute, end_minute } => {
+                if start_minute <= end_minute {
+                    current_minute_of_day >= start_minute && current_minute_of_day < end_minute
+                } else {
+                    // Wrap-around midnight (e.g. 21:00 (1260) to 07:00 (420))
+                    current_minute_of_day >= start_minute || current_minute_of_day < end_minute
+                }
+            }
+            NightModePolicy::AmbientLuxGuided { trigger_lux } => ambient_lux <= trigger_lux,
+        };
+
+        self.is_active = should_activate;
+        if should_activate {
+            self.target_cct = self.configured_warm_target;
+        } else {
+            self.target_cct = CCT_DAYLIGHT_D65;
+        }
+    }
+
+    /// Advance governor simulation time and perform smooth transition.
+    pub fn advance_time(&mut self, delta_ms: u32) -> u32 {
+        let target_q8 = self.target_cct << 8;
+        if self.current_cct_q8 == target_q8 || delta_ms == 0 {
+            return self.current_cct();
+        }
+
+        let step_q8 = ((self.transition_speed_kelvin_per_sec as u64 * 256 * delta_ms as u64) / 1000) as u32;
+        let step_q8 = if step_q8 == 0 { 1 } else { step_q8 };
+
+        if self.current_cct_q8 < target_q8 {
+            if self.current_cct_q8 + step_q8 >= target_q8 {
+                self.current_cct_q8 = target_q8;
+            } else {
+                self.current_cct_q8 += step_q8;
+            }
+        } else {
+            if self.current_cct_q8 <= target_q8 + step_q8 {
+                self.current_cct_q8 = target_q8;
+            } else {
+                self.current_cct_q8 -= step_q8;
+            }
+        }
+
+        self.current_cct()
+    }
+
+    /// Convert Correlated Color Temperature (Kelvin) to RGB channel gains.
+    pub fn compute_rgb_gain(&self) -> RgbColorGain {
+        let kelvin = self.current_cct();
+        Self::kelvin_to_rgb(kelvin)
+    }
+
+    /// Produce 3x3 color transform matrix for DRM KMS scanout pipeline.
+    pub fn to_display_ctm(&self) -> ColorTransformMatrix3x3 {
+        let gain = self.compute_rgb_gain();
+        ColorTransformMatrix3x3::from_rgb_gain(gain)
+    }
+
+    /// Convert Kelvin (2000K to 6500K) to calibrated fixed-point Q8 RGB gains.
+    pub fn kelvin_to_rgb(kelvin: u32) -> RgbColorGain {
+        let k = if kelvin < CCT_MIN_KELVIN {
+            CCT_MIN_KELVIN
+        } else if kelvin > CCT_MAX_KELVIN {
+            CCT_MAX_KELVIN
+        } else {
+            kelvin
+        };
+
+        // Red is 100% (256) for all temperatures <= 6500K.
+        let r_q8 = 256u16;
+
+        // Piecewise lookup table for Green and Blue attenuation from 2000K to 6500K in 500K steps:
+        // 2000K: G=140, B=35
+        // 2500K: G=168, B=72
+        // 3000K: G=188, B=108
+        // 3500K: G=204, B=140
+        // 4000K: G=216, B=168
+        // 4500K: G=226, B=192
+        // 5000K: G=236, B=212
+        // 5500K: G=244, B=230
+        // 6000K: G=250, B=244
+        // 6500K: G=256, B=256
+        const TABLE_K: [u32; 10] = [2000, 2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 6500];
+        const TABLE_G: [u16; 10] = [140, 168, 188, 204, 216, 226, 236, 244, 250, 256];
+        const TABLE_B: [u16; 10] = [35, 72, 108, 140, 168, 192, 212, 230, 244, 256];
+
+        let mut idx = 0;
+        for i in 0..9 {
+            if k >= TABLE_K[i] && k <= TABLE_K[i + 1] {
+                idx = i;
+                break;
+            }
+        }
+
+        let k0 = TABLE_K[idx];
+        let k1 = TABLE_K[idx + 1];
+        let span = k1 - k0;
+        let offset = k - k0;
+
+        let g0 = TABLE_G[idx] as u32;
+        let g1 = TABLE_G[idx + 1] as u32;
+        let g_interp = g0 + ((offset * (g1 - g0)) / span);
+
+        let b0 = TABLE_B[idx] as u32;
+        let b1 = TABLE_B[idx + 1] as u32;
+        let b_interp = b0 + ((offset * (b1 - b0)) / span);
+
+        RgbColorGain {
+            r_q8,
+            g_q8: g_interp as u16,
+            b_q8: b_interp as u16,
+        }
+    }
+}
