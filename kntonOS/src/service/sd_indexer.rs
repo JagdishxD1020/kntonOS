@@ -285,3 +285,137 @@ impl ProtonPrefixDetector {
         }
     }
 }
+
+// MicroSD filesystem format type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsType {
+    Ext4,
+    Btrfs,
+    Unknown,
+}
+
+// MicroSD mount state in handheld environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountState {
+    Unmounted,
+    Probing,
+    Mounted,
+    Ejected,
+}
+
+// Fixed-size cache block for eliminating redundant MicroSD read round-trips.
+pub const CACHE_BLOCK_SIZE: usize = 512;
+
+// MicroSD card mount point watcher and read-ahead block cache.
+pub struct MicroSdMountWatcher {
+    pub state: MountState,
+    pub fs_type: FsType,
+    pub mount_path: [u8; MAX_PATH_LEN],
+    pub mount_path_len: usize,
+    pub capacity_bytes: u64,
+    pub free_bytes: u64,
+    cache_buffer: [u8; CACHE_BLOCK_SIZE],
+    cache_offset: u32,
+    cache_valid_len: usize,
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+}
+
+impl MicroSdMountWatcher {
+    // Construct mount watcher for default Steam Deck SD card path.
+    pub const fn new(default_path: &str, fs_type: FsType) -> Self {
+        let mut path_buf = [0u8; MAX_PATH_LEN];
+        let bytes = default_path.as_bytes();
+        let copy_len = if bytes.len() > MAX_PATH_LEN { MAX_PATH_LEN } else { bytes.len() };
+        let mut i = 0;
+        while i < copy_len {
+            path_buf[i] = bytes[i];
+            i += 1;
+        }
+
+        Self {
+            state: MountState::Unmounted,
+            fs_type,
+            mount_path: path_buf,
+            mount_path_len: copy_len,
+            capacity_bytes: 0,
+            free_bytes: 0,
+            cache_buffer: [0; CACHE_BLOCK_SIZE],
+            cache_offset: u32::MAX,
+            cache_valid_len: 0,
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    // Process card insertion and filesystem mount event.
+    pub fn on_card_inserted(&mut self, path: &str, fs_type: FsType, capacity: u64, free: u64) {
+        let bytes = path.as_bytes();
+        let copy_len = bytes.len().min(MAX_PATH_LEN);
+        self.mount_path[..copy_len].copy_from_slice(&bytes[..copy_len]);
+        self.mount_path_len = copy_len;
+        self.fs_type = fs_type;
+        self.capacity_bytes = capacity;
+        self.free_bytes = free;
+        self.state = MountState::Mounted;
+        self.invalidate_cache();
+    }
+
+    // Process card ejection event.
+    pub fn on_card_ejected(&mut self) {
+        self.state = MountState::Ejected;
+        self.capacity_bytes = 0;
+        self.free_bytes = 0;
+        self.invalidate_cache();
+    }
+
+    // Check if card is currently mounted and accessible.
+    pub fn is_mounted(&self) -> bool {
+        self.state == MountState::Mounted
+    }
+
+    // Invalidate read-ahead block cache.
+    pub fn invalidate_cache(&mut self) {
+        self.cache_offset = u32::MAX;
+        self.cache_valid_len = 0;
+    }
+
+    // Fetch block data using read-ahead cache to eliminate slow flash transactions.
+    pub fn read_cached<'a>(&'a mut self, file_offset: u32, length: usize, raw_source: &[u8]) -> &'a [u8] {
+        let len = length.min(CACHE_BLOCK_SIZE);
+
+        // Check cache hit: requested range fits inside current cached window
+        if self.cache_offset != u32::MAX
+            && file_offset >= self.cache_offset
+            && (file_offset + len as u32) <= (self.cache_offset + self.cache_valid_len as u32)
+        {
+            self.cache_hits += 1;
+            let rel_offset = (file_offset - self.cache_offset) as usize;
+            return &self.cache_buffer[rel_offset..rel_offset + len];
+        }
+
+        // Cache miss: fill read-ahead buffer from source
+        self.cache_misses += 1;
+        self.cache_offset = file_offset;
+
+        let src_start = (file_offset as usize).min(raw_source.len());
+        let src_end = (src_start + CACHE_BLOCK_SIZE).min(raw_source.len());
+        let fill_len = src_end.saturating_sub(src_start);
+
+        self.cache_buffer[..fill_len].copy_from_slice(&raw_source[src_start..src_end]);
+        self.cache_valid_len = fill_len;
+
+        let res_len = len.min(fill_len);
+        &self.cache_buffer[..res_len]
+    }
+
+    // Compute read-ahead cache hit ratio percentage [0..100].
+    pub fn cache_hit_ratio_pct(&self) -> u8 {
+        let total = self.cache_hits + self.cache_misses;
+        if total == 0 {
+            0
+        } else {
+            (((self.cache_hits as u64) * 100) / (total as u64)) as u8
+        }
+    }
+}
