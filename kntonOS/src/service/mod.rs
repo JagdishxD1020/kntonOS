@@ -9,6 +9,9 @@ pub use power_daemon::*;
 pub mod audio_daemon;
 pub use audio_daemon::*;
 
+pub mod net_daemon;
+pub use net_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
