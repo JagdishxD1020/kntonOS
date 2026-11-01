@@ -370,3 +370,92 @@ impl DynamicCurrentThrottle {
 }
 
 pub static CURRENT_THROTTLE: DynamicCurrentThrottle = DynamicCurrentThrottle::new();
+
+
+// ============================================================================
+// Verification Self-Test Suite & Subsystem Sentinel
+// ============================================================================
+
+/// Comprehensive verification self-test for SteamDeck Battery Health & Charging Management Subsystem.
+pub fn verify_battery_manager_subsystem() -> bool {
+    // 1. Precision Coulomb Counter & Degradation Estimator
+    COULOMB_COUNTER.set_telemetry(32_032, STEAMDECK_DESIGN_CAPACITY_MWH, 0); // 80% SoC baseline
+    if COULOMB_COUNTER.get_state_of_charge_pct() != 80 {
+        return false;
+    }
+    if COULOMB_COUNTER.get_state_of_health_pct() != 100 {
+        return false;
+    }
+
+    // Simulate discharge: 2,000 mA draw for 1,800,000 ms (1800s = 0.5h -> 1000 mAh discharged)
+    // Microamp-seconds = -2000 * 1800000 = -3,600,000,000 uA*s = -1000 mAh
+    COULOMB_COUNTER.update_coulomb(7_500, -2_000, 1_800_000, 1_000_000);
+
+    // Delta mWh = (-1000 * 7500) / 1000 = -7500 mWh
+    // New remaining = 32032 - 7500 = 24532 mWh -> ~61% SoC
+    let soc = COULOMB_COUNTER.get_state_of_charge_pct();
+    if soc < 60 || soc > 63 {
+        return false;
+    }
+
+    // 2. Passthrough Charging Governor & High-Load Bypass
+    PASSTHROUGH_GOVERNOR.set_target_soc_limit(80);
+
+    // Disconnected from AC -> BatteryOnly
+    let mode_no_ac = PASSTHROUGH_GOVERNOR.evaluate(false, soc, 15_000, 0);
+    if mode_no_ac != PowerPathMode::BatteryOnly || PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // Connected to 45W AC at 61% SoC -> ConcurrentCharging (needs to charge to 80%)
+    let mode_charging = PASSTHROUGH_GOVERNOR.evaluate(true, soc, 18_000, 45_000);
+    if mode_charging != PowerPathMode::ConcurrentCharging || PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // Battery reaches 82% SoC -> DirectAcPassthrough (bypass battery cells)
+    let mode_passthrough = PASSTHROUGH_GOVERNOR.evaluate(true, 82, 22_000, 45_000);
+    if mode_passthrough != PowerPathMode::DirectAcPassthrough || !PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // High transient load spike (52W) exceeding 45W charger -> HybridPowerBoost
+    let mode_hybrid = PASSTHROUGH_GOVERNOR.evaluate(true, 82, 52_000, 45_000);
+    if mode_hybrid != PowerPathMode::HybridPowerBoost {
+        return false;
+    }
+
+    // 3. JEITA Low-Temperature Inhibitor & Dynamic Current Throttling
+    // Sub-zero test (-5.0°C): Must inhibit charging to prevent lithium metal dendrite formation
+    let p_freeze = CURRENT_THROTTLE.evaluate(-5_000, 3_000);
+    if p_freeze.zone != JeitaZone::UnderTempInhibit || p_freeze.is_charging_permitted || p_freeze.max_charge_current_ma != 0 {
+        return false;
+    }
+    if !CURRENT_THROTTLE.is_inhibited() {
+        return false;
+    }
+
+    // Cold test (5.0°C): Throttled to max 1000 mA
+    let p_cold = CURRENT_THROTTLE.evaluate(5_000, 3_000);
+    if p_cold.zone != JeitaZone::ColdThrottled || !p_cold.is_charging_permitted || p_cold.max_charge_current_ma != 1_000 {
+        return false;
+    }
+
+    // Nominal room temp (24.0°C): Standard full fast charge (3000 mA)
+    let p_nominal = CURRENT_THROTTLE.evaluate(24_000, 3_000);
+    if p_nominal.zone != JeitaZone::StandardNormal || !p_nominal.is_charging_permitted || p_nominal.max_charge_current_ma != 3_000 {
+        return false;
+    }
+
+    // Over-temperature test (58.0°C): Emergency cutoff
+    let p_overtemp = CURRENT_THROTTLE.evaluate(58_000, 3_000);
+    if p_overtemp.zone != JeitaZone::OverTempInhibit || p_overtemp.is_charging_permitted || p_overtemp.max_charge_current_ma != 0 {
+        return false;
+    }
+
+    // Clean baseline reset
+    CURRENT_THROTTLE.evaluate(25_000, 3_000);
+    PASSTHROUGH_GOVERNOR.evaluate(false, 80, 15_000, 0);
+
+    true
+}
