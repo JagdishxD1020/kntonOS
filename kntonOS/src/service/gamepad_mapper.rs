@@ -695,4 +695,117 @@ impl DualTrackpadManager {
     }
 }
 
+// Unified SteamDeck Gamepad Mapper coordinating virtual input, calibrated sticks, and haptic trackpads.
+pub struct SteamDeckGamepadMapper {
+    pub virtual_driver: VirtualGamepadDriver,
+    pub left_stick: AnalogStickProcessor,
+    pub right_stick: AnalogStickProcessor,
+    pub trackpads: DualTrackpadManager,
+}
+
+impl SteamDeckGamepadMapper {
+    // Construct default unified gamepad mapper instance.
+    pub const fn new() -> Self {
+        Self {
+            virtual_driver: VirtualGamepadDriver::new(EmulationMode::DualMode),
+            left_stick: AnalogStickProcessor::new(StickCalibration::default_left()),
+            right_stick: AnalogStickProcessor::new(StickCalibration::default_right()),
+            trackpads: DualTrackpadManager::new(),
+        }
+    }
+
+    // Process physical analog stick inputs and update virtual controller axes.
+    pub fn update_sticks(&mut self, raw_lx: i16, raw_ly: i16, raw_rx: i16, raw_ry: i16) {
+        let (lx, ly) = self.left_stick.process(raw_lx, raw_ly);
+        let (rx, ry) = self.right_stick.process(raw_rx, raw_ry);
+        self.virtual_driver.set_left_stick(lx, ly);
+        self.virtual_driver.set_right_stick(rx, ry);
+    }
+}
+
+// Comprehensive self-test suite verifying SteamDeck gamepad mapping, stick calibration and trackpads.
+pub fn verify_gamepad_mapper_subsystem() -> bool {
+    let mut mapper = SteamDeckGamepadMapper::new();
+
+    // 1. Verify Virtual Gamepad Driver (XInput & DirectInput dual mode)
+    if !mapper.virtual_driver.is_connected() {
+        return false;
+    }
+    mapper.virtual_driver.press_button(XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_UP);
+    mapper.virtual_driver.set_left_trigger(200);
+    mapper.virtual_driver.press_deck_button(DECK_BUTTON_L4 | DECK_BUTTON_R4);
+
+    let xstate = mapper.virtual_driver.xinput_state;
+    if (xstate.buttons & XINPUT_GAMEPAD_A) == 0 || (xstate.buttons & XINPUT_GAMEPAD_DPAD_UP) == 0 {
+        return false;
+    }
+    if xstate.left_trigger != 200 {
+        return false;
+    }
+
+    let dstate = mapper.virtual_driver.dinput_state;
+    if (dstate.buttons & (1 << 0)) == 0 || (dstate.buttons & (1 << 10)) == 0 || (dstate.buttons & (1 << 11)) == 0 {
+        return false;
+    }
+    if dstate.pov_hat != 0 {
+        return false;
+    }
+
+    // 2. Verify Analog Stick Deadzone & Anti-Drift Calibration
+    let (lx0, ly0) = mapper.left_stick.process(1000, 1000);
+    if lx0 != 0 || ly0 != 0 {
+        return false;
+    }
+
+    let (lx_full, _) = mapper.left_stick.process(32000, 0);
+    if lx_full < 30000 {
+        return false;
+    }
+
+    let mut drift_filter = DynamicDriftFilter::new(1500);
+    for _ in 0..70 {
+        drift_filter.feed_idle_sample(400, -300);
+    }
+    if drift_filter.bias_x != 400 || drift_filter.bias_y != -300 {
+        return false;
+    }
+
+    // 3. Verify Dual Capacitive Trackpad Filtering & Haptic Detents
+    let mut left_touch = TrackpadSample::new();
+    left_touch.x = 1000;
+    left_touch.y = 1000;
+    left_touch.touching = true;
+
+    let mut right_touch = TrackpadSample::new();
+    right_touch.x = 500;
+    right_touch.y = 500;
+    right_touch.touching = true;
+    right_touch.clicked = true;
+
+    mapper.trackpads.process(left_touch, right_touch);
+
+    let mut found_click = false;
+    while let Some(hap) = mapper.trackpads.pop_haptic() {
+        if hap.trackpad == TrackpadId::Right && hap.intensity_pct == 90 {
+            found_click = true;
+        }
+    }
+    if !found_click {
+        return false;
+    }
+
+    // 4. Verify End-to-End Gamepad Mapper Pipeline
+    mapper.update_sticks(0, 0, 15000, -15000);
+    let st = mapper.virtual_driver.xinput_state;
+    if st.thumb_lx != 0 || st.thumb_ly != 0 {
+        return false;
+    }
+    if st.thumb_rx == 0 || st.thumb_ry == 0 {
+        return false;
+    }
+
+    true
+}
+
+
 
