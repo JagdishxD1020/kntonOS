@@ -292,5 +292,118 @@ impl QuickSettingsOverlay {
 
     }
 
-}
-
+}
+
+
+// 32-bit RGBA color representation for composition and alpha blending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellColorRgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl ShellColorRgba {
+    // Construct RGBA color.
+    pub const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
+    // Blend source color over destination using standard non-premultiplied alpha blending.
+    pub fn blend_over(self, dst: Self) -> Self {
+        let src_a = self.a as u32;
+        let dst_a = dst.a as u32;
+        let out_a = src_a + (dst_a * (255 - src_a) + 127) / 255;
+        if out_a == 0 {
+            return Self::new(0, 0, 0, 0);
+        }
+        let out_r = ((self.r as u32 * src_a) + (dst.r as u32 * dst_a * (255 - src_a) + 127) / 255) / out_a;
+        let out_g = ((self.g as u32 * src_a) + (dst.g as u32 * dst_a * (255 - src_a) + 127) / 255) / out_a;
+        let out_b = ((self.b as u32 * src_a) + (dst.b as u32 * dst_a * (255 - src_a) + 127) / 255) / out_a;
+
+        Self::new(
+            core::cmp::min(out_r, 255) as u8,
+            core::cmp::min(out_g, 255) as u8,
+            core::cmp::min(out_b, 255) as u8,
+            core::cmp::min(out_a, 255) as u8,
+        )
+    }
+}
+
+// Acrylic glass blur filter simulator for quick-access and HUD backgrounds.
+pub struct AcrylicBlurFilter;
+
+impl AcrylicBlurFilter {
+    // Apply dual-pass box blur on a 1D pixel row buffer simulating acrylic frost effect.
+    pub fn box_blur_row(src: &[ShellColorRgba], dst: &mut [ShellColorRgba], radius: usize) {
+        if src.is_empty() || dst.len() < src.len() {
+            return;
+        }
+        let len = src.len();
+        let mut i = 0;
+        while i < len {
+            let start = if i >= radius { i - radius } else { 0 };
+            let end = if i + radius < len { i + radius } else { len - 1 };
+            let count = (end - start + 1) as u32;
+
+            let mut sum_r: u32 = 0;
+            let mut sum_g: u32 = 0;
+            let mut sum_b: u32 = 0;
+            let mut sum_a: u32 = 0;
+
+            let mut j = start;
+            while j <= end {
+                sum_r += src[j].r as u32;
+                sum_g += src[j].g as u32;
+                sum_b += src[j].b as u32;
+                sum_a += src[j].a as u32;
+                j += 1;
+            }
+
+            dst[i] = ShellColorRgba::new(
+                (sum_r / count) as u8,
+                (sum_g / count) as u8,
+                (sum_b / count) as u8,
+                (sum_a / count) as u8,
+            );
+            i += 1;
+        }
+    }
+}
+
+// Compositor surface layer identifier in the visual hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompositorLayerType {
+    GameBackground = 0,
+    SystemNotification = 1,
+    QuickSettingsMenu = 2,
+    HardwareHudOverlay = 3,
+    ToastMessage = 4,
+}
+
+// Surface descriptor representing a compositable handheld visual layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositorSurface {
+    pub layer_type: CompositorLayerType,
+    pub width: u32,
+    pub height: u32,
+    pub opacity: f32,
+    pub visible: bool,
+    pub z_order: u32,
+}
+
+impl CompositorSurface {
+    // Construct new surface.
+    pub const fn new(layer_type: CompositorLayerType, width: u32, height: u32, z_order: u32) -> Self {
+        Self {
+            layer_type,
+            width,
+            height,
+            opacity: 1.0,
+            visible: true,
+            z_order,
+        }
+    }
+}
+
