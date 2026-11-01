@@ -658,3 +658,112 @@ pub fn verify_headphone_hotplug_coordinator() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 6: Audio Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// Handheld userspace audio and acoustic governor service orchestrator.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioDaemon {
+    pub router: AudioRouter,
+    pub scaler: VolumeScaler,
+    pub limiter: AcousticLimiter,
+    pub mixer: AudioFrameMixer,
+    pub hotplug: HeadphoneJackHotplug,
+    pub cycles_polled: u64,
+}
+
+impl AudioDaemon {
+    /// Initializes complete audio service supervisor.
+    pub const fn new() -> Self {
+        Self {
+            router: AudioRouter::new(),
+            scaler: VolumeScaler::new(),
+            limiter: AcousticLimiter::new(),
+            mixer: AudioFrameMixer::new(),
+            hotplug: HeadphoneJackHotplug::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic audio supervisor tick cycle.
+    pub fn poll_audio_cycle(&mut self) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Userspace Audio
+/// & Acoustic Governor Service subsystem.
+pub fn verify_audio_daemon_subsystem() -> bool {
+    if !verify_audio_sink_routing() {
+        return false;
+    }
+    if !verify_volume_curve_scaler() {
+        return false;
+    }
+    if !verify_acoustic_limiter() {
+        return false;
+    }
+    if !verify_audio_frame_mixer() {
+        return false;
+    }
+    if !verify_headphone_hotplug_coordinator() {
+        return false;
+    }
+
+    // Integrated AudioDaemon verification
+    let mut daemon = AudioDaemon::new();
+
+    // 1. Initial state
+    if daemon.cycles_polled != 0 || daemon.router.active_sink != AudioEndpoint::InternalSpeakers {
+        return false;
+    }
+
+    // 2. Headphone insertion workflow
+    daemon.hotplug.on_headphone_inserted(&mut daemon.router, &mut daemon.scaler, &mut daemon.limiter);
+    if daemon.router.active_sink != AudioEndpoint::HeadphoneJack35mm {
+        return false;
+    }
+
+    // 3. Process test audio frame through integrated pipeline
+    let mut game_frame = AudioPcmFrame::new();
+    let mut voice_frame = AudioPcmFrame::new();
+    let mut out_frame = AudioPcmFrame::new();
+
+    for i in 0..AUDIO_FRAME_SAMPLES {
+        game_frame.samples_l[i] = 10000;
+        game_frame.samples_r[i] = 10000;
+        voice_frame.samples_l[i] = 5000;
+        voice_frame.samples_r[i] = 5000;
+    }
+
+    daemon.mixer.mix_streams(
+        &game_frame,
+        &voice_frame,
+        &daemon.scaler,
+        &mut daemon.limiter,
+        &mut out_frame,
+    );
+
+    if daemon.mixer.frames_mixed != 1 {
+        return false;
+    }
+    if out_frame.samples_l[0] == 0 {
+        return false;
+    }
+
+    // 4. Tick supervisor cycle
+    daemon.poll_audio_cycle();
+    if daemon.cycles_polled != 1 {
+        return false;
+    }
+
+    // 5. Headphone extraction workflow (must auto-mute Master for privacy)
+    daemon.hotplug.on_headphone_extracted(&mut daemon.router, &mut daemon.scaler, &mut daemon.limiter);
+    if daemon.router.active_sink != AudioEndpoint::InternalSpeakers || !daemon.scaler.muted[StreamType::Master as usize] {
+        return false;
+    }
+
+    true
+}
+
