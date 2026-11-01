@@ -494,7 +494,7 @@ impl RollingFrameTimeBuffer {
         }
 
         // 99th percentile index
-        let p99_idx = (self.count.saturating_sub(1) * 99) / 100;
+        let p99_idx = ((self.count * 99) / 100).min(self.count.saturating_sub(1));
         let p99 = sorted_copy[p99_idx];
 
         // Stutter detection: count frames exceeding 1.5x of the average frame time
@@ -896,6 +896,117 @@ impl GamescopeOverlayService {
         self.command_buffer.count()
     }
 }
+
+// Comprehensive self-test suite verifying overlay rendering, telemetry collector, and frame latency buffer.
+pub fn verify_perf_overlay_subsystem() -> bool {
+    let mut service = GamescopeOverlayService::new(1280, 800);
+
+    // 1. Verify Hardware Telemetry Collector
+    service.collector.update_cpu_core(0, 2800, 40, 52);
+    service.collector.update_cpu_core(1, 2800, 60, 54);
+    service.collector.update_cpu_core(2, 2800, 30, 50);
+    service.collector.update_cpu_core(3, 2800, 70, 56);
+    let telem = service.collector.snapshot();
+    if telem.average_cpu_load() != 50 {
+        return false;
+    }
+
+    service.collector.update_gpu(1600, 85, 4096, 62);
+    let telem2 = service.collector.snapshot();
+    if telem2.gpu.shader_load_pct != 85 || telem2.vram_usage_pct() != 50 {
+        return false;
+    }
+
+    service.collector.update_fan(3400, 60);
+    service.collector.update_battery(80, 20000, 7600);
+    service.collector.set_tdp(25);
+    let telem3 = service.collector.snapshot();
+    if telem3.fan.current_rpm != 3400 || telem3.target_tdp_watts != 25 {
+        return false;
+    }
+    if telem3.battery.remaining_time_minutes != 96 {
+        return false;
+    }
+
+    // 2. Verify Rolling Frame-Time Latency Buffer & P99 Latency
+    for _ in 0..59 {
+        service.record_frame(16_666);
+    }
+    service.record_frame(40_000);
+
+    let stats = service.frame_buffer.compute_stats();
+    if stats.total_frames_recorded != 60 {
+        return false;
+    }
+    if stats.instantaneous_fps != 25 {
+        return false;
+    }
+    if stats.min_frame_time_us != 16_666 || stats.max_frame_time_us != 40_000 {
+        return false;
+    }
+    if stats.p99_frame_time_us != 40_000 {
+        return false;
+    }
+    if stats.stutter_count != 1 {
+        return false;
+    }
+
+    // 3. Verify HUD Layout Anchor and Positioning
+    let (tl_x, tl_y) = service.layout.calculate_origin(100, 50);
+    if tl_x != 12 || tl_y != 12 {
+        return false;
+    }
+
+    service.layout.set_anchor(ScreenAnchor::TopRight);
+    let (tr_x, tr_y) = service.layout.calculate_origin(100, 50);
+    if tr_x != (1280 - 100 - 12) || tr_y != 12 {
+        return false;
+    }
+
+    service.layout.set_anchor(ScreenAnchor::BottomRight);
+    let (br_x, br_y) = service.layout.calculate_origin(100, 50);
+    if br_x != (1280 - 100 - 12) || br_y != (800 - 50 - 12) {
+        return false;
+    }
+
+    service.layout.set_anchor(ScreenAnchor::TopLeft);
+    service.layout.set_opacity(75);
+    service.layout.set_scale(100);
+
+    // 4. Verify Multi-Level HUD Overlay Command Generation
+    service.renderer.set_level(HudOverlayLevel::FpsOnly);
+    let cmd_cnt1 = service.update_render_commands();
+    if cmd_cnt1 != 2 {
+        return false;
+    }
+
+    service.renderer.set_level(HudOverlayLevel::FpsBatteryTdp);
+    let cmd_cnt2 = service.update_render_commands();
+    if cmd_cnt2 < 4 {
+        return false;
+    }
+
+    service.renderer.set_level(HudOverlayLevel::FullMetrics);
+    let cmd_cnt3 = service.update_render_commands();
+    if cmd_cnt3 < 7 {
+        return false;
+    }
+
+    service.renderer.set_level(HudOverlayLevel::DiagnosticsHistogram);
+    let cmd_cnt4 = service.update_render_commands();
+    if cmd_cnt4 < 12 {
+        return false;
+    }
+
+    service.renderer.set_level(HudOverlayLevel::Off);
+    let cmd_cnt_off = service.update_render_commands();
+    if cmd_cnt_off != 0 {
+        return false;
+    }
+
+    true
+}
+
 
 
 
