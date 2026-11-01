@@ -601,3 +601,114 @@ impl SdGamingIndexerService {
         Ok(pos)
     }
 }
+
+// Comprehensive self-test suite verifying MicroSD mount watcher, ACF parser, and query engine.
+pub fn verify_sd_indexer_subsystem() -> bool {
+    let mut service = SdGamingIndexerService::new("/run/media/mmcblk0p1", FsType::Ext4);
+
+    // 1. Verify Mount Watcher and Read-Ahead Cache
+    if service.watcher.is_mounted() {
+        return false;
+    }
+
+    service.watcher.on_card_inserted(
+        "/run/media/mmcblk0p1",
+        FsType::Ext4,
+        512_000_000_000,
+        128_000_000_000,
+    );
+    if !service.watcher.is_mounted() {
+        return false;
+    }
+
+    // Populate fake sector data and verify read-ahead caching
+    let mut sector_data = [0u8; 1024];
+    sector_data[10..15].copy_from_slice(b"STEAM");
+    let chunk1 = service.watcher.read_cached(0, 32, &sector_data);
+    if &chunk1[10..15] != b"STEAM" {
+        return false;
+    }
+    let chunk2 = service.watcher.read_cached(10, 5, &sector_data);
+    if chunk2 != b"STEAM" {
+        return false;
+    }
+    if service.watcher.cache_hits != 1 || service.watcher.cache_misses != 1 {
+        return false;
+    }
+
+    // 2. Ingest Windows/Proton Title via AppManifest
+    let acf_cyberpunk = "\"AppState\"\n{\n    \"appid\" \"1091500\"\n    \"name\" \"Cyberpunk 2077\"\n    \"installdir\" \"Cyberpunk 2077\"\n    \"SizeOnDisk\" \"73829182390\"\n    \"buildid\" \"1234567\"\n}\n";
+    let ok1 = service.scanner.ingest_manifest(
+        &mut service.table,
+        acf_cyberpunk,
+        GameInstallSource::MicroSdExt4,
+        true,
+        "bin/x64/Cyberpunk2077.exe",
+    );
+    if !ok1 {
+        return false;
+    }
+
+    // 3. Ingest Native Linux Title via AppManifest
+    let acf_stardew = "\"AppState\"\n{\n    \"appid\" \"413150\"\n    \"name\" \"Stardew Valley\"\n    \"installdir\" \"Stardew Valley\"\n    \"SizeOnDisk\" \"500000000\"\n    \"buildid\" \"889900\"\n}\n";
+    let ok2 = service.scanner.ingest_manifest(
+        &mut service.table,
+        acf_stardew,
+        GameInstallSource::MicroSdExt4,
+        false,
+        "StardewValley.bin.x86_64",
+    );
+    if !ok2 {
+        return false;
+    }
+
+    if service.table.count() != 2 {
+        return false;
+    }
+
+    // 4. Verify Queries by AppID and Case-Insensitive Title Prefix
+    let g1 = service.find_by_appid(1091500);
+    if g1.is_none() {
+        return false;
+    }
+    let e1 = g1.unwrap();
+    if e1.title_str() != "Cyberpunk 2077" || !e1.has_proton_prefix {
+        return false;
+    }
+
+    let g2 = service.find_by_title_prefix("stardew");
+    if g2.is_none() {
+        return false;
+    }
+    let e2 = g2.unwrap();
+    if e2.appid != 413150 || e2.has_proton_prefix {
+        return false;
+    }
+
+    let total_size = service.calculate_storage_usage(None);
+    if total_size != (73829182390 + 500000000) {
+        return false;
+    }
+
+    // 5. Verify Zero-Allocation Launch Command Resolution
+    let mut cmd_buf = [0u8; 128];
+    let len1 = service.resolve_launch_target(1091500, &mut cmd_buf).unwrap();
+    let expected_target1 = "proton run /run/media/mmcblk0p1/steamapps/common/Cyberpunk 2077/bin/x64/Cyberpunk2077.exe";
+    if core::str::from_utf8(&cmd_buf[..len1]).unwrap_or("") != expected_target1 {
+        return false;
+    }
+
+    let len2 = service.resolve_launch_target(413150, &mut cmd_buf).unwrap();
+    let expected_target2 = "/run/media/mmcblk0p1/steamapps/common/Stardew Valley/StardewValley.bin.x86_64";
+    if core::str::from_utf8(&cmd_buf[..len2]).unwrap_or("") != expected_target2 {
+        return false;
+    }
+
+    // 6. Eject card
+    service.watcher.on_card_ejected();
+    if service.watcher.is_mounted() {
+        return false;
+    }
+
+    true
+}

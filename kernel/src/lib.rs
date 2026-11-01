@@ -1617,6 +1617,12 @@ pub extern "C" fn kmain() -> ! {
     } else {
         serial_write_str("[KNT-PANIC] SteamDeck audio haptic daemon self-test failed!\r\n");
     }
+
+    // Verify kntonOS SteamDeck MicroSD Card Gaming Library Fast-Indexing Service (TASK-KNT-337)
+    if knton_os::service::verify_sd_indexer_subsystem() {
+        serial_write_str("[KNT-OS-SDINDEX-PASS] kntonOS SteamDeck microSD gaming library indexer verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] SteamDeck microSD gaming library indexer self-test failed!\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
