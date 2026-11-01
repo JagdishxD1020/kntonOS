@@ -192,3 +192,249 @@ impl DualBmi160Driver {
 }
 
 pub static IMU_DRIVER: DualBmi160Driver = DualBmi160Driver::new();
+
+
+// ============================================================================
+// Feature 2: Complementary Filter Orientation Fusion & Thermal Bias Calibration
+// ============================================================================
+
+/// Euler angle orientation representation in millidegrees (-180,000 to +180,000 mdeg).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrientationEuler {
+    pub roll_mdeg: i32,
+    pub pitch_mdeg: i32,
+    pub yaw_mdeg: i32,
+    pub is_calibrated: bool,
+}
+
+/// Zero-rate gyroscope bias tracker and stationary stillness detector.
+pub struct ThermalBiasCalibrator {
+    bias_x_mdeg_s: AtomicI32,
+    bias_y_mdeg_s: AtomicI32,
+    bias_z_mdeg_s: AtomicI32,
+    still_samples_count: AtomicU32,
+    accum_x: AtomicI32,
+    accum_y: AtomicI32,
+    accum_z: AtomicI32,
+    is_calibrated: AtomicBool,
+    last_cal_temp_mdeg_c: AtomicI32,
+}
+
+impl ThermalBiasCalibrator {
+    pub const fn new() -> Self {
+        Self {
+            bias_x_mdeg_s: AtomicI32::new(0),
+            bias_y_mdeg_s: AtomicI32::new(0),
+            bias_z_mdeg_s: AtomicI32::new(0),
+            still_samples_count: AtomicU32::new(0),
+            accum_x: AtomicI32::new(0),
+            accum_y: AtomicI32::new(0),
+            accum_z: AtomicI32::new(0),
+            is_calibrated: AtomicBool::new(false),
+            last_cal_temp_mdeg_c: AtomicI32::new(35_000),
+        }
+    }
+
+    /// Evaluates if the handheld is stationary to accumulate and calibrate zero-rate bias.
+    pub fn process_sample(&self, sample: &MotionSample) -> bool {
+        // Check gyro magnitude < 1.5 °/s (1500 mdeg/s) on all axes
+        let gx = sample.gyro_mdeg_s[0].abs();
+        let gy = sample.gyro_mdeg_s[1].abs();
+        let gz = sample.gyro_mdeg_s[2].abs();
+
+        // Check accel magnitude within 1g ± 0.1g (900 to 1100 mg)
+        let ax = sample.accel_mg[0] as i64;
+        let ay = sample.accel_mg[1] as i64;
+        let az = sample.accel_mg[2] as i64;
+        let accel_sq = ax * ax + ay * ay + az * az;
+        let is_1g = accel_sq >= 810_000 && accel_sq <= 1_210_000; // ~900^2 .. 1100^2
+
+        if gx < 1500 && gy < 1500 && gz < 1500 && is_1g {
+            self.accum_x.fetch_add(sample.gyro_mdeg_s[0], Ordering::Relaxed);
+            self.accum_y.fetch_add(sample.gyro_mdeg_s[1], Ordering::Relaxed);
+            self.accum_z.fetch_add(sample.gyro_mdeg_s[2], Ordering::Relaxed);
+            let count = self.still_samples_count.fetch_add(1, Ordering::AcqRel) + 1;
+
+            if count >= 30 {
+                // Calibrate bias
+                self.bias_x_mdeg_s.store(self.accum_x.load(Ordering::Relaxed) / count as i32, Ordering::Release);
+                self.bias_y_mdeg_s.store(self.accum_y.load(Ordering::Relaxed) / count as i32, Ordering::Release);
+                self.bias_z_mdeg_s.store(self.accum_z.load(Ordering::Relaxed) / count as i32, Ordering::Release);
+                self.is_calibrated.store(true, Ordering::Release);
+                self.last_cal_temp_mdeg_c.store(sample.temp_mdeg_c, Ordering::Release);
+
+                // Reset accumulation
+                self.accum_x.store(0, Ordering::Relaxed);
+                self.accum_y.store(0, Ordering::Relaxed);
+                self.accum_z.store(0, Ordering::Relaxed);
+                self.still_samples_count.store(0, Ordering::Release);
+                return true;
+            }
+        } else {
+            // Motion detected; reset still window
+            self.accum_x.store(0, Ordering::Relaxed);
+            self.accum_y.store(0, Ordering::Relaxed);
+            self.accum_z.store(0, Ordering::Relaxed);
+            self.still_samples_count.store(0, Ordering::Release);
+        }
+
+        self.is_calibrated.load(Ordering::Acquire)
+    }
+
+    /// Subtracts calibrated zero-rate bias from raw gyro readings.
+    pub fn correct_gyro(&self, raw_gyro_mdeg_s: [i32; 3]) -> [i32; 3] {
+        [
+            raw_gyro_mdeg_s[0] - self.bias_x_mdeg_s.load(Ordering::Acquire),
+            raw_gyro_mdeg_s[1] - self.bias_y_mdeg_s.load(Ordering::Acquire),
+            raw_gyro_mdeg_s[2] - self.bias_z_mdeg_s.load(Ordering::Acquire),
+        ]
+    }
+
+    pub fn is_calibrated(&self) -> bool {
+        self.is_calibrated.load(Ordering::Acquire)
+    }
+
+    pub fn set_bias(&self, bx: i32, by: i32, bz: i32) {
+        self.bias_x_mdeg_s.store(bx, Ordering::Release);
+        self.bias_y_mdeg_s.store(by, Ordering::Release);
+        self.bias_z_mdeg_s.store(bz, Ordering::Release);
+        self.is_calibrated.store(true, Ordering::Release);
+    }
+}
+
+/// Fixed-point arctangent approximation returning millidegrees (-180,000 to +180,000).
+fn approx_atan2_mdeg(y: i32, x: i32) -> i32 {
+    if x == 0 && y == 0 {
+        return 0;
+    }
+    if x == 0 {
+        return if y > 0 { 90_000 } else { -90_000 };
+    }
+
+    let abs_y = y.abs() as i64;
+    let abs_x = x.abs() as i64;
+    let ratio = if abs_x >= abs_y {
+        (abs_y * 1000) / abs_x
+    } else {
+        (abs_x * 1000) / abs_y
+    };
+
+    // Polynomial approximation of atan(r): r - r^3 / 3 in milliradians
+    let r = ratio; // 0..1000
+    let r3 = (r * r * r) / 1_000_000;
+    let mrad = r - r3 / 3;
+    // 1 mrad = 57.2957795 millidegrees (57296 / 1000)
+    let mut deg = ((mrad * 57296) / 1000) as i32;
+    if abs_x < abs_y {
+        deg = 90_000 - deg;
+    }
+
+    if x < 0 && y >= 0 {
+        180_000 - deg
+    } else if x < 0 && y < 0 {
+        -(180_000 - deg)
+    } else if x >= 0 && y < 0 {
+        -deg
+    } else {
+        deg
+    }
+}
+
+/// Fixed-point integer square root.
+fn isqrt(val: i64) -> i64 {
+    if val <= 0 {
+        return 0;
+    }
+    let mut x0 = val / 2;
+    if x0 == 0 {
+        return 1;
+    }
+    let mut x1 = (x0 + val / x0) / 2;
+    while x1 < x0 {
+        x0 = x1;
+        x1 = (x0 + val / x0) / 2;
+    }
+    x0
+}
+
+/// Complementary orientation fusion filter fusing gyro integration and gravity vector.
+pub struct ComplementaryFilter {
+    roll_mdeg: AtomicI32,
+    pitch_mdeg: AtomicI32,
+    yaw_mdeg: AtomicI32,
+    last_timestamp_us: AtomicU64,
+}
+
+impl ComplementaryFilter {
+    pub const fn new() -> Self {
+        Self {
+            roll_mdeg: AtomicI32::new(0),
+            pitch_mdeg: AtomicI32::new(0),
+            yaw_mdeg: AtomicI32::new(0),
+            last_timestamp_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Fuses gyro angular rates and accelerometer gravity vector.
+    /// Alpha = 0.98 (gyro) / 0.02 (accel).
+    pub fn update(&self, sample: &MotionSample, corrected_gyro: [i32; 3]) -> OrientationEuler {
+        let prev_time = self.last_timestamp_us.swap(sample.timestamp_us, Ordering::AcqRel);
+        let dt_us = if sample.timestamp_us > prev_time && prev_time > 0 {
+            (sample.timestamp_us - prev_time) as i64
+        } else {
+            5_000 // Default 5ms (200 Hz)
+        };
+
+        let prev_roll = self.roll_mdeg.load(Ordering::Acquire);
+        let prev_pitch = self.pitch_mdeg.load(Ordering::Acquire);
+        let prev_yaw = self.yaw_mdeg.load(Ordering::Acquire);
+
+        // Gyro integration: d_angle = (rate * dt_us) / 1_000_000
+        let gyro_roll = prev_roll + ((corrected_gyro[0] as i64 * dt_us) / 1_000_000) as i32;
+        let gyro_pitch = prev_pitch + ((corrected_gyro[1] as i64 * dt_us) / 1_000_000) as i32;
+        let gyro_yaw = prev_yaw + ((corrected_gyro[2] as i64 * dt_us) / 1_000_000) as i32;
+
+        // Accelerometer tilt reference
+        let ay = sample.accel_mg[1] as i64;
+        let az = sample.accel_mg[2] as i64;
+
+        let accel_roll = approx_atan2_mdeg(sample.accel_mg[1], sample.accel_mg[2]);
+        let yz_norm = isqrt(ay * ay + az * az) as i32;
+        let accel_pitch = approx_atan2_mdeg(-sample.accel_mg[0], yz_norm);
+
+        // Complementary blend: 98% gyro + 2% accel
+        let fused_roll = ((gyro_roll as i64 * 98 + accel_roll as i64 * 2) / 100) as i32;
+        let fused_pitch = ((gyro_pitch as i64 * 98 + accel_pitch as i64 * 2) / 100) as i32;
+        let fused_yaw = gyro_yaw; // Yaw has no gravity vector reference, relies on gyro integration
+
+        self.roll_mdeg.store(fused_roll, Ordering::Release);
+        self.pitch_mdeg.store(fused_pitch, Ordering::Release);
+        self.yaw_mdeg.store(fused_yaw, Ordering::Release);
+
+        OrientationEuler {
+            roll_mdeg: fused_roll,
+            pitch_mdeg: fused_pitch,
+            yaw_mdeg: fused_yaw,
+            is_calibrated: true,
+        }
+    }
+
+    pub fn get_orientation(&self) -> OrientationEuler {
+        OrientationEuler {
+            roll_mdeg: self.roll_mdeg.load(Ordering::Acquire),
+            pitch_mdeg: self.pitch_mdeg.load(Ordering::Acquire),
+            yaw_mdeg: self.yaw_mdeg.load(Ordering::Acquire),
+            is_calibrated: true,
+        }
+    }
+
+    pub fn reset(&self) {
+        self.roll_mdeg.store(0, Ordering::Release);
+        self.pitch_mdeg.store(0, Ordering::Release);
+        self.yaw_mdeg.store(0, Ordering::Release);
+        self.last_timestamp_us.store(0, Ordering::Release);
+    }
+}
+
+pub static BIAS_CALIBRATOR: ThermalBiasCalibrator = ThermalBiasCalibrator::new();
+pub static ORIENTATION_FUSION: ComplementaryFilter = ComplementaryFilter::new();
