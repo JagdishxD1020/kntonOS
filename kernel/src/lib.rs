@@ -1617,6 +1617,11 @@ pub extern "C" fn kmain() -> ! {
     } else {
         serial_write_str("[KNT-PANIC] SteamDeck audio haptic daemon self-test failed!\r\n");
     }
+    // Verify kntonOS SteamDeck Battery Health & Charging Management Subsystem (TASK-KNT-336)
+    if knton_os::service::verify_battery_manager_subsystem() {
+        serial_write_str("[KNT-OS-BATMGR-PASS] kntonOS SteamDeck battery health & charging management verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] Battery management subsystem self-test failed!\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)

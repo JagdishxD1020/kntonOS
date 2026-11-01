@@ -1,0 +1,461 @@
+//! SteamDeck Battery Health & Charging Management Subsystem (TASK-KNT-336).
+//!
+//! Provides fuel gauge coulomb counting, battery degradation cycle aging estimation,
+//! NVDC power-path passthrough charging governance, and JEITA low-temperature
+//! lithium charging protection with dynamic current throttling.
+
+#![allow(dead_code)]
+
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+
+// ============================================================================
+// Feature 1: Fuel Gauge Coulomb Counter & Cycle Aging Estimator
+// ============================================================================
+
+/// Design capacity of standard SteamDeck 40.04 Wh Li-ion battery pack.
+pub const STEAMDECK_DESIGN_CAPACITY_MWH: u32 = 40_040;
+pub const STEAMDECK_DESIGN_VOLTAGE_MV: u32 = 7_700; // 2S nominal 7.7V (3.85V/cell)
+pub const STEAMDECK_FULL_VOLTAGE_MV: u32 = 8_700;   // 2S full 8.7V (4.35V/cell)
+pub const STEAMDECK_CUTOFF_VOLTAGE_MV: u32 = 6_000; // 2S empty 6.0V (3.00V/cell)
+
+/// Battery operating state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatteryState {
+    Discharging,
+    Charging,
+    Full,
+    NotChargingPassthrough,
+    CriticalLow,
+}
+
+/// Fuel gauge telemetry snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct FuelGaugeTelemetry {
+    pub pack_voltage_mv: u32,
+    pub current_ma: i32, // Positive = into battery (charging), negative = discharging
+    pub power_mw: i32,
+    pub state_of_charge_pct: u8,
+    pub state_of_health_pct: u8,
+    pub remaining_capacity_mwh: u32,
+    pub full_charge_capacity_mwh: u32,
+    pub cycle_count: u32,
+    pub cell_temp_mdeg_c: i32,
+}
+
+/// High-precision fuel gauge coulomb counter and battery degradation monitor.
+pub struct PrecisionCoulombCounter {
+    pack_voltage_mv: AtomicU32,
+    current_ma: AtomicI32,
+    coulomb_accum_uamp_sec: AtomicI32,
+    remaining_capacity_mwh: AtomicU32,
+    full_charge_capacity_mwh: AtomicU32,
+    design_capacity_mwh: u32,
+    accumulated_discharge_mah: AtomicU32,
+    cycle_count: AtomicU32,
+    internal_resistance_mohm: AtomicU32,
+    last_update_ts: AtomicU64,
+}
+
+impl PrecisionCoulombCounter {
+    pub const fn new() -> Self {
+        Self {
+            pack_voltage_mv: AtomicU32::new(7_700),
+            current_ma: AtomicI32::new(0),
+            coulomb_accum_uamp_sec: AtomicI32::new(0),
+            remaining_capacity_mwh: AtomicU32::new(STEAMDECK_DESIGN_CAPACITY_MWH),
+            full_charge_capacity_mwh: AtomicU32::new(STEAMDECK_DESIGN_CAPACITY_MWH),
+            design_capacity_mwh: STEAMDECK_DESIGN_CAPACITY_MWH,
+            accumulated_discharge_mah: AtomicU32::new(0),
+            cycle_count: AtomicU32::new(0),
+            internal_resistance_mohm: AtomicU32::new(65), // Nominal ~65 mΩ pack impedance
+            last_update_ts: AtomicU64::new(0),
+        }
+    }
+
+    /// Integrates current over time (coulomb counting) and updates remaining capacity.
+    pub fn update_coulomb(&self, voltage_mv: u32, current_ma: i32, dt_ms: u32, timestamp: u64) {
+        self.pack_voltage_mv.store(voltage_mv, Ordering::Release);
+        self.current_ma.store(current_ma, Ordering::Release);
+        self.last_update_ts.store(timestamp, Ordering::Release);
+
+        // Microamp-seconds = current_ma * 1000 * dt_ms / 1000 = current_ma * dt_ms
+        let delta_uamp_sec = current_ma as i64 * dt_ms as i64;
+        let prev_accum = self.coulomb_accum_uamp_sec.load(Ordering::Acquire) as i64;
+        let new_accum = prev_accum + delta_uamp_sec;
+
+        // 1 mAh = 3,600,000 uA*sec
+        // 1 mWh = (1 mAh * voltage_mv) / 1000
+        if new_accum.abs() >= 3_600_000 {
+            let delta_mah = (new_accum / 3_600_000) as i32;
+            let remainder = (new_accum % 3_600_000) as i32;
+            self.coulomb_accum_uamp_sec.store(remainder, Ordering::Release);
+
+            let delta_mwh = (delta_mah as i64 * voltage_mv as i64 / 1000) as i32;
+            let current_rem = self.remaining_capacity_mwh.load(Ordering::Acquire) as i32;
+            let fcc = self.full_charge_capacity_mwh.load(Ordering::Acquire) as i32;
+
+            let updated_rem = (current_rem + delta_mwh).max(0).min(fcc) as u32;
+            self.remaining_capacity_mwh.store(updated_rem, Ordering::Release);
+
+            // Track discharge cycles: 1 cycle = full design capacity discharged (~5200 mAh)
+            if delta_mah < 0 {
+                let discharge = self.accumulated_discharge_mah.fetch_add((-delta_mah) as u32, Ordering::AcqRel) + (-delta_mah) as u32;
+                let design_mah = (self.design_capacity_mwh * 1000) / STEAMDECK_DESIGN_VOLTAGE_MV;
+                let cycles = discharge / design_mah;
+                self.cycle_count.store(cycles, Ordering::Release);
+
+                // Age full charge capacity slightly with cycles (empirical Li-ion model: ~0.035% per cycle)
+                if cycles > 0 {
+                    let degraded_fcc = (self.design_capacity_mwh as u64 * (10_000 - (cycles as u64 * 35).min(4000))) / 10_000;
+                    self.full_charge_capacity_mwh.store(degraded_fcc as u32, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Calculates State of Charge (SoC) percentage (0..100%).
+    pub fn get_state_of_charge_pct(&self) -> u8 {
+        let rem = self.remaining_capacity_mwh.load(Ordering::Acquire);
+        let fcc = self.full_charge_capacity_mwh.load(Ordering::Acquire);
+        if fcc == 0 {
+            return 0;
+        }
+        ((rem as u64 * 100) / fcc as u64).min(100) as u8
+    }
+
+    /// Calculates State of Health (SoH) percentage based on capacity retention.
+    pub fn get_state_of_health_pct(&self) -> u8 {
+        let fcc = self.full_charge_capacity_mwh.load(Ordering::Acquire);
+        ((fcc as u64 * 100) / self.design_capacity_mwh as u64).min(100) as u8
+    }
+
+    pub fn get_voltage_mv(&self) -> u32 {
+        self.pack_voltage_mv.load(Ordering::Acquire)
+    }
+
+    pub fn get_current_ma(&self) -> i32 {
+        self.current_ma.load(Ordering::Acquire)
+    }
+
+    pub fn get_remaining_capacity_mwh(&self) -> u32 {
+        self.remaining_capacity_mwh.load(Ordering::Acquire)
+    }
+
+    pub fn get_full_charge_capacity_mwh(&self) -> u32 {
+        self.full_charge_capacity_mwh.load(Ordering::Acquire)
+    }
+
+    pub fn get_cycle_count(&self) -> u32 {
+        self.cycle_count.load(Ordering::Acquire)
+    }
+
+    pub fn set_telemetry(&self, rem_mwh: u32, fcc_mwh: u32, cycles: u32) {
+        self.remaining_capacity_mwh.store(rem_mwh, Ordering::Release);
+        self.full_charge_capacity_mwh.store(fcc_mwh, Ordering::Release);
+        self.cycle_count.store(cycles, Ordering::Release);
+    }
+}
+
+pub static COULOMB_COUNTER: PrecisionCoulombCounter = PrecisionCoulombCounter::new();
+
+
+// ============================================================================
+// Feature 2: Passthrough Charging Governor & Cell Bypass
+// ============================================================================
+
+/// Power path routing topology for NVDC buck-boost charger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerPathMode {
+    /// Running exclusively from battery cells (no AC connected).
+    BatteryOnly,
+    /// AC adapter powering system and charging battery cells concurrently.
+    ConcurrentCharging,
+    /// Direct AC passthrough: battery idled/bypassed, system powered directly from AC.
+    DirectAcPassthrough,
+    /// Hybrid power boost: battery assists AC adapter when transient load exceeds AC wattage.
+    HybridPowerBoost,
+}
+
+/// Passthrough charging governor controlling battery bypass during gaming.
+pub struct PassthroughGovernor {
+    target_soc_limit_pct: AtomicU32,
+    hysteresis_pct: u32,
+    is_passthrough_engaged: AtomicBool,
+    active_mode: AtomicU32, // PowerPathMode as u32
+    ac_input_limit_mw: AtomicU32,
+    system_load_mw: AtomicU32,
+}
+
+impl PassthroughGovernor {
+    pub const fn new() -> Self {
+        Self {
+            target_soc_limit_pct: AtomicU32::new(80), // Default 80% battery protect threshold
+            hysteresis_pct: 5,                        // 5% deadband before resuming charge
+            is_passthrough_engaged: AtomicBool::new(false),
+            active_mode: AtomicU32::new(PowerPathMode::BatteryOnly as u32),
+            ac_input_limit_mw: AtomicU32::new(45_000), // SteamDeck 45W USB-PD
+            system_load_mw: AtomicU32::new(15_000),
+        }
+    }
+
+    pub fn set_target_soc_limit(&self, limit_pct: u8) {
+        self.target_soc_limit_pct.store(limit_pct.min(100) as u32, Ordering::Release);
+    }
+
+    pub fn get_target_soc_limit(&self) -> u8 {
+        self.target_soc_limit_pct.load(Ordering::Acquire) as u8
+    }
+
+    /// Evaluates AC attachment, battery SoC, and system load to determine power path.
+    pub fn evaluate(
+        &self,
+        ac_present: bool,
+        current_soc_pct: u8,
+        system_load_mw: u32,
+        ac_capacity_mw: u32,
+    ) -> PowerPathMode {
+        self.system_load_mw.store(system_load_mw, Ordering::Release);
+        self.ac_input_limit_mw.store(ac_capacity_mw, Ordering::Release);
+
+        if !ac_present || ac_capacity_mw == 0 {
+            self.is_passthrough_engaged.store(false, Ordering::Release);
+            self.active_mode.store(PowerPathMode::BatteryOnly as u32, Ordering::Release);
+            return PowerPathMode::BatteryOnly;
+        }
+
+        // Check if transient system demand exceeds AC adapter capability
+        if system_load_mw > ac_capacity_mw {
+            self.is_passthrough_engaged.store(false, Ordering::Release);
+            self.active_mode.store(PowerPathMode::HybridPowerBoost as u32, Ordering::Release);
+            return PowerPathMode::HybridPowerBoost;
+        }
+
+        let target_soc = self.target_soc_limit_pct.load(Ordering::Acquire) as u8;
+        let was_engaged = self.is_passthrough_engaged.load(Ordering::Acquire);
+
+        let engage = if was_engaged {
+            // Drop below (target - hysteresis) to re-engage charging
+            current_soc_pct >= target_soc.saturating_sub(self.hysteresis_pct as u8)
+        } else {
+            current_soc_pct >= target_soc
+        };
+
+        self.is_passthrough_engaged.store(engage, Ordering::Release);
+        let mode = if engage {
+            PowerPathMode::DirectAcPassthrough
+        } else {
+            PowerPathMode::ConcurrentCharging
+        };
+
+        self.active_mode.store(mode as u32, Ordering::Release);
+        mode
+    }
+
+    pub fn is_passthrough_active(&self) -> bool {
+        self.is_passthrough_engaged.load(Ordering::Acquire)
+    }
+
+    pub fn get_active_mode(&self) -> PowerPathMode {
+        match self.active_mode.load(Ordering::Acquire) {
+            1 => PowerPathMode::ConcurrentCharging,
+            2 => PowerPathMode::DirectAcPassthrough,
+            3 => PowerPathMode::HybridPowerBoost,
+            _ => PowerPathMode::BatteryOnly,
+        }
+    }
+}
+
+pub static PASSTHROUGH_GOVERNOR: PassthroughGovernor = PassthroughGovernor::new();
+
+
+// ============================================================================
+// Feature 3: Low-Temperature Lithium Inhibitor & Dynamic Current Throttling
+// ============================================================================
+
+/// JEITA battery thermal safety charging zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JeitaZone {
+    /// Below 0°C: Lithium metal plating risk; charging prohibited (0 mA).
+    UnderTempInhibit,
+    /// 0°C to 10°C: Low ion mobility; current severely throttled (max 1000 mA, 8.2V).
+    ColdThrottled,
+    /// 10°C to 45°C: Nominal charging window; full fast charge (max 3000 mA, 8.7V).
+    StandardNormal,
+    /// 45°C to 55°C: High cell temperature; current throttled (max 1200 mA, 8.2V).
+    WarmThrottled,
+    /// Above 55°C: Thermal runaway safety cutoff; charging prohibited (0 mA).
+    OverTempInhibit,
+}
+
+/// JEITA dynamic thermal charging envelope profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JeitaThermalProfile {
+    pub zone: JeitaZone,
+    pub max_charge_current_ma: u32,
+    pub max_charge_voltage_mv: u32,
+    pub is_charging_permitted: bool,
+}
+
+/// Dynamic charge current governor and low-temperature lithium inhibitor.
+pub struct DynamicCurrentThrottle {
+    active_zone: AtomicU32, // JeitaZone as u32
+    allowed_charge_current_ma: AtomicU32,
+    max_charge_voltage_mv: AtomicU32,
+    is_charging_inhibited: AtomicBool,
+}
+
+impl DynamicCurrentThrottle {
+    pub const fn new() -> Self {
+        Self {
+            active_zone: AtomicU32::new(JeitaZone::StandardNormal as u32),
+            allowed_charge_current_ma: AtomicU32::new(3_000), // Standard 3A charge current
+            max_charge_voltage_mv: AtomicU32::new(STEAMDECK_FULL_VOLTAGE_MV),
+            is_charging_inhibited: AtomicBool::new(false),
+        }
+    }
+
+    /// Evaluates cell temperature against JEITA safety envelope and throttles current.
+    pub fn evaluate(&self, cell_temp_mdeg_c: i32, charger_max_ma: u32) -> JeitaThermalProfile {
+        let (zone, max_ma, max_mv, permitted) = if cell_temp_mdeg_c < 0 {
+            // Below 0°C: Absolute freeze cutoff to prevent catastrophic lithium dendritic plating
+            (JeitaZone::UnderTempInhibit, 0, 0, false)
+        } else if cell_temp_mdeg_c < 10_000 {
+            // 0°C .. 10°C: Cold throttle (0.25C max)
+            (JeitaZone::ColdThrottled, 1_000.min(charger_max_ma), 8_200, true)
+        } else if cell_temp_mdeg_c <= 45_000 {
+            // 10°C .. 45°C: Full fast charging
+            (JeitaZone::StandardNormal, 3_000.min(charger_max_ma), STEAMDECK_FULL_VOLTAGE_MV, true)
+        } else if cell_temp_mdeg_c < 55_000 {
+            // 45°C .. 55°C: Warm throttle
+            (JeitaZone::WarmThrottled, 1_200.min(charger_max_ma), 8_200, true)
+        } else {
+            // >= 55°C: Thermal runaway safety cutoff
+            (JeitaZone::OverTempInhibit, 0, 0, false)
+        };
+
+        self.active_zone.store(zone as u32, Ordering::Release);
+        self.allowed_charge_current_ma.store(max_ma, Ordering::Release);
+        self.max_charge_voltage_mv.store(max_mv, Ordering::Release);
+        self.is_charging_inhibited.store(!permitted, Ordering::Release);
+
+        JeitaThermalProfile {
+            zone,
+            max_charge_current_ma: max_ma,
+            max_charge_voltage_mv: max_mv,
+            is_charging_permitted: permitted,
+        }
+    }
+
+    pub fn get_allowed_current_ma(&self) -> u32 {
+        self.allowed_charge_current_ma.load(Ordering::Acquire)
+    }
+
+    pub fn get_max_voltage_mv(&self) -> u32 {
+        self.max_charge_voltage_mv.load(Ordering::Acquire)
+    }
+
+    pub fn is_inhibited(&self) -> bool {
+        self.is_charging_inhibited.load(Ordering::Acquire)
+    }
+
+    pub fn get_zone(&self) -> JeitaZone {
+        match self.active_zone.load(Ordering::Acquire) {
+            0 => JeitaZone::UnderTempInhibit,
+            1 => JeitaZone::ColdThrottled,
+            2 => JeitaZone::StandardNormal,
+            3 => JeitaZone::WarmThrottled,
+            _ => JeitaZone::OverTempInhibit,
+        }
+    }
+}
+
+pub static CURRENT_THROTTLE: DynamicCurrentThrottle = DynamicCurrentThrottle::new();
+
+
+// ============================================================================
+// Verification Self-Test Suite & Subsystem Sentinel
+// ============================================================================
+
+/// Comprehensive verification self-test for SteamDeck Battery Health & Charging Management Subsystem.
+pub fn verify_battery_manager_subsystem() -> bool {
+    // 1. Precision Coulomb Counter & Degradation Estimator
+    COULOMB_COUNTER.set_telemetry(32_032, STEAMDECK_DESIGN_CAPACITY_MWH, 0); // 80% SoC baseline
+    if COULOMB_COUNTER.get_state_of_charge_pct() != 80 {
+        return false;
+    }
+    if COULOMB_COUNTER.get_state_of_health_pct() != 100 {
+        return false;
+    }
+
+    // Simulate discharge: 2,000 mA draw for 1,800,000 ms (1800s = 0.5h -> 1000 mAh discharged)
+    // Microamp-seconds = -2000 * 1800000 = -3,600,000,000 uA*s = -1000 mAh
+    COULOMB_COUNTER.update_coulomb(7_500, -2_000, 1_800_000, 1_000_000);
+
+    // Delta mWh = (-1000 * 7500) / 1000 = -7500 mWh
+    // New remaining = 32032 - 7500 = 24532 mWh -> ~61% SoC
+    let soc = COULOMB_COUNTER.get_state_of_charge_pct();
+    if soc < 60 || soc > 63 {
+        return false;
+    }
+
+    // 2. Passthrough Charging Governor & High-Load Bypass
+    PASSTHROUGH_GOVERNOR.set_target_soc_limit(80);
+
+    // Disconnected from AC -> BatteryOnly
+    let mode_no_ac = PASSTHROUGH_GOVERNOR.evaluate(false, soc, 15_000, 0);
+    if mode_no_ac != PowerPathMode::BatteryOnly || PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // Connected to 45W AC at 61% SoC -> ConcurrentCharging (needs to charge to 80%)
+    let mode_charging = PASSTHROUGH_GOVERNOR.evaluate(true, soc, 18_000, 45_000);
+    if mode_charging != PowerPathMode::ConcurrentCharging || PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // Battery reaches 82% SoC -> DirectAcPassthrough (bypass battery cells)
+    let mode_passthrough = PASSTHROUGH_GOVERNOR.evaluate(true, 82, 22_000, 45_000);
+    if mode_passthrough != PowerPathMode::DirectAcPassthrough || !PASSTHROUGH_GOVERNOR.is_passthrough_active() {
+        return false;
+    }
+
+    // High transient load spike (52W) exceeding 45W charger -> HybridPowerBoost
+    let mode_hybrid = PASSTHROUGH_GOVERNOR.evaluate(true, 82, 52_000, 45_000);
+    if mode_hybrid != PowerPathMode::HybridPowerBoost {
+        return false;
+    }
+
+    // 3. JEITA Low-Temperature Inhibitor & Dynamic Current Throttling
+    // Sub-zero test (-5.0°C): Must inhibit charging to prevent lithium metal dendrite formation
+    let p_freeze = CURRENT_THROTTLE.evaluate(-5_000, 3_000);
+    if p_freeze.zone != JeitaZone::UnderTempInhibit || p_freeze.is_charging_permitted || p_freeze.max_charge_current_ma != 0 {
+        return false;
+    }
+    if !CURRENT_THROTTLE.is_inhibited() {
+        return false;
+    }
+
+    // Cold test (5.0°C): Throttled to max 1000 mA
+    let p_cold = CURRENT_THROTTLE.evaluate(5_000, 3_000);
+    if p_cold.zone != JeitaZone::ColdThrottled || !p_cold.is_charging_permitted || p_cold.max_charge_current_ma != 1_000 {
+        return false;
+    }
+
+    // Nominal room temp (24.0°C): Standard full fast charge (3000 mA)
+    let p_nominal = CURRENT_THROTTLE.evaluate(24_000, 3_000);
+    if p_nominal.zone != JeitaZone::StandardNormal || !p_nominal.is_charging_permitted || p_nominal.max_charge_current_ma != 3_000 {
+        return false;
+    }
+
+    // Over-temperature test (58.0°C): Emergency cutoff
+    let p_overtemp = CURRENT_THROTTLE.evaluate(58_000, 3_000);
+    if p_overtemp.zone != JeitaZone::OverTempInhibit || p_overtemp.is_charging_permitted || p_overtemp.max_charge_current_ma != 0 {
+        return false;
+    }
+
+    // Clean baseline reset
+    CURRENT_THROTTLE.evaluate(25_000, 3_000);
+    PASSTHROUGH_GOVERNOR.evaluate(false, 80, 15_000, 0);
+
+    true
+}
