@@ -1576,6 +1576,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-BT-PASS] kntonOS userspace bluetooth peripheral manager verified\r\n");
     }
 
+    // Verify kntonOS SteamDeck USB-C PD & DisplayPort Alt-Mode Dock Daemon (TASK-KNT-331)
+    if !knton_os::service::verify_dock_daemon_subsystem() {
+        serial_write_str("[KNT-PANIC] SteamDeck dock daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-DOCK-PASS] kntonOS SteamDeck USB-C PD & DP Alt-Mode dock daemon verified\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

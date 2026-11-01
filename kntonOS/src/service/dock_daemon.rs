@@ -701,3 +701,110 @@ pub fn verify_dock_modesetting_and_audio() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 6: Dock Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// SteamDeck USB-C PD & DisplayPort Alt-Mode Dock supervisor orchestrator.
+#[derive(Debug, Clone, Copy)]
+pub struct DockDaemon {
+    pub typec_ctrl: UsbTypeCController,
+    pub pd_engine: UsbPdProtocolEngine,
+    pub dp_altmode: DpAltModeController,
+    pub hub: SteamDeckDockHub,
+    pub modeset_coord: DockModesettingCoordinator,
+    pub cycles_polled: u64,
+}
+
+impl DockDaemon {
+    /// Initializes dock supervisor orchestrator in native handheld mode.
+    pub const fn new() -> Self {
+        Self {
+            typec_ctrl: UsbTypeCController::new(),
+            pd_engine: UsbPdProtocolEngine::new(),
+            dp_altmode: DpAltModeController::new(),
+            hub: SteamDeckDockHub::new(),
+            modeset_coord: DockModesettingCoordinator::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic dock daemon polling cycle.
+    pub fn poll_dock_cycle(&mut self) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+    }
+}
+
+/// Comprehensive verification function for the complete SteamDeck USB-C PD
+/// & DisplayPort Alt-Mode Dock Daemon subsystem.
+pub fn verify_dock_daemon_subsystem() -> bool {
+    if !verify_usb_typec_cc_state_machine() {
+        return false;
+    }
+    if !verify_usb_pd_contract_negotiation() {
+        return false;
+    }
+    if !verify_dp_alt_mode_signaling() {
+        return false;
+    }
+    if !verify_steamdeck_dock_hub() {
+        return false;
+    }
+    if !verify_dock_modesetting_and_audio() {
+        return false;
+    }
+
+    // Integrated coordinator verification
+    let mut daemon = DockDaemon::new();
+
+    // 1. Initial state
+    if daemon.cycles_polled != 0 || daemon.modeset_coord.is_docked {
+        return false;
+    }
+
+    // 2. Attach dock cable: CC pin sensing
+    let cc_st = daemon.typec_ctrl.poll_cc_pins(1650, 0);
+    if cc_st != CcConnectionState::AttachedSink || daemon.typec_ctrl.orientation != CcPinOrientation::Cc1Normal {
+        return false;
+    }
+
+    // 3. Negotiate 45W fast charge contract
+    let dock_caps = [
+        PowerDeliveryObject::fixed(5000, 3000),
+        PowerDeliveryObject::fixed(9000, 3000),
+        PowerDeliveryObject::fixed(15000, 3000),
+    ];
+    let pd_st = daemon.pd_engine.evaluate_source_capabilities(&dock_caps);
+    if pd_st != PdContractStatus::FastCharge45WActive || !daemon.pd_engine.is_fast_charging_45w {
+        return false;
+    }
+
+    // 4. Configure DP Pin Assignment D and assert HPD
+    daemon.dp_altmode.configure_pin_assignment(DpPinAssignment::PinAssignmentD_2LaneUsb3);
+    daemon.dp_altmode.update_hpd(HpdSignalState::High);
+    if !daemon.dp_altmode.is_scanout_ready() {
+        return false;
+    }
+
+    // 5. Official Valve dock probe & hub configuration
+    let is_valve = daemon.hub.probe_dock_hardware(VALVE_VENDOR_ID, STEAM_DECK_DOCK_PID1);
+    if !is_valve || !daemon.hub.is_official_valve_dock {
+        return false;
+    }
+    daemon.hub.set_ethernet_link(true, 1000);
+
+    // 6. Modeset external monitor & audio routing
+    daemon.modeset_coord.on_dock_attached(2560, 1440, 144);
+    if !daemon.modeset_coord.is_docked || daemon.modeset_coord.active_audio != DockAudioSink::ExternalDigitalHdmiDp {
+        return false;
+    }
+
+    // 7. Tick maintenance cycle
+    daemon.poll_dock_cycle();
+    if daemon.cycles_polled != 1 {
+        return false;
+    }
+
+    true
+}
+
