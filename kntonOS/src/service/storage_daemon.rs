@@ -588,3 +588,127 @@ impl UserlandFilesystemAutomounter {
 }
 
 pub static FS_AUTOMOUNTER: UserlandFilesystemAutomounter = UserlandFilesystemAutomounter::new();
+
+use core::sync::atomic::AtomicU64;
+
+/// Dynamic storage capacity telemetry.
+#[derive(Debug, Clone, Copy)]
+pub struct StorageTelemetry {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+    pub usage_pct: u8,
+    pub wear_level_estimate_pct: u8,
+}
+
+impl StorageTelemetry {
+    pub const fn empty() -> Self {
+        Self {
+            total_bytes: 0,
+            free_bytes: 0,
+            used_bytes: 0,
+            usage_pct: 0,
+            wear_level_estimate_pct: 100,
+        }
+    }
+
+    pub fn new(total_bytes: u64, free_bytes: u64) -> Self {
+        let used = total_bytes.saturating_sub(free_bytes);
+        let usage = if total_bytes > 0 {
+            ((used as u128 * 100) / total_bytes as u128) as u8
+        } else {
+            0
+        };
+        Self {
+            total_bytes,
+            free_bytes,
+            used_bytes: used,
+            usage_pct: usage.min(100),
+            wear_level_estimate_pct: 98, // 98% health estimate for high-end UHS-I cards
+        }
+    }
+
+    pub fn update_free(&mut self, free: u64) {
+        self.free_bytes = free;
+        self.used_bytes = self.total_bytes.saturating_sub(free);
+        if self.total_bytes > 0 {
+            self.usage_pct = (((self.used_bytes as u128 * 100) / self.total_bytes as u128) as u8).min(100);
+        }
+    }
+}
+
+/// Dynamic I/O throughput rate governor preventing frame pacing stutter during storage activity.
+pub struct IoThroughputGovernor {
+    max_read_mbps: AtomicU32,
+    max_write_mbps: AtomicU32,
+    accumulated_read_bytes: AtomicU64,
+    accumulated_write_bytes: AtomicU64,
+    game_mode_active: AtomicBool,
+    throttled_events: AtomicU32,
+}
+
+impl IoThroughputGovernor {
+    pub const fn new() -> Self {
+        Self {
+            max_read_mbps: AtomicU32::new(90),  // 90 MB/s read cap
+            max_write_mbps: AtomicU32::new(45), // 45 MB/s write cap
+            accumulated_read_bytes: AtomicU64::new(0),
+            accumulated_write_bytes: AtomicU64::new(0),
+            game_mode_active: AtomicBool::new(false),
+            throttled_events: AtomicU32::new(0),
+        }
+    }
+
+    /// Sets game mode state: when active, clamps write throughput to protect gameplay responsiveness.
+    pub fn set_game_mode(&self, active: bool) {
+        self.game_mode_active.store(active, Ordering::SeqCst);
+        if active {
+            // Tighten write bandwidth to 20 MB/s to prevent asset loading hitches
+            self.max_write_mbps.store(20, Ordering::SeqCst);
+        } else {
+            self.max_write_mbps.store(45, Ordering::SeqCst);
+        }
+    }
+
+    /// Requests transfer quota for a read or write operation.
+    pub fn request_io(&self, bytes: usize, is_write: bool) -> Result<(), StorageError> {
+        let max_mbps = if is_write {
+            self.max_write_mbps.load(Ordering::Acquire)
+        } else {
+            self.max_read_mbps.load(Ordering::Acquire)
+        };
+
+        let max_bytes_per_sec = max_mbps as u64 * 1024 * 1024;
+        let single_req_cap = (max_bytes_per_sec / 10) as usize; // Max 100ms chunk
+
+        if bytes > single_req_cap {
+            self.throttled_events.fetch_add(1, Ordering::Relaxed);
+            return Err(StorageError::IoThrottleExceeded);
+        }
+
+        if is_write {
+            self.accumulated_write_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        } else {
+            self.accumulated_read_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+
+        Ok(())
+    }
+
+    pub fn get_throttle_count(&self) -> u32 {
+        self.throttled_events.load(Ordering::Acquire)
+    }
+
+    pub fn get_accumulated_io(&self) -> (u64, u64) {
+        (
+            self.accumulated_read_bytes.load(Ordering::Acquire),
+            self.accumulated_write_bytes.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn is_game_mode_active(&self) -> bool {
+        self.game_mode_active.load(Ordering::Acquire)
+    }
+}
+
+pub static IO_GOVERNOR: IoThroughputGovernor = IoThroughputGovernor::new();
