@@ -18,6 +18,9 @@ pub use gamepad_mapper::*;
 pub mod net_daemon;
 pub use net_daemon::*;
 
+pub mod bluetooth_daemon;
+pub use bluetooth_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
