@@ -1561,7 +1561,6 @@ pub extern "C" fn kmain() -> ! {
     } else {
         serial_write_str("[KNT-OS-NET-PASS] kntonOS userspace network manager & wi-fi daemon verified\r\n");
     }
-    }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
