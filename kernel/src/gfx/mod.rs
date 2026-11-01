@@ -834,6 +834,12 @@ pub fn test_work_graphs_subsystem() -> bool {
     true
 }
 
+
+
+pub mod msaa_resolve;
+
+pub use msaa_resolve::*;
+
 
-pub mod msaa_resolve;
-pub use msaa_resolve::*;
+pub mod deck_shell;
+pub use deck_shell::*;
