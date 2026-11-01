@@ -362,3 +362,182 @@ impl AcousticFanGovernor {
 }
 
 pub static FAN_GOVERNOR: AcousticFanGovernor = AcousticFanGovernor::new();
+
+
+// ============================================================================
+// Feature 3: Handheld Skin-Temperature Comfort Governor & Throttling Prevention
+// ============================================================================
+
+/// Handheld skin comfort status for palm grips and rear chassis touch zones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkinComfortStatus {
+    /// Ergonomically comfortable (< 39.5°C).
+    Comfortable,
+    /// Warm to touch (39.5°C - 41.5°C); fan acoustic offset applied.
+    WarmGrip,
+    /// Uncomfortable heat soak (> 41.5°C); active chassis cooling required.
+    HotGrip,
+    /// Threshold exceeded (> 44.0°C); thermal safety TDP throttling recommended.
+    ExceededLimit,
+}
+
+/// Throttling risk assessment based on predictive thermal gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrottlingRiskLevel {
+    /// Safe thermal headroom (> 15°C margin to PROCHOT).
+    Low,
+    /// Moderate temperature rise; monitor gradient.
+    Moderate,
+    /// Rapid thermal escalation; anticipatory fan boost active.
+    High,
+    /// APU silicon within 3°C of PROCHOT 100°C; throttling imminent.
+    Imminent,
+}
+
+/// Handheld skin comfort governor and thermal dissipation estimator.
+pub struct SkinComfortGovernor {
+    comfort_threshold_mdeg: i32,
+    warning_threshold_mdeg: i32,
+    limit_threshold_mdeg: i32,
+    estimated_grip_mdeg: AtomicI32,
+    status: AtomicU32, // SkinComfortStatus as u32
+    recommended_tdp_clamp_watts: AtomicU32,
+}
+
+impl SkinComfortGovernor {
+    pub const fn new() -> Self {
+        Self {
+            comfort_threshold_mdeg: 39_500, // 39.5°C
+            warning_threshold_mdeg: 41_500, // 41.5°C
+            limit_threshold_mdeg: 44_000,   // 44.0°C max touch limit
+            estimated_grip_mdeg: AtomicI32::new(32_000),
+            status: AtomicU32::new(0),
+            recommended_tdp_clamp_watts: AtomicU32::new(15), // Standard 15W TDP
+        }
+    }
+
+    /// Estimates palm grip temperature from multi-zone thermal flux:
+    /// Grip ≈ Ambient + 0.18*(APU - Ambient) + 0.35*(Battery - Ambient)
+    pub fn update(&self, apu_mdeg: i32, ambient_mdeg: i32, battery_mdeg: i32) -> SkinComfortStatus {
+        let apu_flux = if apu_mdeg > ambient_mdeg { apu_mdeg - ambient_mdeg } else { 0 };
+        let battery_flux = if battery_mdeg > ambient_mdeg { battery_mdeg - ambient_mdeg } else { 0 };
+
+        let est_grip = ambient_mdeg + (apu_flux * 18) / 100 + (battery_flux * 35) / 100;
+        self.estimated_grip_mdeg.store(est_grip, Ordering::Release);
+
+        let (stat, tdp_clamp) = if est_grip >= self.limit_threshold_mdeg {
+            (SkinComfortStatus::ExceededLimit, 9) // Clamp to 9W to cool handheld
+        } else if est_grip >= self.warning_threshold_mdeg {
+            (SkinComfortStatus::HotGrip, 12)     // Clamp to 12W
+        } else if est_grip >= self.comfort_threshold_mdeg {
+            (SkinComfortStatus::WarmGrip, 15)    // Maintain 15W with fan offset
+        } else {
+            (SkinComfortStatus::Comfortable, 15) // Full 15W unrestricted
+        };
+
+        self.status.store(stat as u32, Ordering::Release);
+        self.recommended_tdp_clamp_watts.store(tdp_clamp, Ordering::Release);
+        stat
+    }
+
+    pub fn get_estimated_grip_temp(&self) -> i32 {
+        self.estimated_grip_mdeg.load(Ordering::Acquire)
+    }
+
+    pub fn get_status(&self) -> SkinComfortStatus {
+        match self.status.load(Ordering::Acquire) {
+            0 => SkinComfortStatus::Comfortable,
+            1 => SkinComfortStatus::WarmGrip,
+            2 => SkinComfortStatus::HotGrip,
+            _ => SkinComfortStatus::ExceededLimit,
+        }
+    }
+
+    pub fn get_recommended_tdp(&self) -> u32 {
+        self.recommended_tdp_clamp_watts.load(Ordering::Acquire)
+    }
+
+    /// Additional fan RPM boost required to mitigate skin warmth.
+    pub fn get_acoustic_rpm_boost(&self) -> u32 {
+        match self.get_status() {
+            SkinComfortStatus::Comfortable => 0,
+            SkinComfortStatus::WarmGrip => 300,
+            SkinComfortStatus::HotGrip => 750,
+            SkinComfortStatus::ExceededLimit => 1400,
+        }
+    }
+}
+
+/// Throttling prevention model tracking thermal rise gradients (dT/dt).
+pub struct ThrottlingPreventionModel {
+    last_apu_temp_mdeg: AtomicI32,
+    last_timestamp_ms: AtomicU64,
+    gradient_mdeg_per_sec: AtomicI32,
+    risk_level: AtomicU32,
+}
+
+impl ThrottlingPreventionModel {
+    pub const fn new() -> Self {
+        Self {
+            last_apu_temp_mdeg: AtomicI32::new(35_000),
+            last_timestamp_ms: AtomicU64::new(0),
+            gradient_mdeg_per_sec: AtomicI32::new(0),
+            risk_level: AtomicU32::new(0),
+        }
+    }
+
+    /// Evaluates current APU temperature against historical gradient to preempt PROCHOT.
+    pub fn evaluate(&self, current_apu_mdeg: i32, timestamp_ms: u64) -> ThrottlingRiskLevel {
+        let prev_temp = self.last_apu_temp_mdeg.swap(current_apu_mdeg, Ordering::AcqRel);
+        let prev_time = self.last_timestamp_ms.swap(timestamp_ms, Ordering::AcqRel);
+
+        let gradient = if timestamp_ms > prev_time && prev_time > 0 {
+            let dt_ms = (timestamp_ms - prev_time) as i64;
+            let d_temp = (current_apu_mdeg - prev_temp) as i64;
+            ((d_temp * 1000) / dt_ms) as i32
+        } else {
+            0
+        };
+        self.gradient_mdeg_per_sec.store(gradient, Ordering::Release);
+
+        // PROCHOT limit is 100°C (100_000 m°C)
+        let risk = if current_apu_mdeg >= 97_000 {
+            ThrottlingRiskLevel::Imminent
+        } else if current_apu_mdeg >= 90_000 || (current_apu_mdeg >= 84_000 && gradient > 3_000) {
+            ThrottlingRiskLevel::High
+        } else if current_apu_mdeg >= 80_000 || gradient > 4_000 {
+            ThrottlingRiskLevel::Moderate
+        } else {
+            ThrottlingRiskLevel::Low
+        };
+
+        self.risk_level.store(risk as u32, Ordering::Release);
+        risk
+    }
+
+    pub fn get_gradient(&self) -> i32 {
+        self.gradient_mdeg_per_sec.load(Ordering::Acquire)
+    }
+
+    pub fn get_risk_level(&self) -> ThrottlingRiskLevel {
+        match self.risk_level.load(Ordering::Acquire) {
+            0 => ThrottlingRiskLevel::Low,
+            1 => ThrottlingRiskLevel::Moderate,
+            2 => ThrottlingRiskLevel::High,
+            _ => ThrottlingRiskLevel::Imminent,
+        }
+    }
+
+    /// Proactive RPM anticipation boost based on gradient.
+    pub fn get_anticipatory_fan_boost(&self) -> u32 {
+        match self.get_risk_level() {
+            ThrottlingRiskLevel::Low => 0,
+            ThrottlingRiskLevel::Moderate => 350,
+            ThrottlingRiskLevel::High => 900,
+            ThrottlingRiskLevel::Imminent => 2000,
+        }
+    }
+}
+
+pub static SKIN_COMFORT: SkinComfortGovernor = SkinComfortGovernor::new();
+pub static THROTTLING_PREVENTION: ThrottlingPreventionModel = ThrottlingPreventionModel::new();
