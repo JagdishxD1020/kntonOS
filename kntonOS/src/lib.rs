@@ -20,6 +20,7 @@ pub use service::verify_perf_overlay_subsystem;
 pub use service::verify_thermal_governor_subsystem;
 pub use service::verify_dock_daemon_subsystem;
 pub use service::verify_backlight_daemon_subsystem;
+pub use service::verify_motion_daemon_subsystem;
 
 /// Verification sentinel proving full userspace OS subsystem readiness.
 pub fn verify_knton_os_userspace() -> bool {
@@ -39,6 +40,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && service::verify_dock_daemon_subsystem()
         && service::verify_thermal_governor_subsystem()
         && service::verify_backlight_daemon_subsystem()
+        && service::verify_motion_daemon_subsystem()
         && ipc::verify_ipc_ports()
         && ipc::verify_ipc_dispatcher_subsystem()
         && shell::verify_game_mode_shell()
