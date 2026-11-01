@@ -1,5 +1,9 @@
 //! User-mode execution runtime and syscall callgate interface.
 
+pub mod syscall;
+
+pub use syscall::*;
+
 /// Process Environment Block (PEB) representation for userland processes.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessEnvironmentBlock {
@@ -44,12 +48,7 @@ impl ThreadEnvironmentBlock {
 
 /// Fast syscall dispatch simulation for userspace operations.
 pub fn fast_syscall(syscall_num: u32, arg1: u64, arg2: u64, arg3: u64) -> i64 {
-    match syscall_num {
-        0x01 => (arg1 + arg2 + arg3) as i64, // NtTestSys
-        0x10 => (arg1 & !0xFFF) as i64,      // NtAllocateVirtualMemory alignment check
-        0x20 => 0,                           // NtYieldExecution success
-        _ => -1,                             // Unknown syscall
-    }
+    dynamic_syscall(syscall_num, arg1, arg2, arg3)
 }
 
 /// Verification self-test for userspace runtime.
@@ -61,6 +60,10 @@ pub fn verify_user_runtime() -> bool {
 
     let teb = ThreadEnvironmentBlock::new(202, 0x0000_7FFF_FFFF_0000, 0x10_000);
     if teb.thread_id != 202 || teb.stack_limit >= teb.stack_base {
+        return false;
+    }
+
+    if !validate_teb_pointer(0x0000_7FFF_FFFF_1000, teb.stack_base, teb.stack_limit) {
         return false;
     }
 
