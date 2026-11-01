@@ -1407,7 +1407,7 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // Verify kntonOS User-Mode Memory Allocator & Dynamic Syscall Stubs (TASK-KNT-317)
-    if kntonOS::verify_usermode_allocator_subsystem() {
+    if knton_os::verify_usermode_allocator_subsystem() {
         serial_write_str("[KNT-OS-ALLOC-PASS] kntonOS user-mode memory allocator and dynamic syscall stubs verified\r\n");
     } else {
         serial_write_str("[KNT-PANIC] kntonOS user-mode memory allocator self-test failed!\r\n");
