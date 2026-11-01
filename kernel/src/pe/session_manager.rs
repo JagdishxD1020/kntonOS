@@ -421,3 +421,309 @@ pub fn verify_environment_inheritance_and_spawn_rules() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: Service Registry & Crash Recovery Auto-Restart Supervisor
+// ============================================================================
+
+/// Operational state of a supervised background service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    /// Service is registered but not running.
+    Stopped,
+    /// Service binary has been spawned and is initializing its IPC port.
+    Starting,
+    /// Service is healthy and reporting periodic heartbeats.
+    Running,
+    /// Service terminated abnormally or raised an unhandled fault.
+    Crashed,
+    /// Service is within backoff delay awaiting restart.
+    Recovering,
+    /// Service exceeded max retry attempts and has been disabled to prevent restart loop.
+    Disabled,
+}
+
+/// Classification of services managed by the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceType {
+    /// Kernel-mode or native micro-kernel driver server.
+    CoreDriver,
+    /// System background daemon running in Session 0.
+    SystemDaemon,
+    /// Interactive desktop/gaming shell running in Session 1.
+    UserShell,
+    /// User application or gaming runtime.
+    GameRuntime,
+}
+
+/// Action to be taken by supervisor in response to a service crash event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceCrashAction {
+    /// Restart immediately or after backoff delay.
+    ScheduleRestart {
+        /// Delay in milliseconds before attempting restart.
+        delay_ms: u32,
+    },
+    /// Halt and lock down the target session due to critical failure.
+    HaltSession {
+        /// Target session identifier to lockdown.
+        session_id: u32,
+    },
+    /// Do not restart; service exceeded max attempts and is marked Disabled.
+    MarkDisabled,
+    /// No action needed (normal voluntary exit).
+    Ignore,
+}
+
+/// Descriptor tracking the lifecycle and health metrics of a supervised service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceDescriptor {
+    /// Unique service identifier.
+    pub service_id: u32,
+    /// Human-readable service name (e.g. "AudioSrv", "Csrss", "GameShell").
+    pub name: String,
+    /// Service functional category.
+    pub service_type: ServiceType,
+    /// Process spawn configuration and restart policy.
+    pub spawn_rule: ProcessSpawnRule,
+    /// Current execution state.
+    pub state: ServiceState,
+    /// PID of currently running process instance, if active.
+    pub current_pid: Option<u64>,
+    /// Number of consecutive crashes without sustained healthy execution.
+    pub consecutive_crashes: u32,
+    /// Cumulative crash count over service lifetime.
+    pub total_crashes: u32,
+    /// Tick timestamp when last crash occurred.
+    pub last_crash_tick: u64,
+    /// Tick timestamp when next restart is scheduled to execute.
+    pub next_restart_tick: u64,
+    /// Tick timestamp of most recent heartbeat signal.
+    pub last_heartbeat_tick: u64,
+}
+
+impl ServiceDescriptor {
+    /// Creates a new service descriptor in Stopped state.
+    pub fn new(service_id: u32, name: &str, service_type: ServiceType, spawn_rule: ProcessSpawnRule) -> Self {
+        Self {
+            service_id,
+            name: name.to_string(),
+            service_type,
+            spawn_rule,
+            state: ServiceState::Stopped,
+            current_pid: None,
+            consecutive_crashes: 0,
+            total_crashes: 0,
+            last_crash_tick: 0,
+            next_restart_tick: 0,
+            last_heartbeat_tick: 0,
+        }
+    }
+}
+
+/// Central supervisor registry managing service life-cycle, heartbeats, and fault recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceRegistry {
+    /// Map of service ID to service descriptor.
+    pub services: BTreeMap<u32, ServiceDescriptor>,
+    /// Auto-incrementing service identifier counter.
+    pub next_service_id: u32,
+}
+
+impl ServiceRegistry {
+    /// Initializes an empty service registry.
+    pub fn new() -> Self {
+        Self {
+            services: BTreeMap::new(),
+            next_service_id: 1,
+        }
+    }
+
+    /// Registers a new service and returns its unique ID.
+    pub fn register_service(&mut self, name: &str, service_type: ServiceType, spawn_rule: ProcessSpawnRule) -> u32 {
+        let sid = self.next_service_id;
+        self.next_service_id += 1;
+
+        let desc = ServiceDescriptor::new(sid, name, service_type, spawn_rule);
+        self.services.insert(sid, desc);
+        sid
+    }
+
+    /// Marks a service as Running and records its active PID.
+    pub fn notify_service_started(&mut self, service_id: u32, pid: u64, current_tick: u64) -> bool {
+        if let Some(svc) = self.services.get_mut(&service_id) {
+            svc.state = ServiceState::Running;
+            svc.current_pid = Some(pid);
+            svc.last_heartbeat_tick = current_tick;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records a periodic health heartbeat from a running service.
+    pub fn notify_service_heartbeat(&mut self, service_id: u32, current_tick: u64) -> bool {
+        if let Some(svc) = self.services.get_mut(&service_id) {
+            if svc.state == ServiceState::Running {
+                svc.last_heartbeat_tick = current_tick;
+                // Sustained heartbeats reset consecutive crash counter
+                if current_tick.saturating_sub(svc.last_crash_tick) > 10_000 {
+                    svc.consecutive_crashes = 0;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Processes a service crash event, evaluates restart policy, and returns action.
+    pub fn handle_service_crash(&mut self, service_id: u32, exit_code: i32, current_tick: u64) -> ServiceCrashAction {
+        let svc = match self.services.get_mut(&service_id) {
+            Some(s) => s,
+            None => return ServiceCrashAction::Ignore,
+        };
+
+        svc.current_pid = None;
+        svc.total_crashes += 1;
+        svc.consecutive_crashes += 1;
+        svc.last_crash_tick = current_tick;
+
+        // If exit code is clean 0 and policy is not Always, treat as voluntary stop
+        if exit_code == 0 && svc.spawn_rule.restart_policy != RestartPolicy::Always {
+            svc.state = ServiceState::Stopped;
+            return ServiceCrashAction::Ignore;
+        }
+
+        match svc.spawn_rule.restart_policy {
+            RestartPolicy::Never => {
+                svc.state = ServiceState::Stopped;
+                ServiceCrashAction::Ignore
+            }
+            RestartPolicy::CriticalSessionHalt => {
+                svc.state = ServiceState::Crashed;
+                ServiceCrashAction::HaltSession {
+                    session_id: svc.spawn_rule.target_session_id,
+                }
+            }
+            RestartPolicy::Always => {
+                svc.state = ServiceState::Recovering;
+                svc.next_restart_tick = current_tick + 100; // Fast 100ms restart
+                ServiceCrashAction::ScheduleRestart { delay_ms: 100 }
+            }
+            RestartPolicy::OnCrashWithBackoff { max_retries, backoff_ms } => {
+                if svc.consecutive_crashes > max_retries {
+                    // Exceeded max retry budget: disable to prevent thrashing
+                    svc.state = ServiceState::Disabled;
+                    ServiceCrashAction::MarkDisabled
+                } else {
+                    svc.state = ServiceState::Recovering;
+                    let delay = backoff_ms.saturating_mul(svc.consecutive_crashes);
+                    svc.next_restart_tick = current_tick + (delay as u64);
+                    ServiceCrashAction::ScheduleRestart { delay_ms: delay }
+                }
+            }
+        }
+    }
+
+    /// Scans for services in Recovering state whose restart backoff timer has matured.
+    pub fn poll_pending_restarts(&mut self, current_tick: u64) -> Vec<u32> {
+        let mut ready = Vec::new();
+        for (sid, svc) in self.services.iter_mut() {
+            if svc.state == ServiceState::Recovering && current_tick >= svc.next_restart_tick {
+                svc.state = ServiceState::Starting;
+                ready.push(*sid);
+            }
+        }
+        ready
+    }
+}
+
+/// Verification test for service registry and crash recovery policies.
+pub fn verify_service_registry_and_recovery() -> bool {
+    let mut registry = ServiceRegistry::new();
+
+    // 1. Register a critical service (csrss.exe)
+    let csrss_rule = ProcessSpawnRule::new_critical_service("C:\\Windows\\System32\\csrss.exe", 0);
+    let csrss_id = registry.register_service("csrss", ServiceType::SystemDaemon, csrss_rule);
+    if csrss_id != 1 {
+        return false;
+    }
+
+    // 2. Register an interactive shell with backoff (gameshell.exe)
+    let mut shell_rule = ProcessSpawnRule::new_interactive_shell("C:\\Knton\\Shell\\gameshell.exe", 1);
+    shell_rule.restart_policy = RestartPolicy::OnCrashWithBackoff {
+        max_retries: 2,
+        backoff_ms: 200,
+    };
+    let shell_id = registry.register_service("gameshell", ServiceType::UserShell, shell_rule);
+
+    // 3. Start gameshell and test crash recovery with backoff
+    registry.notify_service_started(shell_id, 501, 1000);
+    if registry.services.get(&shell_id).map(|s| s.state) != Some(ServiceState::Running) {
+        return false;
+    }
+
+    // Crash 1: Should schedule restart with backoff
+    let action1 = registry.handle_service_crash(shell_id, -1, 1500);
+    match action1 {
+        ServiceCrashAction::ScheduleRestart { delay_ms } => {
+            if delay_ms != 200 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    if registry.services.get(&shell_id).map(|s| s.state) != Some(ServiceState::Recovering) {
+        return false;
+    }
+
+    // Advance clock past backoff delay and poll restart
+    let restarts = registry.poll_pending_restarts(1705);
+    if !restarts.contains(&shell_id) {
+        return false;
+    }
+    if registry.services.get(&shell_id).map(|s| s.state) != Some(ServiceState::Starting) {
+        return false;
+    }
+
+    // Start again, then Crash 2
+    registry.notify_service_started(shell_id, 502, 1750);
+    let action2 = registry.handle_service_crash(shell_id, -1, 1800);
+    match action2 {
+        ServiceCrashAction::ScheduleRestart { delay_ms } => {
+            if delay_ms != 400 { // 2nd consecutive crash: 200 * 2 = 400ms
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // Crash 3: Exceeds max_retries (2): should mark Disabled
+    registry.poll_pending_restarts(2250);
+    registry.notify_service_started(shell_id, 503, 2300);
+    let action3 = registry.handle_service_crash(shell_id, -1, 2350);
+    if action3 != ServiceCrashAction::MarkDisabled {
+        return false;
+    }
+    if registry.services.get(&shell_id).map(|s| s.state) != Some(ServiceState::Disabled) {
+        return false;
+    }
+
+    // 4. Test CriticalSessionHalt on critical service crash
+    registry.notify_service_started(csrss_id, 401, 3000);
+    let crit_action = registry.handle_service_crash(csrss_id, -1073741819_i32, 3500);
+    match crit_action {
+        ServiceCrashAction::HaltSession { session_id } => {
+            if session_id != 0 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    true
+}
