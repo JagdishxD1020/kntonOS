@@ -33,6 +33,9 @@ pub use dock_daemon::*;
 pub mod thermal_governor;
 pub use thermal_governor::*;
 
+pub mod backlight_daemon;
+pub use backlight_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
