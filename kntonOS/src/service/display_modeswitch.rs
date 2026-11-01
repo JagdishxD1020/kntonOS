@@ -243,3 +243,173 @@ impl HotplugListener {
 }
 
 pub static HOTPLUG_LISTENER: HotplugListener = HotplugListener::new();
+
+
+// ============================================================================
+// Feature 2: Seamless DRM Atomic Modesetting & Resolution Scaler
+// ============================================================================
+
+/// Display topology layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayTopologyMode {
+    /// Internal eDP panel only (handheld mode).
+    InternalOnly,
+    /// External display is primary (docked console mode, internal panel blanked).
+    ExternalPrimary,
+    /// Mirror internal screen to external monitor.
+    ClonedMirror,
+    /// Extended multi-monitor workspace.
+    DualExtended,
+}
+
+/// Scaling filter used when game resolution differs from physical panel resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayScalingFilter {
+    /// Integer pixel doubling (sharp retro / pixel art).
+    NearestInteger,
+    /// Smooth bilinear filtering.
+    Bilinear,
+    /// AMD FidelityFX Super Resolution edge-preserving upscaler.
+    FsrUpscale,
+    /// Aspect ratio preservation with letterboxing/pillarboxing.
+    FitPreserveAspect,
+}
+
+/// DRM atomic commit flags.
+pub const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x01;
+pub const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x02;
+pub const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x04;
+
+/// DRM atomic modesetting commit state descriptor.
+#[derive(Debug, Clone, Copy)]
+pub struct DrmAtomicCommitState {
+    pub crtc_id: u32,
+    pub connector_id: u32,
+    pub plane_id: u32,
+    pub active_timing: DisplayModeTiming,
+    pub scaling_filter: DisplayScalingFilter,
+    pub is_enabled: bool,
+}
+
+/// DRM atomic modeswitch manager.
+pub struct DrmModesetManager {
+    topology: AtomicU32, // DisplayTopologyMode as u32
+    internal_w: AtomicU32,
+    internal_h: AtomicU32,
+    internal_hz: AtomicU32,
+    external_w: AtomicU32,
+    external_h: AtomicU32,
+    external_hz: AtomicU32,
+    scaling_filter: AtomicU32, // DisplayScalingFilter as u32
+    modeset_sequence_id: AtomicU64,
+    is_switching: AtomicBool,
+}
+
+impl DrmModesetManager {
+    pub const fn new() -> Self {
+        Self {
+            topology: AtomicU32::new(DisplayTopologyMode::InternalOnly as u32),
+            internal_w: AtomicU32::new(1280),
+            internal_h: AtomicU32::new(800),
+            internal_hz: AtomicU32::new(60),
+            external_w: AtomicU32::new(1920),
+            external_h: AtomicU32::new(1080),
+            external_hz: AtomicU32::new(60),
+            scaling_filter: AtomicU32::new(DisplayScalingFilter::FsrUpscale as u32),
+            modeset_sequence_id: AtomicU64::new(0),
+            is_switching: AtomicBool::new(false),
+        }
+    }
+
+    /// Tests whether the proposed resolution and pixel clock are supported by AMD Van Gogh DCN.
+    pub fn test_modeset(&self, timing: &DisplayModeTiming) -> bool {
+        // Max pixel clock on SteamDeck DCN 3.0.1 is ~1.2 GHz (supports 4K 120Hz via DSC)
+        if timing.pixel_clock_khz > 1_200_000 {
+            return false;
+        }
+        // Maximum resolution bounds
+        if timing.width > 3840 || timing.height > 2160 || timing.width < 640 || timing.height < 480 {
+            return false;
+        }
+        // Maximum refresh rate bounds
+        if timing.refresh_rate_hz < 30 || timing.refresh_rate_hz > 240 {
+            return false;
+        }
+        true
+    }
+
+    /// Performs a seamless atomic modeset transition to target display topology and timing.
+    pub fn commit_atomic_modeset(
+        &self,
+        target_topology: DisplayTopologyMode,
+        target_timing: DisplayModeTiming,
+        flags: u32,
+    ) -> Result<u64, &'static str> {
+        if !self.test_modeset(&target_timing) {
+            return Err("Target mode exceeds display engine capabilities");
+        }
+
+        if (flags & DRM_MODE_ATOMIC_TEST_ONLY) != 0 {
+            return Ok(0); // Test passed
+        }
+
+        self.is_switching.store(true, Ordering::Release);
+
+        match target_topology {
+            DisplayTopologyMode::InternalOnly => {
+                self.internal_w.store(target_timing.width, Ordering::Release);
+                self.internal_h.store(target_timing.height, Ordering::Release);
+                self.internal_hz.store(target_timing.refresh_rate_hz, Ordering::Release);
+            }
+            DisplayTopologyMode::ExternalPrimary | DisplayTopologyMode::ClonedMirror | DisplayTopologyMode::DualExtended => {
+                self.external_w.store(target_timing.width, Ordering::Release);
+                self.external_h.store(target_timing.height, Ordering::Release);
+                self.external_hz.store(target_timing.refresh_rate_hz, Ordering::Release);
+            }
+        }
+
+        self.topology.store(target_topology as u32, Ordering::Release);
+        let seq = self.modeset_sequence_id.fetch_add(1, Ordering::AcqRel) + 1;
+        self.is_switching.store(false, Ordering::Release);
+        Ok(seq)
+    }
+
+    pub fn get_topology(&self) -> DisplayTopologyMode {
+        match self.topology.load(Ordering::Acquire) {
+            1 => DisplayTopologyMode::ExternalPrimary,
+            2 => DisplayTopologyMode::ClonedMirror,
+            3 => DisplayTopologyMode::DualExtended,
+            _ => DisplayTopologyMode::InternalOnly,
+        }
+    }
+
+    pub fn get_active_timing(&self, connector: DisplayConnectorType) -> DisplayModeTiming {
+        match connector {
+            DisplayConnectorType::InternalEdp => DisplayModeTiming::new_progressive(
+                self.internal_w.load(Ordering::Acquire),
+                self.internal_h.load(Ordering::Acquire),
+                self.internal_hz.load(Ordering::Acquire),
+            ),
+            _ => DisplayModeTiming::new_progressive(
+                self.external_w.load(Ordering::Acquire),
+                self.external_h.load(Ordering::Acquire),
+                self.external_hz.load(Ordering::Acquire),
+            ),
+        }
+    }
+
+    pub fn set_scaling_filter(&self, filter: DisplayScalingFilter) {
+        self.scaling_filter.store(filter as u32, Ordering::Release);
+    }
+
+    pub fn get_scaling_filter(&self) -> DisplayScalingFilter {
+        match self.scaling_filter.load(Ordering::Acquire) {
+            0 => DisplayScalingFilter::NearestInteger,
+            1 => DisplayScalingFilter::Bilinear,
+            2 => DisplayScalingFilter::FsrUpscale,
+            _ => DisplayScalingFilter::FitPreserveAspect,
+        }
+    }
+}
+
+pub static MODESET_MANAGER: DrmModesetManager = DrmModesetManager::new();
