@@ -168,3 +168,120 @@ impl GameIndexTable {
         total
     }
 }
+
+// Zero-allocation parser for Steam ACF/VDF AppManifest descriptors.
+pub struct SteamAppManifestParser;
+
+impl SteamAppManifestParser {
+    // Extract quoted value for a given quoted key within ACF/VDF text.
+    pub fn extract_field<'a>(acf_text: &'a str, key: &str) -> Option<&'a str> {
+        let mut key_pattern = [0u8; 40];
+        let k_bytes = key.as_bytes();
+        if k_bytes.len() + 2 > key_pattern.len() {
+            return None;
+        }
+
+        key_pattern[0] = b'"';
+        key_pattern[1..1 + k_bytes.len()].copy_from_slice(k_bytes);
+        key_pattern[1 + k_bytes.len()] = b'"';
+        let key_str = core::str::from_utf8(&key_pattern[..2 + k_bytes.len()]).ok()?;
+
+        let key_pos = acf_text.find(key_str)?;
+        let rest = &acf_text[key_pos + key_str.len()..];
+
+        // Find opening quote of value
+        let val_start = rest.find('"')? + 1;
+        let val_rest = &rest[val_start..];
+        let val_end = val_rest.find('"')?;
+
+        Some(&val_rest[..val_end])
+    }
+
+    // Parse unsigned integer from string slice in `#![no_std]`.
+    pub fn parse_u64(s: &str) -> Option<u64> {
+        let mut val = 0u64;
+        let bytes = s.trim().as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        }
+        Some(val)
+    }
+
+    // Parse ACF appmanifest payload into structured game metadata entry.
+    pub fn parse_manifest(acf_text: &str, mount_source: GameInstallSource) -> Option<IndexedGameEntry> {
+        let appid_str = Self::extract_field(acf_text, "appid")?;
+        let appid = Self::parse_u64(appid_str)? as u32;
+
+        let name_str = Self::extract_field(acf_text, "name").unwrap_or("Unknown Title");
+        let installdir_str = Self::extract_field(acf_text, "installdir").unwrap_or("");
+        let size_str = Self::extract_field(acf_text, "SizeOnDisk").unwrap_or("0");
+        let size_bytes = Self::parse_u64(size_str).unwrap_or(0);
+        let buildid_str = Self::extract_field(acf_text, "buildid").unwrap_or("0");
+        let buildid = Self::parse_u64(buildid_str).unwrap_or(0) as u32;
+
+        let mut entry = IndexedGameEntry::empty();
+        entry.appid = appid;
+        entry.set_title(name_str);
+        entry.set_install_dir(installdir_str);
+        entry.size_bytes = size_bytes;
+        entry.build_id = buildid;
+        entry.mount_source = mount_source;
+
+        Some(entry)
+    }
+}
+
+// Proton compatibility data and wineprefix directory analyzer.
+pub struct ProtonPrefixDetector;
+
+impl ProtonPrefixDetector {
+    // Inspect whether game has an active Proton compatdata prefix sandbox.
+    pub fn inspect_prefix(entry: &mut IndexedGameEntry, has_drive_c: bool) {
+        if has_drive_c {
+            entry.has_proton_prefix = true;
+            entry.compat_tool = CompatibilityTool::ProtonExperimental;
+
+            // Build relative path compatdata/<appid>/pfx
+            let mut path_buf = [0u8; MAX_PATH_LEN];
+            let prefix_header = b"compatdata/";
+            let pfx_suffix = b"/pfx";
+            let mut pos = 0;
+
+            path_buf[..prefix_header.len()].copy_from_slice(prefix_header);
+            pos += prefix_header.len();
+
+            let mut appid_str = [0u8; 10];
+            let mut v = entry.appid;
+            let mut i = 10;
+            if v == 0 {
+                path_buf[pos] = b'0';
+                pos += 1;
+            } else {
+                while v > 0 {
+                    i -= 1;
+                    appid_str[i] = b'0' + (v % 10) as u8;
+                    v /= 10;
+                }
+                let len = 10 - i;
+                path_buf[pos..pos + len].copy_from_slice(&appid_str[i..10]);
+                pos += len;
+            }
+
+            path_buf[pos..pos + pfx_suffix.len()].copy_from_slice(pfx_suffix);
+            pos += pfx_suffix.len();
+
+            entry.prefix_path[..pos].copy_from_slice(&path_buf[..pos]);
+            entry.prefix_path_len = pos;
+        } else {
+            entry.has_proton_prefix = false;
+            entry.compat_tool = CompatibilityTool::NativeLinux;
+            entry.prefix_path_len = 0;
+        }
+    }
+}
