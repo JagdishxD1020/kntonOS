@@ -6,6 +6,9 @@ pub use device_daemon::*;
 pub mod power_daemon;
 pub use power_daemon::*;
 
+pub mod gamepad_mapper;
+pub use gamepad_mapper::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
