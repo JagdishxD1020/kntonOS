@@ -44,6 +44,8 @@ pub use haptics_daemon::*;
 
 pub mod battery_manager;
 pub use battery_manager::*;
+pub mod speaker_dsp;
+pub use speaker_dsp::*;
 
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

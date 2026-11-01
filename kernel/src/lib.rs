@@ -1622,6 +1622,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-BATMGR-PASS] kntonOS SteamDeck battery health & charging management verified\r\n");
     } else {
         serial_write_str("[KNT-PANIC] Battery management subsystem self-test failed!\r\n");
+    // Verify kntonOS SteamDeck Audio Speaker DSP & Binaural Headphone Spatializer (TASK-KNT-335)
+    if !knton_os::service::verify_speaker_dsp_subsystem() {
+        serial_write_str("[KNT-PANIC] Speaker DSP daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-SPKDSP-PASS] kntonOS SteamDeck speaker DSP & binaural spatializer verified\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
