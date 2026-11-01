@@ -756,3 +756,207 @@ pub fn verify_audio_volume_mixer() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Handheld Gamepad Controller Event Queue & Deadzone Filter
+// ============================================================================
+
+/// Gamepad digital button bitmask flags.
+pub const GAMEPAD_BTN_A: u16            = 1 << 0;
+pub const GAMEPAD_BTN_B: u16            = 1 << 1;
+pub const GAMEPAD_BTN_X: u16            = 1 << 2;
+pub const GAMEPAD_BTN_Y: u16            = 1 << 3;
+pub const GAMEPAD_BTN_DPAD_UP: u16      = 1 << 4;
+pub const GAMEPAD_BTN_DPAD_DOWN: u16    = 1 << 5;
+pub const GAMEPAD_BTN_DPAD_LEFT: u16    = 1 << 6;
+pub const GAMEPAD_BTN_DPAD_RIGHT: u16   = 1 << 7;
+pub const GAMEPAD_BTN_LB: u16           = 1 << 8;
+pub const GAMEPAD_BTN_RB: u16           = 1 << 9;
+pub const GAMEPAD_BTN_THUMB_L: u16      = 1 << 10;
+pub const GAMEPAD_BTN_THUMB_R: u16      = 1 << 11;
+pub const GAMEPAD_BTN_VIEW: u16         = 1 << 12;
+pub const GAMEPAD_BTN_MENU: u16         = 1 << 13;
+pub const GAMEPAD_BTN_QUICK_ACCESS: u16 = 1 << 14;
+
+/// Capacity of the static ring buffer queue storing controller input frames.
+pub const GAMEPAD_QUEUE_CAPACITY: usize = 32;
+
+/// Instantaneous physical controller snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GamepadInputState {
+    /// Digital button states bitmask.
+    pub buttons: u16,
+    /// Left thumbstick X axis (-32768 to 32767).
+    pub thumb_lx: i16,
+    /// Left thumbstick Y axis (-32768 to 32767).
+    pub thumb_ly: i16,
+    /// Right thumbstick X axis (-32768 to 32767).
+    pub thumb_rx: i16,
+    /// Right thumbstick Y axis (-32768 to 32767).
+    pub thumb_ry: i16,
+    /// Left analog trigger travel (0 to 255).
+    pub trigger_l: u8,
+    /// Right analog trigger travel (0 to 255).
+    pub trigger_r: u8,
+    /// High-resolution microsecond timestamp.
+    pub timestamp_us: u64,
+}
+
+impl GamepadInputState {
+    /// Creates a neutral centered controller state.
+    pub const fn new() -> Self {
+        Self {
+            buttons: 0,
+            thumb_lx: 0,
+            thumb_ly: 0,
+            thumb_rx: 0,
+            thumb_ry: 0,
+            trigger_l: 0,
+            trigger_r: 0,
+            timestamp_us: 0,
+        }
+    }
+}
+
+/// Circular event queue and radial deadzone filter for handheld game controllers.
+#[derive(Debug, Clone, Copy)]
+pub struct GamepadEventQueue {
+    /// Ring buffer storing recent input events.
+    pub queue: [GamepadInputState; GAMEPAD_QUEUE_CAPACITY],
+    /// Queue read index.
+    pub head: usize,
+    /// Queue write index.
+    pub tail: usize,
+    /// Total events stored in queue.
+    pub count: usize,
+    /// Radial deadzone threshold for left stick (e.g. 4000 = ~12% deadzone to prevent drift).
+    pub deadzone_radius: i32,
+    /// Low-frequency left rumble motor intensity (0 to 255).
+    pub rumble_left: u8,
+    /// High-frequency right rumble motor intensity (0 to 255).
+    pub rumble_right: u8,
+}
+
+impl GamepadEventQueue {
+    /// Default stick deadzone threshold (4096 out of 32768 = 12.5%).
+    pub const DEFAULT_DEADZONE: i32 = 4096;
+
+    /// Initializes empty gamepad event queue.
+    pub const fn new() -> Self {
+        Self {
+            queue: [GamepadInputState::new(); GAMEPAD_QUEUE_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+            deadzone_radius: Self::DEFAULT_DEADZONE,
+            rumble_left: 0,
+            rumble_right: 0,
+        }
+    }
+
+    /// Applies radial deadzone filter to an analog stick pair (X, Y).
+    pub fn filter_stick_deadzone(&self, raw_x: i16, raw_y: i16) -> (i16, i16) {
+        let x = raw_x as i32;
+        let y = raw_y as i32;
+        // Euclidean magnitude approximation: |x| + |y| or integer hypotenuse
+        let dist_sq = x * x + y * y;
+        let deadzone_sq = self.deadzone_radius * self.deadzone_radius;
+
+        if dist_sq <= deadzone_sq {
+            (0, 0)
+        } else {
+            (raw_x, raw_y)
+        }
+    }
+
+    /// Enqueues a new raw controller input frame with deadzone filtering.
+    pub fn push_event(&mut self, mut raw: GamepadInputState) -> bool {
+        let (flx, fly) = self.filter_stick_deadzone(raw.thumb_lx, raw.thumb_ly);
+        let (frx, fry) = self.filter_stick_deadzone(raw.thumb_rx, raw.thumb_ry);
+
+        raw.thumb_lx = flx;
+        raw.thumb_ly = fly;
+        raw.thumb_rx = frx;
+        raw.thumb_ry = fry;
+
+        if self.count >= GAMEPAD_QUEUE_CAPACITY {
+            // Queue full: overwrite oldest event
+            self.head = (self.head + 1) % GAMEPAD_QUEUE_CAPACITY;
+            self.count -= 1;
+        }
+
+        self.queue[self.tail] = raw;
+        self.tail = (self.tail + 1) % GAMEPAD_QUEUE_CAPACITY;
+        self.count += 1;
+        true
+    }
+
+    /// Dequeues the next pending controller event.
+    pub fn pop_event(&mut self) -> Option<GamepadInputState> {
+        if self.count == 0 {
+            None
+        } else {
+            let event = self.queue[self.head];
+            self.head = (self.head + 1) % GAMEPAD_QUEUE_CAPACITY;
+            self.count -= 1;
+            Some(event)
+        }
+    }
+
+    /// Sets haptic force feedback vibration.
+    pub fn set_rumble(&mut self, left_intensity: u8, right_intensity: u8) {
+        self.rumble_left = left_intensity;
+        self.rumble_right = right_intensity;
+    }
+}
+
+/// Verification test for gamepad controller event queue and deadzone filter.
+pub fn verify_gamepad_event_queue() -> bool {
+    let mut queue = GamepadEventQueue::new();
+
+    // 1. Initial queue state
+    if queue.count != 0 || queue.pop_event().is_some() {
+        return false;
+    }
+
+    // 2. Test Deadzone Filter: stick drift reading (X=1200, Y=-800) within 4096 deadzone
+    let (fx, fy) = queue.filter_stick_deadzone(1200, -800);
+    if fx != 0 || fy != 0 {
+        return false; // Drift was not filtered to 0!
+    }
+
+    // Stick deflection outside deadzone (X=16000, Y=20000)
+    let (real_x, real_y) = queue.filter_stick_deadzone(16000, 20000);
+    if real_x != 16000 || real_y != 20000 {
+        return false;
+    }
+
+    // 3. Push and pop an input event
+    let mut input = GamepadInputState::new();
+    input.buttons = GAMEPAD_BTN_A | GAMEPAD_BTN_QUICK_ACCESS;
+    input.thumb_lx = 18000;
+    input.trigger_r = 250;
+    input.timestamp_us = 50000;
+
+    queue.push_event(input);
+    if queue.count != 1 {
+        return false;
+    }
+
+    let popped = queue.pop_event().unwrap();
+    if popped.buttons != (GAMEPAD_BTN_A | GAMEPAD_BTN_QUICK_ACCESS) || popped.thumb_lx != 18000 || popped.trigger_r != 250 {
+        return false;
+    }
+    if queue.count != 0 {
+        return false;
+    }
+
+    // 4. Test rumble feedback
+    queue.set_rumble(128, 255);
+    if queue.rumble_left != 128 || queue.rumble_right != 255 {
+        return false;
+    }
+
+    true
+}
