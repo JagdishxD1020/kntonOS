@@ -268,3 +268,131 @@ pub fn verify_volume_curve_scaler() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: Master Acoustic Loudness Limiter & Anti-Clipping Dynamics Processor
+// ============================================================================
+
+/// Dynamic Range Compressor (DRC) and anti-clipping peak limiter.
+#[derive(Debug, Clone, Copy)]
+pub struct AcousticLimiter {
+    /// Normal operating ceiling threshold (e.g. 28000 / 32767 = -1.3 dBFS).
+    pub standard_ceiling: i16,
+    /// Power-saving ceiling threshold under low battery (e.g. 20000 = -4.3 dBFS).
+    pub battery_safe_ceiling: i16,
+    /// Battery safe mode active.
+    pub battery_safe_mode: bool,
+    /// Current instantaneous gain reduction scalar in Q8 (256 = unity, < 256 = gain reduced).
+    pub current_gain_q8: u16,
+    /// Counter tracking peak samples clamped by limiter to prevent digital wrap.
+    pub clips_prevented: u32,
+    /// Maximum absolute peak observed during current monitoring window.
+    pub peak_hold: i16,
+}
+
+impl AcousticLimiter {
+    /// Initializes acoustic limiter with handheld speaker protection profile.
+    pub const fn new() -> Self {
+        Self {
+            standard_ceiling: 28000,
+            battery_safe_ceiling: 20000,
+            battery_safe_mode: false,
+            current_gain_q8: 256,
+            clips_prevented: 0,
+            peak_hold: 0,
+        }
+    }
+
+    /// Toggles battery safe loudness mode to protect speaker amplifier rails.
+    pub fn set_battery_safe_mode(&mut self, enabled: bool) {
+        self.battery_safe_mode = enabled;
+    }
+
+    /// Returns the active ceiling threshold.
+    pub const fn active_ceiling(&self) -> i16 {
+        if self.battery_safe_mode {
+            self.battery_safe_ceiling
+        } else {
+            self.standard_ceiling
+        }
+    }
+
+    /// Processes an individual 16-bit PCM sample through the anti-clipping limiter.
+    pub fn process_sample(&mut self, sample: i16) -> i16 {
+        let abs_sample = if sample == i16::MIN {
+            i16::MAX as u32
+        } else {
+            sample.abs() as u32
+        };
+
+        if abs_sample as i16 > self.peak_hold {
+            self.peak_hold = abs_sample as i16;
+        }
+
+        let ceiling = self.active_ceiling() as u32;
+
+        if abs_sample <= ceiling {
+            // Below threshold: smooth release towards unity gain (256)
+            if self.current_gain_q8 < 256 {
+                self.current_gain_q8 = (self.current_gain_q8 + 1).min(256);
+            }
+            sample
+        } else {
+            // Above threshold: fast attack peak limiting
+            self.clips_prevented = self.clips_prevented.saturating_add(1);
+            let target_gain = ((ceiling * 256) / abs_sample) as u16;
+            self.current_gain_q8 = target_gain.min(self.current_gain_q8);
+
+            // Apply limiter attenuation with sign preservation
+            let limited = (sample as i32 * self.current_gain_q8 as i32) / 256;
+            limited.clamp(-(ceiling as i32), ceiling as i32) as i16
+        }
+    }
+
+    /// Resets maximum peak hold register.
+    pub fn reset_peak_hold(&mut self) {
+        self.peak_hold = 0;
+    }
+}
+
+/// Verification test for master acoustic loudness limiter and anti-clipping dynamics processor.
+pub fn verify_acoustic_limiter() -> bool {
+    let mut limiter = AcousticLimiter::new();
+
+    // 1. Initial state checks
+    if limiter.active_ceiling() != 28000 || limiter.current_gain_q8 != 256 || limiter.clips_prevented != 0 {
+        return false;
+    }
+
+    // 2. Normal sample within headroom (15000) passes through unattenuated
+    let out_normal = limiter.process_sample(15000);
+    if out_normal != 15000 || limiter.current_gain_q8 != 256 || limiter.clips_prevented != 0 {
+        return false;
+    }
+
+    // 3. Excessive burst sample exceeding ceiling (32000): should be clamped to <= 28000
+    let out_clipped = limiter.process_sample(32000);
+    if out_clipped > 28000 || limiter.clips_prevented != 1 || limiter.current_gain_q8 >= 256 {
+        return false;
+    }
+
+    // 4. Test battery safe mode (ceiling drops to 20000)
+    limiter.set_battery_safe_mode(true);
+    if limiter.active_ceiling() != 20000 {
+        return false;
+    }
+
+    // 25000 sample now exceeds 20000 ceiling, must be limited to <= 20000
+    let out_bat = limiter.process_sample(25000);
+    if out_bat > 20000 || limiter.clips_prevented < 2 {
+        return false;
+    }
+
+    // 5. Check negative peak clipping symmetry
+    let out_neg = limiter.process_sample(-30000);
+    if out_neg < -20000 {
+        return false;
+    }
+
+    true
+}
+
