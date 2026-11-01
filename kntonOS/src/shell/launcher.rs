@@ -605,14 +605,19 @@ impl DeckGameLauncher {
         self.launch_broker.request_launch(selected, &self.catalog, tick)
     }
 
-    // Handle Quick-Access physical hardware button press (QAM).
-    pub fn handle_quick_access_button(&mut self) {
+    // Handle Quick-Access physical hardware button press (QAM) with tick recording.
+    pub fn handle_quick_access_button_with_tick(&mut self, tick: u64) {
         self.drawer.toggle();
         if self.drawer.is_open && self.launch_broker.is_game_running() {
             let _ = self.launch_broker.suspend();
         } else if !self.drawer.is_open && matches!(self.launch_broker.state(), LaunchState::Suspended { .. }) {
-            let _ = self.launch_broker.resume(0);
+            let _ = self.launch_broker.resume(tick);
         }
+    }
+
+    // Handle Quick-Access physical hardware button press (QAM).
+    pub fn handle_quick_access_button(&mut self) {
+        self.handle_quick_access_button_with_tick(0);
     }
 
     // Handle controller D-pad left navigation.
@@ -651,6 +656,135 @@ impl DeckGameLauncher {
         }
     }
 }
+
+// Comprehensive self-test suite verifying game title catalog, layout grid, launch broker and quick-access drawer.
+pub fn test_os_launcher_subsystem() -> bool {
+    let mut launcher = DeckGameLauncher::new(4, 2, 80, 50, 8, 8);
+
+    // 1. Verify Game Title Metadata & Catalog Registration
+    let game1 = GameTitleMetadata::new(
+        "Knton Cyber Odyssey",
+        "/bin/games/cyber_odyssey.exe",
+        "Knton Game Studios",
+        GameCategory::Action,
+        95,
+        "--fullscreen --renderer=d3d12",
+    );
+    let game2 = GameTitleMetadata::new(
+        "Stellar Fleet Commander",
+        "/bin/games/stellar_fleet.exe",
+        "Nebula Works",
+        GameCategory::Strategy,
+        88,
+        "--vk-sync --low-latency",
+    );
+    let game3 = GameTitleMetadata::new(
+        "Pixel Dungeons 64",
+        "/bin/games/pixel_dungeon.exe",
+        "Retro Lab",
+        GameCategory::Indie,
+        92,
+        "",
+    );
+
+    let idx1 = match launcher.register_title(game1) {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+    let idx2 = match launcher.register_title(game2) {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+    let _idx3 = match launcher.register_title(game3) {
+        Ok(idx) => idx,
+        Err(_) => return false,
+    };
+
+    if launcher.catalog.total_games() != 3 {
+        return false;
+    }
+    if launcher.catalog.count_by_category(GameCategory::Action) != 1 {
+        return false;
+    }
+    if launcher.catalog.find_by_title("Stellar Fleet Commander").map(|(i, _)| i) != Some(idx2) {
+        return false;
+    }
+
+    // 2. Verify Thumbnail Grid Controller Navigation and Viewport Calculations
+    if launcher.grid.selected_cell != 0 {
+        return false;
+    }
+    if !launcher.handle_dpad_right() || launcher.grid.selected_cell != 1 {
+        return false;
+    }
+    if !launcher.handle_dpad_left() || launcher.grid.selected_cell != 0 {
+        return false;
+    }
+    if launcher.handle_dpad_down() {
+        return false;
+    }
+    if launcher.grid.cell_rect(0, 10, 10) != Some((10, 10, 80, 50)) {
+        return false;
+    }
+
+    // 3. Verify Process Launch Broker & Execution Lifecycle
+    let pid = match launcher.launch_selected(100) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if pid < 2000 || !launcher.launch_broker.is_game_running() {
+        return false;
+    }
+    if launcher.launch_broker.active_title_index() != Some(idx1) {
+        return false;
+    }
+
+    // 4. Verify Quick-Access Hardware Drawer & Process Suspension
+    launcher.handle_quick_access_button();
+    if !launcher.drawer.is_open {
+        return false;
+    }
+    if !matches!(launcher.launch_broker.state(), LaunchState::Suspended { .. }) {
+        return false;
+    }
+
+    // Test hardware slider clamp limits and DRRS / GPU profile switching
+    launcher.drawer.set_tdp(35);
+    if launcher.drawer.target_tdp_watts != 30 {
+        return false;
+    }
+    launcher.drawer.set_tdp(2);
+    if launcher.drawer.target_tdp_watts != 5 {
+        return false;
+    }
+    launcher.drawer.set_tdp(15);
+
+    launcher.drawer.cycle_refresh_rate();
+    if launcher.drawer.refresh_rate != DrrsRefreshRate::Hz120 {
+        return false;
+    }
+    launcher.drawer.cycle_gpu_profile();
+    if launcher.drawer.gpu_profile != GpuClockProfile::PowerSave {
+        return false;
+    }
+
+    // Close quick-access drawer and resume execution
+    launcher.handle_quick_access_button_with_tick(100);
+    if launcher.drawer.is_open || !launcher.launch_broker.is_game_running() {
+        return false;
+    }
+
+    // Terminate running game process and verify play time tracking
+    if launcher.launch_broker.terminate(0, &mut launcher.catalog, 160).is_err() {
+        return false;
+    }
+    if launcher.catalog.get_game(idx1).map(|g| g.play_time_seconds) != Some(60) {
+        return false;
+    }
+
+    true
+}
+
 
 
 

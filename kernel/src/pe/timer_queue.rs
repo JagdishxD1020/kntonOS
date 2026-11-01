@@ -480,8 +480,8 @@ pub fn test_win32_timer_queue_subsystem() -> bool {
             tq,
             Some(test_timer_callback),
             core::ptr::null_mut(),
-            10,
-            20,
+            10_000,
+            20_000,
             WT_EXECUTEDEFAULT,
         );
         if created != TRUE || timer_handle == 0 {
@@ -498,7 +498,7 @@ pub fn test_win32_timer_queue_subsystem() -> bool {
             return false;
         }
 
-        let due_fires = win32_step_timer_queue_ticks(15);
+        let due_fires = win32_step_timer_queue_ticks(15_000);
         if due_fires != 1 || TEST_TIMER_CALLBACK_FIRED.load(Ordering::SeqCst) < 1 {
             return false;
         }

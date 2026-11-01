@@ -50,5 +50,5 @@ pub fn verify_game_mode_shell() -> bool {
         return false;
     }
 
-    true
+    launcher::test_os_launcher_subsystem()
 }

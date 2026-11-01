@@ -994,6 +994,13 @@ pub fn test_game_shell_subsystem() -> bool {
     }
     crate::serial_write_str("  * Transparent framebuffer blitting and clipping boundaries verified\r\n");
 
+    // 4. Verify kntonOS Deck Game Launcher & Quick-Access Hardware Menu (TASK-KNT-319)
+    if !knton_os::shell::test_os_launcher_subsystem() {
+        crate::serial_write_str("[KNT-SHELL-FAIL] kntonOS game launcher self-test failed!\r\n");
+        return false;
+    }
+    crate::serial_write_str("[KNT-OS-LAUNCHER-PASS] kntonOS game launcher and quick-access hardware drawer verified\r\n");
+
     crate::serial_write_str("[KNT-GAME-SHELL-PASS] Handheld gaming shell, launcher and telemetry HUD verified\r\n");
     true
 }
