@@ -528,3 +528,207 @@ impl TrackpadHapticGenerator {
         (self.total_clicks_emitted, self.total_ratchets_emitted)
     }
 }
+
+// Operating thermal protection safety classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalSafetyState {
+    Normal,
+    WarningThrottled,
+    CriticalTrip,
+}
+
+// Thermal protection limiter and coil overload monitor preventing LRA burnout.
+pub struct MotorThermalLimiter {
+    pub ambient_temp_c: u8,
+    pub estimated_temp_c: u8,
+    heat_accumulator: u32,
+    pub state: ThermalSafetyState,
+    pub trip_count: u32,
+    pub throttle_count: u32,
+}
+
+impl MotorThermalLimiter {
+    // Construct thermal safety monitor with specified chassis ambient baseline.
+    pub const fn new(ambient_temp_c: u8) -> Self {
+        Self {
+            ambient_temp_c,
+            estimated_temp_c: ambient_temp_c,
+            heat_accumulator: (ambient_temp_c as u32) * 1000,
+            state: ThermalSafetyState::Normal,
+            trip_count: 0,
+            throttle_count: 0,
+        }
+    }
+
+    // Step thermal simulation by delta_ms given active driving amplitude percentage [0..100].
+    pub fn tick_ms(&mut self, amplitude_pct: u8, delta_ms: u16) {
+        // Heating power proportional to square of coil current/amplitude: P = I^2 * R
+        let p_heat = (amplitude_pct as u32 * amplitude_pct as u32 * 6) / 100;
+        let delta = delta_ms as u32;
+        let heat_added = p_heat * delta;
+
+        // Passive convective/conductive heat dissipation towards ambient
+        let cur_temp = self.heat_accumulator / 1000;
+        let diff_to_ambient = cur_temp.saturating_sub(self.ambient_temp_c as u32);
+        let heat_dissipated = (diff_to_ambient * 4 * delta) / 10;
+
+        self.heat_accumulator = self.heat_accumulator
+            .saturating_add(heat_added)
+            .saturating_sub(heat_dissipated);
+
+        // Keep accumulator at or above ambient
+        let min_accum = (self.ambient_temp_c as u32) * 1000;
+        if self.heat_accumulator < min_accum {
+            self.heat_accumulator = min_accum;
+        }
+
+        self.estimated_temp_c = ((self.heat_accumulator / 1000).min(125)) as u8;
+
+        // Evaluate safety state with hysteresis recovery
+        match self.state {
+            ThermalSafetyState::Normal => {
+                if self.estimated_temp_c >= 75 {
+                    self.state = ThermalSafetyState::CriticalTrip;
+                    self.trip_count += 1;
+                } else if self.estimated_temp_c >= 60 {
+                    self.state = ThermalSafetyState::WarningThrottled;
+                    self.throttle_count += 1;
+                }
+            }
+            ThermalSafetyState::WarningThrottled => {
+                if self.estimated_temp_c >= 75 {
+                    self.state = ThermalSafetyState::CriticalTrip;
+                    self.trip_count += 1;
+                } else if self.estimated_temp_c <= 50 {
+                    self.state = ThermalSafetyState::Normal;
+                }
+            }
+            ThermalSafetyState::CriticalTrip => {
+                if self.estimated_temp_c <= 52 {
+                    self.state = ThermalSafetyState::Normal;
+                }
+            }
+        }
+    }
+
+    // Filter requested excitation amplitude according to active thermal safety state.
+    pub fn regulate_amplitude(&self, requested_amplitude: u8) -> u8 {
+        match self.state {
+            ThermalSafetyState::Normal => requested_amplitude,
+            ThermalSafetyState::WarningThrottled => (requested_amplitude / 2).min(50),
+            ThermalSafetyState::CriticalTrip => 0,
+        }
+    }
+
+    // Check if motor drive is completely inhibited due to thermal emergency.
+    pub fn is_tripped(&self) -> bool {
+        self.state == ThermalSafetyState::CriticalTrip
+    }
+}
+
+// Integrated SteamDeck audio-haptic feedback and DSP rumble daemon supervisor.
+pub struct SteamDeckHapticsDaemon {
+    pub dual_lra: DualLraController,
+    pub audio_filter: AudioToHapticsDspFilter,
+    pub trackpad_left: TrackpadHapticGenerator,
+    pub trackpad_right: TrackpadHapticGenerator,
+    pub thermal_left: MotorThermalLimiter,
+    pub thermal_right: MotorThermalLimiter,
+}
+
+impl SteamDeckHapticsDaemon {
+    // Construct initialized haptics daemon supervisor.
+    pub const fn new() -> Self {
+        Self {
+            dual_lra: DualLraController::new(),
+            audio_filter: AudioToHapticsDspFilter::new(AudioDspFilterConfig::default_48k()),
+            trackpad_left: TrackpadHapticGenerator::new(TrackpadHapticConfig::default_config()),
+            trackpad_right: TrackpadHapticGenerator::new(TrackpadHapticConfig::default_config()),
+            thermal_left: MotorThermalLimiter::new(35),
+            thermal_right: MotorThermalLimiter::new(35),
+        }
+    }
+
+    // Trigger haptic waveform pulse on specified channel subject to thermal limits.
+    pub fn trigger_haptic(&mut self, channel: HapticChannel, mut params: WaveformParameters) -> bool {
+        let left_amp = self.thermal_left.regulate_amplitude(params.amplitude_pct);
+        let right_amp = self.thermal_right.regulate_amplitude(params.amplitude_pct);
+
+        match channel {
+            HapticChannel::Left => {
+                if left_amp == 0 {
+                    return false;
+                }
+                params.amplitude_pct = left_amp;
+                self.dual_lra.left.play_waveform(params);
+                true
+            }
+            HapticChannel::Right => {
+                if right_amp == 0 {
+                    return false;
+                }
+                params.amplitude_pct = right_amp;
+                self.dual_lra.right.play_waveform(params);
+                true
+            }
+            HapticChannel::Both => {
+                let both_active = left_amp > 0 || right_amp > 0;
+                if left_amp > 0 {
+                    let mut p = params;
+                    p.amplitude_pct = left_amp;
+                    self.dual_lra.left.play_waveform(p);
+                }
+                if right_amp > 0 {
+                    let mut p = params;
+                    p.amplitude_pct = right_amp;
+                    self.dual_lra.right.play_waveform(p);
+                }
+                both_active
+            }
+        }
+    }
+
+    // Process incoming audio PCM block and dynamically synthesize bass rumble.
+    pub fn process_audio_block(&mut self, samples: &[i16]) -> bool {
+        let res_left = self.dual_lra.left.config.resonant_freq_hz;
+        if let Some(params) = self.audio_filter.transcode_to_haptic(samples, res_left) {
+            self.trigger_haptic(HapticChannel::Both, params)
+        } else {
+            false
+        }
+    }
+
+    // Trigger capacitive trackpad click feel.
+    pub fn trigger_trackpad_click(&mut self, channel: HapticChannel, profile: TrackpadClickProfile) -> bool {
+        let resonant = match channel {
+            HapticChannel::Left => self.dual_lra.left.config.resonant_freq_hz,
+            HapticChannel::Right => self.dual_lra.right.config.resonant_freq_hz,
+            HapticChannel::Both => 200,
+        };
+
+        let params = match channel {
+            HapticChannel::Left => self.trackpad_left.synthesize_profile(profile, resonant),
+            HapticChannel::Right => self.trackpad_right.synthesize_profile(profile, resonant),
+            HapticChannel::Both => self.trackpad_left.synthesize_profile(profile, resonant),
+        };
+
+        self.trigger_haptic(channel, params)
+    }
+
+    // Advance daemon clock tick for thermal decay, active playback, and braking.
+    pub fn tick_ms(&mut self, delta_ms: u16) {
+        let left_amp = self.dual_lra.left.current_params.amplitude_pct;
+        let right_amp = self.dual_lra.right.current_params.amplitude_pct;
+
+        self.thermal_left.tick_ms(
+            if self.dual_lra.left.is_active() { left_amp } else { 0 },
+            delta_ms,
+        );
+        self.thermal_right.tick_ms(
+            if self.dual_lra.right.is_active() { right_amp } else { 0 },
+            delta_ms,
+        );
+
+        self.dual_lra.tick_ms(delta_ms);
+    }
+}
