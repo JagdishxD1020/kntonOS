@@ -111,3 +111,99 @@ impl UserRuntimeManager {
 }
 
 pub static USER_RUNTIME_MGR: UserRuntimeManager = UserRuntimeManager::new();
+
+pub const SYS_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x0018;
+pub const SYS_NT_CREATE_THREAD_EX: u32 = 0x00B4;
+pub const SYS_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x0004;
+pub const SYS_NT_YIELD_EXECUTION: u32 = 0x0046;
+
+/// High-performance Syscall Callgate Dispatcher processing NT syscall requests.
+pub struct SyscallCallgateDispatcher {
+    total_dispatched: AtomicU64,
+    allocated_virtual_bytes: AtomicU64,
+    created_threads_count: AtomicU64,
+    yield_count: AtomicU64,
+}
+
+impl SyscallCallgateDispatcher {
+    pub const fn new() -> Self {
+        Self {
+            total_dispatched: AtomicU64::new(0),
+            allocated_virtual_bytes: AtomicU64::new(0),
+            created_threads_count: AtomicU64::new(0),
+            yield_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Fast syscall dispatch matching Microsoft x64 calling convention with registers RCX, RDX, R8, R9.
+    pub fn dispatch(
+        &self,
+        syscall_id: u32,
+        arg1_rcx: u64,
+        arg2_rdx: u64,
+        arg3_r8: u64,
+        arg4_r9: u64,
+    ) -> u32 {
+        self.total_dispatched.fetch_add(1, Ordering::Relaxed);
+
+        match syscall_id {
+            SYS_NT_ALLOCATE_VIRTUAL_MEMORY => {
+                // arg1: ProcessHandle, arg2: BaseAddress, arg3: RegionSize, arg4: Protect
+                let process_handle = arg1_rcx;
+                let _base_address = arg2_rdx;
+                let region_size = arg3_r8;
+                let _protect = arg4_r9;
+                if process_handle == 0 || region_size == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.allocated_virtual_bytes.fetch_add(region_size, Ordering::Relaxed);
+                STATUS_SUCCESS
+            }
+            SYS_NT_CREATE_THREAD_EX => {
+                // arg1: ThreadHandle, arg2: DesiredAccess, arg3: StartRoutine, arg4: ProcessHandle
+                let _thread_handle = arg1_rcx;
+                let _access = arg2_rdx;
+                let start_routine = arg3_r8;
+                let process_handle = arg4_r9;
+                if process_handle == 0 || start_routine == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                self.created_threads_count.fetch_add(1, Ordering::Relaxed);
+                STATUS_SUCCESS
+            }
+            SYS_NT_WAIT_FOR_SINGLE_OBJECT => {
+                // arg1: Handle, arg2: Alertable, arg3: Timeout, arg4: Reserved
+                let handle = arg1_rcx;
+                let _alertable = arg2_rdx;
+                let _timeout = arg3_r8;
+                let _reserved = arg4_r9;
+                if handle == 0 {
+                    return STATUS_INVALID_PARAMETER;
+                }
+                STATUS_SUCCESS
+            }
+            SYS_NT_YIELD_EXECUTION => {
+                self.yield_count.fetch_add(1, Ordering::Relaxed);
+                STATUS_SUCCESS
+            }
+            _ => STATUS_INVALID_PARAMETER,
+        }
+    }
+
+    /// Retrieve total syscall requests processed.
+    pub fn get_total_dispatched(&self) -> u64 {
+        self.total_dispatched.load(Ordering::Acquire)
+    }
+
+    /// Retrieve total threads created via NtCreateThreadEx.
+    pub fn get_created_threads(&self) -> u64 {
+        self.created_threads_count.load(Ordering::Acquire)
+    }
+
+    /// Retrieve total yields via NtYieldExecution.
+    pub fn get_yield_count(&self) -> u64 {
+        self.yield_count.load(Ordering::Acquire)
+    }
+}
+
+pub static SYSCALL_CALLGATE: SyscallCallgateDispatcher = SyscallCallgateDispatcher::new();
