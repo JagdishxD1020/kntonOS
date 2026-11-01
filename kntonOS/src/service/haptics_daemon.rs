@@ -268,3 +268,138 @@ impl DualLraController {
         self.right.stop_with_braking();
     }
 }
+
+// Configuration for real-time audio-to-haptics DSP bass extraction filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioDspFilterConfig {
+    pub sample_rate_hz: u32,
+    pub cutoff_freq_hz: u16,
+    pub threshold_amplitude: i16,
+    pub bass_boost_gain: u8,
+    pub enabled: bool,
+}
+
+impl AudioDspFilterConfig {
+    // Construct default 150 Hz sub-bass transcode filter for 48kHz audio streams.
+    pub const fn default_48k() -> Self {
+        Self {
+            sample_rate_hz: 48000,
+            cutoff_freq_hz: 150,
+            threshold_amplitude: 3200,
+            bass_boost_gain: 2,
+            enabled: true,
+        }
+    }
+}
+
+// Result of audio PCM chunk analysis for tactile transducer excitation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioHapticAnalysis {
+    pub punch_detected: bool,
+    pub peak_bass_energy: u32,
+    pub recommended_amplitude_pct: u8,
+    pub pulse_duration_ms: u16,
+}
+
+// Low-latency audio-to-haptics DSP transcode filter extracting punch < 150 Hz.
+pub struct AudioToHapticsDspFilter {
+    pub config: AudioDspFilterConfig,
+    lowpass_accumulator: i32,
+    envelope_energy: u32,
+    total_samples_processed: u64,
+    total_punches_detected: u32,
+}
+
+impl AudioToHapticsDspFilter {
+    // Construct DSP filter instance.
+    pub const fn new(config: AudioDspFilterConfig) -> Self {
+        Self {
+            config,
+            lowpass_accumulator: 0,
+            envelope_energy: 0,
+            total_samples_processed: 0,
+            total_punches_detected: 0,
+        }
+    }
+
+    // Process a single signed 16-bit PCM audio sample through 150 Hz low-pass filter.
+    pub fn filter_sample(&mut self, sample: i16) -> i16 {
+        if !self.config.enabled {
+            return 0;
+        }
+
+        // Fixed-point single-pole IIR filter: alpha = (2 * pi * 150) / 48000 ~= 20 / 1024
+        let input_val = sample as i32;
+        let diff = input_val - (self.lowpass_accumulator >> 10);
+        self.lowpass_accumulator += diff * 20;
+
+        let filtered_sample = (self.lowpass_accumulator >> 10).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let abs_val = filtered_sample.unsigned_abs() as u32;
+
+        // Peak envelope follower with instant attack and exponential decay
+        if abs_val > self.envelope_energy {
+            self.envelope_energy = abs_val;
+        } else {
+            // Decay by ~1/128 per sample (approx 10ms decay at 48kHz)
+            self.envelope_energy = self.envelope_energy.saturating_sub(self.envelope_energy >> 7);
+        }
+
+        self.total_samples_processed += 1;
+        filtered_sample
+    }
+
+    // Analyze a chunk of audio PCM samples and produce haptic rumble parameters.
+    pub fn process_chunk(&mut self, samples: &[i16]) -> AudioHapticAnalysis {
+        let mut max_filtered_energy = 0u32;
+
+        for &sample in samples {
+            let filtered = self.filter_sample(sample);
+            let energy = filtered.unsigned_abs() as u32;
+            if energy > max_filtered_energy {
+                max_filtered_energy = energy;
+            }
+        }
+
+        let thresh = self.config.threshold_amplitude as u32;
+        let punch = max_filtered_energy > thresh;
+
+        let amp_pct = if punch {
+            self.total_punches_detected += 1;
+            let excess = max_filtered_energy.saturating_sub(thresh);
+            // Dynamic range compression and bass boost scaling
+            let raw_pct = 20 + (((excess * self.config.bass_boost_gain as u32) * 80) / (32767 - thresh));
+            (raw_pct.min(100)) as u8
+        } else {
+            0
+        };
+
+        // Standard tactile transient duration for low-end punch
+        let duration = if punch {
+            if amp_pct > 60 { 24 } else { 16 }
+        } else {
+            0
+        };
+
+        AudioHapticAnalysis {
+            punch_detected: punch,
+            peak_bass_energy: max_filtered_energy,
+            recommended_amplitude_pct: amp_pct,
+            pulse_duration_ms: duration,
+        }
+    }
+
+    // Transcode audio chunk directly into tactile waveform command for resonant actuator.
+    pub fn transcode_to_haptic(&mut self, samples: &[i16], resonant_freq_hz: u16) -> Option<WaveformParameters> {
+        let analysis = self.process_chunk(samples);
+        if analysis.punch_detected && analysis.recommended_amplitude_pct > 0 {
+            Some(WaveformParameters::new(
+                HapticWaveform::Sine,
+                resonant_freq_hz,
+                analysis.recommended_amplitude_pct,
+                analysis.pulse_duration_ms,
+            ))
+        } else {
+            None
+        }
+    }
+}
