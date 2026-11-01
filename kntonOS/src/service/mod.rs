@@ -27,6 +27,9 @@ pub use bluetooth_daemon::*;
 pub mod perf_overlay;
 pub use perf_overlay::*;
 
+pub mod haptics_daemon;
+pub use haptics_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
