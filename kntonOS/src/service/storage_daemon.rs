@@ -712,3 +712,124 @@ impl IoThroughputGovernor {
 }
 
 pub static IO_GOVERNOR: IoThroughputGovernor = IoThroughputGovernor::new();
+
+/// Comprehensive verification self-test for SteamDeck Storage & SD Card Hotplug Automount Daemon.
+pub fn verify_storage_daemon_subsystem() -> bool {
+    // 1. MicroSD UHS-I Hotplug Detection
+    let cid = CardCid {
+        manufacturer_id: 0x03,
+        oem_id: *b"SD",
+        product_name: *b"SD512",
+        product_rev: 0x10,
+        serial_number: 0x12345678,
+    };
+    let csd = CardCsd {
+        capacity_sectors: 1_000_000_000,
+        sector_size_bytes: 512,
+        max_transfer_speed_mbps: 104,
+    };
+
+    SD_DETECTOR.handle_insert(cid, csd, UhsSpeedMode::Sdr104);
+    if !SD_DETECTOR.is_card_present() {
+        return false;
+    }
+    if SD_DETECTOR.get_state() != CardState::Ready {
+        return false;
+    }
+    if SD_DETECTOR.get_speed_mode() != UhsSpeedMode::Sdr104 {
+        return false;
+    }
+    if SD_DETECTOR.get_capacity_bytes() < 500_000_000_000 {
+        return false;
+    }
+
+    // 2. Block Partition Scanner (MBR layout)
+    let mut mbr_sector = [0u8; SECTOR_SIZE];
+    mbr_sector[510] = 0x55;
+    mbr_sector[511] = 0xAA;
+
+    let p_offset = 446;
+    mbr_sector[p_offset] = 0x00;        // non-bootable
+    mbr_sector[p_offset + 4] = 0x83;    // Linux ext4
+    // Start LBA: 2048 (0x00000800)
+    mbr_sector[p_offset + 8] = 0x00;
+    mbr_sector[p_offset + 9] = 0x08;
+    mbr_sector[p_offset + 10] = 0x00;
+    mbr_sector[p_offset + 11] = 0x00;
+    // Sector count: 999_990_000 (0x3B9AC970)
+    mbr_sector[p_offset + 12] = 0x70;
+    mbr_sector[p_offset + 13] = 0xC9;
+    mbr_sector[p_offset + 14] = 0x9A;
+    mbr_sector[p_offset + 15] = 0x3B;
+
+    if PARTITION_SCANNER.parse_mbr(&mbr_sector).is_err() {
+        return false;
+    }
+    if PARTITION_SCANNER.partition_count() != 1 {
+        return false;
+    }
+
+    let part = match PARTITION_SCANNER.get_partition(0) {
+        Some(p) => p,
+        None => return false,
+    };
+    if part.partition_type != PartitionType::MbrLinux || part.start_lba != 2048 {
+        return false;
+    }
+
+    // 3. Userland Filesystem Automounter & Steam Library Provisioning
+    let mount_desc = match FS_AUTOMOUNTER.automount_partition(&part, DEFAULT_SDCARD_MOUNT) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+
+    if mount_desc.fs_type != FilesystemType::Ext4 || !mount_desc.steam_library_valid {
+        return false;
+    }
+    if !FS_AUTOMOUNTER.is_mounted() || !FS_AUTOMOUNTER.is_steam_ready() {
+        return false;
+    }
+
+    // 4. Dynamic Storage Telemetry & I/O Rate Governor
+    let mut telem = StorageTelemetry::new(512_000_000_000, 200_000_000_000);
+    if telem.used_bytes != 312_000_000_000 || telem.usage_pct != 60 {
+        return false;
+    }
+    telem.update_free(100_000_000_000);
+    if telem.usage_pct != 80 {
+        return false;
+    }
+
+    // Test I/O Governor
+    if IO_GOVERNOR.request_io(1024 * 1024, false).is_err() {
+        return false;
+    }
+    IO_GOVERNOR.set_game_mode(true);
+    if !IO_GOVERNOR.is_game_mode_active() {
+        return false;
+    }
+    // Attempt large write (10 MB) exceeding game mode burst cap (2 MB) -> must be throttled
+    if IO_GOVERNOR.request_io(10 * 1024 * 1024, true).is_ok() {
+        return false;
+    }
+    // Moderate write (512 KB) must succeed
+    if IO_GOVERNOR.request_io(512 * 1024, true).is_err() {
+        return false;
+    }
+    IO_GOVERNOR.set_game_mode(false);
+
+    // 5. Clean Teardown
+    if FS_AUTOMOUNTER.unmount().is_err() {
+        return false;
+    }
+    if FS_AUTOMOUNTER.is_mounted() {
+        return false;
+    }
+
+    SD_DETECTOR.handle_remove();
+    if SD_DETECTOR.is_card_present() {
+        return false;
+    }
+
+    true
+}
