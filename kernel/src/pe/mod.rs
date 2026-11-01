@@ -62,6 +62,8 @@ pub mod large_page_free;
 pub mod pmu_sampler;
 pub mod safe_seh_guard;
 pub mod cfi_unwind;
+pub mod session_manager;
+pub use session_manager::*;
 
 pub use header::*;
 pub use ntdll::*;
