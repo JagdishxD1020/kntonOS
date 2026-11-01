@@ -266,3 +266,107 @@ impl PassthroughGovernor {
 }
 
 pub static PASSTHROUGH_GOVERNOR: PassthroughGovernor = PassthroughGovernor::new();
+
+
+// ============================================================================
+// Feature 3: Low-Temperature Lithium Inhibitor & Dynamic Current Throttling
+// ============================================================================
+
+/// JEITA battery thermal safety charging zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JeitaZone {
+    /// Below 0°C: Lithium metal plating risk; charging prohibited (0 mA).
+    UnderTempInhibit,
+    /// 0°C to 10°C: Low ion mobility; current severely throttled (max 1000 mA, 8.2V).
+    ColdThrottled,
+    /// 10°C to 45°C: Nominal charging window; full fast charge (max 3000 mA, 8.7V).
+    StandardNormal,
+    /// 45°C to 55°C: High cell temperature; current throttled (max 1200 mA, 8.2V).
+    WarmThrottled,
+    /// Above 55°C: Thermal runaway safety cutoff; charging prohibited (0 mA).
+    OverTempInhibit,
+}
+
+/// JEITA dynamic thermal charging envelope profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JeitaThermalProfile {
+    pub zone: JeitaZone,
+    pub max_charge_current_ma: u32,
+    pub max_charge_voltage_mv: u32,
+    pub is_charging_permitted: bool,
+}
+
+/// Dynamic charge current governor and low-temperature lithium inhibitor.
+pub struct DynamicCurrentThrottle {
+    active_zone: AtomicU32, // JeitaZone as u32
+    allowed_charge_current_ma: AtomicU32,
+    max_charge_voltage_mv: AtomicU32,
+    is_charging_inhibited: AtomicBool,
+}
+
+impl DynamicCurrentThrottle {
+    pub const fn new() -> Self {
+        Self {
+            active_zone: AtomicU32::new(JeitaZone::StandardNormal as u32),
+            allowed_charge_current_ma: AtomicU32::new(3_000), // Standard 3A charge current
+            max_charge_voltage_mv: AtomicU32::new(STEAMDECK_FULL_VOLTAGE_MV),
+            is_charging_inhibited: AtomicBool::new(false),
+        }
+    }
+
+    /// Evaluates cell temperature against JEITA safety envelope and throttles current.
+    pub fn evaluate(&self, cell_temp_mdeg_c: i32, charger_max_ma: u32) -> JeitaThermalProfile {
+        let (zone, max_ma, max_mv, permitted) = if cell_temp_mdeg_c < 0 {
+            // Below 0°C: Absolute freeze cutoff to prevent catastrophic lithium dendritic plating
+            (JeitaZone::UnderTempInhibit, 0, 0, false)
+        } else if cell_temp_mdeg_c < 10_000 {
+            // 0°C .. 10°C: Cold throttle (0.25C max)
+            (JeitaZone::ColdThrottled, 1_000.min(charger_max_ma), 8_200, true)
+        } else if cell_temp_mdeg_c <= 45_000 {
+            // 10°C .. 45°C: Full fast charging
+            (JeitaZone::StandardNormal, 3_000.min(charger_max_ma), STEAMDECK_FULL_VOLTAGE_MV, true)
+        } else if cell_temp_mdeg_c < 55_000 {
+            // 45°C .. 55°C: Warm throttle
+            (JeitaZone::WarmThrottled, 1_200.min(charger_max_ma), 8_200, true)
+        } else {
+            // >= 55°C: Thermal runaway safety cutoff
+            (JeitaZone::OverTempInhibit, 0, 0, false)
+        };
+
+        self.active_zone.store(zone as u32, Ordering::Release);
+        self.allowed_charge_current_ma.store(max_ma, Ordering::Release);
+        self.max_charge_voltage_mv.store(max_mv, Ordering::Release);
+        self.is_charging_inhibited.store(!permitted, Ordering::Release);
+
+        JeitaThermalProfile {
+            zone,
+            max_charge_current_ma: max_ma,
+            max_charge_voltage_mv: max_mv,
+            is_charging_permitted: permitted,
+        }
+    }
+
+    pub fn get_allowed_current_ma(&self) -> u32 {
+        self.allowed_charge_current_ma.load(Ordering::Acquire)
+    }
+
+    pub fn get_max_voltage_mv(&self) -> u32 {
+        self.max_charge_voltage_mv.load(Ordering::Acquire)
+    }
+
+    pub fn is_inhibited(&self) -> bool {
+        self.is_charging_inhibited.load(Ordering::Acquire)
+    }
+
+    pub fn get_zone(&self) -> JeitaZone {
+        match self.active_zone.load(Ordering::Acquire) {
+            0 => JeitaZone::UnderTempInhibit,
+            1 => JeitaZone::ColdThrottled,
+            2 => JeitaZone::StandardNormal,
+            3 => JeitaZone::WarmThrottled,
+            _ => JeitaZone::OverTempInhibit,
+        }
+    }
+}
+
+pub static CURRENT_THROTTLE: DynamicCurrentThrottle = DynamicCurrentThrottle::new();
