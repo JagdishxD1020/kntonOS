@@ -549,3 +549,119 @@ pub fn verify_pairing_and_security_store() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Battery Telemetry Reporting for Wireless Controllers
+// ============================================================================
+
+/// Battery power state of wireless gaming controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerBatteryStatus {
+    Discharging,
+    Charging,
+    Full,
+    VoltageLow,
+}
+
+/// Real-time wireless gaming controller battery telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerBatteryTelemetry {
+    pub level_pct: u8,
+    pub status: ControllerBatteryStatus,
+    pub is_cable_connected: bool,
+    pub is_low_battery: bool,
+    pub is_critical: bool,
+}
+
+impl ControllerBatteryTelemetry {
+    pub const fn new() -> Self {
+        Self {
+            level_pct: 100,
+            status: ControllerBatteryStatus::Discharging,
+            is_cable_connected: false,
+            is_low_battery: false,
+            is_critical: false,
+        }
+    }
+
+    /// Decodes PlayStation DualShock 4 / DualSense Bluetooth battery status byte.
+    /// Bit 0..3: Battery capacity (0 = 0%, 10 = 100%).
+    /// Bit 4: Cable connected & charging flag.
+    /// Bit 5: Full capacity flag.
+    pub fn parse_playstation_battery(&mut self, raw_byte: u8) {
+        let capacity_steps = raw_byte & 0x0F;
+        self.level_pct = ((capacity_steps as u16 * 100) / 10).min(100) as u8;
+
+        let charging = (raw_byte & 0x10) != 0;
+        let fully_charged = (raw_byte & 0x20) != 0;
+
+        self.is_cable_connected = charging || fully_charged;
+        if fully_charged {
+            self.status = ControllerBatteryStatus::Full;
+        } else if charging {
+            self.status = ControllerBatteryStatus::Charging;
+        } else if self.level_pct <= 10 {
+            self.status = ControllerBatteryStatus::VoltageLow;
+        } else {
+            self.status = ControllerBatteryStatus::Discharging;
+        }
+
+        self.evaluate_alerts();
+    }
+
+    /// Decodes Standard BLE Battery Service (GATT 0x180F) 0-100% percentage byte.
+    pub fn parse_ble_battery(&mut self, raw_pct: u8) {
+        self.level_pct = raw_pct.min(100);
+        self.is_cable_connected = false;
+        if self.level_pct <= 10 {
+            self.status = ControllerBatteryStatus::VoltageLow;
+        } else {
+            self.status = ControllerBatteryStatus::Discharging;
+        }
+        self.evaluate_alerts();
+    }
+
+    fn evaluate_alerts(&mut self) {
+        self.is_critical = self.level_pct <= 5 && self.status != ControllerBatteryStatus::Charging;
+        self.is_low_battery = self.level_pct <= 15 && self.status != ControllerBatteryStatus::Charging;
+    }
+}
+
+/// Verification test for wireless controller battery telemetry reporting.
+pub fn verify_controller_battery_telemetry() -> bool {
+    let mut bat = ControllerBatteryTelemetry::new();
+
+    // 1. Initial defaults
+    if bat.level_pct != 100 || bat.status != ControllerBatteryStatus::Discharging {
+        return false;
+    }
+
+    // 2. DualSense: 70% capacity (step 7), discharging (0x07)
+    bat.parse_playstation_battery(0x07);
+    if bat.level_pct != 70 || bat.status != ControllerBatteryStatus::Discharging || bat.is_cable_connected {
+        return false;
+    }
+    if bat.is_low_battery || bat.is_critical {
+        return false;
+    }
+
+    // 3. DualSense: 40% capacity, plugged in & charging (step 4 | 0x10 = 0x14)
+    bat.parse_playstation_battery(0x14);
+    if bat.level_pct != 40 || bat.status != ControllerBatteryStatus::Charging || !bat.is_cable_connected {
+        return false;
+    }
+
+    // 4. DualSense: 10% capacity, unplugged discharging (step 1 = 10%)
+    bat.parse_playstation_battery(0x01);
+    if bat.level_pct != 10 || bat.status != ControllerBatteryStatus::VoltageLow || !bat.is_low_battery {
+        return false;
+    }
+
+    // 5. BLE Battery Service: 5% critical battery
+    bat.parse_ble_battery(5);
+    if bat.level_pct != 5 || !bat.is_critical || !bat.is_low_battery {
+        return false;
+    }
+
+    true
+}
+
