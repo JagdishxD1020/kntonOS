@@ -1514,10 +1514,17 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // Verify kntonOS Device Hardware Daemon & Input Event Dispatcher (TASK-KNT-318)
-    if !kntonOS::service::verify_device_daemon_subsystem() {
+    if !knton_os::service::verify_device_daemon_subsystem() {
         serial_write_str("[KNT-PANIC] Device hardware daemon self-test failed!\r\n");
     } else {
         serial_write_str("[KNT-OS-DEVICE-DAEMON-PASS] kntonOS device hardware daemon and input event dispatcher verified\r\n");
+    }
+
+    // Verify kntonOS Userland IPC Port Service & Message Dispatcher (TASK-KNT-320)
+    if knton_os::ipc::verify_ipc_dispatcher_subsystem() {
+        serial_write_str("[KNT-OS-IPC-PASS] kntonOS userland IPC port service and message dispatcher verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] kntonOS userland IPC dispatcher self-test failed!\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
