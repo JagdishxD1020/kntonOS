@@ -2,9 +2,11 @@
 
 pub mod port;
 pub mod ring;
+pub mod channel;
 
 pub use port::*;
 pub use ring::*;
+pub use channel::*;
 
 pub const MAX_PORT_PAYLOAD: usize = 64;
 
