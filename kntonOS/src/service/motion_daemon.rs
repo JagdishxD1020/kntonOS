@@ -611,3 +611,152 @@ impl GyroAimPipeline {
 
 pub static TOUCH_GATE: CapacitiveTouchGate = CapacitiveTouchGate::new();
 pub static AIM_PIPELINE: GyroAimPipeline = GyroAimPipeline::new();
+
+
+// ============================================================================
+// Feature 4: Shake, Tilt, and Drop Emergency Free-Fall Detection Triggers
+// ============================================================================
+
+/// Handheld tilt posture classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TiltPosture {
+    /// Normal handheld gaming viewing angle (pitch 15°..45° upward).
+    UprightGaming,
+    /// Laid flat on flat surface (dock/table).
+    FlatOnTable,
+    /// Screen facing down (privacy/mute/sleep trigger).
+    FaceDown,
+    /// Steering tilt left (> 30° roll).
+    SteerLeft,
+    /// Steering tilt right (> 30° roll).
+    SteerRight,
+}
+
+/// Motion gesture supervisor and drop emergency detector.
+pub struct MotionGestureSupervisor {
+    freefall_active: AtomicBool,
+    freefall_ticks: AtomicU32,
+    freefall_start_us: AtomicU64,
+    freefall_duration_ms: AtomicU32,
+
+    shake_detected: AtomicBool,
+    shake_energy_accum: AtomicI32,
+    last_accel_x: AtomicI32,
+
+    tilt_posture: AtomicU32, // TiltPosture as u32
+}
+
+impl MotionGestureSupervisor {
+    pub const fn new() -> Self {
+        Self {
+            freefall_active: AtomicBool::new(false),
+            freefall_ticks: AtomicU32::new(0),
+            freefall_start_us: AtomicU64::new(0),
+            freefall_duration_ms: AtomicU32::new(0),
+
+            shake_detected: AtomicBool::new(false),
+            shake_energy_accum: AtomicI32::new(0),
+            last_accel_x: AtomicI32::new(0),
+
+            tilt_posture: AtomicU32::new(0),
+        }
+    }
+
+    /// Evaluates linear acceleration and orientation for free-fall, shake, and tilt triggers.
+    pub fn update(&self, sample: &MotionSample, orientation: &OrientationEuler) {
+        let ax = sample.accel_mg[0] as i64;
+        let ay = sample.accel_mg[1] as i64;
+        let az = sample.accel_mg[2] as i64;
+
+        // 1. Drop & Free-Fall Emergency Detector
+        // In free-fall, acceleration magnitude drops to near zero (|a| < 250 mg)
+        let mag_sq = ax * ax + ay * ay + az * az;
+        let is_weightless = mag_sq < 62_500; // < 250^2 mg^2
+
+        if is_weightless {
+            let ticks = self.freefall_ticks.fetch_add(1, Ordering::AcqRel) + 1;
+            if ticks == 1 {
+                self.freefall_start_us.store(sample.timestamp_us, Ordering::Release);
+            }
+            if ticks >= 10 { // 10 ticks @ 200 Hz = 50ms sustained weightlessness
+                self.freefall_active.store(true, Ordering::Release);
+                let start = self.freefall_start_us.load(Ordering::Acquire);
+                let dur_ms = ((sample.timestamp_us - start) / 1000) as u32;
+                self.freefall_duration_ms.store(dur_ms, Ordering::Release);
+            }
+        } else {
+            self.freefall_ticks.store(0, Ordering::Release);
+            self.freefall_active.store(false, Ordering::Release);
+        }
+
+        // 2. Shake Gesture Detector
+        // Measures high dynamic acceleration jerk on X axis (lateral shake)
+        let prev_x = self.last_accel_x.swap(sample.accel_mg[0], Ordering::AcqRel);
+        let jerk = (sample.accel_mg[0] - prev_x).abs();
+        if jerk > 1200 { // Rapid change in lateral acceleration
+            let accum = self.shake_energy_accum.fetch_add(jerk, Ordering::AcqRel) + jerk;
+            if accum > 3000 {
+                self.shake_detected.store(true, Ordering::Release);
+            }
+        } else {
+            let cur = self.shake_energy_accum.load(Ordering::Acquire);
+            if cur > 100 {
+                self.shake_energy_accum.fetch_sub(100, Ordering::Release);
+            } else {
+                self.shake_energy_accum.store(0, Ordering::Release);
+                self.shake_detected.store(false, Ordering::Release);
+            }
+        }
+
+        // 3. Handheld Tilt Posture Classification
+        // Face down: Z acceleration is strongly negative (gravity pointing up into screen)
+        let posture = if sample.accel_mg[2] < -700 {
+            TiltPosture::FaceDown
+        } else if orientation.roll_mdeg < -30_000 {
+            TiltPosture::SteerLeft
+        } else if orientation.roll_mdeg > 30_000 {
+            TiltPosture::SteerRight
+        } else if sample.accel_mg[2] > 900 && sample.accel_mg[1].abs() < 200 {
+            TiltPosture::FlatOnTable
+        } else {
+            TiltPosture::UprightGaming
+        };
+
+        self.tilt_posture.store(posture as u32, Ordering::Release);
+    }
+
+    pub fn is_freefall_detected(&self) -> bool {
+        self.freefall_active.load(Ordering::Acquire)
+    }
+
+    pub fn get_freefall_duration_ms(&self) -> u32 {
+        self.freefall_duration_ms.load(Ordering::Acquire)
+    }
+
+    pub fn is_shake_detected(&self) -> bool {
+        self.shake_detected.load(Ordering::Acquire)
+    }
+
+    pub fn get_tilt_posture(&self) -> TiltPosture {
+        match self.tilt_posture.load(Ordering::Acquire) {
+            1 => TiltPosture::FlatOnTable,
+            2 => TiltPosture::FaceDown,
+            3 => TiltPosture::SteerLeft,
+            4 => TiltPosture::SteerRight,
+            _ => TiltPosture::UprightGaming,
+        }
+    }
+
+    pub fn reset(&self) {
+        self.freefall_active.store(false, Ordering::Release);
+        self.freefall_ticks.store(0, Ordering::Release);
+        self.freefall_start_us.store(0, Ordering::Release);
+        self.freefall_duration_ms.store(0, Ordering::Release);
+        self.shake_detected.store(false, Ordering::Release);
+        self.shake_energy_accum.store(0, Ordering::Release);
+        self.last_accel_x.store(0, Ordering::Release);
+        self.tilt_posture.store(0, Ordering::Release);
+    }
+}
+
+pub static GESTURE_SUPERVISOR: MotionGestureSupervisor = MotionGestureSupervisor::new();
