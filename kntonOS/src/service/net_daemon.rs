@@ -422,3 +422,160 @@ pub fn verify_dhcp_client() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: DNS Resolver Lookup Cache & Asynchronous Query Pipeline
+// ============================================================================
+
+/// Cached DNS record descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsCacheRecord {
+    pub hostname: [u8; 64],
+    pub hostname_len: u8,
+    pub ip: [u8; 4],
+    pub ttl_sec: u32,
+    pub cached_time_sec: u64,
+    pub is_valid: bool,
+}
+
+impl DnsCacheRecord {
+    pub const fn empty() -> Self {
+        Self {
+            hostname: [0; 64],
+            hostname_len: 0,
+            ip: [0; 4],
+            ttl_sec: 0,
+            cached_time_sec: 0,
+            is_valid: false,
+        }
+    }
+
+    pub fn is_expired(&self, current_time_sec: u64) -> bool {
+        if !self.is_valid {
+            return true;
+        }
+        current_time_sec >= self.cached_time_sec.saturating_add(self.ttl_sec as u64)
+    }
+}
+
+pub const MAX_DNS_CACHE: usize = 16;
+
+/// High-performance zero-allocation DNS resolver cache.
+#[derive(Debug, Clone, Copy)]
+pub struct DnsResolverCache {
+    pub records: [DnsCacheRecord; MAX_DNS_CACHE],
+    pub primary_dns: [u8; 4],
+    pub secondary_dns: [u8; 4],
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+}
+
+impl DnsResolverCache {
+    pub const fn new() -> Self {
+        Self {
+            records: [DnsCacheRecord::empty(); MAX_DNS_CACHE],
+            primary_dns: [1, 1, 1, 1],
+            secondary_dns: [8, 8, 8, 8],
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// Configures upstream authoritative resolver IP addresses.
+    pub fn set_upstreams(&mut self, primary: [u8; 4], secondary: [u8; 4]) {
+        self.primary_dns = primary;
+        self.secondary_dns = secondary;
+    }
+
+    /// Looks up hostname in the fast local cache.
+    pub fn lookup(&mut self, hostname: &[u8], current_time_sec: u64) -> Option<[u8; 4]> {
+        for record in &self.records {
+            if record.is_valid && !record.is_expired(current_time_sec) {
+                let len = record.hostname_len as usize;
+                if len == hostname.len() && &record.hostname[..len] == hostname {
+                    self.cache_hits = self.cache_hits.saturating_add(1);
+                    return Some(record.ip);
+                }
+            }
+        }
+        self.cache_misses = self.cache_misses.saturating_add(1);
+        None
+    }
+
+    /// Stores a freshly resolved A record into the cache.
+    pub fn insert(&mut self, hostname: &[u8], ip: [u8; 4], ttl_sec: u32, current_time_sec: u64) -> bool {
+        let mut slot = None;
+
+        // Try to overwrite existing record with same hostname
+        for i in 0..MAX_DNS_CACHE {
+            let r = &self.records[i];
+            if r.is_valid {
+                let len = r.hostname_len as usize;
+                if len == hostname.len() && &r.hostname[..len] == hostname {
+                    slot = Some(i);
+                    break;
+                }
+            }
+        }
+
+        // Otherwise find first invalid or expired record
+        if slot.is_none() {
+            for i in 0..MAX_DNS_CACHE {
+                if !self.records[i].is_valid || self.records[i].is_expired(current_time_sec) {
+                    slot = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let idx = match slot {
+            Some(i) => i,
+            None => 0, // Fallback ring overwrite
+        };
+
+        let mut buf = [0u8; 64];
+        let len = hostname.len().min(64);
+        buf[..len].copy_from_slice(&hostname[..len]);
+
+        self.records[idx] = DnsCacheRecord {
+            hostname: buf,
+            hostname_len: len as u8,
+            ip,
+            ttl_sec,
+            cached_time_sec: current_time_sec,
+            is_valid: true,
+        };
+        true
+    }
+}
+
+/// Verification test for DNS resolver lookup cache.
+pub fn verify_dns_resolver_cache() -> bool {
+    let mut cache = DnsResolverCache::new();
+
+    // 1. Initial empty cache lookup fails
+    let miss = cache.lookup(b"cdn.knton.os", 100);
+    if miss.is_some() || cache.cache_misses != 1 || cache.cache_hits != 0 {
+        return false;
+    }
+
+    // 2. Insert record (TTL = 300s)
+    let ok = cache.insert(b"cdn.knton.os", [104, 18, 25, 42], 300, 100);
+    if !ok {
+        return false;
+    }
+
+    // 3. Lookup should hit
+    let hit = cache.lookup(b"cdn.knton.os", 200);
+    if hit != Some([104, 18, 25, 42]) || cache.cache_hits != 1 {
+        return false;
+    }
+
+    // 4. Lookup at t=450 (within 100+300=400 TTL? No, 450 > 400 => expired!)
+    let exp = cache.lookup(b"cdn.knton.os", 450);
+    if exp.is_some() {
+        return false;
+    }
+
+    true
+}
+
