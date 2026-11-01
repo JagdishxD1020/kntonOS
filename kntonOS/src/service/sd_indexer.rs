@@ -419,3 +419,83 @@ impl MicroSdMountWatcher {
         }
     }
 }
+
+// Library directory hierarchy scanning phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerStatus {
+    Idle,
+    Scanning,
+    Ready,
+    Error,
+}
+
+// Statistical performance counters for library indexing scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanMetrics {
+    pub manifests_scanned: u32,
+    pub proton_games_count: u32,
+    pub native_games_count: u32,
+    pub total_bytes_discovered: u64,
+}
+
+// Fast directory hierarchy scanner parsing steamapps manifests and prefixes.
+pub struct SteamLibraryHierarchyScanner {
+    pub status: ScannerStatus,
+    pub metrics: ScanMetrics,
+}
+
+impl SteamLibraryHierarchyScanner {
+    // Construct new library scanner instance.
+    pub const fn new() -> Self {
+        Self {
+            status: ScannerStatus::Idle,
+            metrics: ScanMetrics {
+                manifests_scanned: 0,
+                proton_games_count: 0,
+                native_games_count: 0,
+                total_bytes_discovered: 0,
+            },
+        }
+    }
+
+    // Ingest and index a single manifest payload with associated compatdata.
+    pub fn ingest_manifest(
+        &mut self,
+        table: &mut GameIndexTable,
+        acf_text: &str,
+        source: GameInstallSource,
+        has_proton_pfx: bool,
+        relative_exe: &str,
+    ) -> bool {
+        if let Some(mut entry) = SteamAppManifestParser::parse_manifest(acf_text, source) {
+            ProtonPrefixDetector::inspect_prefix(&mut entry, has_proton_pfx);
+            entry.set_executable_target(relative_exe);
+
+            self.metrics.manifests_scanned += 1;
+            if entry.has_proton_prefix {
+                self.metrics.proton_games_count += 1;
+            } else {
+                self.metrics.native_games_count += 1;
+            }
+            self.metrics.total_bytes_discovered = self
+                .metrics
+                .total_bytes_discovered
+                .saturating_add(entry.size_bytes);
+
+            table.insert_or_update(entry)
+        } else {
+            false
+        }
+    }
+
+    // Reset scan metrics and return to idle state.
+    pub fn reset(&mut self) {
+        self.status = ScannerStatus::Idle;
+        self.metrics = ScanMetrics {
+            manifests_scanned: 0,
+            proton_games_count: 0,
+            native_games_count: 0,
+            total_bytes_discovered: 0,
+        };
+    }
+}
