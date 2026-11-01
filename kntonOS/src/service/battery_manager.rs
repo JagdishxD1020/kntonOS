@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 // ============================================================================
 // Feature 1: Fuel Gauge Coulomb Counter & Cycle Aging Estimator
@@ -157,3 +157,112 @@ impl PrecisionCoulombCounter {
 }
 
 pub static COULOMB_COUNTER: PrecisionCoulombCounter = PrecisionCoulombCounter::new();
+
+
+// ============================================================================
+// Feature 2: Passthrough Charging Governor & Cell Bypass
+// ============================================================================
+
+/// Power path routing topology for NVDC buck-boost charger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerPathMode {
+    /// Running exclusively from battery cells (no AC connected).
+    BatteryOnly,
+    /// AC adapter powering system and charging battery cells concurrently.
+    ConcurrentCharging,
+    /// Direct AC passthrough: battery idled/bypassed, system powered directly from AC.
+    DirectAcPassthrough,
+    /// Hybrid power boost: battery assists AC adapter when transient load exceeds AC wattage.
+    HybridPowerBoost,
+}
+
+/// Passthrough charging governor controlling battery bypass during gaming.
+pub struct PassthroughGovernor {
+    target_soc_limit_pct: AtomicU32,
+    hysteresis_pct: u32,
+    is_passthrough_engaged: AtomicBool,
+    active_mode: AtomicU32, // PowerPathMode as u32
+    ac_input_limit_mw: AtomicU32,
+    system_load_mw: AtomicU32,
+}
+
+impl PassthroughGovernor {
+    pub const fn new() -> Self {
+        Self {
+            target_soc_limit_pct: AtomicU32::new(80), // Default 80% battery protect threshold
+            hysteresis_pct: 5,                        // 5% deadband before resuming charge
+            is_passthrough_engaged: AtomicBool::new(false),
+            active_mode: AtomicU32::new(PowerPathMode::BatteryOnly as u32),
+            ac_input_limit_mw: AtomicU32::new(45_000), // SteamDeck 45W USB-PD
+            system_load_mw: AtomicU32::new(15_000),
+        }
+    }
+
+    pub fn set_target_soc_limit(&self, limit_pct: u8) {
+        self.target_soc_limit_pct.store(limit_pct.min(100) as u32, Ordering::Release);
+    }
+
+    pub fn get_target_soc_limit(&self) -> u8 {
+        self.target_soc_limit_pct.load(Ordering::Acquire) as u8
+    }
+
+    /// Evaluates AC attachment, battery SoC, and system load to determine power path.
+    pub fn evaluate(
+        &self,
+        ac_present: bool,
+        current_soc_pct: u8,
+        system_load_mw: u32,
+        ac_capacity_mw: u32,
+    ) -> PowerPathMode {
+        self.system_load_mw.store(system_load_mw, Ordering::Release);
+        self.ac_input_limit_mw.store(ac_capacity_mw, Ordering::Release);
+
+        if !ac_present || ac_capacity_mw == 0 {
+            self.is_passthrough_engaged.store(false, Ordering::Release);
+            self.active_mode.store(PowerPathMode::BatteryOnly as u32, Ordering::Release);
+            return PowerPathMode::BatteryOnly;
+        }
+
+        // Check if transient system demand exceeds AC adapter capability
+        if system_load_mw > ac_capacity_mw {
+            self.is_passthrough_engaged.store(false, Ordering::Release);
+            self.active_mode.store(PowerPathMode::HybridPowerBoost as u32, Ordering::Release);
+            return PowerPathMode::HybridPowerBoost;
+        }
+
+        let target_soc = self.target_soc_limit_pct.load(Ordering::Acquire) as u8;
+        let was_engaged = self.is_passthrough_engaged.load(Ordering::Acquire);
+
+        let engage = if was_engaged {
+            // Drop below (target - hysteresis) to re-engage charging
+            current_soc_pct >= target_soc.saturating_sub(self.hysteresis_pct as u8)
+        } else {
+            current_soc_pct >= target_soc
+        };
+
+        self.is_passthrough_engaged.store(engage, Ordering::Release);
+        let mode = if engage {
+            PowerPathMode::DirectAcPassthrough
+        } else {
+            PowerPathMode::ConcurrentCharging
+        };
+
+        self.active_mode.store(mode as u32, Ordering::Release);
+        mode
+    }
+
+    pub fn is_passthrough_active(&self) -> bool {
+        self.is_passthrough_engaged.load(Ordering::Acquire)
+    }
+
+    pub fn get_active_mode(&self) -> PowerPathMode {
+        match self.active_mode.load(Ordering::Acquire) {
+            1 => PowerPathMode::ConcurrentCharging,
+            2 => PowerPathMode::DirectAcPassthrough,
+            3 => PowerPathMode::HybridPowerBoost,
+            _ => PowerPathMode::BatteryOnly,
+        }
+    }
+}
+
+pub static PASSTHROUGH_GOVERNOR: PassthroughGovernor = PassthroughGovernor::new();
