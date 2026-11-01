@@ -1,7 +1,9 @@
 //! User-mode execution runtime and syscall callgate interface.
 
+pub mod allocator;
 pub mod syscall;
 
+pub use allocator::*;
 pub use syscall::*;
 
 /// Process Environment Block (PEB) representation for userland processes.
