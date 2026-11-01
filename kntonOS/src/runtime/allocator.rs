@@ -233,3 +233,88 @@ impl UserBuddySlabAllocator {
         self.free_pages(ptr, pages_needed);
     }
 }
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Thread-safe GlobalAlloc wrapper around UserBuddySlabAllocator.
+pub struct UserGlobalAlloc {
+    inner: core::cell::UnsafeCell<UserBuddySlabAllocator>,
+    lock: AtomicBool,
+    initialized: AtomicBool,
+}
+
+unsafe impl Sync for UserGlobalAlloc {}
+unsafe impl Send for UserGlobalAlloc {}
+
+impl UserGlobalAlloc {
+    pub const fn new() -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(UserBuddySlabAllocator::new()),
+            lock: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    pub fn lock(&self) -> UserGlobalAllocGuard<'_> {
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        UserGlobalAllocGuard { alloc: self }
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    pub fn manual_init(&self, base_addr: *mut u8, total_bytes: usize) {
+        let mut guard = self.lock();
+        unsafe {
+            guard.init(base_addr, total_bytes);
+        }
+        self.initialized.store(true, Ordering::Release);
+    }
+}
+
+pub struct UserGlobalAllocGuard<'a> {
+    alloc: &'a UserGlobalAlloc,
+}
+
+impl<'a> core::ops::Deref for UserGlobalAllocGuard<'a> {
+    type Target = UserBuddySlabAllocator;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.alloc.inner.get() }
+    }
+}
+
+impl<'a> core::ops::DerefMut for UserGlobalAllocGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.alloc.inner.get() }
+    }
+}
+
+impl<'a> Drop for UserGlobalAllocGuard<'a> {
+    fn drop(&mut self) {
+        self.alloc.lock.store(false, Ordering::Release);
+    }
+}
+
+unsafe impl core::alloc::GlobalAlloc for UserGlobalAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let mut guard = self.lock();
+        if !self.initialized.load(Ordering::Acquire) {
+            let backing = super::syscall::sys_alloc(128 * 1024, 0);
+            if !backing.is_null() {
+                guard.init(backing, 128 * 1024);
+                self.initialized.store(true, Ordering::Release);
+            }
+        }
+        guard.allocate(layout.size(), layout.align()).unwrap_or(core::ptr::null_mut())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        let mut guard = self.lock();
+        guard.deallocate(ptr, layout.size(), layout.align());
+    }
+}
+
+pub static USER_GLOBAL_ALLOCATOR: UserGlobalAlloc = UserGlobalAlloc::new();
