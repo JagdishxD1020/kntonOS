@@ -403,3 +403,128 @@ impl AudioToHapticsDspFilter {
         }
     }
 }
+
+// Haptic tactile feel profile for handheld trackpad interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackpadClickProfile {
+    SharpClick,
+    SoftTap,
+    ReleaseClick,
+    Buzz,
+    RollingRatchetDetent,
+}
+
+// Configuration parameters for trackpad haptic synthesis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackpadHapticConfig {
+    pub click_intensity_pct: u8,
+    pub ratchet_step_units: i32,
+    pub detent_damping_pct: u8,
+}
+
+impl TrackpadHapticConfig {
+    // Construct default ergonomic trackpad tactile feel configuration.
+    pub const fn default_config() -> Self {
+        Self {
+            click_intensity_pct: 85,
+            ratchet_step_units: 32,
+            detent_damping_pct: 10,
+        }
+    }
+}
+
+// Trackpad haptic click feeling generator simulating mechanical dome clicks and scroll wheel ratchets.
+pub struct TrackpadHapticGenerator {
+    pub config: TrackpadHapticConfig,
+    accumulated_motion: i32,
+    total_clicks_emitted: u32,
+    total_ratchets_emitted: u32,
+}
+
+impl TrackpadHapticGenerator {
+    // Construct trackpad haptic tactile generator.
+    pub const fn new(config: TrackpadHapticConfig) -> Self {
+        Self {
+            config,
+            accumulated_motion: 0,
+            total_clicks_emitted: 0,
+            total_ratchets_emitted: 0,
+        }
+    }
+
+    // Synthesize physical haptic pulse packet for requested click profile.
+    pub fn synthesize_profile(&mut self, profile: TrackpadClickProfile, resonant_freq_hz: u16) -> WaveformParameters {
+        self.total_clicks_emitted += 1;
+        match profile {
+            TrackpadClickProfile::SharpClick => {
+                // 6ms high-amplitude square/pulse pulse to mimic crisp mechanical dome collapse
+                WaveformParameters::new(
+                    HapticWaveform::Pulse,
+                    resonant_freq_hz,
+                    self.config.click_intensity_pct,
+                    6,
+                )
+            }
+            TrackpadClickProfile::SoftTap => {
+                // Gentle 8ms sine wave for light capacitive touch confirmation
+                WaveformParameters::new(
+                    HapticWaveform::Sine,
+                    resonant_freq_hz,
+                    (self.config.click_intensity_pct * 40) / 100,
+                    8,
+                )
+            }
+            TrackpadClickProfile::ReleaseClick => {
+                // Light 4ms release snap
+                WaveformParameters::new(
+                    HapticWaveform::Pulse,
+                    resonant_freq_hz,
+                    (self.config.click_intensity_pct * 30) / 100,
+                    4,
+                )
+            }
+            TrackpadClickProfile::Buzz => {
+                // 60ms continuous sine buzz for barrier or boundary alert
+                WaveformParameters::new(
+                    HapticWaveform::Sine,
+                    120,
+                    (self.config.click_intensity_pct * 60) / 100,
+                    60,
+                )
+            }
+            TrackpadClickProfile::RollingRatchetDetent => {
+                // Crisp 3ms micro-click for individual scroll notch
+                WaveformParameters::new(
+                    HapticWaveform::Pulse,
+                    resonant_freq_hz + 30,
+                    (self.config.click_intensity_pct * 55) / 100,
+                    3,
+                )
+            }
+        }
+    }
+
+    // Process finger delta movement on trackpad surface and synthesize rolling ratchet detents.
+    pub fn on_trackpad_motion(&mut self, delta_units: i32, resonant_freq_hz: u16) -> Option<WaveformParameters> {
+        self.accumulated_motion += delta_units;
+        let step = self.config.ratchet_step_units;
+
+        if self.accumulated_motion.abs() >= step {
+            self.accumulated_motion %= step;
+            self.total_ratchets_emitted += 1;
+            Some(self.synthesize_profile(TrackpadClickProfile::RollingRatchetDetent, resonant_freq_hz))
+        } else {
+            None
+        }
+    }
+
+    // Reset accumulated scroll distance.
+    pub fn reset_motion(&mut self) {
+        self.accumulated_motion = 0;
+    }
+
+    // Retrieve lifetime total click and ratchet count.
+    pub fn stats(&self) -> (u32, u32) {
+        (self.total_clicks_emitted, self.total_ratchets_emitted)
+    }
+}
