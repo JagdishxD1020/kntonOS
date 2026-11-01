@@ -240,3 +240,184 @@ pub fn verify_session_descriptor_models() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: Process Spawn Rules & Environment Block Inheritance Engine
+// ============================================================================
+
+/// Auto-restart policy applied by the supervisor when a service or process exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartPolicy {
+    /// Never restart upon process termination.
+    Never,
+    /// Always restart immediately regardless of exit code.
+    Always,
+    /// Restart upon abnormal termination (non-zero exit code or fault) with backoff retry limit.
+    OnCrashWithBackoff {
+        /// Maximum restart attempts allowed within the retry window.
+        max_retries: u32,
+        /// Delay in milliseconds before executing next restart attempt.
+        backoff_ms: u32,
+    },
+    /// Critical system process; crashing this process triggers emergency session lockdown.
+    CriticalSessionHalt,
+}
+
+/// Rule governing how the session manager launches a specific process or subsystem daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSpawnRule {
+    /// Fully qualified executable path.
+    pub binary_path: String,
+    /// Subsystem classification required by binary.
+    pub subsystem: SubsystemType,
+    /// Target session into which process must be instantiated.
+    pub target_session_id: u32,
+    /// Default command-line parameters passed to executable.
+    pub command_line: String,
+    /// Execution priority class (0 = Idle, 1 = BelowNormal, 2 = Normal, 3 = AboveNormal, 4 = High, 5 = Realtime).
+    pub priority_class: u8,
+    /// Crash recovery and restart policy.
+    pub restart_policy: RestartPolicy,
+    /// Whether this daemon is automatically launched during session bootstrap.
+    pub auto_start: bool,
+    /// Whether the process executes with elevated system token privileges.
+    pub elevated_token: bool,
+}
+
+impl ProcessSpawnRule {
+    /// Creates a spawn rule for a native critical system service (e.g. csrss.exe).
+    pub fn new_critical_service(path: &str, session_id: u32) -> Self {
+        Self {
+            binary_path: path.to_string(),
+            subsystem: SubsystemType::Native,
+            target_session_id: session_id,
+            command_line: path.to_string(),
+            priority_class: 4, // High priority
+            restart_policy: RestartPolicy::CriticalSessionHalt,
+            auto_start: true,
+            elevated_token: true,
+        }
+    }
+
+    /// Creates a spawn rule for an interactive user shell (e.g. gameshell.exe).
+    pub fn new_interactive_shell(path: &str, session_id: u32) -> Self {
+        Self {
+            binary_path: path.to_string(),
+            subsystem: SubsystemType::Win32,
+            target_session_id: session_id,
+            command_line: path.to_string(),
+            priority_class: 3, // Above Normal for low input latency
+            restart_policy: RestartPolicy::OnCrashWithBackoff {
+                max_retries: 5,
+                backoff_ms: 1000,
+            },
+            auto_start: true,
+            elevated_token: false,
+        }
+    }
+}
+
+/// Environment block supervisor managing global variables and child process inheritance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentManager {
+    /// Global system-wide environment variables inherited by all sessions.
+    pub system_environment: BTreeMap<String, String>,
+}
+
+impl EnvironmentManager {
+    /// Initializes environment manager with default KntonOS system variables.
+    pub fn new() -> Self {
+        let mut sys = BTreeMap::new();
+        sys.insert("OS".to_string(), "Windows_NT".to_string());
+        sys.insert("KTON_KERNEL".to_string(), "MicroKernel_x86_64".to_string());
+        sys.insert("PROCESSOR_ARCHITECTURE".to_string(), "AMD64".to_string());
+        sys.insert("SYSTEMDRIVE".to_string(), "C:".to_string());
+        sys.insert("SYSTEMROOT".to_string(), "C:\\Windows".to_string());
+        sys.insert("PATH".to_string(), "C:\\Windows\\System32;C:\\Knton\\Bin".to_string());
+
+        Self {
+            system_environment: sys,
+        }
+    }
+
+    /// Composes a unified child process environment by merging:
+    /// 1. System global environment
+    /// 2. Session-specific environment
+    /// 3. Per-spawn override environment
+    pub fn build_process_environment(
+        &self,
+        session: &SessionDescriptor,
+        overrides: &BTreeMap<String, String>,
+    ) -> BTreeMap<String, String> {
+        let mut merged = self.system_environment.clone();
+
+        // Overlay session-specific variables
+        for (k, v) in &session.environment_vars {
+            merged.insert(k.clone(), v.clone());
+        }
+
+        // Overlay process-specific overrides
+        for (k, v) in overrides {
+            merged.insert(k.clone(), v.clone());
+        }
+
+        merged
+    }
+}
+
+/// Verification test for process spawn rules and environment block inheritance.
+pub fn verify_environment_inheritance_and_spawn_rules() -> bool {
+    let env_mgr = EnvironmentManager::new();
+    let sess1 = SessionDescriptor::new_session_1("GamerPro", 200);
+
+    // 1. Verify spawn rule configurations
+    let csrss_rule = ProcessSpawnRule::new_critical_service("C:\\Windows\\System32\\csrss.exe", 0);
+    if csrss_rule.subsystem != SubsystemType::Native || csrss_rule.restart_policy != RestartPolicy::CriticalSessionHalt {
+        return false;
+    }
+    if !csrss_rule.elevated_token || csrss_rule.target_session_id != 0 {
+        return false;
+    }
+
+    let shell_rule = ProcessSpawnRule::new_interactive_shell("C:\\Knton\\Shell\\gameshell.exe", 1);
+    if shell_rule.subsystem != SubsystemType::Win32 || shell_rule.elevated_token {
+        return false;
+    }
+    match shell_rule.restart_policy {
+        RestartPolicy::OnCrashWithBackoff { max_retries, backoff_ms } => {
+            if max_retries != 5 || backoff_ms != 1000 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // 2. Verify environment inheritance hierarchy
+    let mut overrides = BTreeMap::new();
+    overrides.insert("GAME_FPS_TARGET".to_string(), "120".to_string());
+    overrides.insert("SYSTEMROOT".to_string(), "C:\\CustomWin".to_string()); // Override system default
+
+    let child_env = env_mgr.build_process_environment(&sess1, &overrides);
+
+    // Should inherit system global
+    if child_env.get("OS").map(|s| s.as_str()) != Some("Windows_NT") {
+        return false;
+    }
+    // Should inherit session 1 specific
+    if child_env.get("USERNAME").map(|s| s.as_str()) != Some("GamerPro") {
+        return false;
+    }
+    if child_env.get("SESSION_ID").map(|s| s.as_str()) != Some("1") {
+        return false;
+    }
+    // Should respect overrides
+    if child_env.get("GAME_FPS_TARGET").map(|s| s.as_str()) != Some("120") {
+        return false;
+    }
+    if child_env.get("SYSTEMROOT").map(|s| s.as_str()) != Some("C:\\CustomWin") {
+        return false;
+    }
+
+    true
+}
