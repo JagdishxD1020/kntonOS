@@ -449,3 +449,250 @@ impl AnalogStickProcessor {
     }
 }
 
+// SteamDeck capacitive trackpad hardware identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackpadId {
+    Left,
+    Right,
+}
+
+// Operational emulation mode for capacitive trackpads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackpadMode {
+    MouseCursor,
+    ScrollWheel,
+    RadialMenu,
+    VirtualDpad,
+    PrecisionJoystick,
+}
+
+// Raw sensor sample reported by SteamDeck capacitive touch sensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackpadSample {
+    pub x: i16,
+    pub y: i16,
+    pub pressure: u16,
+    pub touching: bool,
+    pub clicked: bool,
+}
+
+impl TrackpadSample {
+    // Construct empty trackpad sample.
+    pub const fn new() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            pressure: 0,
+            touching: false,
+            clicked: false,
+        }
+    }
+}
+
+// Haptic feedback event queued for voice-coil LRA actuator motors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HapticFeedbackEvent {
+    pub trackpad: TrackpadId,
+    pub intensity_pct: u8,
+    pub frequency_hz: u16,
+    pub duration_ms: u16,
+    pub pulses: u8,
+}
+
+impl HapticFeedbackEvent {
+    // Construct click haptic pulse event.
+    pub const fn click(trackpad: TrackpadId) -> Self {
+        Self {
+            trackpad,
+            intensity_pct: 90,
+            frequency_hz: 240,
+            duration_ms: 12,
+            pulses: 1,
+        }
+    }
+
+    // Construct detent tick haptic pulse event.
+    pub const fn tick(trackpad: TrackpadId) -> Self {
+        Self {
+            trackpad,
+            intensity_pct: 60,
+            frequency_hz: 180,
+            duration_ms: 6,
+            pulses: 1,
+        }
+    }
+}
+
+// Capacitive touch filter and mode processor for an individual trackpad.
+pub struct TrackpadFilterEngine {
+    pub id: TrackpadId,
+    pub mode: TrackpadMode,
+    pub filter_alpha: u16,
+    pub filtered_x: i32,
+    pub filtered_y: i32,
+    pub prev_filtered_x: i32,
+    pub prev_filtered_y: i32,
+    pub delta_x: i16,
+    pub delta_y: i16,
+    pub was_touching: bool,
+    pub was_clicked: bool,
+    pub accumulated_detent_dist: i32,
+    pub detent_threshold: i32,
+}
+
+impl TrackpadFilterEngine {
+    // Construct a new trackpad coordinate filter engine.
+    pub const fn new(id: TrackpadId, mode: TrackpadMode) -> Self {
+        Self {
+            id,
+            mode,
+            filter_alpha: 192,
+            filtered_x: 0,
+            filtered_y: 0,
+            prev_filtered_x: 0,
+            prev_filtered_y: 0,
+            delta_x: 0,
+            delta_y: 0,
+            was_touching: false,
+            was_clicked: false,
+            accumulated_detent_dist: 0,
+            detent_threshold: 400,
+        }
+    }
+
+    // Process a new raw capacitive sample and produce optional haptic feedback.
+    pub fn process_sample(
+        &mut self,
+        sample: TrackpadSample,
+    ) -> (i16, i16, Option<HapticFeedbackEvent>) {
+        let mut haptic = None;
+
+        if !sample.touching {
+            self.was_touching = false;
+            self.was_clicked = false;
+            self.delta_x = 0;
+            self.delta_y = 0;
+            self.accumulated_detent_dist = 0;
+            return (0, 0, None);
+        }
+
+        // Tactile bottom click detection triggers strong haptic confirmation
+        if sample.clicked && !self.was_clicked {
+            haptic = Some(HapticFeedbackEvent::click(self.id));
+        }
+        self.was_clicked = sample.clicked;
+
+        if !self.was_touching {
+            self.filtered_x = sample.x as i32;
+            self.filtered_y = sample.y as i32;
+            self.prev_filtered_x = sample.x as i32;
+            self.prev_filtered_y = sample.y as i32;
+            self.delta_x = 0;
+            self.delta_y = 0;
+            self.was_touching = true;
+            if haptic.is_none() {
+                haptic = Some(HapticFeedbackEvent::tick(self.id));
+            }
+            return (self.filtered_x as i16, self.filtered_y as i16, haptic);
+        }
+
+        // Apply EMA low-pass filter to smooth capacitive coordinate jitter
+        let alpha = self.filter_alpha as i32;
+        self.filtered_x = (alpha * sample.x as i32 + (256 - alpha) * self.filtered_x) / 256;
+        self.filtered_y = (alpha * sample.y as i32 + (256 - alpha) * self.filtered_y) / 256;
+
+        self.delta_x = (self.filtered_x - self.prev_filtered_x).clamp(-32768, 32767) as i16;
+        self.delta_y = (self.filtered_y - self.prev_filtered_y).clamp(-32768, 32767) as i16;
+        self.prev_filtered_x = self.filtered_x;
+        self.prev_filtered_y = self.filtered_y;
+
+        // Check detent thresholds for scroll wheel and virtual boundaries
+        match self.mode {
+            TrackpadMode::ScrollWheel => {
+                self.accumulated_detent_dist += self.delta_y as i32;
+                if self.accumulated_detent_dist.abs() >= self.detent_threshold {
+                    self.accumulated_detent_dist = 0;
+                    if haptic.is_none() {
+                        haptic = Some(HapticFeedbackEvent::tick(self.id));
+                    }
+                }
+            }
+            TrackpadMode::VirtualDpad => {
+                let dist_sq = self.filtered_x * self.filtered_x + self.filtered_y * self.filtered_y;
+                if dist_sq >= 3000 * 3000 && !self.was_touching && haptic.is_none() {
+                    haptic = Some(HapticFeedbackEvent::tick(self.id));
+                }
+            }
+            _ => {}
+        }
+
+        (self.filtered_x as i16, self.filtered_y as i16, haptic)
+    }
+}
+
+pub const MAX_HAPTIC_QUEUE: usize = 16;
+
+// Dual capacitive trackpad manager coordinating left/right pads and haptic queue.
+pub struct DualTrackpadManager {
+    pub left_pad: TrackpadFilterEngine,
+    pub right_pad: TrackpadFilterEngine,
+    pub haptic_queue: [Option<HapticFeedbackEvent>; MAX_HAPTIC_QUEUE],
+    pub queue_head: usize,
+    pub queue_tail: usize,
+}
+
+impl DualTrackpadManager {
+    // Construct dual trackpad manager with default Left=ScrollWheel, Right=MouseCursor modes.
+    pub const fn new() -> Self {
+        Self {
+            left_pad: TrackpadFilterEngine::new(TrackpadId::Left, TrackpadMode::ScrollWheel),
+            right_pad: TrackpadFilterEngine::new(TrackpadId::Right, TrackpadMode::MouseCursor),
+            haptic_queue: [None; MAX_HAPTIC_QUEUE],
+            queue_head: 0,
+            queue_tail: 0,
+        }
+    }
+
+    // Push haptic feedback event into delivery queue.
+    pub fn push_haptic(&mut self, event: HapticFeedbackEvent) {
+        let next_head = (self.queue_head + 1) % MAX_HAPTIC_QUEUE;
+        if next_head != self.queue_tail {
+            self.haptic_queue[self.queue_head] = Some(event);
+            self.queue_head = next_head;
+        }
+    }
+
+    // Pop oldest pending haptic event for actuator dispatch.
+    pub fn pop_haptic(&mut self) -> Option<HapticFeedbackEvent> {
+        if self.queue_tail == self.queue_head {
+            return None;
+        }
+        let event = self.haptic_queue[self.queue_tail].take();
+        self.queue_tail = (self.queue_tail + 1) % MAX_HAPTIC_QUEUE;
+        event
+    }
+
+    // Process dual trackpad samples and automatically queue generated haptic pulses.
+    pub fn process(
+        &mut self,
+        left_sample: TrackpadSample,
+        right_sample: TrackpadSample,
+    ) -> ((i16, i16, i16, i16), (i16, i16, i16, i16)) {
+        let (lx, ly, l_hap) = self.left_pad.process_sample(left_sample);
+        let (rx, ry, r_hap) = self.right_pad.process_sample(right_sample);
+
+        if let Some(h) = l_hap {
+            self.push_haptic(h);
+        }
+        if let Some(h) = r_hap {
+            self.push_haptic(h);
+        }
+
+        (
+            (lx, ly, self.left_pad.delta_x, self.left_pad.delta_y),
+            (rx, ry, self.right_pad.delta_x, self.right_pad.delta_y),
+        )
+    }
+}
+
+
