@@ -1406,6 +1406,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] User-mode runtime subsystem self-test failed!\r\n");
     }
 
+    // Verify kntonOS User-Mode Memory Allocator & Dynamic Syscall Stubs (TASK-KNT-317)
+    if knton_os::verify_usermode_allocator_subsystem() {
+        serial_write_str("[KNT-OS-ALLOC-PASS] kntonOS user-mode memory allocator and dynamic syscall stubs verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] kntonOS user-mode memory allocator self-test failed!\r\n");
+    }
+
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 Large Page VirtualAlloc2 self-test failed!\r\n");
