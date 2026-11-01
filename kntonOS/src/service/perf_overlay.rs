@@ -371,3 +371,165 @@ impl HardwareTelemetryCollector {
     }
 }
 
+pub const FRAME_HISTORY_CAPACITY: usize = 120;
+pub const HISTOGRAM_BUCKETS: usize = 8;
+
+// Aggregated frame timing and latency statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTimeStats {
+    pub instantaneous_fps: u32,
+    pub avg_frame_time_us: u32,
+    pub min_frame_time_us: u32,
+    pub max_frame_time_us: u32,
+    pub p99_frame_time_us: u32,
+    pub stutter_count: u32,
+    pub histogram_buckets: [u16; HISTOGRAM_BUCKETS],
+    pub total_frames_recorded: u64,
+}
+
+impl FrameTimeStats {
+    // Construct zeroed frame timing metrics.
+    pub const fn new() -> Self {
+        Self {
+            instantaneous_fps: 0,
+            avg_frame_time_us: 0,
+            min_frame_time_us: 0,
+            max_frame_time_us: 0,
+            p99_frame_time_us: 0,
+            stutter_count: 0,
+            histogram_buckets: [0; HISTOGRAM_BUCKETS],
+            total_frames_recorded: 0,
+        }
+    }
+}
+
+// Rolling frame latency circular buffer calculating 99th percentile and frame spikes.
+pub struct RollingFrameTimeBuffer {
+    samples: [u32; FRAME_HISTORY_CAPACITY],
+    head: usize,
+    count: usize,
+    total_frames: u64,
+}
+
+impl RollingFrameTimeBuffer {
+    // Construct an empty circular frame time latency buffer.
+    pub const fn new() -> Self {
+        Self {
+            samples: [0; FRAME_HISTORY_CAPACITY],
+            head: 0,
+            count: 0,
+            total_frames: 0,
+        }
+    }
+
+    // Record a completed frame presentation time in microseconds.
+    pub fn record_frame(&mut self, frame_time_us: u32) {
+        self.samples[self.head] = frame_time_us;
+        self.head = (self.head + 1) % FRAME_HISTORY_CAPACITY;
+        if self.count < FRAME_HISTORY_CAPACITY {
+            self.count += 1;
+        }
+        self.total_frames += 1;
+    }
+
+    // Determine histogram bucket index from latency in microseconds.
+    fn bucket_for_latency(us: u32) -> usize {
+        if us < 8_333 {
+            0 // > 120 FPS
+        } else if us <= 16_666 {
+            1 // 60 - 120 FPS
+        } else if us <= 20_000 {
+            2 // 50 - 60 FPS
+        } else if us <= 25_000 {
+            3 // 40 - 50 FPS
+        } else if us <= 33_333 {
+            4 // 30 - 40 FPS
+        } else if us <= 50_000 {
+            5 // 20 - 30 FPS
+        } else if us <= 100_000 {
+            6 // 10 - 20 FPS (minor stutter)
+        } else {
+            7 // < 10 FPS (severe hitch)
+        }
+    }
+
+    // Calculate aggregated frame timing, p99 latency, and stutter metrics.
+    pub fn compute_stats(&self) -> FrameTimeStats {
+        if self.count == 0 {
+            return FrameTimeStats::new();
+        }
+
+        let mut sum: u64 = 0;
+        let mut min = u32::MAX;
+        let mut max = 0;
+        let mut buckets = [0u16; HISTOGRAM_BUCKETS];
+
+        // Local copy for in-place insertion sorting to determine percentiles in `#![no_std]`
+        let mut sorted_copy = [0u32; FRAME_HISTORY_CAPACITY];
+        for i in 0..self.count {
+            let val = self.samples[i];
+            sorted_copy[i] = val;
+            sum += val as u64;
+            if val < min {
+                min = val;
+            }
+            if val > max {
+                max = val;
+            }
+            let b_idx = Self::bucket_for_latency(val);
+            buckets[b_idx] = buckets[b_idx].saturating_add(1);
+        }
+
+        let avg = (sum / self.count as u64) as u32;
+
+        // Insertion sort on the active sample window
+        for i in 1..self.count {
+            let key = sorted_copy[i];
+            let mut j = i;
+            while j > 0 && sorted_copy[j - 1] > key {
+                sorted_copy[j] = sorted_copy[j - 1];
+                j -= 1;
+            }
+            sorted_copy[j] = key;
+        }
+
+        // 99th percentile index
+        let p99_idx = (self.count.saturating_sub(1) * 99) / 100;
+        let p99 = sorted_copy[p99_idx];
+
+        // Stutter detection: count frames exceeding 1.5x of the average frame time
+        let stutter_threshold = avg + (avg / 2);
+        let mut stutters = 0u32;
+        for i in 0..self.count {
+            if self.samples[i] > stutter_threshold {
+                stutters += 1;
+            }
+        }
+
+        // Instantaneous FPS based on most recent frame
+        let last_idx = if self.head == 0 {
+            self.count.saturating_sub(1)
+        } else {
+            self.head - 1
+        };
+        let last_us = self.samples[last_idx];
+        let fps = if last_us > 0 {
+            1_000_000 / last_us
+        } else {
+            0
+        };
+
+        FrameTimeStats {
+            instantaneous_fps: fps,
+            avg_frame_time_us: avg,
+            min_frame_time_us: if min == u32::MAX { 0 } else { min },
+            max_frame_time_us: max,
+            p99_frame_time_us: p99,
+            stutter_count: stutters,
+            histogram_buckets: buckets,
+            total_frames_recorded: self.total_frames,
+        }
+    }
+}
+
+
