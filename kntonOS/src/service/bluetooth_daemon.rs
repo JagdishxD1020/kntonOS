@@ -665,3 +665,195 @@ pub fn verify_controller_battery_telemetry() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 5: Latency Packet Ring Buffer & Packet Loss Compensator
+// ============================================================================
+
+pub const BT_RING_CAPACITY: usize = 16;
+
+/// High-resolution controller input report frame received over Bluetooth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtInputReport {
+    pub seq: u8,
+    pub buttons: u16,
+    pub stick_lx: i16,
+    pub stick_ly: i16,
+    pub stick_rx: i16,
+    pub stick_ry: i16,
+    pub timestamp_us: u64,
+    pub is_synthesized: bool,
+}
+
+impl BtInputReport {
+    pub const fn empty() -> Self {
+        Self {
+            seq: 0,
+            buttons: 0,
+            stick_lx: 0,
+            stick_ly: 0,
+            stick_rx: 0,
+            stick_ry: 0,
+            timestamp_us: 0,
+            is_synthesized: false,
+        }
+    }
+}
+
+/// Jitter buffer and dead-reckoning packet loss compensator for wireless controllers.
+#[derive(Debug, Clone, Copy)]
+pub struct PacketLossCompensator {
+    pub ring: [BtInputReport; BT_RING_CAPACITY],
+    pub head: usize,
+    pub tail: usize,
+    pub count: usize,
+    pub last_received: BtInputReport,
+    pub has_received_first: bool,
+    pub packets_received: u64,
+    pub packets_lost: u64,
+    pub packets_compensated: u64,
+}
+
+impl PacketLossCompensator {
+    pub const fn new() -> Self {
+        Self {
+            ring: [BtInputReport::empty(); BT_RING_CAPACITY],
+            head: 0,
+            tail: 0,
+            count: 0,
+            last_received: BtInputReport::empty(),
+            has_received_first: false,
+            packets_received: 0,
+            packets_lost: 0,
+            packets_compensated: 0,
+        }
+    }
+
+    /// Enqueues an incoming Bluetooth HID input report, automatically synthesizing
+    /// dead-reckoned frames if an RF packet drop is detected via sequence discontinuity.
+    pub fn ingest_packet(&mut self, report: BtInputReport) {
+        if self.has_received_first {
+            let expected_seq = self.last_received.seq.wrapping_add(1);
+            if report.seq != expected_seq {
+                let dropped_count = report.seq.wrapping_sub(expected_seq) as usize;
+                // If dropped count is small (1..4 packets), synthesize extrapolated frames
+                if dropped_count >= 1 && dropped_count <= 4 {
+                    self.packets_lost = self.packets_lost.saturating_add(dropped_count as u64);
+                    for step in 1..=dropped_count {
+                        let interp_lx = self.last_received.stick_lx +
+                            (((report.stick_lx as i32 - self.last_received.stick_lx as i32) * step as i32) / (dropped_count as i32 + 1)) as i16;
+                        let interp_ly = self.last_received.stick_ly +
+                            (((report.stick_ly as i32 - self.last_received.stick_ly as i32) * step as i32) / (dropped_count as i32 + 1)) as i16;
+
+                        let synth = BtInputReport {
+                            seq: expected_seq.wrapping_add((step - 1) as u8),
+                            buttons: self.last_received.buttons, // Retain button state
+                            stick_lx: interp_lx,
+                            stick_ly: interp_ly,
+                            stick_rx: self.last_received.stick_rx,
+                            stick_ry: self.last_received.stick_ry,
+                            timestamp_us: self.last_received.timestamp_us + (step as u64 * 4000), // ~250Hz rate
+                            is_synthesized: true,
+                        };
+                        self.push_to_ring(synth);
+                        self.packets_compensated = self.packets_compensated.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        self.last_received = report;
+        self.has_received_first = true;
+        self.packets_received = self.packets_received.saturating_add(1);
+        self.push_to_ring(report);
+    }
+
+    fn push_to_ring(&mut self, item: BtInputReport) {
+        if self.count >= BT_RING_CAPACITY {
+            // Drop oldest
+            self.head = (self.head + 1) % BT_RING_CAPACITY;
+            self.count -= 1;
+        }
+        self.ring[self.tail] = item;
+        self.tail = (self.tail + 1) % BT_RING_CAPACITY;
+        self.count += 1;
+    }
+
+    /// Dequeues the next smooth input frame for game dispatch.
+    pub fn pop_packet(&mut self) -> Option<BtInputReport> {
+        if self.count == 0 {
+            None
+        } else {
+            let item = self.ring[self.head];
+            self.head = (self.head + 1) % BT_RING_CAPACITY;
+            self.count -= 1;
+            Some(item)
+        }
+    }
+}
+
+/// Verification test for latency packet ring buffer and packet loss compensator.
+pub fn verify_packet_ring_and_loss_compensator() -> bool {
+    let mut comp = PacketLossCompensator::new();
+
+    // 1. Initial state
+    if comp.count != 0 || comp.pop_packet().is_some() {
+        return false;
+    }
+
+    // 2. Ingest first normal packet (seq: 10, LX: 0)
+    let p1 = BtInputReport {
+        seq: 10,
+        buttons: 0x0001,
+        stick_lx: 0,
+        stick_ly: 0,
+        stick_rx: 0,
+        stick_ry: 0,
+        timestamp_us: 10000,
+        is_synthesized: false,
+    };
+    comp.ingest_packet(p1);
+    if comp.count != 1 || comp.packets_lost != 0 {
+        return false;
+    }
+
+    // 3. Drop packet seq 11! Ingest packet seq 12 (LX: 10000)
+    let p3 = BtInputReport {
+        seq: 12,
+        buttons: 0x0001,
+        stick_lx: 10000,
+        stick_ly: 0,
+        stick_rx: 0,
+        stick_ry: 0,
+        timestamp_us: 18000,
+        is_synthesized: false,
+    };
+    comp.ingest_packet(p3);
+
+    // Should have synthesized packet 11 with interpolated stick LX = 5000
+    if comp.packets_lost != 1 || comp.packets_compensated != 1 {
+        return false;
+    }
+    // Total count in queue = 3 (p1, synthesized p2, p3)
+    if comp.count != 3 {
+        return false;
+    }
+
+    // 4. Pop and verify packets
+    let out1 = comp.pop_packet().unwrap();
+    if out1.seq != 10 || out1.is_synthesized {
+        return false;
+    }
+
+    let out2 = comp.pop_packet().unwrap();
+    if out2.seq != 11 || !out2.is_synthesized || out2.stick_lx != 5000 {
+        return false;
+    }
+
+    let out3 = comp.pop_packet().unwrap();
+    if out3.seq != 12 || out3.is_synthesized || out3.stick_lx != 10000 {
+        return false;
+    }
+
+    true
+}
+
