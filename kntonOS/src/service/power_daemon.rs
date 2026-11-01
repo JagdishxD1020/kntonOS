@@ -328,3 +328,168 @@ pub fn verify_tdp_governor() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: ACPI Platform Fan Curve Controller & Thermal Throttling Backoff
+// ============================================================================
+
+/// Thermal safety status reflecting system temperatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalSafetyStatus {
+    /// Safe operating temperatures (< 85 C).
+    Normal,
+    /// High thermal load; dynamic fan maxed and safety throttle active (85 C to 94 C).
+    ThrottlingWarning,
+    /// Critical emergency thermal cutoff; severe TDP drop to protect silicon (>= 95 C).
+    CriticalEmergency,
+}
+
+/// Temperature trip point mapping degree Celsius to fan PWM duty cycle percentage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanTripPoint {
+    pub temp_c: u8,
+    pub pwm_pct: u8,
+}
+
+/// Total number of discrete points in the fan curve table.
+pub const FAN_CURVE_POINTS: usize = 6;
+
+/// ACPI platform fan curve acoustic governor and thermal safety monitor.
+#[derive(Debug, Clone, Copy)]
+pub struct PlatformFanController {
+    /// Ordered trip points from coolest to hottest.
+    pub curve: [FanTripPoint; FAN_CURVE_POINTS],
+    /// Last sampled temperature in degrees Celsius.
+    pub last_temp_c: u8,
+    /// Current calculated fan PWM duty cycle (0 to 100%).
+    pub target_pwm_pct: u8,
+    /// Estimated fan rotational speed in RPM (0 to 6000 RPM).
+    pub current_rpm: u16,
+    /// Acoustic hysteresis deadband to prevent rapid cycling.
+    pub hysteresis_c: u8,
+    /// Active thermal safety status.
+    pub safety_status: ThermalSafetyStatus,
+    /// TDP power backoff deduction in Watts applied to active profile.
+    pub throttle_backoff_watts: u32,
+}
+
+impl PlatformFanController {
+    /// Maximum fan RPM at 100% PWM.
+    pub const MAX_RPM: u32 = 6000;
+
+    /// Initializes default acoustic fan curve for handheld platform.
+    pub const fn new() -> Self {
+        Self {
+            curve: [
+                FanTripPoint { temp_c: 40, pwm_pct: 0   }, // Silent below 40C
+                FanTripPoint { temp_c: 50, pwm_pct: 25  }, // Quiet whisper
+                FanTripPoint { temp_c: 65, pwm_pct: 45  }, // Moderate gaming load
+                FanTripPoint { temp_c: 75, pwm_pct: 70  }, // Heavy gaming
+                FanTripPoint { temp_c: 85, pwm_pct: 90  }, // Aggressive cooling
+                FanTripPoint { temp_c: 95, pwm_pct: 100 }, // Full 100% emergency
+            ],
+            last_temp_c: 45,
+            target_pwm_pct: 25,
+            current_rpm: 1500,
+            hysteresis_c: 3,
+            safety_status: ThermalSafetyStatus::Normal,
+            throttle_backoff_watts: 0,
+        }
+    }
+
+    /// Evaluates temperature reading, computes target PWM and thermal safety backoff.
+    pub fn update_temperature(&mut self, temp_c: u8) -> u8 {
+        // Hysteresis deadband: if cooling down, require dropping by at least hysteresis_c
+        if temp_c < self.last_temp_c && (self.last_temp_c - temp_c) < self.hysteresis_c {
+            return self.target_pwm_pct;
+        }
+
+        self.last_temp_c = temp_c;
+
+        // Determine thermal safety status and throttle backoff
+        if temp_c >= 95 {
+            self.safety_status = ThermalSafetyStatus::CriticalEmergency;
+            self.throttle_backoff_watts = 15; // Cut 15W immediately
+        } else if temp_c >= 85 {
+            self.safety_status = ThermalSafetyStatus::ThrottlingWarning;
+            self.throttle_backoff_watts = 5;  // Cut 5W backoff
+        } else {
+            self.safety_status = ThermalSafetyStatus::Normal;
+            self.throttle_backoff_watts = 0;
+        }
+
+        // Interpolate fan PWM
+        self.target_pwm_pct = self.interpolate_pwm(temp_c);
+        self.current_rpm = ((self.target_pwm_pct as u32 * Self::MAX_RPM) / 100) as u16;
+        self.target_pwm_pct
+    }
+
+    /// Interpolates target PWM between curve trip points.
+    fn interpolate_pwm(&self, temp_c: u8) -> u8 {
+        if temp_c <= self.curve[0].temp_c {
+            return self.curve[0].pwm_pct;
+        }
+        let last_idx = FAN_CURVE_POINTS - 1;
+        if temp_c >= self.curve[last_idx].temp_c {
+            return self.curve[last_idx].pwm_pct;
+        }
+
+        for i in 0..last_idx {
+            let p0 = &self.curve[i];
+            let p1 = &self.curve[i + 1];
+            if temp_c >= p0.temp_c && temp_c <= p1.temp_c {
+                let temp_range = (p1.temp_c - p0.temp_c) as u32;
+                let pwm_range = (p1.pwm_pct - p0.pwm_pct) as u32;
+                let temp_offset = (temp_c - p0.temp_c) as u32;
+                let interpolated = p0.pwm_pct as u32 + (temp_offset * pwm_range) / temp_range;
+                return interpolated as u8;
+            }
+        }
+
+        100
+    }
+}
+
+/// Verification test for ACPI platform fan curve and thermal throttling.
+pub fn verify_fan_curve_and_throttling() -> bool {
+    let mut fan = PlatformFanController::new();
+
+    // 1. Below 40C: fan should stay silent at 0% PWM and 0 RPM
+    let pwm = fan.update_temperature(38);
+    if pwm != 0 || fan.current_rpm != 0 || fan.safety_status != ThermalSafetyStatus::Normal {
+        return false;
+    }
+
+    // 2. Exactly at 50C trip point: 25% PWM, 1500 RPM
+    let pwm50 = fan.update_temperature(50);
+    if pwm50 != 25 || fan.current_rpm != 1500 {
+        return false;
+    }
+
+    // 3. Moderate gaming at 70C (interpolated between 65C:45% and 75C:70%)
+    // Offset = 5C out of 10C (50%), PWM = 45 + (5 * 25 / 10) = 45 + 12 = 57%
+    let pwm70 = fan.update_temperature(70);
+    if pwm70 != 57 || fan.safety_status != ThermalSafetyStatus::Normal || fan.throttle_backoff_watts != 0 {
+        return false;
+    }
+
+    // 4. Thermal warning at 88C: fan should ramp up, warning flag set, 5W throttle backoff
+    let pwm88 = fan.update_temperature(88);
+    if pwm88 < 90 || fan.safety_status != ThermalSafetyStatus::ThrottlingWarning || fan.throttle_backoff_watts != 5 {
+        return false;
+    }
+
+    // 5. Critical emergency at 98C: fan 100%, 6000 RPM, CriticalEmergency, 15W throttle backoff
+    let pwm98 = fan.update_temperature(98);
+    if pwm98 != 100 || fan.current_rpm != 6000 || fan.safety_status != ThermalSafetyStatus::CriticalEmergency || fan.throttle_backoff_watts != 15 {
+        return false;
+    }
+
+    // 6. Test hysteresis: dropping from 98C to 97C (< 3C delta) retains target
+    let pwm_hyst = fan.update_temperature(97);
+    if pwm_hyst != 100 {
+        return false;
+    }
+
+    true
+}
+
