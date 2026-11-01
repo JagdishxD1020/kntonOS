@@ -1576,6 +1576,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-BT-PASS] kntonOS userspace bluetooth peripheral manager verified\r\n");
     }
 
+    // Verify kntonOS Gamescope-Style Performance Overlay & HUD Telemetry Service (TASK-KNT-329)
+    if knton_os::service::verify_perf_overlay_subsystem() {
+        serial_write_str("[KNT-OS-PERF-PASS] kntonOS gamescope performance overlay & HUD telemetry verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] Performance overlay daemon self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
