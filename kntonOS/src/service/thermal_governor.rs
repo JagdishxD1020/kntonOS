@@ -219,3 +219,146 @@ impl MultiZoneSensorMatrix {
 }
 
 pub static SENSOR_MATRIX: MultiZoneSensorMatrix = MultiZoneSensorMatrix::new();
+
+
+// ============================================================================
+// Feature 2: Low-Noise Acoustic Fan Curve Smoothing & Hysteresis Governor
+// ============================================================================
+
+/// Fan curve calibration point mapping temperature (m°C) to target fan RPM.
+#[derive(Debug, Clone, Copy)]
+pub struct FanCurvePoint {
+    pub temp_mdeg_c: i32,
+    pub target_rpm: u32,
+}
+
+/// Acoustic fan profile curve with piecewise linear interpolation.
+pub struct AcousticFanCurve {
+    points: [FanCurvePoint; 6],
+}
+
+impl AcousticFanCurve {
+    pub const DEFAULT: Self = Self {
+        points: [
+            FanCurvePoint { temp_mdeg_c: 40_000, target_rpm: 0 },      // Below 40°C: Silent stop
+            FanCurvePoint { temp_mdeg_c: 55_000, target_rpm: 2_000 },  // 55°C: Whisper intake
+            FanCurvePoint { temp_mdeg_c: 68_000, target_rpm: 3_200 },  // 68°C: Low-resonance sweet spot
+            FanCurvePoint { temp_mdeg_c: 78_000, target_rpm: 4_400 },  // 78°C: Sustained gaming
+            FanCurvePoint { temp_mdeg_c: 88_000, target_rpm: 5_600 },  // 88°C: High-cooling profile
+            FanCurvePoint { temp_mdeg_c: 100_000, target_rpm: 6_800 }, // 100°C: Max emergency cooling
+        ],
+    };
+
+    /// Interpolates target RPM for a given temperature in millidegrees Celsius.
+    pub fn evaluate_rpm(&self, temp_mdeg_c: i32) -> u32 {
+        if temp_mdeg_c <= self.points[0].temp_mdeg_c {
+            return self.points[0].target_rpm;
+        }
+        let last_idx = self.points.len() - 1;
+        if temp_mdeg_c >= self.points[last_idx].temp_mdeg_c {
+            return self.points[last_idx].target_rpm;
+        }
+
+        let mut i = 0;
+        while i < last_idx {
+            let p0 = self.points[i];
+            let p1 = self.points[i + 1];
+            if temp_mdeg_c >= p0.temp_mdeg_c && temp_mdeg_c <= p1.temp_mdeg_c {
+                let temp_delta = (p1.temp_mdeg_c - p0.temp_mdeg_c) as i64;
+                let rpm_delta = (p1.target_rpm as i64) - (p0.target_rpm as i64);
+                let offset = (temp_mdeg_c - p0.temp_mdeg_c) as i64;
+                let interpolated = (p0.target_rpm as i64) + (offset * rpm_delta) / temp_delta;
+                return interpolated as u32;
+            }
+            i += 1;
+        }
+
+        self.points[last_idx].target_rpm
+    }
+}
+
+/// Slew rate and hysteresis governor preventing acoustic RPM hunting and flutter.
+pub struct AcousticFanGovernor {
+    curve: AcousticFanCurve,
+    current_commanded_rpm: AtomicU32,
+    target_rpm: AtomicU32,
+    effective_temp_mdeg: AtomicI32,
+    hysteresis_deadband_mdeg: i32,
+    max_ramp_up_step_rpm: u32,
+    max_ramp_down_step_rpm: u32,
+}
+
+impl AcousticFanGovernor {
+    pub const fn new() -> Self {
+        Self {
+            curve: AcousticFanCurve::DEFAULT,
+            current_commanded_rpm: AtomicU32::new(0),
+            target_rpm: AtomicU32::new(0),
+            effective_temp_mdeg: AtomicI32::new(35_000),
+            hysteresis_deadband_mdeg: 3_000, // 3.0°C deadband to avoid downshift flutter
+            max_ramp_up_step_rpm: 150,       // Smooth upward transition (+150 RPM/tick)
+            max_ramp_down_step_rpm: 50,      // Very gentle downward transition (-50 RPM/tick)
+        }
+    }
+
+    /// Evaluates current APU temperature and applies hysteresis deadband and slew-rate smoothing.
+    pub fn step(&self, measured_temp_mdeg: i32) -> u32 {
+        let prev_effective = self.effective_temp_mdeg.load(Ordering::Acquire);
+        let mut new_effective = prev_effective;
+
+        // Apply hysteresis deadband:
+        // Temperature must fall by more than hysteresis_deadband_mdeg below effective to downshift.
+        if measured_temp_mdeg > prev_effective {
+            new_effective = measured_temp_mdeg;
+        } else if measured_temp_mdeg < prev_effective - self.hysteresis_deadband_mdeg {
+            new_effective = measured_temp_mdeg + self.hysteresis_deadband_mdeg;
+        }
+        self.effective_temp_mdeg.store(new_effective, Ordering::Release);
+
+        // Determine raw target RPM from acoustic curve
+        let target = self.curve.evaluate_rpm(new_effective);
+        self.target_rpm.store(target, Ordering::Release);
+
+        // Apply asymmetric slew-rate limiter
+        let current = self.current_commanded_rpm.load(Ordering::Acquire);
+        let next_rpm = if target > current {
+            let delta = target - current;
+            if delta > self.max_ramp_up_step_rpm {
+                current + self.max_ramp_up_step_rpm
+            } else {
+                target
+            }
+        } else if target < current {
+            let delta = current - target;
+            if delta > self.max_ramp_down_step_rpm {
+                current - self.max_ramp_down_step_rpm
+            } else {
+                target
+            }
+        } else {
+            current
+        };
+
+        self.current_commanded_rpm.store(next_rpm, Ordering::Release);
+        next_rpm
+    }
+
+    pub fn get_commanded_rpm(&self) -> u32 {
+        self.current_commanded_rpm.load(Ordering::Acquire)
+    }
+
+    pub fn get_target_rpm(&self) -> u32 {
+        self.target_rpm.load(Ordering::Acquire)
+    }
+
+    pub fn get_effective_temp(&self) -> i32 {
+        self.effective_temp_mdeg.load(Ordering::Acquire)
+    }
+
+    pub fn force_rpm(&self, rpm: u32) {
+        self.target_rpm.store(rpm, Ordering::Release);
+        self.current_commanded_rpm.store(rpm, Ordering::Release);
+    }
+}
+
+pub static FAN_GOVERNOR: AcousticFanGovernor = AcousticFanGovernor::new();
