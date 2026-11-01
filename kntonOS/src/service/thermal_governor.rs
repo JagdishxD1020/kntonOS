@@ -541,3 +541,156 @@ impl ThrottlingPreventionModel {
 
 pub static SKIN_COMFORT: SkinComfortGovernor = SkinComfortGovernor::new();
 pub static THROTTLING_PREVENTION: ThrottlingPreventionModel = ThrottlingPreventionModel::new();
+
+
+// ============================================================================
+// Feature 4: Fan Tachometer Fault Detection & Emergency Thermal Relief Mode
+// ============================================================================
+
+/// Fan hardware fault diagnostic status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanFaultState {
+    /// Fan running within nominal tachometer tolerance.
+    Healthy,
+    /// Commanded RPM > 0 but tachometer reads zero (rotor stall or wire break).
+    RotorStalled,
+    /// Tachometer reading diverges from commanded RPM by > 35%.
+    DeviationAnomaly,
+    /// Tachometer indicates RPM exceeding maximum rated blower speed (> 7,500 RPM).
+    OverspeedRunaway,
+}
+
+/// Fan tachometer sensor monitor and hardware fault detector.
+pub struct FanFaultDetector {
+    fault_state: AtomicU32, // FanFaultState as u32
+    measured_tach_rpm: AtomicU32,
+    consecutive_fault_ticks: AtomicU32,
+    debounce_threshold: u32,
+}
+
+impl FanFaultDetector {
+    pub const fn new() -> Self {
+        Self {
+            fault_state: AtomicU32::new(0),
+            measured_tach_rpm: AtomicU32::new(0),
+            consecutive_fault_ticks: AtomicU32::new(0),
+            debounce_threshold: 3, // 3 consecutive cycles to confirm fault
+        }
+    }
+
+    /// Evaluates measured tachometer RPM against commanded fan RPM.
+    pub fn update(&self, commanded_rpm: u32, measured_rpm: u32) -> FanFaultState {
+        self.measured_tach_rpm.store(measured_rpm, Ordering::Release);
+
+        // Analyze raw state
+        let raw_state = if commanded_rpm >= 1_500 && measured_rpm < 300 {
+            FanFaultState::RotorStalled
+        } else if measured_rpm > 7_500 {
+            FanFaultState::OverspeedRunaway
+        } else if commanded_rpm >= 2_000 {
+            let diff = if commanded_rpm > measured_rpm {
+                commanded_rpm - measured_rpm
+            } else {
+                measured_rpm - commanded_rpm
+            };
+            if diff * 100 / commanded_rpm > 35 {
+                FanFaultState::DeviationAnomaly
+            } else {
+                FanFaultState::Healthy
+            }
+        } else {
+            FanFaultState::Healthy
+        };
+
+        if raw_state != FanFaultState::Healthy {
+            let ticks = self.consecutive_fault_ticks.fetch_add(1, Ordering::AcqRel) + 1;
+            if ticks >= self.debounce_threshold {
+                self.fault_state.store(raw_state as u32, Ordering::Release);
+                return raw_state;
+            }
+        } else {
+            self.consecutive_fault_ticks.store(0, Ordering::Release);
+            self.fault_state.store(FanFaultState::Healthy as u32, Ordering::Release);
+        }
+
+        self.get_fault_state()
+    }
+
+    pub fn get_fault_state(&self) -> FanFaultState {
+        match self.fault_state.load(Ordering::Acquire) {
+            0 => FanFaultState::Healthy,
+            1 => FanFaultState::RotorStalled,
+            2 => FanFaultState::DeviationAnomaly,
+            _ => FanFaultState::OverspeedRunaway,
+        }
+    }
+
+    pub fn get_measured_rpm(&self) -> u32 {
+        self.measured_tach_rpm.load(Ordering::Acquire)
+    }
+
+    pub fn is_fan_operational(&self) -> bool {
+        self.get_fault_state() == FanFaultState::Healthy
+    }
+}
+
+/// Emergency thermal relief manager activated upon cooling failure.
+pub struct EmergencyThermalRelief {
+    is_active: AtomicBool,
+    emergency_pwm_duty_pct: AtomicU32,
+    emergency_tdp_cap_watts: AtomicU32,
+    emergency_shutdown_required: AtomicBool,
+}
+
+impl EmergencyThermalRelief {
+    pub const fn new() -> Self {
+        Self {
+            is_active: AtomicBool::new(false),
+            emergency_pwm_duty_pct: AtomicU32::new(0),
+            emergency_tdp_cap_watts: AtomicU32::new(15),
+            emergency_shutdown_required: AtomicBool::new(false),
+        }
+    }
+
+    /// Evaluates system health and enters emergency relief mode if cooling fails.
+    pub fn evaluate(&self, fault_state: FanFaultState, apu_temp_mdeg: i32) -> bool {
+        if fault_state == FanFaultState::RotorStalled || apu_temp_mdeg >= 98_000 {
+            self.is_active.store(true, Ordering::Release);
+            self.emergency_pwm_duty_pct.store(100, Ordering::Release); // 100% full kickstart
+            self.emergency_tdp_cap_watts.store(4, Ordering::Release);   // Clamp APU to 4W survival mode
+
+            if apu_temp_mdeg >= 102_000 {
+                self.emergency_shutdown_required.store(true, Ordering::Release);
+            }
+            true
+        } else {
+            if self.is_active.load(Ordering::Acquire) && apu_temp_mdeg < 75_000 && fault_state == FanFaultState::Healthy {
+                // Safely disengage emergency mode
+                self.is_active.store(false, Ordering::Release);
+                self.emergency_pwm_duty_pct.store(0, Ordering::Release);
+                self.emergency_tdp_cap_watts.store(15, Ordering::Release);
+                self.emergency_shutdown_required.store(false, Ordering::Release);
+            }
+            self.is_active.load(Ordering::Acquire)
+        }
+    }
+
+    pub fn is_emergency_active(&self) -> bool {
+        self.is_active.load(Ordering::Acquire)
+    }
+
+    pub fn is_shutdown_required(&self) -> bool {
+        self.emergency_shutdown_required.load(Ordering::Acquire)
+    }
+
+    pub fn get_emergency_tdp_cap(&self) -> u32 {
+        self.emergency_tdp_cap_watts.load(Ordering::Acquire)
+    }
+
+    pub fn get_emergency_pwm_duty(&self) -> u32 {
+        self.emergency_pwm_duty_pct.load(Ordering::Acquire)
+    }
+}
+
+pub static FAN_FAULT_DETECTOR: FanFaultDetector = FanFaultDetector::new();
+pub static EMERGENCY_RELIEF: EmergencyThermalRelief = EmergencyThermalRelief::new();
