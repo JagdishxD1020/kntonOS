@@ -46,6 +46,8 @@ pub mod battery_manager;
 pub use battery_manager::*;
 pub mod speaker_dsp;
 pub use speaker_dsp::*;
+pub mod sd_indexer;
+pub use sd_indexer::*;
 
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
