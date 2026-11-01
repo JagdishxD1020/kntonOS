@@ -413,3 +413,151 @@ impl DrmModesetManager {
 }
 
 pub static MODESET_MANAGER: DrmModesetManager = DrmModesetManager::new();
+
+
+// ============================================================================
+// Feature 3: Dynamic Color Space Selection & HDR10 Metadata Routing
+// ============================================================================
+
+/// Display color gamut and dynamic range standard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSpace {
+    /// Standard sRGB gamut (standard PC SDR).
+    SrgbStandard,
+    /// ITU-R BT.709 HDTV color space.
+    Rec709Bt709,
+    /// DCI-P3 cinema wide color gamut.
+    DciP3WideColor,
+    /// ITU-R BT.2020 Wide Color Gamut with HDR10 (ST 2084 PQ).
+    Rec2020Hdr10,
+}
+
+/// Color bit depth per channel (bpc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorDepth {
+    Bpc8 = 8,
+    Bpc10 = 10,
+    Bpc12 = 12,
+}
+
+/// CTA-861.3 HDR10 static mastering metadata descriptor.
+#[derive(Debug, Clone, Copy)]
+pub struct Hdr10StaticMetadata {
+    /// Mastering display maximum luminance in nits (cd/m^2).
+    pub max_luminance_nits: u32,
+    /// Mastering display minimum luminance in milli-nits (1000 = 1.0 nit).
+    pub min_luminance_milli_nits: u32,
+    /// Maximum Content Light Level (MaxCLL) in nits.
+    pub max_cll_nits: u32,
+    /// Maximum Frame-Average Light Level (MaxFALL) in nits.
+    pub max_fall_nits: u32,
+    /// Whether HDR10 PQ transfer function is currently engaged in display controller.
+    pub is_hdr_active: bool,
+}
+
+impl Hdr10StaticMetadata {
+    pub const STEAMDECK_OLED_HDR: Self = Self {
+        max_luminance_nits: 1000,
+        min_luminance_milli_nits: 1, // 0.001 nit true OLED black
+        max_cll_nits: 1000,
+        max_fall_nits: 400,
+        is_hdr_active: true,
+    };
+
+    pub const SDR_DEFAULT: Self = Self {
+        max_luminance_nits: 400,
+        min_luminance_milli_nits: 200,
+        max_cll_nits: 400,
+        max_fall_nits: 200,
+        is_hdr_active: false,
+    };
+}
+
+/// Dynamic color space and HDR10 metadata routing manager.
+pub struct ColorSpaceManager {
+    active_colorspace: AtomicU32, // ColorSpace as u32
+    active_bpc: AtomicU32,        // ColorDepth as u32
+    hdr_active: AtomicBool,
+    max_lum_nits: AtomicU32,
+}
+
+impl ColorSpaceManager {
+    pub const fn new() -> Self {
+        Self {
+            active_colorspace: AtomicU32::new(ColorSpace::SrgbStandard as u32),
+            active_bpc: AtomicU32::new(ColorDepth::Bpc8 as u32),
+            hdr_active: AtomicBool::new(false),
+            max_lum_nits: AtomicU32::new(400),
+        }
+    }
+
+    /// Selects optimal color space and depth based on game request and monitor EDID capability.
+    pub fn select_color_space(
+        &self,
+        requested_space: ColorSpace,
+        monitor: &EdidMonitorInfo,
+    ) -> (ColorSpace, ColorDepth) {
+        let (resolved_space, bpc, is_hdr) = match requested_space {
+            ColorSpace::Rec2020Hdr10 => {
+                if monitor.supports_hdr10 {
+                    (ColorSpace::Rec2020Hdr10, ColorDepth::Bpc10, true)
+                } else {
+                    // Fall back to sRGB if monitor does not support HDR10
+                    (ColorSpace::SrgbStandard, ColorDepth::Bpc8, false)
+                }
+            }
+            ColorSpace::DciP3WideColor => (ColorSpace::DciP3WideColor, ColorDepth::Bpc10, false),
+            ColorSpace::Rec709Bt709 => (ColorSpace::Rec709Bt709, ColorDepth::Bpc8, false),
+            ColorSpace::SrgbStandard => (ColorSpace::SrgbStandard, ColorDepth::Bpc8, false),
+        };
+
+        self.active_colorspace.store(resolved_space as u32, Ordering::Release);
+        self.active_bpc.store(bpc as u32, Ordering::Release);
+        self.hdr_active.store(is_hdr, Ordering::Release);
+
+        if is_hdr {
+            self.max_lum_nits.store(1000, Ordering::Release);
+        } else {
+            self.max_lum_nits.store(400, Ordering::Release);
+        }
+
+        (resolved_space, bpc)
+    }
+
+    pub fn is_hdr_active(&self) -> bool {
+        self.hdr_active.load(Ordering::Acquire)
+    }
+
+    pub fn get_active_colorspace(&self) -> ColorSpace {
+        match self.active_colorspace.load(Ordering::Acquire) {
+            1 => ColorSpace::Rec709Bt709,
+            2 => ColorSpace::DciP3WideColor,
+            3 => ColorSpace::Rec2020Hdr10,
+            _ => ColorSpace::SrgbStandard,
+        }
+    }
+
+    pub fn get_active_bpc(&self) -> ColorDepth {
+        match self.active_bpc.load(Ordering::Acquire) {
+            10 => ColorDepth::Bpc10,
+            12 => ColorDepth::Bpc12,
+            _ => ColorDepth::Bpc8,
+        }
+    }
+
+    pub fn get_hdr_metadata(&self) -> Hdr10StaticMetadata {
+        if self.is_hdr_active() {
+            Hdr10StaticMetadata {
+                max_luminance_nits: self.max_lum_nits.load(Ordering::Acquire),
+                min_luminance_milli_nits: 1,
+                max_cll_nits: 1000,
+                max_fall_nits: 400,
+                is_hdr_active: true,
+            }
+        } else {
+            Hdr10StaticMetadata::SDR_DEFAULT
+        }
+    }
+}
+
+pub static COLOR_MANAGER: ColorSpaceManager = ColorSpaceManager::new();
