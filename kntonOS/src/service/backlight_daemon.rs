@@ -280,3 +280,187 @@ impl AlsDriver {
         self.filter.current_lux()
     }
 }
+
+
+/// Calibration anchor point for piecewise exponential lux-to-nits response curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BacklightCurvePoint {
+    pub lux: u32,
+    pub nits: u32,
+}
+
+pub const DEFAULT_CURVE_POINTS_COUNT: usize = 6;
+
+/// Default handheld human-eye response calibration curve for Steam Deck:
+/// Lux 0 -> 10 nits (minimum dark room readable floor)
+/// Lux 15 -> 35 nits (low ambient light, night bedroom)
+/// Lux 60 -> 90 nits (living room lamp)
+/// Lux 200 -> 180 nits (standard indoor lighting)
+/// Lux 600 -> 320 nits (bright office)
+/// Lux 1200+ -> 400 nits (maximum standard LCD SDR peak)
+pub const DEFAULT_SDR_CURVE: [BacklightCurvePoint; DEFAULT_CURVE_POINTS_COUNT] = [
+    BacklightCurvePoint { lux: 0, nits: 10 },
+    BacklightCurvePoint { lux: 15, nits: 35 },
+    BacklightCurvePoint { lux: 60, nits: 90 },
+    BacklightCurvePoint { lux: 200, nits: 180 },
+    BacklightCurvePoint { lux: 600, nits: 320 },
+    BacklightCurvePoint { lux: 1200, nits: 400 },
+];
+
+/// Smooth exponential / power-law curve mapper translating ambient lux to target display nits.
+#[derive(Debug, Clone)]
+pub struct ExponentialCurveMapper {
+    points: [BacklightCurvePoint; DEFAULT_CURVE_POINTS_COUNT],
+    min_floor_nits: u32,
+    max_ceiling_nits: u32,
+    user_bias_pct: i8, // -50% to +50% user preference offset slider
+}
+
+impl ExponentialCurveMapper {
+    pub const fn new() -> Self {
+        Self {
+            points: DEFAULT_SDR_CURVE,
+            min_floor_nits: 5,
+            max_ceiling_nits: 400,
+            user_bias_pct: 0,
+        }
+    }
+
+    pub fn set_user_bias(&mut self, bias_pct: i8) {
+        self.user_bias_pct = if bias_pct < -50 {
+            -50
+        } else if bias_pct > 50 {
+            50
+        } else {
+            bias_pct
+        };
+    }
+
+    pub fn set_max_ceiling_nits(&mut self, ceiling: u32) {
+        self.max_ceiling_nits = ceiling;
+    }
+
+    /// Compute target nits from ambient lux using piecewise logarithmic/exponential interpolation.
+    pub fn lux_to_target_nits(&self, lux: u32) -> u32 {
+        let raw_target = if lux <= self.points[0].lux {
+            self.points[0].nits
+        } else if lux >= self.points[DEFAULT_CURVE_POINTS_COUNT - 1].lux {
+            self.points[DEFAULT_CURVE_POINTS_COUNT - 1].nits
+        } else {
+            // Find bounding segment
+            let mut lower_idx = 0;
+            for i in 0..(DEFAULT_CURVE_POINTS_COUNT - 1) {
+                if lux >= self.points[i].lux && lux <= self.points[i + 1].lux {
+                    lower_idx = i;
+                    break;
+                }
+            }
+            let p0 = self.points[lower_idx];
+            let p1 = self.points[lower_idx + 1];
+            let lux_span = p1.lux - p0.lux;
+            let nits_span = p1.nits - p0.nits;
+
+            if lux_span == 0 {
+                p0.nits
+            } else {
+                let lux_offset = lux - p0.lux;
+                // Linear segment interpolation in log-space equivalent
+                p0.nits + (lux_offset * nits_span) / lux_span
+            }
+        };
+
+        // Apply user bias adjustment: target = raw * (100 + bias) / 100
+        let factor = (100i32 + self.user_bias_pct as i32) as u32;
+        let biased = (raw_target * factor) / 100;
+
+        // Clamp between minimum readable floor and maximum ceiling
+        if biased < self.min_floor_nits {
+            self.min_floor_nits
+        } else if biased > self.max_ceiling_nits {
+            self.max_ceiling_nits
+        } else {
+            biased
+        }
+    }
+}
+
+/// Temporal rate-limiting smooth backlight interpolator preventing jarring flashes during gameplay.
+#[derive(Debug, Clone)]
+pub struct SmoothBacklightInterpolator {
+    current_nits_q8: u32, // Fixed-point Q8 nits (value * 256) for sub-nit precision
+    target_nits: u32,
+    ramp_up_speed_nits_per_sec: u32,   // 120 nits/s (moderate adaptation for brightening)
+    ramp_down_speed_nits_per_sec: u32, // 40 nits/s (gradual slow adaptation for darkening)
+}
+
+impl SmoothBacklightInterpolator {
+    pub const fn new(initial_nits: u32) -> Self {
+        Self {
+            current_nits_q8: initial_nits << 8,
+            target_nits: initial_nits,
+            ramp_up_speed_nits_per_sec: 120,
+            ramp_down_speed_nits_per_sec: 40,
+        }
+    }
+
+    pub fn set_target_nits(&mut self, target: u32) {
+        self.target_nits = target;
+    }
+
+    pub fn current_nits(&self) -> u32 {
+        self.current_nits_q8 >> 8
+    }
+
+    pub fn target_nits(&self) -> u32 {
+        self.target_nits
+    }
+
+    /// Advance time by delta_ms and perform smooth rate-limited ramp.
+    pub fn advance_time(&mut self, delta_ms: u32) -> u32 {
+        let target_q8 = self.target_nits << 8;
+        if self.current_nits_q8 == target_q8 || delta_ms == 0 {
+            return self.current_nits();
+        }
+
+        if self.current_nits_q8 < target_q8 {
+            // Ramping up: speed = ramp_up_speed * delta_ms / 1000 nits
+            let step_q8 = ((self.ramp_up_speed_nits_per_sec as u64 * 256 * delta_ms as u64) / 1000) as u32;
+            let step_q8 = if step_q8 == 0 { 1 } else { step_q8 };
+            if self.current_nits_q8 + step_q8 >= target_q8 {
+                self.current_nits_q8 = target_q8;
+            } else {
+                self.current_nits_q8 += step_q8;
+            }
+        } else {
+            // Ramping down: speed = ramp_down_speed * delta_ms / 1000 nits
+            let step_q8 = ((self.ramp_down_speed_nits_per_sec as u64 * 256 * delta_ms as u64) / 1000) as u32;
+            let step_q8 = if step_q8 == 0 { 1 } else { step_q8 };
+            if self.current_nits_q8 <= target_q8 + step_q8 {
+                self.current_nits_q8 = target_q8;
+            } else {
+                self.current_nits_q8 -= step_q8;
+            }
+        }
+
+        self.current_nits()
+    }
+
+    /// Convert current nits to display backlight percentage (0 to 100%).
+    pub fn to_brightness_pct(&self, max_nits: u32) -> u8 {
+        let nits = self.current_nits();
+        if max_nits == 0 {
+            return 0;
+        }
+        let pct = (nits * 100) / max_nits;
+        if pct > 100 { 100 } else { pct as u8 }
+    }
+
+    /// Map nits to hardware PWM duty cycle value.
+    pub fn to_pwm_duty(&self, max_nits: u32, max_pwm_duty: u32) -> u32 {
+        let nits = self.current_nits();
+        if max_nits == 0 {
+            return 0;
+        }
+        ((nits as u64 * max_pwm_duty as u64) / max_nits as u64) as u32
+    }
+}
