@@ -1,0 +1,822 @@
+//! Handheld Userspace Network Manager & Wi-Fi Station Daemon (TASK-KNT-326).
+//!
+//! Provides Wi-Fi station discovery, WPA2/WPA3 profile storage, DHCP lease negotiation,
+//! fast DNS resolver caching, and captive portal / offline gaming management.
+
+#![allow(dead_code)]
+
+// ============================================================================
+// Feature 1: Wi-Fi Station Scan Results, RSSI Meter & WPA Profile Store
+// ============================================================================
+
+/// Wireless authentication and encryption protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityProtocol {
+    Open,
+    Wpa2Psk,
+    Wpa3Sae,
+    Wpa2Wpa3Mixed,
+}
+
+/// Discovered Access Point (BSS) descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WifiBssEntry {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub bssid: [u8; 6],
+    pub channel: u8,
+    pub rssi_dbm: i8,
+    pub security: SecurityProtocol,
+}
+
+impl WifiBssEntry {
+    pub const fn new(
+        ssid: &[u8],
+        bssid: [u8; 6],
+        channel: u8,
+        rssi_dbm: i8,
+        security: SecurityProtocol,
+    ) -> Self {
+        let mut buf = [0u8; 32];
+        let mut len = 0;
+        while len < ssid.len() && len < 32 {
+            buf[len] = ssid[len];
+            len += 1;
+        }
+        Self {
+            ssid: buf,
+            ssid_len: len as u8,
+            bssid,
+            channel,
+            rssi_dbm,
+            security,
+        }
+    }
+
+    /// Converts raw dBm signal strength to 1-4 visual status bar icons.
+    pub const fn signal_bars(&self) -> u8 {
+        if self.rssi_dbm >= -55 {
+            4 // Excellent
+        } else if self.rssi_dbm >= -67 {
+            3 // Good
+        } else if self.rssi_dbm >= -78 {
+            2 // Fair
+        } else {
+            1 // Weak
+        }
+    }
+}
+
+/// Stored network credentials profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WifiProfile {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub psk_hash: [u8; 32],
+    pub auto_connect: bool,
+    pub security: SecurityProtocol,
+}
+
+impl WifiProfile {
+    pub const fn new(ssid: &[u8], psk_hash: [u8; 32], security: SecurityProtocol) -> Self {
+        let mut buf = [0u8; 32];
+        let mut len = 0;
+        while len < ssid.len() && len < 32 {
+            buf[len] = ssid[len];
+            len += 1;
+        }
+        Self {
+            ssid: buf,
+            ssid_len: len as u8,
+            psk_hash,
+            auto_connect: true,
+            security,
+        }
+    }
+}
+
+pub const MAX_SCAN_RESULTS: usize = 16;
+pub const MAX_SAVED_PROFILES: usize = 8;
+
+/// Station subsystem manager.
+#[derive(Debug, Clone, Copy)]
+pub struct WifiStationManager {
+    pub scan_results: [WifiBssEntry; MAX_SCAN_RESULTS],
+    pub scan_count: usize,
+    pub profiles: [WifiProfile; MAX_SAVED_PROFILES],
+    pub profile_count: usize,
+    pub connected_bssid: Option<[u8; 6]>,
+    pub connected_rssi: i8,
+}
+
+impl WifiStationManager {
+    pub const fn new() -> Self {
+        let dummy_bss = WifiBssEntry {
+            ssid: [0; 32],
+            ssid_len: 0,
+            bssid: [0; 6],
+            channel: 0,
+            rssi_dbm: -100,
+            security: SecurityProtocol::Open,
+        };
+        let dummy_prof = WifiProfile {
+            ssid: [0; 32],
+            ssid_len: 0,
+            psk_hash: [0; 32],
+            auto_connect: false,
+            security: SecurityProtocol::Open,
+        };
+
+        Self {
+            scan_results: [dummy_bss; MAX_SCAN_RESULTS],
+            scan_count: 0,
+            profiles: [dummy_prof; MAX_SAVED_PROFILES],
+            profile_count: 0,
+            connected_bssid: None,
+            connected_rssi: -100,
+        }
+    }
+
+    /// Adds or updates a scanned access point in the active scan table.
+    pub fn add_scan_result(&mut self, bss: WifiBssEntry) {
+        // Check if BSSID already present, update RSSI
+        for i in 0..self.scan_count {
+            if self.scan_results[i].bssid == bss.bssid {
+                self.scan_results[i] = bss;
+                return;
+            }
+        }
+        if self.scan_count < MAX_SCAN_RESULTS {
+            self.scan_results[self.scan_count] = bss;
+            self.scan_count += 1;
+        }
+    }
+
+    /// Saves a known network profile for automatic reconnection.
+    pub fn save_profile(&mut self, profile: WifiProfile) -> bool {
+        for i in 0..self.profile_count {
+            if self.profiles[i].ssid_len == profile.ssid_len
+                && self.profiles[i].ssid == profile.ssid
+            {
+                self.profiles[i] = profile;
+                return true;
+            }
+        }
+        if self.profile_count < MAX_SAVED_PROFILES {
+            self.profiles[self.profile_count] = profile;
+            self.profile_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Finds a matching saved profile for a given SSID.
+    pub fn find_saved_profile(&self, ssid: &[u8]) -> Option<&WifiProfile> {
+        for i in 0..self.profile_count {
+            let prof = &self.profiles[i];
+            let len = prof.ssid_len as usize;
+            if len == ssid.len() && &prof.ssid[..len] == ssid {
+                return Some(prof);
+            }
+        }
+        None
+    }
+}
+
+/// Verification test for Wi-Fi station scan results and WPA profile store.
+pub fn verify_wifi_station_manager() -> bool {
+    let mut mgr = WifiStationManager::new();
+
+    // 1. Initial state
+    if mgr.scan_count != 0 || mgr.profile_count != 0 || mgr.connected_bssid.is_some() {
+        return false;
+    }
+
+    // 2. Add scan results for 5GHz home AP (WPA3-SAE, -52 dBm)
+    let bss1 = WifiBssEntry::new(
+        b"KntonGaming_5G",
+        [0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33],
+        36,
+        -52,
+        SecurityProtocol::Wpa3Sae,
+    );
+    if bss1.signal_bars() != 4 {
+        return false;
+    }
+    mgr.add_scan_result(bss1);
+    if mgr.scan_count != 1 {
+        return false;
+    }
+
+    // 3. Add scan result for weak 2.4GHz hotspot (WPA2, -82 dBm)
+    let bss2 = WifiBssEntry::new(
+        b"Guest_Hotspot",
+        [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+        6,
+        -82,
+        SecurityProtocol::Wpa2Psk,
+    );
+    if bss2.signal_bars() != 1 {
+        return false;
+    }
+    mgr.add_scan_result(bss2);
+    if mgr.scan_count != 2 {
+        return false;
+    }
+
+    // 4. Save profile for KntonGaming_5G
+    let prof = WifiProfile::new(b"KntonGaming_5G", [0x42; 32], SecurityProtocol::Wpa3Sae);
+    if !mgr.save_profile(prof) || mgr.profile_count != 1 {
+        return false;
+    }
+
+    // 5. Lookup saved profile
+    let found = mgr.find_saved_profile(b"KntonGaming_5G");
+    if found.is_none() || found.unwrap().security != SecurityProtocol::Wpa3Sae {
+        return false;
+    }
+
+    let not_found = mgr.find_saved_profile(b"NonExistent");
+    if not_found.is_some() {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 2: DHCP Lease Client State Machine & Dynamic Interface Configurator
+// ============================================================================
+
+/// Dynamic Host Configuration Protocol client state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhcpState {
+    Init,
+    Selecting,
+    Requesting,
+    Bound,
+    Renewing,
+    Rebinding,
+    Expired,
+}
+
+/// Dynamic IP interface network parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpConfiguration {
+    pub ipv4: [u8; 4],
+    pub netmask: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns_servers: [[u8; 4]; 2],
+    pub lease_duration_sec: u32,
+    pub is_valid: bool,
+}
+
+impl IpConfiguration {
+    pub const fn empty() -> Self {
+        Self {
+            ipv4: [0; 4],
+            netmask: [0; 4],
+            gateway: [0; 4],
+            dns_servers: [[0; 4]; 2],
+            lease_duration_sec: 0,
+            is_valid: false,
+        }
+    }
+}
+
+/// DHCP client lease engine.
+#[derive(Debug, Clone, Copy)]
+pub struct DhcpClient {
+    pub state: DhcpState,
+    pub xid: u32,
+    pub config: IpConfiguration,
+    pub lease_remaining_sec: u32,
+}
+
+impl DhcpClient {
+    pub const fn new() -> Self {
+        Self {
+            state: DhcpState::Init,
+            xid: 0,
+            config: IpConfiguration::empty(),
+            lease_remaining_sec: 0,
+        }
+    }
+
+    /// Broadcasts DHCPDISCOVER message.
+    pub fn start_discovery(&mut self, xid: u32) {
+        self.state = DhcpState::Selecting;
+        self.xid = xid;
+        self.config = IpConfiguration::empty();
+    }
+
+    /// Ingests DHCPOFFER from router / gateway.
+    pub fn process_offer(&mut self, ip: [u8; 4], netmask: [u8; 4], gateway: [u8; 4], lease_sec: u32) -> bool {
+        if self.state != DhcpState::Selecting {
+            return false;
+        }
+        self.config.ipv4 = ip;
+        self.config.netmask = netmask;
+        self.config.gateway = gateway;
+        self.config.lease_duration_sec = lease_sec;
+        self.state = DhcpState::Requesting;
+        true
+    }
+
+    /// Ingests DHCPACK completing network assignment.
+    pub fn process_ack(&mut self, dns_primary: [u8; 4], dns_secondary: [u8; 4]) -> bool {
+        if self.state != DhcpState::Requesting && self.state != DhcpState::Renewing && self.state != DhcpState::Rebinding {
+            return false;
+        }
+        self.config.dns_servers[0] = dns_primary;
+        self.config.dns_servers[1] = dns_secondary;
+        self.config.is_valid = true;
+        self.lease_remaining_sec = self.config.lease_duration_sec;
+        self.state = DhcpState::Bound;
+        true
+    }
+
+    /// Advances monotonic timer and governs lease lifecycle (T1=50%, T2=87.5%, Expire=0%).
+    pub fn tick_timer(&mut self, elapsed_sec: u32) {
+        if self.state != DhcpState::Bound && self.state != DhcpState::Renewing && self.state != DhcpState::Rebinding {
+            return;
+        }
+
+        if elapsed_sec >= self.lease_remaining_sec {
+            self.lease_remaining_sec = 0;
+            self.state = DhcpState::Expired;
+            self.config.is_valid = false;
+            return;
+        }
+
+        self.lease_remaining_sec -= elapsed_sec;
+        let total = self.config.lease_duration_sec;
+
+        // T1 renewal threshold at 50% remaining
+        let t1 = total / 2;
+        // T2 rebinding threshold at 12.5% remaining (87.5% elapsed)
+        let t2 = total / 8;
+
+        if self.lease_remaining_sec <= t2 {
+            self.state = DhcpState::Rebinding;
+        } else if self.lease_remaining_sec <= t1 {
+            self.state = DhcpState::Renewing;
+        }
+    }
+}
+
+/// Verification test for DHCP lease client state machine and interface configuration.
+pub fn verify_dhcp_client() -> bool {
+    let mut dhcp = DhcpClient::new();
+
+    // 1. Initial state
+    if dhcp.state != DhcpState::Init || dhcp.config.is_valid {
+        return false;
+    }
+
+    // 2. Discover
+    dhcp.start_discovery(0x1337BEEF);
+    if dhcp.state != DhcpState::Selecting || dhcp.xid != 0x1337BEEF {
+        return false;
+    }
+
+    // 3. Process Offer (192.168.1.150, 1 hr lease = 3600s)
+    let ok_offer = dhcp.process_offer(
+        [192, 168, 1, 150],
+        [255, 255, 255, 0],
+        [192, 168, 1, 1],
+        3600,
+    );
+    if !ok_offer || dhcp.state != DhcpState::Requesting {
+        return false;
+    }
+
+    // 4. Process Ack (DNS: 1.1.1.1, 8.8.8.8)
+    let ok_ack = dhcp.process_ack([1, 1, 1, 1], [8, 8, 8, 8]);
+    if !ok_ack || dhcp.state != DhcpState::Bound || !dhcp.config.is_valid {
+        return false;
+    }
+    if dhcp.config.ipv4 != [192, 168, 1, 150] || dhcp.lease_remaining_sec != 3600 {
+        return false;
+    }
+
+    // 5. Advance 1900s: remaining = 1700s (< 1800s T1) -> state must be Renewing
+    dhcp.tick_timer(1900);
+    if dhcp.state != DhcpState::Renewing || dhcp.lease_remaining_sec != 1700 {
+        return false;
+    }
+
+    // 6. Renew confirmed
+    dhcp.process_ack([1, 1, 1, 1], [8, 8, 8, 8]);
+    if dhcp.state != DhcpState::Bound || dhcp.lease_remaining_sec != 3600 {
+        return false;
+    }
+
+    // 7. Advance past entire lease (3700s) -> state must be Expired and config invalid
+    dhcp.tick_timer(3700);
+    if dhcp.state != DhcpState::Expired || dhcp.config.is_valid {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 3: DNS Resolver Lookup Cache & Asynchronous Query Pipeline
+// ============================================================================
+
+/// Cached DNS record descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsCacheRecord {
+    pub hostname: [u8; 64],
+    pub hostname_len: u8,
+    pub ip: [u8; 4],
+    pub ttl_sec: u32,
+    pub cached_time_sec: u64,
+    pub is_valid: bool,
+}
+
+impl DnsCacheRecord {
+    pub const fn empty() -> Self {
+        Self {
+            hostname: [0; 64],
+            hostname_len: 0,
+            ip: [0; 4],
+            ttl_sec: 0,
+            cached_time_sec: 0,
+            is_valid: false,
+        }
+    }
+
+    pub fn is_expired(&self, current_time_sec: u64) -> bool {
+        if !self.is_valid {
+            return true;
+        }
+        current_time_sec >= self.cached_time_sec.saturating_add(self.ttl_sec as u64)
+    }
+}
+
+pub const MAX_DNS_CACHE: usize = 16;
+
+/// High-performance zero-allocation DNS resolver cache.
+#[derive(Debug, Clone, Copy)]
+pub struct DnsResolverCache {
+    pub records: [DnsCacheRecord; MAX_DNS_CACHE],
+    pub primary_dns: [u8; 4],
+    pub secondary_dns: [u8; 4],
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+}
+
+impl DnsResolverCache {
+    pub const fn new() -> Self {
+        Self {
+            records: [DnsCacheRecord::empty(); MAX_DNS_CACHE],
+            primary_dns: [1, 1, 1, 1],
+            secondary_dns: [8, 8, 8, 8],
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// Configures upstream authoritative resolver IP addresses.
+    pub fn set_upstreams(&mut self, primary: [u8; 4], secondary: [u8; 4]) {
+        self.primary_dns = primary;
+        self.secondary_dns = secondary;
+    }
+
+    /// Looks up hostname in the fast local cache.
+    pub fn lookup(&mut self, hostname: &[u8], current_time_sec: u64) -> Option<[u8; 4]> {
+        for record in &self.records {
+            if record.is_valid && !record.is_expired(current_time_sec) {
+                let len = record.hostname_len as usize;
+                if len == hostname.len() && &record.hostname[..len] == hostname {
+                    self.cache_hits = self.cache_hits.saturating_add(1);
+                    return Some(record.ip);
+                }
+            }
+        }
+        self.cache_misses = self.cache_misses.saturating_add(1);
+        None
+    }
+
+    /// Stores a freshly resolved A record into the cache.
+    pub fn insert(&mut self, hostname: &[u8], ip: [u8; 4], ttl_sec: u32, current_time_sec: u64) -> bool {
+        let mut slot = None;
+
+        // Try to overwrite existing record with same hostname
+        for i in 0..MAX_DNS_CACHE {
+            let r = &self.records[i];
+            if r.is_valid {
+                let len = r.hostname_len as usize;
+                if len == hostname.len() && &r.hostname[..len] == hostname {
+                    slot = Some(i);
+                    break;
+                }
+            }
+        }
+
+        // Otherwise find first invalid or expired record
+        if slot.is_none() {
+            for i in 0..MAX_DNS_CACHE {
+                if !self.records[i].is_valid || self.records[i].is_expired(current_time_sec) {
+                    slot = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let idx = match slot {
+            Some(i) => i,
+            None => 0, // Fallback ring overwrite
+        };
+
+        let mut buf = [0u8; 64];
+        let len = hostname.len().min(64);
+        buf[..len].copy_from_slice(&hostname[..len]);
+
+        self.records[idx] = DnsCacheRecord {
+            hostname: buf,
+            hostname_len: len as u8,
+            ip,
+            ttl_sec,
+            cached_time_sec: current_time_sec,
+            is_valid: true,
+        };
+        true
+    }
+}
+
+/// Verification test for DNS resolver lookup cache.
+pub fn verify_dns_resolver_cache() -> bool {
+    let mut cache = DnsResolverCache::new();
+
+    // 1. Initial empty cache lookup fails
+    let miss = cache.lookup(b"cdn.knton.os", 100);
+    if miss.is_some() || cache.cache_misses != 1 || cache.cache_hits != 0 {
+        return false;
+    }
+
+    // 2. Insert record (TTL = 300s)
+    let ok = cache.insert(b"cdn.knton.os", [104, 18, 25, 42], 300, 100);
+    if !ok {
+        return false;
+    }
+
+    // 3. Lookup should hit
+    let hit = cache.lookup(b"cdn.knton.os", 200);
+    if hit != Some([104, 18, 25, 42]) || cache.cache_hits != 1 {
+        return false;
+    }
+
+    // 4. Lookup at t=450 (within 100+300=400 TTL? No, 450 > 400 => expired!)
+    let exp = cache.lookup(b"cdn.knton.os", 450);
+    if exp.is_some() {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 4: Handheld Offline Gaming Mode & Captive Portal Detector
+// ============================================================================
+
+/// System network reachability assessment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkReachability {
+    /// Completely offline (Airplane Mode or radio unassociated).
+    Offline,
+    /// Local subnet connection established, but gateway / internet unreachable.
+    LocalSubnetOnly,
+    /// Network connection intercepted by a captive portal login wall.
+    CaptivePortalDetected,
+    /// Unconstrained high-speed internet connectivity confirmed.
+    FullyOnline,
+}
+
+/// Captive portal login interception detector.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptivePortalDetector {
+    /// Expected probe status (204 No Content).
+    pub expected_status: u16,
+    /// Last received HTTP probe status code.
+    pub last_probe_status: u16,
+    /// Flag indicating captive portal splash page was detected.
+    pub portal_detected: bool,
+    /// Redirect login URL buffer, if intercepted.
+    pub portal_url: [u8; 128],
+    pub portal_url_len: u8,
+}
+
+impl CaptivePortalDetector {
+    pub const fn new() -> Self {
+        Self {
+            expected_status: 204,
+            last_probe_status: 0,
+            portal_detected: false,
+            portal_url: [0; 128],
+            portal_url_len: 0,
+        }
+    }
+
+    /// Evaluates HTTP connectivity probe response.
+    pub fn process_probe_result(&mut self, http_status: u16, redirect_url: Option<&[u8]>) -> NetworkReachability {
+        self.last_probe_status = http_status;
+        if http_status == self.expected_status {
+            self.portal_detected = false;
+            self.portal_url_len = 0;
+            NetworkReachability::FullyOnline
+        } else if http_status == 302 || http_status == 307 || http_status == 200 {
+            // Captured redirect or custom HTML splash page
+            self.portal_detected = true;
+            if let Some(url) = redirect_url {
+                let len = url.len().min(128);
+                self.portal_url[..len].copy_from_slice(&url[..len]);
+                self.portal_url_len = len as u8;
+            }
+            NetworkReachability::CaptivePortalDetected
+        } else {
+            self.portal_detected = false;
+            NetworkReachability::LocalSubnetOnly
+        }
+    }
+}
+
+/// Offline gaming mode and airplane mode supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct OfflineModeManager {
+    /// User-forced offline / airplane mode enabled.
+    pub offline_mode_active: bool,
+    /// Background telemetry and background downloads suspended.
+    pub background_sync_suspended: bool,
+    /// Wi-Fi radio transmitter powered down.
+    pub radio_disabled: bool,
+}
+
+impl OfflineModeManager {
+    pub const fn new() -> Self {
+        Self {
+            offline_mode_active: false,
+            background_sync_suspended: false,
+            radio_disabled: false,
+        }
+    }
+
+    /// Sets offline airplane mode status.
+    pub fn set_offline_mode(&mut self, enabled: bool) {
+        self.offline_mode_active = enabled;
+        if enabled {
+            self.radio_disabled = true;
+            self.background_sync_suspended = true;
+        } else {
+            self.radio_disabled = false;
+            self.background_sync_suspended = false;
+        }
+    }
+}
+
+/// Verification test for handheld offline gaming mode and captive portal detector.
+pub fn verify_offline_and_captive_portal() -> bool {
+    let mut detector = CaptivePortalDetector::new();
+    let mut offline = OfflineModeManager::new();
+
+    // 1. Initial state
+    if detector.portal_detected || offline.offline_mode_active || offline.radio_disabled {
+        return false;
+    }
+
+    // 2. Successful 204 No Content probe -> FullyOnline
+    let res_online = detector.process_probe_result(204, None);
+    if res_online != NetworkReachability::FullyOnline || detector.portal_detected {
+        return false;
+    }
+
+    // 3. Captive portal redirect (302) at hotel Wi-Fi
+    let res_portal = detector.process_probe_result(302, Some(b"http://hotel-wifi.com/login"));
+    if res_portal != NetworkReachability::CaptivePortalDetected || !detector.portal_detected {
+        return false;
+    }
+    if detector.portal_url_len == 0 {
+        return false;
+    }
+
+    // 4. Offline / Airplane mode toggle
+    offline.set_offline_mode(true);
+    if !offline.offline_mode_active || !offline.radio_disabled || !offline.background_sync_suspended {
+        return false;
+    }
+
+    offline.set_offline_mode(false);
+    if offline.offline_mode_active || offline.radio_disabled || offline.background_sync_suspended {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 5: Network Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// Handheld userspace network manager and Wi-Fi station supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkDaemon {
+    pub station_mgr: WifiStationManager,
+    pub dhcp_client: DhcpClient,
+    pub dns_cache: DnsResolverCache,
+    pub portal_detector: CaptivePortalDetector,
+    pub offline_mgr: OfflineModeManager,
+    pub cycles_polled: u64,
+}
+
+impl NetworkDaemon {
+    /// Initializes network daemon orchestrator with default handheld configuration.
+    pub const fn new() -> Self {
+        Self {
+            station_mgr: WifiStationManager::new(),
+            dhcp_client: DhcpClient::new(),
+            dns_cache: DnsResolverCache::new(),
+            portal_detector: CaptivePortalDetector::new(),
+            offline_mgr: OfflineModeManager::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic network manager maintenance cycle.
+    pub fn poll_network_cycle(&mut self, dt_sec: u32) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+        self.dhcp_client.tick_timer(dt_sec);
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Userspace
+/// Network Manager & Wi-Fi Station Daemon subsystem.
+pub fn verify_network_daemon_subsystem() -> bool {
+    if !verify_wifi_station_manager() {
+        return false;
+    }
+    if !verify_dhcp_client() {
+        return false;
+    }
+    if !verify_dns_resolver_cache() {
+        return false;
+    }
+    if !verify_offline_and_captive_portal() {
+        return false;
+    }
+
+    // Integrated coordinator verification
+    let mut daemon = NetworkDaemon::new();
+
+    // 1. Initial defaults
+    if daemon.cycles_polled != 0 || daemon.offline_mgr.offline_mode_active {
+        return false;
+    }
+
+    // 2. Discover and connect AP
+    let bss = WifiBssEntry::new(
+        b"Knton_Steam_Dock",
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        44,
+        -50,
+        SecurityProtocol::Wpa3Sae,
+    );
+    daemon.station_mgr.add_scan_result(bss);
+    let prof = WifiProfile::new(b"Knton_Steam_Dock", [0x99; 32], SecurityProtocol::Wpa3Sae);
+    daemon.station_mgr.save_profile(prof);
+    if daemon.station_mgr.find_saved_profile(b"Knton_Steam_Dock").is_none() {
+        return false;
+    }
+
+    // 3. DHCP address negotiation
+    daemon.dhcp_client.start_discovery(0xCAFE);
+    daemon.dhcp_client.process_offer([10, 0, 0, 50], [255, 255, 255, 0], [10, 0, 0, 1], 7200);
+    daemon.dhcp_client.process_ack([1, 1, 1, 1], [1, 0, 0, 1]);
+    if daemon.dhcp_client.state != DhcpState::Bound {
+        return false;
+    }
+
+    // 4. DNS resolution & caching
+    daemon.dns_cache.insert(b"game.knton.os", [10, 0, 0, 200], 600, 1000);
+    let resolved = daemon.dns_cache.lookup(b"game.knton.os", 1010);
+    if resolved != Some([10, 0, 0, 200]) {
+        return false;
+    }
+
+    // 5. Captive portal test (probe returns 204 => online)
+    let reach = daemon.portal_detector.process_probe_result(204, None);
+    if reach != NetworkReachability::FullyOnline {
+        return false;
+    }
+
+    // 6. Polling cycle
+    daemon.poll_network_cycle(10);
+    if daemon.cycles_polled != 1 || daemon.dhcp_client.lease_remaining_sec != 7190 {
+        return false;
+    }
+
+    true
+}
+

@@ -1555,6 +1555,14 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] SteamDeck gamepad mapper self-test failed!\r\n");
     }
 
+    // Verify kntonOS Userspace Network Manager & Wi-Fi Station Daemon (TASK-KNT-326)
+    if !knton_os::service::verify_network_daemon_subsystem() {
+        serial_write_str("[KNT-PANIC] Network manager daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-NET-PASS] kntonOS userspace network manager & wi-fi daemon verified\r\n");
+    }
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

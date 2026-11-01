@@ -27,6 +27,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && service::verify_audio_daemon_subsystem()
         && service::verify_display_daemon_subsystem()
         && service::verify_gamepad_mapper_subsystem()
+        && service::verify_network_daemon_subsystem()
         && ipc::verify_ipc_ports()
         && ipc::verify_ipc_dispatcher_subsystem()
         && shell::verify_game_mode_shell()
