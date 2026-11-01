@@ -507,3 +507,135 @@ impl HardwareOverlayPlaneAllocator {
 }
 
 pub static OVERLAY_ALLOCATOR: HardwareOverlayPlaneAllocator = HardwareOverlayPlaneAllocator::new();
+
+use core::sync::atomic::{AtomicU16, AtomicU32};
+
+/// Dynamic display refresh rate modes supported by handheld panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshRate {
+    Hz40 = 40,
+    Hz48 = 48,
+    Hz60 = 60,
+    Hz90 = 90,
+    Hz120 = 120,
+}
+
+impl RefreshRate {
+    /// Returns frame presentation interval in microseconds.
+    pub const fn target_frame_time_us(&self) -> u32 {
+        match self {
+            RefreshRate::Hz40 => 25_000,
+            RefreshRate::Hz48 => 20_833,
+            RefreshRate::Hz60 => 16_666,
+            RefreshRate::Hz90 => 11_111,
+            RefreshRate::Hz120 => 8_333,
+        }
+    }
+
+    pub fn from_hz(hz: u16) -> Option<Self> {
+        match hz {
+            40 => Some(RefreshRate::Hz40),
+            48 => Some(RefreshRate::Hz48),
+            60 => Some(RefreshRate::Hz60),
+            90 => Some(RefreshRate::Hz90),
+            120 => Some(RefreshRate::Hz120),
+            _ => None,
+        }
+    }
+}
+
+/// Dynamic Refresh Rate Switcher (DRRS) managing glitchless display panel clocking.
+pub struct DynamicRefreshRateSwitcher {
+    current_rate: AtomicU16,
+    switch_count: AtomicU32,
+}
+
+impl DynamicRefreshRateSwitcher {
+    pub const fn new() -> Self {
+        Self {
+            current_rate: AtomicU16::new(60),
+            switch_count: AtomicU32::new(0),
+        }
+    }
+
+    /// Sets the dynamic panel refresh rate.
+    pub fn set_refresh_rate(&self, rate: RefreshRate) -> Result<(), DisplayError> {
+        let hz = rate as u16;
+        let old = self.current_rate.swap(hz, Ordering::SeqCst);
+        if old != hz {
+            self.switch_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Retrieves active refresh rate mode.
+    pub fn get_refresh_rate(&self) -> RefreshRate {
+        let hz = self.current_rate.load(Ordering::Acquire);
+        RefreshRate::from_hz(hz).unwrap_or(RefreshRate::Hz60)
+    }
+
+    pub fn get_switch_count(&self) -> u32 {
+        self.switch_count.load(Ordering::Acquire)
+    }
+}
+
+/// Presentation pacer synchronizing frame delivery and mitigating visual judder.
+pub struct FramePresentationPacer {
+    last_present_timestamp_us: AtomicU64,
+    target_interval_us: AtomicU32,
+    consecutive_on_time: AtomicU32,
+    judder_events: AtomicU32,
+}
+
+impl FramePresentationPacer {
+    pub const fn new() -> Self {
+        Self {
+            last_present_timestamp_us: AtomicU64::new(0),
+            target_interval_us: AtomicU32::new(16_666),
+            consecutive_on_time: AtomicU32::new(0),
+            judder_events: AtomicU32::new(0),
+        }
+    }
+
+    /// Updates target pacing interval corresponding to the active display refresh rate.
+    pub fn update_rate(&self, rate: RefreshRate) {
+        self.target_interval_us.store(rate.target_frame_time_us(), Ordering::SeqCst);
+    }
+
+    /// Evaluates if a frame at current timestamp is ready for display flip without tearing or stutter.
+    pub fn pace_frame(&self, current_timestamp_us: u64) -> bool {
+        let last = self.last_present_timestamp_us.load(Ordering::Acquire);
+        let target = self.target_interval_us.load(Ordering::Acquire) as u64;
+
+        if last == 0 {
+            self.last_present_timestamp_us.store(current_timestamp_us, Ordering::Release);
+            self.consecutive_on_time.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
+        let delta = current_timestamp_us.saturating_sub(last);
+        // Allow within 90% of frame time threshold
+        if delta >= (target * 9) / 10 {
+            // Check for excessive judder (> 1.8x frame time)
+            if delta > (target * 18) / 10 {
+                self.judder_events.fetch_add(1, Ordering::Relaxed);
+            }
+            self.last_present_timestamp_us.store(current_timestamp_us, Ordering::Release);
+            self.consecutive_on_time.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get_judder_count(&self) -> u32 {
+        self.judder_events.load(Ordering::Acquire)
+    }
+
+    pub fn get_on_time_count(&self) -> u32 {
+        self.consecutive_on_time.load(Ordering::Acquire)
+    }
+}
+
+pub static DRRS_SWITCHER: DynamicRefreshRateSwitcher = DynamicRefreshRateSwitcher::new();
+pub static PRESENTATION_PACER: FramePresentationPacer = FramePresentationPacer::new();
