@@ -1407,7 +1407,7 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // Verify kntonOS User-Mode Memory Allocator & Dynamic Syscall Stubs (TASK-KNT-317)
-    if knton_os::verify_usermode_allocator_subsystem() {
+    if kntonOS::verify_usermode_allocator_subsystem() {
         serial_write_str("[KNT-OS-ALLOC-PASS] kntonOS user-mode memory allocator and dynamic syscall stubs verified\r\n");
     } else {
         serial_write_str("[KNT-PANIC] kntonOS user-mode memory allocator self-test failed!\r\n");
@@ -1518,6 +1518,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Device hardware daemon self-test failed!\r\n");
     } else {
         serial_write_str("[KNT-OS-DEVICE-DAEMON-PASS] kntonOS device hardware daemon and input event dispatcher verified\r\n");
+    }
+
+    // Verify kntonOS Userspace Power Management & Thermal Profile Daemon (TASK-KNT-321)
+    if !kntonOS::service::verify_power_daemon_subsystem() {
+        serial_write_str("[KNT-PANIC] Power and thermal daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-PWR-PASS] kntonOS power management & thermal daemon verified\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
