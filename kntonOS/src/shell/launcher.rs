@@ -297,3 +297,155 @@ impl ThumbnailGrid {
     }
 }
 
+// Lifecycle state of the managed game process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchState {
+    Idle,
+    Preparing { title_index: usize },
+    Running { pid: u32, title_index: usize, start_tick: u64 },
+    Suspended { pid: u32, title_index: usize },
+    Terminated { pid: u32, title_index: usize, exit_code: i32 },
+}
+
+// Process launch broker supervising game execution and lifecycle states.
+pub struct ProcessLaunchBroker {
+    state: LaunchState,
+    next_pid: u32,
+    launch_count: u64,
+    last_exit_code: Option<i32>,
+}
+
+impl ProcessLaunchBroker {
+    // Construct an idle process launch broker.
+    pub const fn new() -> Self {
+        Self {
+            state: LaunchState::Idle,
+            next_pid: 2000,
+            launch_count: 0,
+            last_exit_code: None,
+        }
+    }
+
+    // Return the current execution state.
+    pub fn state(&self) -> &LaunchState {
+        &self.state
+    }
+
+    // Return active process PID if running or suspended.
+    pub fn active_pid(&self) -> Option<u32> {
+        match self.state {
+            LaunchState::Running { pid, .. } | LaunchState::Suspended { pid, .. } => Some(pid),
+            _ => None,
+        }
+    }
+
+    // Return active game title index if launched.
+    pub fn active_title_index(&self) -> Option<usize> {
+        match self.state {
+            LaunchState::Preparing { title_index }
+            | LaunchState::Running { title_index, .. }
+            | LaunchState::Suspended { title_index, .. }
+            | LaunchState::Terminated { title_index, .. } => Some(title_index),
+            LaunchState::Idle => None,
+        }
+    }
+
+    // Check if a game process is currently running.
+    pub fn is_game_running(&self) -> bool {
+        matches!(self.state, LaunchState::Running { .. })
+    }
+
+    // Request execution launch of a game title from catalog.
+    pub fn request_launch(
+        &mut self,
+        title_index: usize,
+        catalog: &GameLibraryCatalog,
+        start_tick: u64,
+    ) -> Result<u32, &'static str> {
+        if self.is_game_running() {
+            return Err("Another process is currently running");
+        }
+        if catalog.get_game(title_index).is_none() {
+            return Err("Invalid game title index");
+        }
+
+        self.state = LaunchState::Preparing { title_index };
+        let pid = self.next_pid;
+        self.next_pid = self.next_pid.wrapping_add(1);
+        self.launch_count += 1;
+
+        self.state = LaunchState::Running {
+            pid,
+            title_index,
+            start_tick,
+        };
+        Ok(pid)
+    }
+
+    // Suspend active game process for quick hardware drawer overlay or system pause.
+    pub fn suspend(&mut self) -> Result<(), &'static str> {
+        match self.state {
+            LaunchState::Running { pid, title_index, .. } => {
+                self.state = LaunchState::Suspended { pid, title_index };
+                Ok(())
+            }
+            _ => Err("Process is not in running state"),
+        }
+    }
+
+    // Resume suspended game execution.
+    pub fn resume(&mut self, current_tick: u64) -> Result<(), &'static str> {
+        match self.state {
+            LaunchState::Suspended { pid, title_index } => {
+                self.state = LaunchState::Running {
+                    pid,
+                    title_index,
+                    start_tick: current_tick,
+                };
+                Ok(())
+            }
+            _ => Err("Process is not in suspended state"),
+        }
+    }
+
+    // Terminate running or suspended game and update play time.
+    pub fn terminate(
+        &mut self,
+        exit_code: i32,
+        catalog: &mut GameLibraryCatalog,
+        current_tick: u64,
+    ) -> Result<(), &'static str> {
+        match self.state {
+            LaunchState::Running { pid, title_index, start_tick } => {
+                let duration = current_tick.saturating_sub(start_tick);
+                if let Some(meta) = catalog.get_game_mut(title_index) {
+                    meta.add_play_time(duration);
+                }
+                self.last_exit_code = Some(exit_code);
+                self.state = LaunchState::Terminated {
+                    pid,
+                    title_index,
+                    exit_code,
+                };
+                Ok(())
+            }
+            LaunchState::Suspended { pid, title_index } => {
+                self.last_exit_code = Some(exit_code);
+                self.state = LaunchState::Terminated {
+                    pid,
+                    title_index,
+                    exit_code,
+                };
+                Ok(())
+            }
+            _ => Err("No active process to terminate"),
+        }
+    }
+
+    // Return the total number of game launches initiated.
+    pub fn total_launches(&self) -> u64 {
+        self.launch_count
+    }
+}
+
+
