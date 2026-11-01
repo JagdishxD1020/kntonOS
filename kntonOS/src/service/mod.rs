@@ -45,6 +45,9 @@ pub use haptics_daemon::*;
 pub mod battery_manager;
 pub use battery_manager::*;
 
+pub mod display_modeswitch;
+pub use display_modeswitch::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
