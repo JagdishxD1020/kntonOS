@@ -794,3 +794,148 @@ impl PresentationLatencyTracker {
 
 pub static VSYNC_FENCE: VsyncFence = VsyncFence::new();
 pub static LATENCY_TRACKER: PresentationLatencyTracker = PresentationLatencyTracker::new();
+
+/// Comprehensive verification self-test for Display Compositor & Direct Scanout Manager.
+pub fn verify_display_daemon_subsystem() -> bool {
+    // 1. Framebuffer Surface Lease & Direct Scanout Bypass
+    let game_surface = SurfaceDescriptor {
+        surface_id: SurfaceId(101),
+        owner_pid: 501,
+        width: 1280,
+        height: 800,
+        stride_bytes: 1280 * 4,
+        format: SurfaceFormat::Bgra8Unorm,
+        buffer_address: 0x0000_0001_8000_0000,
+        is_fullscreen: true,
+        is_leased: false,
+    };
+
+    if SURFACE_LEASE_MGR.register_surface(game_surface).is_err() {
+        return false;
+    }
+
+    let lease_id = match SURFACE_LEASE_MGR.request_lease(SurfaceId(101), 501) {
+        Ok(id) => id,
+        Err(_) => return false,
+    };
+
+    let active_lease = SURFACE_LEASE_MGR.get_active_lease();
+    if !SCANOUT_BYPASS.can_bypass(&active_lease) {
+        return false;
+    }
+
+    if SCANOUT_BYPASS.activate_bypass(&game_surface).is_err() {
+        return false;
+    }
+    if !SCANOUT_BYPASS.is_bypass_active() {
+        return false;
+    }
+
+    let flip_res = SCANOUT_BYPASS.queue_direct_flip(0x0000_0001_8010_0000);
+    if flip_res.is_err() || flip_res.unwrap() == 0 {
+        return false;
+    }
+
+    SCANOUT_BYPASS.deactivate_bypass();
+    if SURFACE_LEASE_MGR.release_lease(lease_id, 501).is_err() {
+        return false;
+    }
+
+    // 2. Hardware Overlay Plane Allocator & Layer Compositor
+    let dialog_surface = SurfaceDescriptor {
+        surface_id: SurfaceId(102),
+        owner_pid: 100,
+        width: 600,
+        height: 400,
+        stride_bytes: 600 * 4,
+        format: SurfaceFormat::Rgba8Unorm,
+        buffer_address: 0x0000_0001_8020_0000,
+        is_fullscreen: false,
+        is_leased: false,
+    };
+    let hud_surface = SurfaceDescriptor {
+        surface_id: SurfaceId(103),
+        owner_pid: 100,
+        width: 1280,
+        height: 800,
+        stride_bytes: 1280 * 4,
+        format: SurfaceFormat::Rgba8Unorm,
+        buffer_address: 0x0000_0001_8030_0000,
+        is_fullscreen: false,
+        is_leased: false,
+    };
+
+    let _ = SURFACE_LEASE_MGR.register_surface(dialog_surface);
+    let _ = SURFACE_LEASE_MGR.register_surface(hud_surface);
+
+    if OVERLAY_ALLOCATOR.allocate_plane(OverlayPlaneType::PrimaryGame, SurfaceId(101)).is_err() {
+        return false;
+    }
+    if OVERLAY_ALLOCATOR.allocate_plane(OverlayPlaneType::SystemDialog, SurfaceId(102)).is_err() {
+        return false;
+    }
+    if OVERLAY_ALLOCATOR.allocate_plane(OverlayPlaneType::HudOverlay, SurfaceId(103)).is_err() {
+        return false;
+    }
+
+    if OVERLAY_ALLOCATOR.configure_plane(OverlayPlaneType::HudOverlay, 0, 0, 1280, 800, 80).is_err() {
+        return false;
+    }
+
+    let comp = OVERLAY_ALLOCATOR.compose_layers();
+    if comp.total_active != 3 || comp.active_plane_mask != 0x07 || !comp.requires_blending {
+        return false;
+    }
+
+    let _ = OVERLAY_ALLOCATOR.disable_plane(OverlayPlaneType::HudOverlay);
+    if OVERLAY_ALLOCATOR.compose_layers().total_active != 2 {
+        return false;
+    }
+
+    // 3. Dynamic Refresh Rate Switcher (DRRS) & Pacer
+    if DRRS_SWITCHER.set_refresh_rate(RefreshRate::Hz40).is_err() {
+        return false;
+    }
+    if DRRS_SWITCHER.get_refresh_rate() != RefreshRate::Hz40 {
+        return false;
+    }
+    if DRRS_SWITCHER.set_refresh_rate(RefreshRate::Hz120).is_err() {
+        return false;
+    }
+    if DRRS_SWITCHER.get_refresh_rate() != RefreshRate::Hz120 {
+        return false;
+    }
+    let _ = DRRS_SWITCHER.set_refresh_rate(RefreshRate::Hz60);
+
+    PRESENTATION_PACER.update_rate(RefreshRate::Hz60);
+    if !PRESENTATION_PACER.pace_frame(1_000_000) {
+        return false;
+    }
+    // Presenting 5ms later is too early for 60Hz
+    if PRESENTATION_PACER.pace_frame(1_005_000) {
+        return false;
+    }
+    // Presenting 17ms later is on time for 60Hz
+    if !PRESENTATION_PACER.pace_frame(1_017_000) {
+        return false;
+    }
+
+    // 4. VSync Fence & Latency Telemetry
+    let vsync_seq = VSYNC_FENCE.signal_vsync(1_017_000);
+    if vsync_seq == 0 || VSYNC_FENCE.get_vsync_count() == 0 {
+        return false;
+    }
+
+    LATENCY_TRACKER.record_frame(1_000_000, 1_016_666, false);
+    LATENCY_TRACKER.record_frame(1_017_000, 1_033_666, false);
+
+    if LATENCY_TRACKER.get_total_frames() < 2 {
+        return false;
+    }
+    let avg = LATENCY_TRACKER.average_latency_us();
+    if avg < 15_000 || avg > 18_000 {
+        return false;
+    }
+
+    true
+}
