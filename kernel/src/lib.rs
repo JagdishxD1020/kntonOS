@@ -1548,6 +1548,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] kntonOS display compositor self-test failed!\r\n");
     }
 
+    // Verify kntonOS SteamDeck Gamepad Mapper & Virtual Input Driver (TASK-KNT-325)
+    if knton_os::service::verify_gamepad_mapper_subsystem() {
+        serial_write_str("[KNT-OS-PADMAP-PASS] kntonOS SteamDeck gamepad mapper and virtual input driver verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] SteamDeck gamepad mapper self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

@@ -12,6 +12,9 @@ pub use audio_daemon::*;
 pub mod display_daemon;
 pub use display_daemon::*;
 
+pub mod gamepad_mapper;
+pub use gamepad_mapper::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
