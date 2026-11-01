@@ -30,6 +30,9 @@ pub use perf_overlay::*;
 pub mod dock_daemon;
 pub use dock_daemon::*;
 
+pub mod thermal_governor;
+pub use thermal_governor::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
