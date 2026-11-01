@@ -588,6 +588,10 @@ pub extern "C" fn kmain() -> ! {
     }
     // Initialize and verify Direct3D 12 Agility Dynamic Multisample Anti-Aliasing (MSAA) Resolve Governor (TASK-KNT-309)
     gfx::test_msaa_resolve_subsystem();
+    // Initialize and verify Handheld Game Mode UI Compositor & Hardware HUD Overlay (TASK-KNT-316)
+    if !gfx::test_deck_shell_subsystem() {
+        serial_write_str("[KNT-PANIC] Handheld UI compositor and HUD overlay self-test failed!\r\n");
+    }
 
     // Initialize and verify Direct3D 12 Variable Rate Shading (VRS) & Tier 2 Shading Rate Engine (TASK-KNT-159)
     if !gfx::test_vrs_subsystem() {
