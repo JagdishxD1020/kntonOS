@@ -42,6 +42,9 @@ pub use motion_daemon::*;
 pub mod haptics_daemon;
 pub use haptics_daemon::*;
 
+pub mod sd_indexer;
+pub use sd_indexer::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
