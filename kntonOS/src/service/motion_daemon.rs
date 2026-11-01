@@ -438,3 +438,176 @@ impl ComplementaryFilter {
 
 pub static BIAS_CALIBRATOR: ThermalBiasCalibrator = ThermalBiasCalibrator::new();
 pub static ORIENTATION_FUSION: ComplementaryFilter = ComplementaryFilter::new();
+
+
+// ============================================================================
+// Feature 3: Gyro-to-Mouse / Right-Stick Aim Assist & Capacitive Touch Gate
+// ============================================================================
+
+/// Capacitive touch sensor trigger gate source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchGateSource {
+    RightThumbstickCap,
+    LeftThumbstickCap,
+    RightTrackpad,
+    AlwaysOn,
+}
+
+/// Aim assist output mapping mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AimMappingMode {
+    MouseEmulation,
+    RightStickEmulation,
+    Disabled,
+}
+
+/// Computed aim assist output frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AimOutput {
+    /// Relative mouse delta X (pixels).
+    pub mouse_dx: i32,
+    /// Relative mouse delta Y (pixels).
+    pub mouse_dy: i32,
+    /// Virtual right stick analog X deflection (-32768..32767).
+    pub stick_x: i16,
+    /// Virtual right stick analog Y deflection (-32768..32767).
+    pub stick_y: i16,
+    /// Whether aim assist gate was open during this cycle.
+    pub is_active: bool,
+}
+
+/// Capacitive touch sensor enable gate.
+pub struct CapacitiveTouchGate {
+    source: AtomicU32, // TouchGateSource as u32
+    is_touched: AtomicBool,
+}
+
+impl CapacitiveTouchGate {
+    pub const fn new() -> Self {
+        Self {
+            source: AtomicU32::new(0), // Default RightThumbstickCap
+            is_touched: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_source(&self, src: TouchGateSource) {
+        self.source.store(src as u32, Ordering::Release);
+    }
+
+    pub fn update_touch(&self, touched: bool) {
+        self.is_touched.store(touched, Ordering::Release);
+    }
+
+    pub fn is_gate_open(&self) -> bool {
+        match self.source.load(Ordering::Acquire) {
+            3 => true, // AlwaysOn
+            _ => self.is_touched.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// High-precision gyro aim assist mapping pipeline.
+pub struct GyroAimPipeline {
+    mode: AtomicU32, // AimMappingMode as u32
+    sensitivity_pct: AtomicU32, // Sensitivity scaling percentage (100 = 1.0x)
+    deadzone_mdeg_s: AtomicI32, // Deadzone to suppress micro-hand tremors (e.g. 150 mdeg/s)
+    invert_pitch: AtomicBool,
+}
+
+impl GyroAimPipeline {
+    pub const fn new() -> Self {
+        Self {
+            mode: AtomicU32::new(0), // Default MouseEmulation
+            sensitivity_pct: AtomicU32::new(100),
+            deadzone_mdeg_s: AtomicI32::new(150), // 0.15 °/s tremor deadband
+            invert_pitch: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_mode(&self, mode: AimMappingMode) {
+        self.mode.store(mode as u32, Ordering::Release);
+    }
+
+    pub fn set_sensitivity(&self, sens_pct: u32) {
+        self.sensitivity_pct.store(sens_pct, Ordering::Release);
+    }
+
+    pub fn set_deadzone(&self, deadzone_mdeg_s: i32) {
+        self.deadzone_mdeg_s.store(deadzone_mdeg_s, Ordering::Release);
+    }
+
+    pub fn set_invert_pitch(&self, invert: bool) {
+        self.invert_pitch.store(invert, Ordering::Release);
+    }
+
+    /// Evaluates gyro angular rate and capacitive touch state to produce aim output.
+    pub fn process(&self, gyro_mdeg_s: [i32; 3], gate_open: bool) -> AimOutput {
+        if !gate_open || self.mode.load(Ordering::Acquire) == AimMappingMode::Disabled as u32 {
+            return AimOutput::default();
+        }
+
+        let deadzone = self.deadzone_mdeg_s.load(Ordering::Acquire);
+        let sens = self.sensitivity_pct.load(Ordering::Acquire) as i64;
+        let invert = self.invert_pitch.load(Ordering::Acquire);
+
+        // Yaw controls horizontal aim, Pitch controls vertical aim
+        let mut raw_yaw = gyro_mdeg_s[2];   // Yaw rate (Z axis on handheld)
+        let mut raw_pitch = gyro_mdeg_s[0]; // Pitch rate (X axis on handheld)
+
+        // Apply tremor suppression deadzone
+        if raw_yaw.abs() < deadzone {
+            raw_yaw = 0;
+        } else if raw_yaw > 0 {
+            raw_yaw -= deadzone;
+        } else {
+            raw_yaw += deadzone;
+        }
+
+        if raw_pitch.abs() < deadzone {
+            raw_pitch = 0;
+        } else if raw_pitch > 0 {
+            raw_pitch -= deadzone;
+        } else {
+            raw_pitch += deadzone;
+        }
+
+        if invert {
+            raw_pitch = -raw_pitch;
+        }
+
+        match self.mode.load(Ordering::Acquire) {
+            0 => {
+                // MouseEmulation: 1000 mdeg/s (1°/s) at 100% sens -> ~10 mouse counts
+                let dx = ((raw_yaw as i64 * sens * 10) / 100_000) as i32;
+                let dy = -((raw_pitch as i64 * sens * 10) / 100_000) as i32;
+                AimOutput {
+                    mouse_dx: dx,
+                    mouse_dy: dy,
+                    stick_x: 0,
+                    stick_y: 0,
+                    is_active: true,
+                }
+            }
+            1 => {
+                // RightStickEmulation: Full deflection (32767) at ~180°/s (180,000 mdeg/s)
+                let sx = ((raw_yaw as i64 * 32767 * sens) / (180_000 * 100)) as i32;
+                let sy = -((raw_pitch as i64 * 32767 * sens) / (180_000 * 100)) as i32;
+
+                let clamp_sx = if sx > 32767 { 32767 } else if sx < -32768 { -32768 } else { sx as i16 };
+                let clamp_sy = if sy > 32767 { 32767 } else if sy < -32768 { -32768 } else { sy as i16 };
+
+                AimOutput {
+                    mouse_dx: 0,
+                    mouse_dy: 0,
+                    stick_x: clamp_sx,
+                    stick_y: clamp_sy,
+                    is_active: true,
+                }
+            }
+            _ => AimOutput::default(),
+        }
+    }
+}
+
+pub static TOUCH_GATE: CapacitiveTouchGate = CapacitiveTouchGate::new();
+pub static AIM_PIPELINE: GyroAimPipeline = GyroAimPipeline::new();
