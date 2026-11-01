@@ -1,8 +1,10 @@
 //! Inter-process communication port architecture.
 
 pub mod port;
+pub mod ring;
 
 pub use port::*;
+pub use ring::*;
 
 pub const MAX_PORT_PAYLOAD: usize = 64;
 
