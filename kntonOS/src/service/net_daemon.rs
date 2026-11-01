@@ -579,3 +579,140 @@ pub fn verify_dns_resolver_cache() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Handheld Offline Gaming Mode & Captive Portal Detector
+// ============================================================================
+
+/// System network reachability assessment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkReachability {
+    /// Completely offline (Airplane Mode or radio unassociated).
+    Offline,
+    /// Local subnet connection established, but gateway / internet unreachable.
+    LocalSubnetOnly,
+    /// Network connection intercepted by a captive portal login wall.
+    CaptivePortalDetected,
+    /// Unconstrained high-speed internet connectivity confirmed.
+    FullyOnline,
+}
+
+/// Captive portal login interception detector.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptivePortalDetector {
+    /// Expected probe status (204 No Content).
+    pub expected_status: u16,
+    /// Last received HTTP probe status code.
+    pub last_probe_status: u16,
+    /// Flag indicating captive portal splash page was detected.
+    pub portal_detected: bool,
+    /// Redirect login URL buffer, if intercepted.
+    pub portal_url: [u8; 128],
+    pub portal_url_len: u8,
+}
+
+impl CaptivePortalDetector {
+    pub const fn new() -> Self {
+        Self {
+            expected_status: 204,
+            last_probe_status: 0,
+            portal_detected: false,
+            portal_url: [0; 128],
+            portal_url_len: 0,
+        }
+    }
+
+    /// Evaluates HTTP connectivity probe response.
+    pub fn process_probe_result(&mut self, http_status: u16, redirect_url: Option<&[u8]>) -> NetworkReachability {
+        self.last_probe_status = http_status;
+        if http_status == self.expected_status {
+            self.portal_detected = false;
+            self.portal_url_len = 0;
+            NetworkReachability::FullyOnline
+        } else if http_status == 302 || http_status == 307 || http_status == 200 {
+            // Captured redirect or custom HTML splash page
+            self.portal_detected = true;
+            if let Some(url) = redirect_url {
+                let len = url.len().min(128);
+                self.portal_url[..len].copy_from_slice(&url[..len]);
+                self.portal_url_len = len as u8;
+            }
+            NetworkReachability::CaptivePortalDetected
+        } else {
+            self.portal_detected = false;
+            NetworkReachability::LocalSubnetOnly
+        }
+    }
+}
+
+/// Offline gaming mode and airplane mode supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct OfflineModeManager {
+    /// User-forced offline / airplane mode enabled.
+    pub offline_mode_active: bool,
+    /// Background telemetry and background downloads suspended.
+    pub background_sync_suspended: bool,
+    /// Wi-Fi radio transmitter powered down.
+    pub radio_disabled: bool,
+}
+
+impl OfflineModeManager {
+    pub const fn new() -> Self {
+        Self {
+            offline_mode_active: false,
+            background_sync_suspended: false,
+            radio_disabled: false,
+        }
+    }
+
+    /// Sets offline airplane mode status.
+    pub fn set_offline_mode(&mut self, enabled: bool) {
+        self.offline_mode_active = enabled;
+        if enabled {
+            self.radio_disabled = true;
+            self.background_sync_suspended = true;
+        } else {
+            self.radio_disabled = false;
+            self.background_sync_suspended = false;
+        }
+    }
+}
+
+/// Verification test for handheld offline gaming mode and captive portal detector.
+pub fn verify_offline_and_captive_portal() -> bool {
+    let mut detector = CaptivePortalDetector::new();
+    let mut offline = OfflineModeManager::new();
+
+    // 1. Initial state
+    if detector.portal_detected || offline.offline_mode_active || offline.radio_disabled {
+        return false;
+    }
+
+    // 2. Successful 204 No Content probe -> FullyOnline
+    let res_online = detector.process_probe_result(204, None);
+    if res_online != NetworkReachability::FullyOnline || detector.portal_detected {
+        return false;
+    }
+
+    // 3. Captive portal redirect (302) at hotel Wi-Fi
+    let res_portal = detector.process_probe_result(302, Some(b"http://hotel-wifi.com/login"));
+    if res_portal != NetworkReachability::CaptivePortalDetected || !detector.portal_detected {
+        return false;
+    }
+    if detector.portal_url_len == 0 {
+        return false;
+    }
+
+    // 4. Offline / Airplane mode toggle
+    offline.set_offline_mode(true);
+    if !offline.offline_mode_active || !offline.radio_disabled || !offline.background_sync_suspended {
+        return false;
+    }
+
+    offline.set_offline_mode(false);
+    if offline.offline_mode_active || offline.radio_disabled || offline.background_sync_suspended {
+        return false;
+    }
+
+    true
+}
+
