@@ -182,3 +182,235 @@ pub fn verify_battery_fuel_gauge() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 2: USB-PD Charging Contract State Machine & Power Profile Negotiator
+// ============================================================================
+
+/// Power Delivery contract profiles negotiated over USB-C CC lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbPdContract {
+    /// No active PD contract; USB-C port disconnected.
+    Disconnected,
+    /// 5V @ 3A (15W baseline USB-C).
+    Fix5V3A,
+    /// 9V @ 3A (27W fast phone charger).
+    Fix9V3A,
+    /// 15V @ 3A (45W ultrabook charger).
+    Fix15V3A,
+    /// 20V @ 3.25A (65W standard handheld gaming dock).
+    Fix20V3_25A,
+    /// 20V @ 5A (100W high-power dock).
+    Fix20V5A,
+    /// 28V @ 5A (140W USB-PD 3.1 Extended Power Range EPR).
+    Epr28V5A,
+}
+
+impl UsbPdContract {
+    /// Returns maximum power in Watts delivered by this contract.
+    pub const fn max_watts(&self) -> u16 {
+        match self {
+            Self::Disconnected => 0,
+            Self::Fix5V3A => 15,
+            Self::Fix9V3A => 27,
+            Self::Fix15V3A => 45,
+            Self::Fix20V3_25A => 65,
+            Self::Fix20V5A => 100,
+            Self::Epr28V5A => 140,
+        }
+    }
+
+    /// Returns nominal voltage in millivolts for this contract.
+    pub const fn voltage_mv(&self) -> u32 {
+        match self {
+            Self::Disconnected => 0,
+            Self::Fix5V3A => 5000,
+            Self::Fix9V3A => 9000,
+            Self::Fix15V3A => 15000,
+            Self::Fix20V3_25A | Self::Fix20V5A => 20000,
+            Self::Epr28V5A => 28000,
+        }
+    }
+
+    /// Returns maximum current limit in milliamperes for this contract.
+    pub const fn current_ma(&self) -> u32 {
+        match self {
+            Self::Disconnected => 0,
+            Self::Fix5V3A | Self::Fix9V3A | Self::Fix15V3A => 3000,
+            Self::Fix20V3_25A => 3250,
+            Self::Fix20V5A | Self::Epr28V5A => 5000,
+        }
+    }
+}
+
+/// Operational state of the USB-PD policy engine state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbPdState {
+    /// No USB-C charger attached.
+    Unattached,
+    /// Power source detected on CC lines, awaiting capabilities broadcast.
+    SourceAttached,
+    /// Protocol handshake in progress.
+    Negotiating,
+    /// High-power PD contract actively negotiated and stable.
+    ContractActive,
+    /// Down-negotiated to lower power profile due to handheld thermal throttling.
+    ThermalThrottled,
+    /// Fault condition (over-voltage, over-current, reverse current).
+    Fault,
+}
+
+/// USB-PD power profile negotiator and charging manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbPdNegotiator {
+    /// Currently active PD contract.
+    pub current_contract: UsbPdContract,
+    /// Current state of the PD state machine.
+    pub current_state: UsbPdState,
+    /// Negotiated voltage in millivolts.
+    pub negotiated_voltage_mv: u32,
+    /// Negotiated current in milliamperes.
+    pub negotiated_current_ma: u32,
+    /// Negotiated maximum power in Watts.
+    pub negotiated_max_watts: u16,
+    /// Whether connected source supports USB-PD 3.1 Extended Power Range (EPR).
+    pub is_epr_supported: bool,
+    /// Flag indicating pass-through bypass charging is active (protecting battery).
+    pub bypass_charging_engaged: bool,
+}
+
+impl UsbPdNegotiator {
+    /// Initializes negotiator in unattached disconnected state.
+    pub const fn new() -> Self {
+        Self {
+            current_contract: UsbPdContract::Disconnected,
+            current_state: UsbPdState::Unattached,
+            negotiated_voltage_mv: 0,
+            negotiated_current_ma: 0,
+            negotiated_max_watts: 0,
+            is_epr_supported: false,
+            bypass_charging_engaged: false,
+        }
+    }
+
+    /// Handles USB-C cable insertion event.
+    pub fn on_cable_attached(&mut self) {
+        self.current_state = UsbPdState::SourceAttached;
+    }
+
+    /// Handles USB-C cable removal event.
+    pub fn on_cable_detached(&mut self) {
+        self.current_contract = UsbPdContract::Disconnected;
+        self.current_state = UsbPdState::Unattached;
+        self.negotiated_voltage_mv = 0;
+        self.negotiated_current_ma = 0;
+        self.negotiated_max_watts = 0;
+        self.is_epr_supported = false;
+        self.bypass_charging_engaged = false;
+    }
+
+    /// Selects and negotiates the optimal power profile offered by the attached source.
+    pub fn negotiate_contract(&mut self, requested_watts: u16, offered_profiles: &[UsbPdContract]) -> bool {
+        self.current_state = UsbPdState::Negotiating;
+
+        // Find the highest offered profile that fits our requested target (or best available)
+        let mut best_contract = UsbPdContract::Disconnected;
+        for &profile in offered_profiles {
+            if profile.max_watts() <= requested_watts && profile.max_watts() > best_contract.max_watts() {
+                best_contract = profile;
+            }
+        }
+
+        // If no profile was strictly <= requested, pick the highest available profile
+        if best_contract == UsbPdContract::Disconnected && !offered_profiles.is_empty() {
+            best_contract = offered_profiles[0];
+            for &profile in offered_profiles {
+                if profile.max_watts() > best_contract.max_watts() {
+                    best_contract = profile;
+                }
+            }
+        }
+
+        if best_contract == UsbPdContract::Disconnected {
+            self.current_state = UsbPdState::Fault;
+            return false;
+        }
+
+        self.current_contract = best_contract;
+        self.negotiated_voltage_mv = best_contract.voltage_mv();
+        self.negotiated_current_ma = best_contract.current_ma();
+        self.negotiated_max_watts = best_contract.max_watts();
+        self.is_epr_supported = best_contract == UsbPdContract::Epr28V5A;
+        self.current_state = UsbPdState::ContractActive;
+
+        // Pass-through bypass charging can be engaged if we have >= 45W and battery is healthy
+        self.bypass_charging_engaged = self.negotiated_max_watts >= 45;
+
+        true
+    }
+
+    /// Down-negotiates power profile during emergency thermal throttling.
+    pub fn on_thermal_throttle(&mut self) {
+        if self.current_state == UsbPdState::ContractActive {
+            // Drop power to 27W or 15W to reduce charging heat dissipation
+            if self.current_contract.max_watts() > 27 {
+                self.current_contract = UsbPdContract::Fix9V3A;
+                self.negotiated_voltage_mv = UsbPdContract::Fix9V3A.voltage_mv();
+                self.negotiated_current_ma = UsbPdContract::Fix9V3A.current_ma();
+                self.negotiated_max_watts = UsbPdContract::Fix9V3A.max_watts();
+                self.current_state = UsbPdState::ThermalThrottled;
+                self.bypass_charging_engaged = false;
+            }
+        }
+    }
+}
+
+/// Verification test for USB-PD charging contracts and power negotiation.
+pub fn verify_usb_pd_charging_contracts() -> bool {
+    let mut pd = UsbPdNegotiator::new();
+
+    // 1. Initial state
+    if pd.current_state != UsbPdState::Unattached || pd.current_contract != UsbPdContract::Disconnected {
+        return false;
+    }
+
+    // 2. Attach cable
+    pd.on_cable_attached();
+    if pd.current_state != UsbPdState::SourceAttached {
+        return false;
+    }
+
+    // 3. Negotiate 65W target from a 100W dock offering [5V, 9V, 15V, 20V/3.25A, 20V/5A]
+    let dock_profiles = [
+        UsbPdContract::Fix5V3A,
+        UsbPdContract::Fix9V3A,
+        UsbPdContract::Fix15V3A,
+        UsbPdContract::Fix20V3_25A,
+        UsbPdContract::Fix20V5A,
+    ];
+    let ok = pd.negotiate_contract(65, &dock_profiles);
+    if !ok || pd.current_contract != UsbPdContract::Fix20V3_25A {
+        return false;
+    }
+    if pd.negotiated_max_watts != 65 || pd.negotiated_voltage_mv != 20000 || !pd.bypass_charging_engaged {
+        return false;
+    }
+    if pd.current_state != UsbPdState::ContractActive {
+        return false;
+    }
+
+    // 4. Test thermal throttle downgrade
+    pd.on_thermal_throttle();
+    if pd.current_state != UsbPdState::ThermalThrottled || pd.negotiated_max_watts != 27 {
+        return false;
+    }
+
+    // 5. Test detachment
+    pd.on_cable_detached();
+    if pd.current_state != UsbPdState::Unattached || pd.current_contract != UsbPdContract::Disconnected {
+        return false;
+    }
+
+    true
+}
