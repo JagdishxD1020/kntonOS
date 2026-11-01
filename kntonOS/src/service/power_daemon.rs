@@ -493,3 +493,175 @@ pub fn verify_fan_curve_and_throttling() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Handheld System Suspend / Sleep / Resume Coordination Protocol
+// ============================================================================
+
+/// System operational power phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendPhase {
+    /// Active interactive gaming execution.
+    Running,
+    /// Broadcasting suspend preparation to audio, display, GPU, and input daemons.
+    PreparingSleep,
+    /// Low-power quiescent state (ACPI S0i3 Modern Standby / S3 sleep).
+    Sleeping,
+    /// Hardware unblanking, audio unmute, and thread unfreeze sequence.
+    Waking,
+}
+
+/// Hardware trigger that initiated system wakeup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeReason {
+    None,
+    PowerButton,
+    GamepadHome,
+    UsbPowerConnected,
+    RtcAlarm,
+}
+
+/// Bitmask identifiers for subsystems participating in coordinated suspend.
+pub const SUBSYSTEM_AUDIO: u32   = 1 << 0;
+pub const SUBSYSTEM_DISPLAY: u32 = 1 << 1;
+pub const SUBSYSTEM_GPU: u32     = 1 << 2;
+pub const SUBSYSTEM_INPUT: u32   = 1 << 3;
+pub const SUBSYSTEM_STORAGE: u32 = 1 << 4;
+pub const ALL_SUBSYSTEMS_READY: u32 = SUBSYSTEM_AUDIO
+    | SUBSYSTEM_DISPLAY
+    | SUBSYSTEM_GPU
+    | SUBSYSTEM_INPUT
+    | SUBSYSTEM_STORAGE;
+
+/// Handheld instant sleep and fast-resume coordinator.
+#[derive(Debug, Clone, Copy)]
+pub struct SuspendCoordinator {
+    /// Current power phase.
+    pub phase: SuspendPhase,
+    /// Subsystem readiness acknowledgment bitmask.
+    pub prepared_mask: u32,
+    /// Trigger that caused the latest wakeup.
+    pub last_wake_reason: WakeReason,
+    /// Monotonic timestamp in milliseconds when sleep was entered.
+    pub sleep_enter_ms: u64,
+    /// Monotonic timestamp in milliseconds when resume completed.
+    pub resume_complete_ms: u64,
+    /// Total lifetime suspend/resume cycles successfully handled.
+    pub total_sleep_cycles: u32,
+    /// Fast instant-resume bypass active.
+    pub instant_resume_supported: bool,
+}
+
+impl SuspendCoordinator {
+    /// Initializes suspend coordinator in fully operational Running state.
+    pub const fn new() -> Self {
+        Self {
+            phase: SuspendPhase::Running,
+            prepared_mask: 0,
+            last_wake_reason: WakeReason::None,
+            sleep_enter_ms: 0,
+            resume_complete_ms: 0,
+            total_sleep_cycles: 0,
+            instant_resume_supported: true,
+        }
+    }
+
+    /// Initiates graceful sleep sequence across all registered handheld subsystems.
+    pub fn initiate_suspend(&mut self, timestamp_ms: u64) -> bool {
+        if self.phase != SuspendPhase::Running {
+            return false;
+        }
+        self.phase = SuspendPhase::PreparingSleep;
+        self.prepared_mask = 0;
+        self.sleep_enter_ms = timestamp_ms;
+        true
+    }
+
+    /// Records acknowledgment from an individual subsystem (e.g. audio muted, display off).
+    pub fn acknowledge_subsystem_ready(&mut self, subsystem_mask: u32) -> bool {
+        if self.phase != SuspendPhase::PreparingSleep {
+            return false;
+        }
+        self.prepared_mask |= subsystem_mask;
+
+        // If all subsystems have acknowledged flush & mute, enter full low-power sleep
+        if self.prepared_mask == ALL_SUBSYSTEMS_READY {
+            self.phase = SuspendPhase::Sleeping;
+        }
+        true
+    }
+
+    /// Hardware interrupt handler to awaken the system.
+    pub fn trigger_resume(&mut self, reason: WakeReason, timestamp_ms: u64) -> bool {
+        if self.phase != SuspendPhase::Sleeping && self.phase != SuspendPhase::PreparingSleep {
+            return false;
+        }
+
+        self.phase = SuspendPhase::Waking;
+        self.last_wake_reason = reason;
+        self.resume_complete_ms = timestamp_ms;
+        self.total_sleep_cycles = self.total_sleep_cycles.saturating_add(1);
+
+        // Hardware devices restored (display unblanked, audio unmuted, threads unfrozen)
+        self.phase = SuspendPhase::Running;
+        self.prepared_mask = 0;
+        true
+    }
+
+    /// Checks if the handheld is running in fully active interactive mode.
+    pub const fn is_fully_awake(&self) -> bool {
+        matches!(self.phase, SuspendPhase::Running)
+    }
+}
+
+/// Verification test for handheld system suspend sleep resume coordination.
+pub fn verify_suspend_coordinator() -> bool {
+    let mut coord = SuspendCoordinator::new();
+
+    // 1. Initial awake state
+    if !coord.is_fully_awake() || coord.phase != SuspendPhase::Running || coord.total_sleep_cycles != 0 {
+        return false;
+    }
+
+    // 2. Initiate suspend sequence at t=1000ms
+    let ok = coord.initiate_suspend(1000);
+    if !ok || coord.phase != SuspendPhase::PreparingSleep {
+        return false;
+    }
+
+    // 3. Acknowledge subsystems one by one
+    coord.acknowledge_subsystem_ready(SUBSYSTEM_AUDIO);
+    coord.acknowledge_subsystem_ready(SUBSYSTEM_DISPLAY);
+    coord.acknowledge_subsystem_ready(SUBSYSTEM_GPU);
+    coord.acknowledge_subsystem_ready(SUBSYSTEM_INPUT);
+    if coord.phase != SuspendPhase::PreparingSleep {
+        return false; // Storage subsystem still pending
+    }
+
+    coord.acknowledge_subsystem_ready(SUBSYSTEM_STORAGE);
+    if coord.phase != SuspendPhase::Sleeping {
+        return false; // Should now be in low-power sleeping state!
+    }
+
+    // 4. Trigger resume via Gamepad Home button at t=5000ms
+    let resume_ok = coord.trigger_resume(WakeReason::GamepadHome, 5000);
+    if !resume_ok || !coord.is_fully_awake() || coord.total_sleep_cycles != 1 {
+        return false;
+    }
+    if coord.last_wake_reason != WakeReason::GamepadHome || coord.resume_complete_ms != 5000 {
+        return false;
+    }
+
+    // 5. Test another cycle via PowerButton
+    coord.initiate_suspend(6000);
+    coord.acknowledge_subsystem_ready(ALL_SUBSYSTEMS_READY);
+    if coord.phase != SuspendPhase::Sleeping {
+        return false;
+    }
+    coord.trigger_resume(WakeReason::PowerButton, 9500);
+    if !coord.is_fully_awake() || coord.total_sleep_cycles != 2 || coord.last_wake_reason != WakeReason::PowerButton {
+        return false;
+    }
+
+    true
+}
+
