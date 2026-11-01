@@ -143,3 +143,156 @@ pub fn verify_usb_typec_cc_state_machine() -> bool {
 
     true
 }
+
+// ============================================================================
+// Feature 2: USB Power Delivery 3.0 PDO Contract Negotiation
+// ============================================================================
+
+/// USB-PD Power Data Object (Fixed Supply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowerDeliveryObject {
+    pub voltage_mv: u32,
+    pub max_current_ma: u32,
+}
+
+impl PowerDeliveryObject {
+    pub const fn fixed(voltage_mv: u32, max_current_ma: u32) -> Self {
+        Self {
+            voltage_mv,
+            max_current_ma,
+        }
+    }
+
+    pub const fn power_watts(&self) -> u32 {
+        (self.voltage_mv * self.max_current_ma) / 1_000_000
+    }
+}
+
+/// Power Delivery contract state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdContractStatus {
+    Default5V,
+    Negotiating,
+    FastCharge45WActive,
+    ContractActive(u32, u32), // Watts, Voltage in mV
+    ContractFailed,
+}
+
+/// USB Power Delivery 3.0 negotiation engine targeting Steam Deck 45W fast charge.
+#[derive(Debug, Clone, Copy)]
+pub struct UsbPdProtocolEngine {
+    pub status: PdContractStatus,
+    pub negotiated_voltage_mv: u32,
+    pub negotiated_current_ma: u32,
+    pub negotiated_watts: u32,
+    pub is_fast_charging_45w: bool,
+}
+
+impl UsbPdProtocolEngine {
+    pub const fn new() -> Self {
+        Self {
+            status: PdContractStatus::Default5V,
+            negotiated_voltage_mv: 5000,
+            negotiated_current_ma: 1500,
+            negotiated_watts: 7,
+            is_fast_charging_45w: false,
+        }
+    }
+
+    /// Evaluates Source Capabilities list and requests optimal contract.
+    /// Prefers official Steam Deck native 15V@3A (45W) profile.
+    pub fn evaluate_source_capabilities(&mut self, pdos: &[PowerDeliveryObject]) -> PdContractStatus {
+        if pdos.is_empty() {
+            self.status = PdContractStatus::ContractFailed;
+            return self.status;
+        }
+
+        self.status = PdContractStatus::Negotiating;
+
+        // 1. Check for exact 15V @ >=3000mA (45W) match
+        for pdo in pdos {
+            if pdo.voltage_mv == 15000 && pdo.max_current_ma >= 3000 {
+                self.negotiated_voltage_mv = 15000;
+                self.negotiated_current_ma = 3000;
+                self.negotiated_watts = 45;
+                self.is_fast_charging_45w = true;
+                self.status = PdContractStatus::FastCharge45WActive;
+                return self.status;
+            }
+        }
+
+        // 2. Otherwise find highest power supply available
+        let mut best_pdo: Option<PowerDeliveryObject> = None;
+        let mut best_power = 0;
+
+        for pdo in pdos {
+            let pwr = pdo.power_watts();
+            if pwr > best_power {
+                best_power = pwr;
+                best_pdo = Some(*pdo);
+            }
+        }
+
+        if let Some(best) = best_pdo {
+            self.negotiated_voltage_mv = best.voltage_mv;
+            self.negotiated_current_ma = best.max_current_ma;
+            self.negotiated_watts = best.power_watts();
+            self.is_fast_charging_45w = false;
+            self.status = PdContractStatus::ContractActive(self.negotiated_watts, self.negotiated_voltage_mv);
+        } else {
+            self.status = PdContractStatus::ContractFailed;
+        }
+
+        self.status
+    }
+}
+
+/// Verification test for USB Power Delivery 3.0 PDO contract negotiation.
+pub fn verify_usb_pd_contract_negotiation() -> bool {
+    let mut engine = UsbPdProtocolEngine::new();
+
+    // 1. Initial 5V default
+    if engine.status != PdContractStatus::Default5V || engine.is_fast_charging_45w {
+        return false;
+    }
+
+    // 2. Official Steam Deck 45W charger: offers [5V@3A, 9V@3A, 15V@3A]
+    let steam_deck_ac = [
+        PowerDeliveryObject::fixed(5000, 3000),
+        PowerDeliveryObject::fixed(9000, 3000),
+        PowerDeliveryObject::fixed(15000, 3000),
+    ];
+    let st = engine.evaluate_source_capabilities(&steam_deck_ac);
+    if st != PdContractStatus::FastCharge45WActive || !engine.is_fast_charging_45w {
+        return false;
+    }
+    if engine.negotiated_voltage_mv != 15000 || engine.negotiated_watts != 45 {
+        return false;
+    }
+
+    // 3. Fallback: 65W laptop charger offering [5V@3A, 9V@3A, 15V@3A, 20V@3.25A]
+    // Steam Deck engine should still select 15V@3A as official optimal charge curve
+    let dock_ac = [
+        PowerDeliveryObject::fixed(5000, 3000),
+        PowerDeliveryObject::fixed(9000, 3000),
+        PowerDeliveryObject::fixed(15000, 3000),
+        PowerDeliveryObject::fixed(20000, 3250),
+    ];
+    let st2 = engine.evaluate_source_capabilities(&dock_ac);
+    if st2 != PdContractStatus::FastCharge45WActive || !engine.is_fast_charging_45w {
+        return false;
+    }
+
+    // 4. Low-power 18W phone charger offering [5V@3A, 9V@2A] -> fallback to 9V 18W
+    let phone_ac = [
+        PowerDeliveryObject::fixed(5000, 3000),
+        PowerDeliveryObject::fixed(9000, 2000),
+    ];
+    let st3 = engine.evaluate_source_capabilities(&phone_ac);
+    if st3 != PdContractStatus::ContractActive(18, 9000) || engine.is_fast_charging_45w {
+        return false;
+    }
+
+    true
+}
+
