@@ -561,3 +561,125 @@ impl ColorSpaceManager {
 }
 
 pub static COLOR_MANAGER: ColorSpaceManager = ColorSpaceManager::new();
+
+
+// ============================================================================
+// Feature 4: Variable Refresh Rate (VRR) & Display Clock Pacing Governor
+// ============================================================================
+
+/// Variable Refresh Rate (VRR) operational state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrrStatus {
+    /// VRR disabled (fixed refresh rate).
+    Disabled,
+    /// VRR actively tracking game frame rate within dynamic window.
+    ActiveTracking,
+    /// Game FPS below VRR window; Low Frame-Rate Compensation (LFC) active.
+    LfcEngaged,
+}
+
+/// Variable refresh rate governor and frame-time pacing supervisor.
+pub struct VrrPacingGovernor {
+    vrr_enabled: AtomicBool,
+    vrr_min_hz: AtomicU32,
+    vrr_max_hz: AtomicU32,
+    target_refresh_cap_hz: AtomicU32,
+    effective_refresh_hz: AtomicU32,
+    lfc_multiplier: AtomicU32,
+    status: AtomicU32, // VrrStatus as u32
+}
+
+impl VrrPacingGovernor {
+    pub const fn new() -> Self {
+        Self {
+            vrr_enabled: AtomicBool::new(false),
+            vrr_min_hz: AtomicU32::new(40),
+            vrr_max_hz: AtomicU32::new(120),
+            target_refresh_cap_hz: AtomicU32::new(60),
+            effective_refresh_hz: AtomicU32::new(60),
+            lfc_multiplier: AtomicU32::new(1),
+            status: AtomicU32::new(VrrStatus::Disabled as u32),
+        }
+    }
+
+    /// Configures VRR capabilities from monitor EDID.
+    pub fn configure_monitor_vrr(&self, monitor: &EdidMonitorInfo) {
+        if monitor.native_mode.is_vrr_capable {
+            self.vrr_min_hz.store(monitor.min_refresh_hz, Ordering::Release);
+            self.vrr_max_hz.store(monitor.max_refresh_hz, Ordering::Release);
+            self.vrr_enabled.store(true, Ordering::Release);
+        } else {
+            self.vrr_enabled.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn set_vrr_enabled(&self, enabled: bool) {
+        self.vrr_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn set_target_refresh_cap(&self, cap_hz: u32) {
+        self.target_refresh_cap_hz.store(cap_hz, Ordering::Release);
+    }
+
+    /// Evaluates game render FPS and paces display refresh timing with LFC.
+    pub fn pace_frame(&self, current_fps: u32) -> VrrStatus {
+        if !self.vrr_enabled.load(Ordering::Acquire) {
+            let cap = self.target_refresh_cap_hz.load(Ordering::Acquire);
+            self.effective_refresh_hz.store(cap, Ordering::Release);
+            self.lfc_multiplier.store(1, Ordering::Release);
+            self.status.store(VrrStatus::Disabled as u32, Ordering::Release);
+            return VrrStatus::Disabled;
+        }
+
+        let min_hz = self.vrr_min_hz.load(Ordering::Acquire);
+        let max_hz = self.vrr_max_hz.load(Ordering::Acquire);
+        let cap_hz = self.target_refresh_cap_hz.load(Ordering::Acquire);
+        let upper_limit = max_hz.min(cap_hz);
+
+        if current_fps >= min_hz {
+            // Direct VRR window: match display refresh to game FPS
+            let paced_hz = current_fps.min(upper_limit);
+            self.effective_refresh_hz.store(paced_hz, Ordering::Release);
+            self.lfc_multiplier.store(1, Ordering::Release);
+            self.status.store(VrrStatus::ActiveTracking as u32, Ordering::Release);
+            VrrStatus::ActiveTracking
+        } else {
+            // Below VRR floor -> Engage Low Frame-Rate Compensation (LFC)
+            // Multiplier doubles or triples frames to fit inside [min_hz..max_hz]
+            let mult = if current_fps > 0 {
+                let m = (min_hz + current_fps - 1) / current_fps;
+                m.max(2)
+            } else {
+                2
+            };
+            let lfc_hz = (current_fps * mult).min(upper_limit).max(min_hz);
+
+            self.effective_refresh_hz.store(lfc_hz, Ordering::Release);
+            self.lfc_multiplier.store(mult, Ordering::Release);
+            self.status.store(VrrStatus::LfcEngaged as u32, Ordering::Release);
+            VrrStatus::LfcEngaged
+        }
+    }
+
+    pub fn get_effective_refresh_hz(&self) -> u32 {
+        self.effective_refresh_hz.load(Ordering::Acquire)
+    }
+
+    pub fn get_lfc_multiplier(&self) -> u32 {
+        self.lfc_multiplier.load(Ordering::Acquire)
+    }
+
+    pub fn get_status(&self) -> VrrStatus {
+        match self.status.load(Ordering::Acquire) {
+            1 => VrrStatus::ActiveTracking,
+            2 => VrrStatus::LfcEngaged,
+            _ => VrrStatus::Disabled,
+        }
+    }
+
+    pub fn is_vrr_active(&self) -> bool {
+        self.get_status() != VrrStatus::Disabled
+    }
+}
+
+pub static VRR_GOVERNOR: VrrPacingGovernor = VrrPacingGovernor::new();
