@@ -713,3 +713,267 @@ impl NightModeGovernor {
         }
     }
 }
+
+
+/// Panel display technology variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdrPanelType {
+    /// Steam Deck LCD (SDR 400-nit, 68% sRGB).
+    SteamDeckLcdSdr,
+    /// Steam Deck OLED (HDR10 1000-nit peak, 600-nit sustained, 110% DCI-P3).
+    SteamDeckOledHdr10,
+    /// External HDMI 2.0 / DP 1.4 HDR10 monitor/TV connected via dock.
+    ExternalDisplayHdr,
+}
+
+/// CIE 1931 xy chromaticity coordinates (normalized in units of 0.00002 per CTA-861-G).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromaticityPoint {
+    pub x: u16,
+    pub y: u16,
+}
+
+impl ChromaticityPoint {
+    pub const fn from_f32_approx(x: u32, y: u32) -> Self {
+        // x and y in 1/100,000ths
+        Self {
+            x: ((x * 50000) / 100000) as u16,
+            y: ((y * 50000) / 100000) as u16,
+        }
+    }
+}
+
+/// SMPTE ST 2086 mastering display color primaries and white point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MasteringDisplayPrimaries {
+    pub red: ChromaticityPoint,
+    pub green: ChromaticityPoint,
+    pub blue: ChromaticityPoint,
+    pub white: ChromaticityPoint,
+}
+
+/// DCI-P3 color gamut primaries for Steam Deck OLED panel.
+pub const STEAM_DECK_OLED_PRIMARIES: MasteringDisplayPrimaries = MasteringDisplayPrimaries {
+    // Red: x = 0.680, y = 0.320 -> x = 34000, y = 16000
+    red: ChromaticityPoint { x: 34000, y: 16000 },
+    // Green: x = 0.265, y = 0.690 -> x = 13250, y = 34500
+    green: ChromaticityPoint { x: 13250, y: 34500 },
+    // Blue: x = 0.150, y = 0.060 -> x = 7500, y = 3000
+    blue: ChromaticityPoint { x: 7500, y: 3000 },
+    // D65 White: x = 0.3127, y = 0.3290 -> x = 15635, y = 16450
+    white: ChromaticityPoint { x: 15635, y: 16450 },
+};
+
+/// SMPTE ST 2086 / CTA-861-G static HDR mastering display metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdrMasteringMetadata {
+    pub primaries: MasteringDisplayPrimaries,
+    pub max_luminance_nits: u32,
+    pub min_luminance_subnits: u32, // In 0.0001 cd/m² units (5 = 0.0005 nits true black for OLED)
+}
+
+/// CTA-861.3 content light level metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdrContentLightLevel {
+    pub max_cll_nits: u16,  // Maximum Content Light Level (peak specular highlight)
+    pub max_fall_nits: u16, // Maximum Frame-Average Light Level
+}
+
+/// Tone-mapping algorithm operator for HDR scene compression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToneMappingOperator {
+    /// Passthrough (1:1 linear PQ without compression).
+    Passthrough,
+    /// Reinhard highlight compression.
+    Reinhard,
+    /// Filmic S-curve tone mapper (preserves shadow contrast and highlight rolloff).
+    FilmicHable,
+    /// AMD FreeSync Premium Pro / Valve dynamic HDR tone mapper.
+    AmdDynamicHdr,
+}
+
+/// Dynamic tone-mapping state calibrated against ambient room illumination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicToneMappingParameters {
+    pub operator: ToneMappingOperator,
+    pub paper_white_nits: u32,
+    pub peak_specular_nits: u32,
+    pub shadow_boost_pct: u8,
+    pub contrast_exponent_q8: u16, // 256 = 1.0 gamma exponent
+}
+
+/// HDR display tone-mapping auto-calibrator coordinating metadata injection.
+#[derive(Debug, Clone)]
+pub struct HdrAutoCalibrator {
+    panel_type: HdrPanelType,
+    hdr_enabled: bool,
+    mastering_meta: HdrMasteringMetadata,
+    content_light_level: HdrContentLightLevel,
+    tone_mapping: DynamicToneMappingParameters,
+}
+
+impl HdrAutoCalibrator {
+    pub const fn new(panel_type: HdrPanelType) -> Self {
+        let (max_nits, min_subnits) = match panel_type {
+            HdrPanelType::SteamDeckLcdSdr => (400, 5000),      // 0.5 nits IPS black level
+            HdrPanelType::SteamDeckOledHdr10 => (1000, 5),     // 0.0005 nits OLED true black
+            HdrPanelType::ExternalDisplayHdr => (1000, 100),   // 0.01 nits typical HDR monitor
+        };
+
+        Self {
+            panel_type,
+            hdr_enabled: match panel_type {
+                HdrPanelType::SteamDeckOledHdr10 | HdrPanelType::ExternalDisplayHdr => true,
+                HdrPanelType::SteamDeckLcdSdr => false,
+            },
+            mastering_meta: HdrMasteringMetadata {
+                primaries: STEAM_DECK_OLED_PRIMARIES,
+                max_luminance_nits: max_nits,
+                min_luminance_subnits: min_subnits,
+            },
+            content_light_level: HdrContentLightLevel {
+                max_cll_nits: max_nits as u16,
+                max_fall_nits: (max_nits / 2) as u16,
+            },
+            tone_mapping: DynamicToneMappingParameters {
+                operator: ToneMappingOperator::FilmicHable,
+                paper_white_nits: 200,
+                peak_specular_nits: max_nits,
+                shadow_boost_pct: 0,
+                contrast_exponent_q8: 256,
+            },
+        }
+    }
+
+    pub fn is_hdr_supported(&self) -> bool {
+        self.panel_type != HdrPanelType::SteamDeckLcdSdr
+    }
+
+    pub fn is_hdr_active(&self) -> bool {
+        self.hdr_enabled && self.is_hdr_supported()
+    }
+
+    pub fn set_hdr_enabled(&mut self, enabled: bool) -> bool {
+        if enabled && !self.is_hdr_supported() {
+            return false;
+        }
+        self.hdr_enabled = enabled;
+        true
+    }
+
+    pub fn panel_type(&self) -> HdrPanelType {
+        self.panel_type
+    }
+
+    pub fn set_panel_type(&mut self, panel: HdrPanelType) {
+        self.panel_type = panel;
+        let (max_nits, min_subnits) = match panel {
+            HdrPanelType::SteamDeckLcdSdr => (400, 5000),
+            HdrPanelType::SteamDeckOledHdr10 => (1000, 5),
+            HdrPanelType::ExternalDisplayHdr => (1000, 100),
+        };
+        self.mastering_meta.max_luminance_nits = max_nits;
+        self.mastering_meta.min_luminance_subnits = min_subnits;
+        self.content_light_level.max_cll_nits = max_nits as u16;
+        self.content_light_level.max_fall_nits = (max_nits / 2) as u16;
+        self.tone_mapping.peak_specular_nits = max_nits;
+    }
+
+    pub fn mastering_metadata(&self) -> HdrMasteringMetadata {
+        self.mastering_meta
+    }
+
+    pub fn content_light_level(&self) -> HdrContentLightLevel {
+        self.content_light_level
+    }
+
+    pub fn tone_mapping_params(&self) -> DynamicToneMappingParameters {
+        self.tone_mapping
+    }
+
+    /// Adapt HDR tone-mapping parameters dynamically based on ambient lux.
+    /// In dark gaming environments (0-50 lux), lowers paper white to 120-160 nits to preserve dark adaptation,
+    /// retaining massive 1000-nit specular headroom.
+    /// In bright daylight (300-1000+ lux), lifts paper white to 280-350 nits and boosts shadow tones.
+    pub fn recalibrate_for_ambient_lux(&mut self, ambient_lux: u32) {
+        if !self.is_hdr_active() {
+            return;
+        }
+
+        if ambient_lux <= 20 {
+            // Dark room / night gaming: prevent eye fatigue, keep paper white modest
+            self.tone_mapping.paper_white_nits = 140;
+            self.tone_mapping.shadow_boost_pct = 0;
+            self.tone_mapping.contrast_exponent_q8 = 256;
+        } else if ambient_lux <= 150 {
+            // Normal indoor lighting
+            self.tone_mapping.paper_white_nits = 200;
+            self.tone_mapping.shadow_boost_pct = 5;
+            self.tone_mapping.contrast_exponent_q8 = 256;
+        } else if ambient_lux <= 600 {
+            // Bright office / daylight room: lift paper white and compensate shadow detail
+            self.tone_mapping.paper_white_nits = 280;
+            self.tone_mapping.shadow_boost_pct = 20;
+            self.tone_mapping.contrast_exponent_q8 = 240; // slightly brighten near-blacks
+        } else {
+            // Outdoor sun: push paper white to 350-400 nits and maximize shadow boost
+            self.tone_mapping.paper_white_nits = 380;
+            self.tone_mapping.shadow_boost_pct = 40;
+            self.tone_mapping.contrast_exponent_q8 = 220;
+        }
+    }
+
+    /// Produce 26-byte CTA-861-G HDR Static Metadata Data Block (HDMI/DP AVI InfoFrame payload).
+    pub fn serialize_cta861_metadata_block(&self, out: &mut [u8; 26]) {
+        // Byte 0: Extended Tag Code (0x07 = Capability Data Block / HDR Static Metadata)
+        out[0] = 0x07;
+        // Byte 1: Electro-Optical Transfer Function (0x02 = SMPTE ST 2084 PQ)
+        out[1] = if self.is_hdr_active() { 0x02 } else { 0x00 };
+        // Byte 2: Static Metadata Descriptor Type (0x00 = Type 1)
+        out[2] = 0x00;
+
+        let prim = &self.mastering_meta.primaries;
+        // Bytes 3-4: Display Primary 0 (Green) X
+        out[3] = (prim.green.x & 0xFF) as u8;
+        out[4] = ((prim.green.x >> 8) & 0xFF) as u8;
+        // Bytes 5-6: Display Primary 0 (Green) Y
+        out[5] = (prim.green.y & 0xFF) as u8;
+        out[6] = ((prim.green.y >> 8) & 0xFF) as u8;
+        // Bytes 7-8: Display Primary 1 (Blue) X
+        out[7] = (prim.blue.x & 0xFF) as u8;
+        out[8] = ((prim.blue.x >> 8) & 0xFF) as u8;
+        // Bytes 9-10: Display Primary 1 (Blue) Y
+        out[9] = (prim.blue.y & 0xFF) as u8;
+        out[10] = ((prim.blue.y >> 8) & 0xFF) as u8;
+        // Bytes 11-12: Display Primary 2 (Red) X
+        out[11] = (prim.red.x & 0xFF) as u8;
+        out[12] = ((prim.red.x >> 8) & 0xFF) as u8;
+        // Bytes 13-14: Display Primary 2 (Red) Y
+        out[13] = (prim.red.y & 0xFF) as u8;
+        out[14] = ((prim.red.y >> 8) & 0xFF) as u8;
+        // Bytes 15-16: White Point X
+        out[15] = (prim.white.x & 0xFF) as u8;
+        out[16] = ((prim.white.x >> 8) & 0xFF) as u8;
+        // Bytes 17-18: White Point Y
+        out[17] = (prim.white.y & 0xFF) as u8;
+        out[18] = ((prim.white.y >> 8) & 0xFF) as u8;
+
+        // Bytes 19-20: Max Mastering Luminance (nits)
+        let max_lum = self.mastering_meta.max_luminance_nits as u16;
+        out[19] = (max_lum & 0xFF) as u8;
+        out[20] = ((max_lum >> 8) & 0xFF) as u8;
+
+        // Bytes 21-22: Min Mastering Luminance (0.0001 nits)
+        let min_lum = self.mastering_meta.min_luminance_subnits as u16;
+        out[21] = (min_lum & 0xFF) as u8;
+        out[22] = ((min_lum >> 8) & 0xFF) as u8;
+
+        // Bytes 23-24: MaxCLL
+        let max_cll = self.content_light_level.max_cll_nits;
+        out[23] = (max_cll & 0xFF) as u8;
+        out[24] = ((max_cll >> 8) & 0xFF) as u8;
+
+        // Byte 25: MaxFALL LSB
+        out[25] = (self.content_light_level.max_fall_nits & 0xFF) as u8;
+    }
+}
