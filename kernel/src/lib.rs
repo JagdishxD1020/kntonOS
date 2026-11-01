@@ -1604,6 +1604,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-ALS-PASS] kntonOS SteamDeck ambient light & HDR auto-calibrator verified\r\n");
     }
 
+    // Verify kntonOS SteamDeck Audio Speaker DSP & Binaural Headphone Spatializer (TASK-KNT-335)
+    if !knton_os::service::verify_speaker_dsp_subsystem() {
+        serial_write_str("[KNT-PANIC] Speaker DSP daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-SPKDSP-PASS] kntonOS SteamDeck speaker DSP & binaural spatializer verified\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

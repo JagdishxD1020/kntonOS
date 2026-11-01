@@ -371,7 +371,7 @@ impl VoiceCoilThermalProtector {
         Self {
             current_temp_q8: 25 << 8, // 25°C ambient initial
             ambient_temp_celsius: 25,
-            thermal_resistance_q8: 512, // 2.0 °C / Watt
+            thermal_resistance_q8: 11520, // 45.0 °C / Watt micro-speaker thermal resistance
             thermal_time_constant_ms: 2500, // 2.5 second thermal mass
             protection_gain_q8: 256,
             is_throttling: false,
@@ -1111,4 +1111,176 @@ impl AudioLatencySynchronizer {
             }
         }
     }
+}
+
+
+/// Audio output routing destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioOutputSink {
+    InternalSpeakers,
+    Headphones35mm,
+    UsbDac,
+}
+
+/// Unified userspace Audio Speaker DSP & Spatializer Daemon.
+pub struct SpeakerDspDaemon {
+    pub speaker_eq: ParametricEqualizer,
+    pub crosstalk: StereoCrosstalkCanceller,
+    pub excursion_limiter: ExcursionLimiter,
+    pub thermal_protector: VoiceCoilThermalProtector,
+    pub spatializer: BinauralHrtfSpatializer,
+    pub voice_capture: VoiceChatCaptureProcessor,
+    pub latency_sync: AudioLatencySynchronizer,
+    pub sink: AudioOutputSink,
+}
+
+impl SpeakerDspDaemon {
+    pub fn new() -> Self {
+        Self {
+            speaker_eq: load_steamdeck_speaker_eq_profile(),
+            crosstalk: StereoCrosstalkCanceller::new(),
+            excursion_limiter: ExcursionLimiter::new(),
+            thermal_protector: VoiceCoilThermalProtector::new(),
+            spatializer: BinauralHrtfSpatializer::new(),
+            voice_capture: VoiceChatCaptureProcessor::new(),
+            latency_sync: AudioLatencySynchronizer::new(),
+            sink: AudioOutputSink::InternalSpeakers,
+        }
+    }
+
+    pub fn set_output_sink(&mut self, sink: AudioOutputSink) {
+        self.sink = sink;
+    }
+
+    /// Process playback stereo audio stream through appropriate DSP pipeline based on sink.
+    pub fn process_playback_stereo(&mut self, left: &mut [i16], right: &mut [i16], delta_ms: u32) {
+        match self.sink {
+            AudioOutputSink::InternalSpeakers => {
+                // Speaker chain: SteamDeck EQ -> Crosstalk Cancellation -> Excursion Limiter -> Thermal Protection
+                self.speaker_eq.process_stereo(left, right);
+                self.crosstalk.process_stereo(left, right);
+                self.excursion_limiter.process_frame(left, right);
+                self.thermal_protector.process_frame(left, right, delta_ms);
+            }
+            AudioOutputSink::Headphones35mm | AudioOutputSink::UsbDac => {
+                // Direct headphone monitoring (linear response, no speaker limiting needed)
+            }
+        }
+
+        // Push into zero-drop latency ring buffer
+        self.latency_sync.ring_buffer.write_stereo_block(left, right);
+        self.latency_sync.record_dsp_period(120, left.len()); // ~120us DSP processing latency
+    }
+}
+
+/// Verification self-test suite for Steam Deck Speaker DSP & Spatializer Subsystem (TASK-KNT-335).
+pub fn verify_speaker_dsp_subsystem() -> bool {
+    // 1. Verify Biquad Parametric EQ and Valve Steam Deck calibration profile
+    let mut eq = load_steamdeck_speaker_eq_profile();
+    let mut left = [1000i16; 64];
+    let mut right = [1000i16; 64];
+    eq.process_stereo(&mut left, &mut right);
+    // After EQ processing, output should reflect filter gain without overflowing
+    if left[10] == 1000 || left[10] == 0 {
+        return false;
+    }
+
+    // 2. Verify Stereo Crosstalk Canceller (X-TC)
+    let mut xtc = StereoCrosstalkCanceller::new();
+    let mut l_sig = [0i16; 32];
+    let mut r_sig = [0i16; 32];
+    l_sig[0] = 20000; // Left impulse
+    xtc.process_stereo(&mut l_sig, &mut r_sig);
+    // Right channel should contain delayed inverted crosstalk signal at delay offset 8
+    if r_sig[8] >= 0 || r_sig[8] < -12000 {
+        return false;
+    }
+
+    // 3. Verify Smart Amp Excursion Limiter and Thermal Protector
+    let mut exc = ExcursionLimiter::new();
+    let mut l_loud = [32000i16; 64];
+    let mut r_loud = [32000i16; 64];
+    exc.process_frame(&mut l_loud, &mut r_loud);
+    // Displacement for 32000 peak is ~468um > Xmax 450um, so gain must attenuate
+    if exc.current_gain_q8 >= 256 || l_loud[0] >= 32000 {
+        return false;
+    }
+
+    let mut thermal = VoiceCoilThermalProtector::new();
+    let mut l_sustained = [28000i16; 128];
+    let mut r_sustained = [28000i16; 128];
+    // Simulate loud gameplay for 25 seconds (25,000 ms)
+    for _ in 0..100 {
+        thermal.process_frame(&mut l_sustained, &mut r_sustained, 250);
+    }
+    // Thermal model should detect temperature rise
+    if thermal.current_temperature_celsius() <= 30 {
+        return false;
+    }
+
+    // 4. Verify 3.5mm Headphone Binaural HRTF 7.1 Spatializer
+    let mut spatializer = BinauralHrtfSpatializer::new();
+    let mut ch_in = [[0i16; AUDIO_FRAME_SIZE]; SURROUND_7_1_CHANNELS];
+    // Feed Side Left channel (index 6) with audio signal
+    for i in 0..AUDIO_FRAME_SIZE {
+        ch_in[6][i] = 16000;
+    }
+    let refs: [&[i16]; SURROUND_7_1_CHANNELS] = [
+        &ch_in[0], &ch_in[1], &ch_in[2], &ch_in[3],
+        &ch_in[4], &ch_in[5], &ch_in[6], &ch_in[7],
+    ];
+    let mut out_l = [0i16; AUDIO_FRAME_SIZE];
+    let mut out_r = [0i16; AUDIO_FRAME_SIZE];
+    spatializer.spatial_downmix_7_1(&refs, &mut out_l, &mut out_r);
+
+    // Left ear (ipsilateral) should have much stronger energy than right ear (contralateral head shadow)
+    let sum_l: i64 = out_l.iter().map(|&x| (x as i64).abs()).sum();
+    let sum_r: i64 = out_r.iter().map(|&x| (x as i64).abs()).sum();
+    if sum_l <= sum_r || sum_l == 0 {
+        return false;
+    }
+
+    // 5. Verify Dual-Mic Beamforming and ANS Voice Chat Filter
+    let mut voice_proc = VoiceChatCaptureProcessor::new();
+    let mic_l = [8000i16; 64];
+    let mic_r = [8000i16; 64];
+    let mut out_clean = [0i16; 64];
+    voice_proc.process_capture(&mic_l, &mic_r, &mut out_clean);
+    if out_clean[10] == 0 {
+        return false;
+    }
+    // Verify VAD classified input as speech
+    if !voice_proc.noise_suppressor.is_speech_active() {
+        return false;
+    }
+
+    // 6. Verify Zero-Drop Lock-Free Ring Buffer & Latency Synchronizer
+    let mut ring = ZeroDropAudioRingBuffer::new();
+    let test_l = [1234i16; 64];
+    let test_r = [5678i16; 64];
+    let written = ring.write_stereo_block(&test_l, &test_r);
+    if written != 64 || ring.available_read_frames() != 64 {
+        return false;
+    }
+
+    let mut read_l = [0i16; 64];
+    let mut read_r = [0i16; 64];
+    let read_cnt = ring.read_stereo_block(&mut read_l, &mut read_r);
+    if read_cnt != 64 || read_l[0] != 1234 || read_r[0] != 5678 {
+        return false;
+    }
+    if ring.available_read_frames() != 0 {
+        return false;
+    }
+
+    // 7. Verify Unified Daemon Integration Loop
+    let mut daemon = SpeakerDspDaemon::new();
+    let mut frame_l = [5000i16; AUDIO_FRAME_SIZE];
+    let mut frame_r = [5000i16; AUDIO_FRAME_SIZE];
+    daemon.process_playback_stereo(&mut frame_l, &mut frame_r, 10);
+    if daemon.latency_sync.metrics.total_frames_processed == 0 {
+        return false;
+    }
+
+    true
 }
