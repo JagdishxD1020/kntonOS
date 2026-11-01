@@ -36,6 +36,9 @@ pub use thermal_governor::*;
 pub mod backlight_daemon;
 pub use backlight_daemon::*;
 
+pub mod speaker_dsp;
+pub use speaker_dsp::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
