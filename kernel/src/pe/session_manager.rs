@@ -727,3 +727,231 @@ pub fn verify_service_registry_and_recovery() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: KntPort IPC Endpoints & Multi-Session Rendezvous Router
+// ============================================================================
+
+/// Message packet transmitted across a KntPort LPC/ALPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KntPortMessage {
+    /// Unique monotonically increasing message identifier.
+    pub msg_id: u64,
+    /// Process identifier of the sender.
+    pub sender_pid: u64,
+    /// Session identifier of the sender.
+    pub sender_session_id: u32,
+    /// Application-defined message type or LPC message code.
+    pub msg_type: u32,
+    /// Payload bytes.
+    pub payload: Vec<u8>,
+}
+
+/// Named IPC port endpoint facilitating client-server connection and messaging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KntPort {
+    /// Unique port identifier.
+    pub port_id: u32,
+    /// Canonical NT path name for the port (e.g. "\\Smss\\Port", "\\Csrss\\ApiPort").
+    pub name: String,
+    /// Owning session that instantiated this port.
+    pub owning_session_id: u32,
+    /// Whether processes originating from external sessions can connect to this port.
+    pub is_public_cross_session: bool,
+    /// Maximum allowed payload size in bytes.
+    pub max_message_size: u32,
+    /// List of client PIDs currently connected to this port.
+    pub connected_pids: Vec<u64>,
+    /// Inbound message queue awaiting server consumption.
+    pub message_queue: Vec<KntPortMessage>,
+}
+
+impl KntPort {
+    /// Creates a new named KntPort endpoint.
+    pub fn new(port_id: u32, name: &str, owning_session_id: u32, is_public: bool, max_message_size: u32) -> Self {
+        Self {
+            port_id,
+            name: name.to_string(),
+            owning_session_id,
+            is_public_cross_session: is_public,
+            max_message_size,
+            connected_pids: Vec::new(),
+            message_queue: Vec::new(),
+        }
+    }
+}
+
+/// Central IPC router enforcing session isolation and routing messages across KntPorts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortRouter {
+    /// Map of canonical port name to KntPort endpoint.
+    pub ports: BTreeMap<String, KntPort>,
+    /// Auto-incrementing port ID.
+    pub next_port_id: u32,
+    /// Monotonically increasing message ID.
+    pub next_msg_id: u64,
+}
+
+impl PortRouter {
+    /// Initializes an empty port router.
+    pub fn new() -> Self {
+        Self {
+            ports: BTreeMap::new(),
+            next_port_id: 1,
+            next_msg_id: 1,
+        }
+    }
+
+    /// Registers a new named port in the router namespace.
+    pub fn register_port(
+        &mut self,
+        name: &str,
+        owning_session_id: u32,
+        is_public: bool,
+        max_message_size: u32,
+    ) -> Result<u32, &'static str> {
+        if self.ports.contains_key(name) {
+            return Err("PortAlreadyExists");
+        }
+        let pid = self.next_port_id;
+        self.next_port_id += 1;
+
+        let port = KntPort::new(pid, name, owning_session_id, is_public, max_message_size);
+        self.ports.insert(name.to_string(), port);
+        Ok(pid)
+    }
+
+    /// Connects a client process to a named port with cross-session authorization validation.
+    pub fn connect_to_port(
+        &mut self,
+        port_name: &str,
+        caller_pid: u64,
+        caller_session_id: u32,
+    ) -> Result<u32, &'static str> {
+        let port = self.ports.get_mut(port_name).ok_or("PortNotFound")?;
+
+        // Session boundary check:
+        // If connecting across session boundary, the port must be explicitly designated public.
+        if port.owning_session_id != caller_session_id && !port.is_public_cross_session {
+            return Err("AccessDeniedCrossSessionPrivatePort");
+        }
+
+        if !port.connected_pids.contains(&caller_pid) {
+            port.connected_pids.push(caller_pid);
+        }
+
+        Ok(port.port_id)
+    }
+
+    /// Sends a message into the specified port queue.
+    pub fn send_message(
+        &mut self,
+        port_name: &str,
+        sender_pid: u64,
+        sender_session_id: u32,
+        msg_type: u32,
+        data: &[u8],
+    ) -> Result<u64, &'static str> {
+        let port = self.ports.get_mut(port_name).ok_or("PortNotFound")?;
+
+        // Cross-session check
+        if port.owning_session_id != sender_session_id && !port.is_public_cross_session {
+            return Err("AccessDeniedCrossSession");
+        }
+
+        if data.len() > port.max_message_size as usize {
+            return Err("MessageTooLarge");
+        }
+
+        let mid = self.next_msg_id;
+        self.next_msg_id += 1;
+
+        let msg = KntPortMessage {
+            msg_id: mid,
+            sender_pid,
+            sender_session_id,
+            msg_type,
+            payload: data.to_vec(),
+        };
+
+        port.message_queue.push(msg);
+        Ok(mid)
+    }
+
+    /// Receives and removes the oldest message from a port queue for the owning session.
+    pub fn receive_message(&mut self, port_name: &str, receiver_session_id: u32) -> Option<KntPortMessage> {
+        let port = self.ports.get_mut(port_name)?;
+        // Only processes belonging to the owning session can dequeue messages
+        if port.owning_session_id != receiver_session_id {
+            return None;
+        }
+
+        if !port.message_queue.is_empty() {
+            Some(port.message_queue.remove(0))
+        } else {
+            None
+        }
+    }
+}
+
+/// Verification test for KntPort IPC rendezvous and session boundary isolation.
+pub fn verify_knt_port_ipc_rendezvous() -> bool {
+    let mut router = PortRouter::new();
+
+    // 1. Register a public system port in Session 0 (\Smss\PublicApi)
+    let pub_port_id = router.register_port("\\Smss\\PublicApi", 0, true, 4096).unwrap();
+    if pub_port_id != 1 {
+        return false;
+    }
+
+    // 2. Register a private internal port in Session 0 (\Kernel\InternalLsa)
+    let priv_port_id = router.register_port("\\Kernel\\InternalLsa", 0, false, 4096).unwrap();
+    if priv_port_id != 2 {
+        return false;
+    }
+
+    // 3. Client in Session 1 connects to public Session 0 port: Should SUCCEED
+    let conn_ok = router.connect_to_port("\\Smss\\PublicApi", 601, 1);
+    if conn_ok.is_err() {
+        return false;
+    }
+
+    // 4. Client in Session 1 connects to private Session 0 port: Must FAIL with AccessDenied
+    let conn_err = router.connect_to_port("\\Kernel\\InternalLsa", 601, 1);
+    if conn_err != Err("AccessDeniedCrossSessionPrivatePort") {
+        return false;
+    }
+
+    // 5. Client in Session 0 connects to private Session 0 port: Should SUCCEED
+    let conn_sess0 = router.connect_to_port("\\Kernel\\InternalLsa", 402, 0);
+    if conn_sess0.is_err() {
+        return false;
+    }
+
+    // 6. Test message delivery through public port from Session 1 to Session 0
+    let payload = b"CONNECT_SESSION_1_HANDHELD";
+    let send_res = router.send_message("\\Smss\\PublicApi", 601, 1, 0x101, payload);
+    if send_res.is_err() {
+        return false;
+    }
+
+    // 7. Session 0 receives the message
+    let recv_msg = router.receive_message("\\Smss\\PublicApi", 0);
+    match recv_msg {
+        Some(m) => {
+            if m.sender_pid != 601 || m.sender_session_id != 1 || m.payload != payload {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    // 8. Session 1 tries to unauthorized dequeue from Session 0 port: Must return None
+    let unauthorized_recv = router.receive_message("\\Smss\\PublicApi", 1);
+    if unauthorized_recv.is_some() {
+        return false;
+    }
+
+    true
+}
