@@ -499,3 +499,105 @@ impl SteamLibraryHierarchyScanner {
         };
     }
 }
+
+// Central microSD gaming library fast-indexing service daemon.
+pub struct SdGamingIndexerService {
+    pub table: GameIndexTable,
+    pub watcher: MicroSdMountWatcher,
+    pub scanner: SteamLibraryHierarchyScanner,
+}
+
+impl SdGamingIndexerService {
+    // Construct initialized gaming library indexer service.
+    pub const fn new(default_mount_path: &str, fs_type: FsType) -> Self {
+        Self {
+            table: GameIndexTable::new(),
+            watcher: MicroSdMountWatcher::new(default_mount_path, fs_type),
+            scanner: SteamLibraryHierarchyScanner::new(),
+        }
+    }
+
+    // Lookup game entry by Steam AppID.
+    pub fn find_by_appid(&self, appid: u32) -> Option<&IndexedGameEntry> {
+        self.table.get_by_appid(appid)
+    }
+
+    // Zero-allocation case-insensitive title prefix lookup.
+    pub fn find_by_title_prefix(&self, prefix: &str) -> Option<&IndexedGameEntry> {
+        let p_bytes = prefix.as_bytes();
+        if p_bytes.is_empty() {
+            return None;
+        }
+
+        for i in 0..self.table.count() {
+            let entry = &self.table.entries[i];
+            if entry.title_len < p_bytes.len() {
+                continue;
+            }
+
+            let mut matched = true;
+            for j in 0..p_bytes.len() {
+                let c1 = entry.title[j].to_ascii_lowercase();
+                let c2 = p_bytes[j].to_ascii_lowercase();
+                if c1 != c2 {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    // Calculate aggregated storage footprint, optionally filtered by mount source.
+    pub fn calculate_storage_usage(&self, source_filter: Option<GameInstallSource>) -> u64 {
+        let mut sum = 0u64;
+        for i in 0..self.table.count() {
+            let entry = &self.table.entries[i];
+            match source_filter {
+                Some(src) => {
+                    if entry.mount_source == src {
+                        sum = sum.saturating_add(entry.size_bytes);
+                    }
+                }
+                None => {
+                    sum = sum.saturating_add(entry.size_bytes);
+                }
+            }
+        }
+        sum
+    }
+
+    // Resolve full execution launch target command into caller-provided buffer without allocation.
+    pub fn resolve_launch_target(&self, appid: u32, out_buffer: &mut [u8]) -> Result<usize, &'static str> {
+        let entry = self.table.get_by_appid(appid).ok_or("AppID not found")?;
+        let mount_str = core::str::from_utf8(&self.watcher.mount_path[..self.watcher.mount_path_len])
+            .unwrap_or("/run/media/mmcblk0p1");
+
+        let mut pos = 0;
+
+        let write_slice = |buf: &mut [u8], offset: &mut usize, slice: &[u8]| -> Result<(), &'static str> {
+            if *offset + slice.len() > buf.len() {
+                return Err("Buffer too small");
+            }
+            buf[*offset..*offset + slice.len()].copy_from_slice(slice);
+            *offset += slice.len();
+            Ok(())
+        };
+
+        if entry.has_proton_prefix {
+            write_slice(out_buffer, &mut pos, b"proton run ")?;
+        }
+
+        write_slice(out_buffer, &mut pos, mount_str.as_bytes())?;
+        write_slice(out_buffer, &mut pos, b"/steamapps/common/")?;
+        write_slice(out_buffer, &mut pos, &entry.install_dir[..entry.install_dir_len])?;
+        write_slice(out_buffer, &mut pos, b"/")?;
+        write_slice(out_buffer, &mut pos, &entry.executable_target[..entry.executable_target_len])?;
+
+        Ok(pos)
+    }
+}
