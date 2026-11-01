@@ -613,6 +613,12 @@ impl VrrPacingGovernor {
         }
     }
 
+    pub fn set_vrr_range(&self, min_hz: u32, max_hz: u32) {
+        self.vrr_min_hz.store(min_hz, Ordering::Release);
+        self.vrr_max_hz.store(max_hz, Ordering::Release);
+        self.vrr_enabled.store(true, Ordering::Release);
+    }
+
     pub fn set_vrr_enabled(&self, enabled: bool) {
         self.vrr_enabled.store(enabled, Ordering::Release);
     }
@@ -683,3 +689,141 @@ impl VrrPacingGovernor {
 }
 
 pub static VRR_GOVERNOR: VrrPacingGovernor = VrrPacingGovernor::new();
+
+
+// ============================================================================
+// Verification Self-Test Suite & Subsystem Sentinel
+// ============================================================================
+
+/// Comprehensive verification self-test for SteamDeck External Monitor Hotplug & Display Modeswitching.
+pub fn verify_display_modeswitch_subsystem() -> bool {
+    // 1. EDID Parsing & Hotplug Event Listener
+    let mut edid = [0u8; 128];
+    edid[0..8].copy_from_slice(&EdidParser::EDID_HEADER);
+    // Manufacturer ID: "SAM" (0x4C2D)
+    edid[8] = 0x4C;
+    edid[9] = 0x2D;
+    edid[10] = 0x01;
+    edid[11] = 0x04;
+    edid[12] = 0x78;
+    edid[13] = 0x56;
+    edid[14] = 0x34;
+    edid[15] = 0x12;
+
+    // DTD: 1920x1080 @ 60Hz (148.5 MHz pixel clock)
+    edid[54] = 0x02;
+    edid[55] = 0x3A;
+    edid[56] = 0x80;
+    edid[57] = 0x18;
+    edid[58] = 0x71;
+    edid[59] = 0x38;
+    edid[60] = 0x2D;
+    edid[61] = 0x40;
+
+    // CTA-861 Extension present (HDR10 capable)
+    edid[126] = 1;
+
+    // Compute checksum
+    let mut sum: u8 = 0;
+    let mut i = 0;
+    while i < 127 {
+        sum = sum.wrapping_add(edid[i]);
+        i += 1;
+    }
+    edid[127] = (256u16.wrapping_sub(sum as u16) % 256) as u8;
+
+    let monitor_info = match EdidParser::parse(&edid) {
+        Ok(info) => info,
+        Err(_) => return false,
+    };
+
+    if !monitor_info.is_valid || monitor_info.manufacturer_id != *b"SAM" {
+        return false;
+    }
+    if monitor_info.native_mode.width != 1920 || monitor_info.native_mode.height != 1080 {
+        return false;
+    }
+    if monitor_info.native_mode.refresh_rate_hz != 60 || !monitor_info.supports_hdr10 {
+        return false;
+    }
+
+    // Hotplug Event Listener test
+    HOTPLUG_LISTENER.handle_hpd(DisplayConnectorType::UsbCDpAltMode, HotplugEvent::Connected, 1_000);
+    if !HOTPLUG_LISTENER.is_external_active() {
+        return false;
+    }
+    if HOTPLUG_LISTENER.get_active_connector() != DisplayConnectorType::UsbCDpAltMode {
+        return false;
+    }
+
+    // 2. Seamless DRM Atomic Modesetting & Resolution Scaler
+    let mode_4k_120 = DisplayModeTiming::new_progressive(3840, 2160, 120);
+
+    // Test-only commit
+    if MODESET_MANAGER.commit_atomic_modeset(
+        DisplayTopologyMode::ExternalPrimary,
+        mode_4k_120,
+        DRM_MODE_ATOMIC_TEST_ONLY,
+    ).is_err() {
+        return false;
+    }
+
+    // Actual atomic modeset commit
+    let seq = match MODESET_MANAGER.commit_atomic_modeset(
+        DisplayTopologyMode::ExternalPrimary,
+        mode_4k_120,
+        DRM_MODE_ATOMIC_ALLOW_MODESET,
+    ) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if seq == 0 || MODESET_MANAGER.get_topology() != DisplayTopologyMode::ExternalPrimary {
+        return false;
+    }
+
+    let active_ext = MODESET_MANAGER.get_active_timing(DisplayConnectorType::UsbCDpAltMode);
+    if active_ext.width != 3840 || active_ext.height != 2160 || active_ext.refresh_rate_hz != 120 {
+        return false;
+    }
+
+    MODESET_MANAGER.set_scaling_filter(DisplayScalingFilter::FsrUpscale);
+    if MODESET_MANAGER.get_scaling_filter() != DisplayScalingFilter::FsrUpscale {
+        return false;
+    }
+
+    // 3. Dynamic Color Space Selection & HDR10 Metadata Routing
+    let (colorspace, depth) = COLOR_MANAGER.select_color_space(ColorSpace::Rec2020Hdr10, &monitor_info);
+    if colorspace != ColorSpace::Rec2020Hdr10 || depth != ColorDepth::Bpc10 || !COLOR_MANAGER.is_hdr_active() {
+        return false;
+    }
+
+    let hdr_meta = COLOR_MANAGER.get_hdr_metadata();
+    if !hdr_meta.is_hdr_active || hdr_meta.max_luminance_nits != 1000 {
+        return false;
+    }
+
+    // 4. Variable Refresh Rate (VRR) & Display Clock Pacing
+    VRR_GOVERNOR.configure_monitor_vrr(&monitor_info);
+    VRR_GOVERNOR.set_vrr_range(40, 120);
+    VRR_GOVERNOR.set_target_refresh_cap(120);
+
+    // Pace at 75 FPS within 40..120Hz VRR window -> ActiveTracking
+    let vrr_stat = VRR_GOVERNOR.pace_frame(75);
+    if vrr_stat != VrrStatus::ActiveTracking || VRR_GOVERNOR.get_effective_refresh_hz() != 75 {
+        return false;
+    }
+
+    // Pace at 30 FPS below 40Hz VRR floor -> Low Frame-Rate Compensation (LFC 2x multiplier = 60Hz)
+    let lfc_stat = VRR_GOVERNOR.pace_frame(30);
+    if lfc_stat != VrrStatus::LfcEngaged || VRR_GOVERNOR.get_lfc_multiplier() != 2 || VRR_GOVERNOR.get_effective_refresh_hz() != 60 {
+        return false;
+    }
+
+    // Clean baseline reset
+    let mode_internal = DisplayModeTiming::new_progressive(1280, 800, 60);
+    let _ = MODESET_MANAGER.commit_atomic_modeset(DisplayTopologyMode::InternalOnly, mode_internal, DRM_MODE_ATOMIC_ALLOW_MODESET);
+    HOTPLUG_LISTENER.handle_hpd(DisplayConnectorType::InternalEdp, HotplugEvent::Disconnected, 2_000);
+    COLOR_MANAGER.select_color_space(ColorSpace::SrgbStandard, &monitor_info);
+
+    true
+}
