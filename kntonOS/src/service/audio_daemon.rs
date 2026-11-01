@@ -396,3 +396,135 @@ pub fn verify_acoustic_limiter() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Low-Latency Ring-Buffer Audio Frame Mixer & PCM Sample Pipeline
+// ============================================================================
+
+/// Number of stereo sample pairs per low-latency audio processing frame (64 samples = 1.33ms @ 48kHz).
+pub const AUDIO_FRAME_SAMPLES: usize = 64;
+
+/// Stereo 16-bit PCM audio frame buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioPcmFrame {
+    pub samples_l: [i16; AUDIO_FRAME_SAMPLES],
+    pub samples_r: [i16; AUDIO_FRAME_SAMPLES],
+}
+
+impl AudioPcmFrame {
+    /// Initializes zero-filled silent frame.
+    pub const fn new() -> Self {
+        Self {
+            samples_l: [0; AUDIO_FRAME_SAMPLES],
+            samples_r: [0; AUDIO_FRAME_SAMPLES],
+        }
+    }
+
+    /// Clears both stereo channels to silence.
+    pub fn clear(&mut self) {
+        self.samples_l.fill(0);
+        self.samples_r.fill(0);
+    }
+}
+
+/// Low-latency multi-stream audio frame mixer and PCM pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioFrameMixer {
+    /// Total audio frames processed.
+    pub frames_mixed: u64,
+    /// Total peak samples processed.
+    pub peak_sample_seen: i16,
+}
+
+impl AudioFrameMixer {
+    /// Initializes audio frame mixer.
+    pub const fn new() -> Self {
+        Self {
+            frames_mixed: 0,
+            peak_sample_seen: 0,
+        }
+    }
+
+    /// Mixes two input stream frames (e.g. game and voice) into output frame
+    /// with per-stream volume scaling and acoustic limiting.
+    pub fn mix_streams(
+        &mut self,
+        game_frame: &AudioPcmFrame,
+        voice_frame: &AudioPcmFrame,
+        scaler: &VolumeScaler,
+        limiter: &mut AcousticLimiter,
+        out_frame: &mut AudioPcmFrame,
+    ) {
+        for i in 0..AUDIO_FRAME_SAMPLES {
+            // 1. Scale left channel
+            let game_l = scaler.scale_sample(StreamType::GameAudio, game_frame.samples_l[i]);
+            let voice_l = scaler.scale_sample(StreamType::VoiceChat, voice_frame.samples_l[i]);
+            let mixed_l = game_l.saturating_add(voice_l);
+            let limited_l = limiter.process_sample(mixed_l);
+            out_frame.samples_l[i] = limited_l;
+
+            // 2. Scale right channel
+            let game_r = scaler.scale_sample(StreamType::GameAudio, game_frame.samples_r[i]);
+            let voice_r = scaler.scale_sample(StreamType::VoiceChat, voice_frame.samples_r[i]);
+            let mixed_r = game_r.saturating_add(voice_r);
+            let limited_r = limiter.process_sample(mixed_r);
+            out_frame.samples_r[i] = limited_r;
+
+            // Track max peak
+            let abs_l = limited_l.abs();
+            if abs_l > self.peak_sample_seen {
+                self.peak_sample_seen = abs_l;
+            }
+        }
+
+        self.frames_mixed = self.frames_mixed.saturating_add(1);
+    }
+}
+
+/// Verification test for low-latency audio frame mixer and PCM sample pipeline.
+pub fn verify_audio_frame_mixer() -> bool {
+    let mut mixer = AudioFrameMixer::new();
+    let mut scaler = VolumeScaler::new();
+    let mut limiter = AcousticLimiter::new();
+
+    scaler.set_volume(StreamType::Master, 100);
+    scaler.set_volume(StreamType::GameAudio, 100);
+    scaler.set_volume(StreamType::VoiceChat, 100);
+
+    let mut game = AudioPcmFrame::new();
+    let mut voice = AudioPcmFrame::new();
+    let mut out = AudioPcmFrame::new();
+
+    // Populate synthetic test tones: game has 8000 peak, voice has 4000 peak
+    for i in 0..AUDIO_FRAME_SAMPLES {
+        game.samples_l[i] = 8000;
+        game.samples_r[i] = 8000;
+        voice.samples_l[i] = 4000;
+        voice.samples_r[i] = 4000;
+    }
+
+    mixer.mix_streams(&game, &voice, &scaler, &mut limiter, &mut out);
+
+    // Sum should be 8000 + 4000 = 12000 on both channels
+    if out.samples_l[0] != 12000 || out.samples_r[0] != 12000 {
+        return false;
+    }
+    if mixer.frames_mixed != 1 || mixer.peak_sample_seen != 12000 {
+        return false;
+    }
+
+    // Test extreme saturation / limiting: two 20000 signals sum to 40000 -> saturated 32767 -> limited to <= 28000
+    for i in 0..AUDIO_FRAME_SAMPLES {
+        game.samples_l[i] = 20000;
+        voice.samples_l[i] = 20000;
+    }
+    mixer.mix_streams(&game, &voice, &scaler, &mut limiter, &mut out);
+    if out.samples_l[0] > 28000 {
+        return false; // Limiter failed to cap output!
+    }
+    if mixer.frames_mixed != 2 {
+        return false;
+    }
+
+    true
+}
+
