@@ -760,3 +760,143 @@ impl MotionGestureSupervisor {
 }
 
 pub static GESTURE_SUPERVISOR: MotionGestureSupervisor = MotionGestureSupervisor::new();
+
+
+// ============================================================================
+// Verification Self-Test Suite & Subsystem Sentinel
+// ============================================================================
+
+/// Comprehensive verification self-test for SteamDeck Gyro & Accelerometer Motion Sensor Service.
+pub fn verify_motion_daemon_subsystem() -> bool {
+    // 1. Dual BMI160 IMU Driver Initialization & Frame Ingestion
+    if !IMU_DRIVER.init() || !IMU_DRIVER.is_operational() {
+        return false;
+    }
+
+    // Ingest sample frame: 1.0g on Z-axis (raw = 8192), 10°/s on Z-axis (raw = 164), 30°C silicon
+    let raw_frame = RawImuFrame {
+        accel_x: 0,
+        accel_y: 0,
+        accel_z: 8192,
+        gyro_x: 0,
+        gyro_y: 0,
+        gyro_z: 164,
+        sensor_temp_raw: 3584, // 23°C + (3584*1000)/512 m°C = 30_000 m°C (30.0°C)
+        timestamp_us: 10_000,
+    };
+
+    IMU_DRIVER.ingest_frame(ImuChannel::PrimaryChassis, &raw_frame);
+    let sample = IMU_DRIVER.get_latest_sample(ImuChannel::PrimaryChassis);
+
+    if sample.accel_mg[2] != 1000 || sample.gyro_mdeg_s[2] != 10_000 || sample.temp_mdeg_c != 30_000 {
+        return false;
+    }
+
+    // 2. Thermal Bias Auto-Calibration & Complementary Filter Fusion
+    BIAS_CALIBRATOR.set_bias(120, -80, 250);
+    let raw_gyro = [120, 920, 250];
+    let corrected = BIAS_CALIBRATOR.correct_gyro(raw_gyro);
+    if corrected[0] != 0 || corrected[1] != 1000 || corrected[2] != 0 {
+        return false;
+    }
+
+    // Orientation fusion update: tilt along Y-axis (roll)
+    ORIENTATION_FUSION.reset();
+    let tilt_sample = MotionSample {
+        accel_mg: [0, 500, 866], // ~30° roll angle
+        gyro_mdeg_s: [0, 0, 0],
+        temp_mdeg_c: 30_000,
+        timestamp_us: 20_000,
+    };
+    let orient = ORIENTATION_FUSION.update(&tilt_sample, [0, 0, 0]);
+    if !orient.is_calibrated {
+        return false;
+    }
+
+    // 3. Capacitive Touch Gate & Gyro Aim Assist Pipeline
+    TOUCH_GATE.set_source(TouchGateSource::RightThumbstickCap);
+    TOUCH_GATE.update_touch(false); // Thumb off stick -> gate closed
+    if TOUCH_GATE.is_gate_open() {
+        return false;
+    }
+
+    AIM_PIPELINE.set_mode(AimMappingMode::MouseEmulation);
+    AIM_PIPELINE.set_sensitivity(100);
+    AIM_PIPELINE.set_deadzone(150);
+
+    // With touch gate closed, aim output must be inactive
+    let out_inactive = AIM_PIPELINE.process([0, 0, 5000], TOUCH_GATE.is_gate_open());
+    if out_inactive.is_active || out_inactive.mouse_dx != 0 {
+        return false;
+    }
+
+    // Touch stick -> gate opens
+    TOUCH_GATE.update_touch(true);
+    if !TOUCH_GATE.is_gate_open() {
+        return false;
+    }
+
+    // Tremor below deadzone (100 mdeg/s < 150 mdeg/s) -> filtered out
+    let out_tremor = AIM_PIPELINE.process([0, 0, 100], true);
+    if out_tremor.mouse_dx != 0 {
+        return false;
+    }
+
+    // Deliberate aim motion: 5000 mdeg/s (5°/s). Net yaw = 5000 - 150 = 4850 mdeg/s
+    // dx = (4850 * 100 * 10) / 100_000 = 48 pixels
+    let out_active = AIM_PIPELINE.process([0, 0, 5000], true);
+    if !out_active.is_active || out_active.mouse_dx < 45 || out_active.mouse_dx > 52 {
+        return false;
+    }
+
+    // Test RightStickEmulation mode
+    AIM_PIPELINE.set_mode(AimMappingMode::RightStickEmulation);
+    let out_stick = AIM_PIPELINE.process([0, 0, 5000], true);
+    if !out_stick.is_active || out_stick.stick_x == 0 {
+        return false;
+    }
+
+    // 4. Motion Gesture & Drop Free-Fall Triggers
+    GESTURE_SUPERVISOR.reset();
+    let freefall_sample = MotionSample {
+        accel_mg: [10, -20, 15], // Near zero g weightlessness
+        gyro_mdeg_s: [0, 0, 0],
+        temp_mdeg_c: 30_000,
+        timestamp_us: 100_000,
+    };
+
+    // Simulate 12 ticks of freefall
+    let mut tick = 0;
+    while tick < 12 {
+        let mut s = freefall_sample;
+        s.timestamp_us = 100_000 + tick * 5_000;
+        GESTURE_SUPERVISOR.update(&s, &orient);
+        tick += 1;
+    }
+
+    if !GESTURE_SUPERVISOR.is_freefall_detected() {
+        return false;
+    }
+    if GESTURE_SUPERVISOR.get_freefall_duration_ms() < 50 {
+        return false;
+    }
+
+    // Face down posture trigger
+    let face_down_sample = MotionSample {
+        accel_mg: [0, 0, -980], // Gravity pointing upward into screen
+        gyro_mdeg_s: [0, 0, 0],
+        temp_mdeg_c: 30_000,
+        timestamp_us: 200_000,
+    };
+    GESTURE_SUPERVISOR.update(&face_down_sample, &orient);
+    if GESTURE_SUPERVISOR.get_tilt_posture() != TiltPosture::FaceDown {
+        return false;
+    }
+
+    // Reset clean baseline
+    GESTURE_SUPERVISOR.reset();
+    TOUCH_GATE.update_touch(false);
+    AIM_PIPELINE.set_mode(AimMappingMode::Disabled);
+
+    true
+}

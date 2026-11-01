@@ -1597,6 +1597,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Thermal and fan acoustic governor self-test failed!\r\n");
     }
 
+    // Verify kntonOS SteamDeck Gyro & Accelerometer Motion Sensor Service (TASK-KNT-334)
+    if knton_os::service::verify_motion_daemon_subsystem() {
+        serial_write_str("[KNT-OS-MOTION-PASS] kntonOS SteamDeck gyro & accelerometer motion sensor service verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] Motion sensor service self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
