@@ -1,6 +1,9 @@
-//! Handheld Game Mode UI compositor and hardware settings interface.
+// Handheld Game Mode UI compositor and hardware settings interface.
 
-/// Handheld performance overlay metrics.
+pub mod launcher;
+pub use launcher::*;
+
+// Handheld performance overlay metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct QuickSettings {
     pub target_tdp_watts: u8,
@@ -30,7 +33,7 @@ impl QuickSettings {
     }
 }
 
-/// Verification test for game mode shell.
+// Verification test for game mode shell.
 pub fn verify_game_mode_shell() -> bool {
     let mut qs = QuickSettings::new();
     if qs.target_tdp_watts != 15 || qs.display_hz != 60 {
