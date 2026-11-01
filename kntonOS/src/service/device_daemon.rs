@@ -707,7 +707,7 @@ impl AudioVolumeMixer {
         }
 
         // Apply acoustic limit to master volume
-        let clamped_master = (master.volume_pct * self.acoustic_limit_pct) / 100;
+        let clamped_master = ((master.volume_pct as u32 * self.acoustic_limit_pct as u32) / 100) as u8;
 
         if channel == AudioChannel::Master {
             clamped_master
@@ -955,6 +955,131 @@ pub fn verify_gamepad_event_queue() -> bool {
     // 4. Test rumble feedback
     queue.set_rumble(128, 255);
     if queue.rumble_left != 128 || queue.rumble_right != 255 {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// Feature 6: Device Hardware Daemon Coordinator Orchestrator & Boot Verification
+// ============================================================================
+
+/// Handheld hardware daemon coordinating battery telemetry, USB-PD power,
+/// display hotplug, audio mixer, and gamepad input event dispatching.
+pub struct DeviceHardwareDaemon {
+    pub fuel_gauge: BatteryFuelGauge,
+    pub pd_negotiator: UsbPdNegotiator,
+    pub display_hotplug: DisplayHotPlugManager,
+    pub audio_mixer: AudioVolumeMixer,
+    pub gamepad_queue: GamepadEventQueue,
+    pub cycle_counter: u64,
+}
+
+impl DeviceHardwareDaemon {
+    pub const fn new() -> Self {
+        Self {
+            fuel_gauge: BatteryFuelGauge::new(),
+            pd_negotiator: UsbPdNegotiator::new(),
+            display_hotplug: DisplayHotPlugManager::new(),
+            audio_mixer: AudioVolumeMixer::new(),
+            gamepad_queue: GamepadEventQueue::new(),
+            cycle_counter: 0,
+        }
+    }
+
+    /// Periodic hardware polling loop cycle.
+    pub fn poll_hardware_cycle(&mut self) {
+        self.cycle_counter = self.cycle_counter.saturating_add(1);
+
+        // Link battery status to acoustic governor
+        if self.fuel_gauge.is_low_battery() {
+            self.audio_mixer.update_acoustic_governor(true);
+        } else {
+            self.audio_mixer.update_acoustic_governor(false);
+        }
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Device Hardware Daemon
+/// and Input Event Dispatcher subsystem.
+pub fn verify_device_daemon_subsystem() -> bool {
+    if !verify_battery_fuel_gauge() {
+        return false;
+    }
+    if !verify_usb_pd_charging_contracts() {
+        return false;
+    }
+    if !verify_dp_alt_mode_hotplug() {
+        return false;
+    }
+    if !verify_audio_volume_mixer() {
+        return false;
+    }
+    if !verify_gamepad_event_queue() {
+        return false;
+    }
+
+    // Verify integrated coordinator
+    let mut daemon = DeviceHardwareDaemon::new();
+
+    // 1. Initial coordinator state
+    if daemon.cycle_counter != 0 {
+        return false;
+    }
+
+    // 2. Battery telemetry update
+    daemon.fuel_gauge.update_telemetry(8200, 3200, 85, 310);
+    if daemon.fuel_gauge.status != BatteryStatus::Charging || daemon.fuel_gauge.state_of_charge_pct != 85 {
+        return false;
+    }
+
+    // 3. USB-PD negotiation
+    daemon.pd_negotiator.on_cable_attached();
+    let dock_profiles = [
+        UsbPdContract::Fix5V3A,
+        UsbPdContract::Fix9V3A,
+        UsbPdContract::Fix15V3A,
+        UsbPdContract::Fix20V3_25A,
+    ];
+    if !daemon.pd_negotiator.negotiate_contract(65, &dock_profiles) {
+        return false;
+    }
+    if daemon.pd_negotiator.current_contract != UsbPdContract::Fix20V3_25A || daemon.pd_negotiator.negotiated_max_watts != 65 {
+        return false;
+    }
+
+    // 4. DP Alt Mode external display connection
+    let mode = DisplayPortMode::uhd_60hz();
+    daemon.display_hotplug.on_hpd_asserted(mode);
+    if !daemon.display_hotplug.is_external_monitor_active || daemon.display_hotplug.active_mode != Some(mode) {
+        return false;
+    }
+
+    // 5. Audio mixer adjustment
+    daemon.audio_mixer.set_channel_volume(AudioChannel::Master, 90);
+    daemon.audio_mixer.set_channel_volume(AudioChannel::GameStream, 100);
+    if daemon.audio_mixer.calculate_effective_volume(AudioChannel::GameStream) != 90 {
+        return false;
+    }
+
+    // 6. Gamepad event ingestion
+    let mut input = GamepadInputState::new();
+    input.buttons = GAMEPAD_BTN_A | GAMEPAD_BTN_MENU;
+    input.trigger_r = 200;
+    daemon.gamepad_queue.push_event(input);
+    if daemon.gamepad_queue.count != 1 {
+        return false;
+    }
+
+    // 7. Polling cycle
+    daemon.poll_hardware_cycle();
+    if daemon.cycle_counter != 1 {
+        return false;
+    }
+
+    let popped = daemon.gamepad_queue.pop_event();
+    if popped.is_none() || popped.unwrap().buttons != (GAMEPAD_BTN_A | GAMEPAD_BTN_MENU) {
         return false;
     }
 
