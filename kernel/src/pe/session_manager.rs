@@ -955,3 +955,206 @@ pub fn verify_knt_port_ipc_rendezvous() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 5: Userspace Session Manager Daemon (smss) Orchestrator
+// ============================================================================
+
+/// Central supervisory daemon managing multi-session orchestration and service monitoring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionManager {
+    /// Active sessions indexed by session ID (0 = System, 1 = Interactive User).
+    pub sessions: BTreeMap<u32, SessionDescriptor>,
+    /// Background service registry and crash recovery supervisor.
+    pub service_registry: ServiceRegistry,
+    /// Multi-session LPC/ALPC port router.
+    pub port_router: PortRouter,
+    /// System and session environment block manager.
+    pub environment_mgr: EnvironmentManager,
+    /// Currently focused interactive session mapped to the display scanout.
+    pub active_session_id: u32,
+    /// Monotonically increasing synthetic process ID generator for test harness.
+    pub next_pid: u64,
+    /// Kernel tick counter.
+    pub current_tick: u64,
+}
+
+impl SessionManager {
+    /// Initializes a new SessionManager supervisor.
+    pub fn new() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            service_registry: ServiceRegistry::new(),
+            port_router: PortRouter::new(),
+            environment_mgr: EnvironmentManager::new(),
+            active_session_id: 0,
+            next_pid: 1000,
+            current_tick: 0,
+        }
+    }
+
+    /// Executes the standard operating system boot sequence:
+    /// 1. Initializes Session 0 (Headless background services)
+    /// 2. Registers public system rendezvous port (\\Smss\\Port)
+    /// 3. Registers critical system daemon (csrss.exe) in Session 0
+    /// 4. Initializes Session 1 (Interactive handheld user console)
+    /// 5. Registers interactive user shell (gameshell.exe) in Session 1
+    pub fn bootstrap_system_sessions(&mut self, start_tick: u64) {
+        self.current_tick = start_tick;
+
+        // 1. Session 0 (System Services)
+        let mut sess0 = SessionDescriptor::new_session_0(start_tick);
+        sess0.set_state(SessionState::Active);
+        self.sessions.insert(0, sess0);
+
+        // Register default cross-session SMSS port
+        let _ = self.port_router.register_port("\\Smss\\Port", 0, true, 4096);
+
+        // Register critical csrss service
+        let csrss_rule = ProcessSpawnRule::new_critical_service("C:\\Windows\\System32\\csrss.exe", 0);
+        let csrss_id = self.service_registry.register_service("csrss", ServiceType::SystemDaemon, csrss_rule);
+        let _ = self.spawn_service_process(csrss_id);
+
+        // 2. Session 1 (Interactive Handheld Gaming)
+        let mut sess1 = SessionDescriptor::new_session_1("HandheldGamer", start_tick + 50);
+        sess1.set_state(SessionState::Active);
+        self.sessions.insert(1, sess1);
+
+        // Register interactive shell
+        let shell_rule = ProcessSpawnRule::new_interactive_shell("C:\\Knton\\Shell\\gameshell.exe", 1);
+        let shell_id = self.service_registry.register_service("gameshell", ServiceType::UserShell, shell_rule);
+        let _ = self.spawn_service_process(shell_id);
+
+        self.active_session_id = 1;
+    }
+
+    /// Spawns a process instance for a registered service and binds it to its target session.
+    pub fn spawn_service_process(&mut self, service_id: u32) -> Result<u64, &'static str> {
+        let (target_session, _name) = {
+            let svc = self.service_registry.services.get(&service_id).ok_or("ServiceNotFound")?;
+            (svc.spawn_rule.target_session_id, svc.name.clone())
+        };
+
+        let session = self.sessions.get_mut(&target_session).ok_or("TargetSessionNotFound")?;
+        if session.state != SessionState::Active {
+            return Err("TargetSessionNotActive");
+        }
+
+        let pid = self.next_pid;
+        self.next_pid += 1;
+
+        session.add_process(pid);
+        self.service_registry.notify_service_started(service_id, pid, self.current_tick);
+
+        Ok(pid)
+    }
+
+    /// Handles process termination/crash, updates session tracking, and executes recovery policy.
+    pub fn handle_process_exit(&mut self, pid: u64, exit_code: i32, current_tick: u64) -> ServiceCrashAction {
+        self.current_tick = current_tick;
+
+        // Remove process from its hosting session
+        for session in self.sessions.values_mut() {
+            session.remove_process(pid);
+        }
+
+        // Find service associated with this PID
+        let matched_service_id = self.service_registry.services.iter()
+            .find(|(_, s)| s.current_pid == Some(pid))
+            .map(|(id, _)| *id);
+
+        if let Some(sid) = matched_service_id {
+            let action = self.service_registry.handle_service_crash(sid, exit_code, current_tick);
+            if let ServiceCrashAction::HaltSession { session_id } = action {
+                if let Some(sess) = self.sessions.get_mut(&session_id) {
+                    sess.set_state(SessionState::Locked);
+                }
+            }
+            action
+        } else {
+            ServiceCrashAction::Ignore
+        }
+    }
+
+    /// Advances the supervisor tick, checks pending service restarts, and spawns recovered processes.
+    pub fn tick(&mut self, current_tick: u64) -> Vec<u64> {
+        self.current_tick = current_tick;
+        let pending = self.service_registry.poll_pending_restarts(current_tick);
+        let mut spawned = Vec::new();
+
+        for sid in pending {
+            if let Ok(pid) = self.spawn_service_process(sid) {
+                spawned.push(pid);
+            }
+        }
+
+        spawned
+    }
+}
+
+/// Verification test for full session manager daemon orchestrator pipeline.
+pub fn verify_session_manager_daemon_pipeline() -> bool {
+    let mut sm = SessionManager::new();
+
+    // 1. Bootstrap system sessions
+    sm.bootstrap_system_sessions(100);
+
+    // Verify Session 0 and Session 1 exist and are Active
+    if sm.sessions.len() != 2 || sm.active_session_id != 1 {
+        return false;
+    }
+    let sess0 = sm.sessions.get(&0).unwrap();
+    let sess1 = sm.sessions.get(&1).unwrap();
+    if sess0.state != SessionState::Active || sess1.state != SessionState::Active {
+        return false;
+    }
+    if sess0.active_pids.is_empty() || sess1.active_pids.is_empty() {
+        return false;
+    }
+
+    // 2. Identify the spawned gameshell PID in Session 1
+    let shell_pid = *sess1.active_pids.first().unwrap();
+
+    // 3. Simulate gameshell crash: Should trigger auto-restart backoff
+    let crash_action = sm.handle_process_exit(shell_pid, -1, 500);
+    match crash_action {
+        ServiceCrashAction::ScheduleRestart { delay_ms } => {
+            if delay_ms == 0 {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // Process should be removed from Session 1 active list while recovering
+    if sm.sessions.get(&1).unwrap().active_pids.contains(&shell_pid) {
+        return false;
+    }
+
+    // 4. Advance time past backoff: tick should restart gameshell with a new PID
+    let new_pids = sm.tick(2000);
+    if new_pids.len() != 1 {
+        return false;
+    }
+    let new_shell_pid = new_pids[0];
+    if new_shell_pid == shell_pid {
+        return false;
+    }
+    if !sm.sessions.get(&1).unwrap().active_pids.contains(&new_shell_pid) {
+        return false;
+    }
+
+    // 5. Test inter-session communication from new shell to SMSS public port
+    let payload = b"GET_SESSION_TOPOLOGY";
+    let send_res = sm.port_router.send_message("\\Smss\\Port", new_shell_pid, 1, 0x10, payload);
+    if send_res.is_err() {
+        return false;
+    }
+    let msg = sm.port_router.receive_message("\\Smss\\Port", 0).unwrap();
+    if msg.sender_pid != new_shell_pid || msg.sender_session_id != 1 {
+        return false;
+    }
+
+    true
+}
