@@ -1,3 +1,5 @@
+extern crate alloc;
+use alloc::vec::Vec;
 // Handheld Game Mode UI Compositor & Hardware HUD Overlay (TASK-KNT-316)
 
 // Real-time hardware telemetry, performance HUD, and handheld system metrics.
@@ -518,107 +520,311 @@ impl CompositorSurface {
 
     }
 
+}
+
+
+
+
+
+// Handheld gamepad button inputs.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum HandheldGamepadButton {
+
+    A,
+
+    B,
+
+    X,
+
+    Y,
+
+    DpadUp,
+
+    DpadDown,
+
+    DpadLeft,
+
+    DpadRight,
+
+    LeftBumper,
+
+    RightBumper,
+
+    GuideButton,
+
+    QuickAccessButton,
+
+}
+
+
+
+// Touchscreen gesture inputs for handheld navigation.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+
+pub enum HandheldTouchGesture {
+
+    Tap { x: u32, y: u32 },
+
+    SwipeRightEdge,
+
+    SwipeBottomEdge,
+
+}
+
+
+
+// Target routing destination for input events.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+
+pub enum InputEventRoutingTarget {
+
+    ActiveGameProcess,
+
+    QuickSettingsOverlay,
+
+    HardwareHud,
+
+    SystemModal,
+
+}
+
+
+
+// Handheld input event router and guide button interceptor.
+
+pub struct HandheldInputRouter {
+
+    pub guide_button_pressed: bool,
+
+    pub quick_access_button_pressed: bool,
+
+    pub active_routing_target: InputEventRoutingTarget,
+
+}
+
+
+
+impl HandheldInputRouter {
+
+    // Construct default router directing events to the active game process.
+
+    pub const fn new() -> Self {
+
+        Self {
+
+            guide_button_pressed: false,
+
+            quick_access_button_pressed: false,
+
+            active_routing_target: InputEventRoutingTarget::ActiveGameProcess,
+
+        }
+
+    }
+
+
+
+    // Route gamepad button press event, intercepting QuickAccess/Guide buttons.
+
+    pub fn route_button_press(
+
+        &mut self,
+
+        button: HandheldGamepadButton,
+
+        quick_settings: &mut QuickSettingsOverlay,
+
+    ) -> InputEventRoutingTarget {
+
+        match button {
+
+            HandheldGamepadButton::QuickAccessButton | HandheldGamepadButton::GuideButton => {
+
+                let now_visible = quick_settings.toggle_visibility();
+
+                self.active_routing_target = if now_visible {
+
+                    InputEventRoutingTarget::QuickSettingsOverlay
+
+                } else {
+
+                    InputEventRoutingTarget::ActiveGameProcess
+
+                };
+
+                self.quick_access_button_pressed = true;
+
+                self.active_routing_target
+
+            }
+
+            _ => {
+
+                if quick_settings.visible {
+
+                    InputEventRoutingTarget::QuickSettingsOverlay
+
+                } else {
+
+                    InputEventRoutingTarget::ActiveGameProcess
+
+                }
+
+            }
+
+        }
+
+    }
+
+
+
+    // Route touchscreen gesture, intercepting right edge swipes to open Quick Settings.
+
+    pub fn route_touch_gesture(
+
+        &mut self,
+
+        gesture: HandheldTouchGesture,
+
+        quick_settings: &mut QuickSettingsOverlay,
+
+    ) -> InputEventRoutingTarget {
+
+        match gesture {
+
+            HandheldTouchGesture::SwipeRightEdge => {
+
+                quick_settings.visible = true;
+
+                self.active_routing_target = InputEventRoutingTarget::QuickSettingsOverlay;
+
+                InputEventRoutingTarget::QuickSettingsOverlay
+
+            }
+
+            _ => {
+
+                if quick_settings.visible {
+
+                    InputEventRoutingTarget::QuickSettingsOverlay
+
+                } else {
+
+                    InputEventRoutingTarget::ActiveGameProcess
+
+                }
+
+            }
+
+        }
+
+    }
+
 }
 
 
-// Handheld gamepad button inputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HandheldGamepadButton {
-    A,
-    B,
-    X,
-    Y,
-    DpadUp,
-    DpadDown,
-    DpadLeft,
-    DpadRight,
-    LeftBumper,
-    RightBumper,
-    GuideButton,
-    QuickAccessButton,
+// Maximum concurrent composition layers stacked in visual hierarchy.
+pub const MAX_COMPOSITOR_LAYERS: usize = 8;
+
+// Primary OS Shell Compositor coordinating zero-copy handheld layers, HUD, and quick settings.
+pub struct DeckShellCompositor {
+    layers: Vec<CompositorSurface>,
+    quick_settings: QuickSettingsOverlay,
+    metrics: HudPerformanceMetrics,
+    input_router: HandheldInputRouter,
+    total_frames_composed: u64,
 }
 
-// Touchscreen gesture inputs for handheld navigation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum HandheldTouchGesture {
-    Tap { x: u32, y: u32 },
-    SwipeRightEdge,
-    SwipeBottomEdge,
-}
+impl DeckShellCompositor {
+    // Initialize Handheld Game Mode UI Compositor.
+    pub fn new() -> Self {
+        let mut layers = Vec::new();
+        // Layer 0: Game Background
+        layers.push(CompositorSurface::new(CompositorLayerType::GameBackground, 1280, 800, 0));
+        // Layer 1: Quick Settings Menu
+        let mut qs_surf = CompositorSurface::new(CompositorLayerType::QuickSettingsMenu, 400, 800, 10);
+        qs_surf.visible = false;
+        layers.push(qs_surf);
+        // Layer 2: Hardware HUD Overlay
+        layers.push(CompositorSurface::new(CompositorLayerType::HardwareHudOverlay, 1280, 800, 20));
 
-// Target routing destination for input events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum InputEventRoutingTarget {
-    ActiveGameProcess,
-    QuickSettingsOverlay,
-    HardwareHud,
-    SystemModal,
-}
-
-// Handheld input event router and guide button interceptor.
-pub struct HandheldInputRouter {
-    pub guide_button_pressed: bool,
-    pub quick_access_button_pressed: bool,
-    pub active_routing_target: InputEventRoutingTarget,
-}
-
-impl HandheldInputRouter {
-    // Construct default router directing events to the active game process.
-    pub const fn new() -> Self {
         Self {
-            guide_button_pressed: false,
-            quick_access_button_pressed: false,
-            active_routing_target: InputEventRoutingTarget::ActiveGameProcess,
+            layers,
+            quick_settings: QuickSettingsOverlay::new(),
+            metrics: HudPerformanceMetrics::new(),
+            input_router: HandheldInputRouter::new(),
+            total_frames_composed: 0,
         }
     }
 
-    // Route gamepad button press event, intercepting QuickAccess/Guide buttons.
-    pub fn route_button_press(
-        &mut self,
-        button: HandheldGamepadButton,
-        quick_settings: &mut QuickSettingsOverlay,
-    ) -> InputEventRoutingTarget {
-        match button {
-            HandheldGamepadButton::QuickAccessButton | HandheldGamepadButton::GuideButton => {
-                let now_visible = quick_settings.toggle_visibility();
-                self.active_routing_target = if now_visible {
-                    InputEventRoutingTarget::QuickSettingsOverlay
-                } else {
-                    InputEventRoutingTarget::ActiveGameProcess
-                };
-                self.quick_access_button_pressed = true;
-                self.active_routing_target
-            }
-            _ => {
-                if quick_settings.visible {
-                    InputEventRoutingTarget::QuickSettingsOverlay
-                } else {
-                    InputEventRoutingTarget::ActiveGameProcess
+    // Access active telemetry metrics.
+    pub fn metrics(&self) -> &HudPerformanceMetrics {
+        &self.metrics
+    }
+
+    // Update real-time HUD performance metrics.
+    pub fn update_metrics(&mut self, metrics: HudPerformanceMetrics) {
+        self.metrics = metrics;
+    }
+
+    // Access Quick Settings state.
+    pub fn quick_settings(&self) -> &QuickSettingsOverlay {
+        &self.quick_settings
+    }
+
+    // Access mutable Quick Settings state.
+    pub fn quick_settings_mut(&mut self) -> &mut QuickSettingsOverlay {
+        &mut self.quick_settings
+    }
+
+    // Access input router.
+    pub fn input_router_mut(&mut self) -> &mut HandheldInputRouter {
+        &mut self.input_router
+    }
+
+    // Sort layers by Z-order for painter's algorithm composition.
+    pub fn sort_layers_by_z_order(&mut self) {
+        let len = self.layers.len();
+        let mut i = 0;
+        while i < len {
+            let mut j = i + 1;
+            while j < len {
+                if self.layers[j].z_order < self.layers[i].z_order {
+                    self.layers.swap(i, j);
                 }
+                j += 1;
             }
+            i += 1;
         }
     }
 
-    // Route touchscreen gesture, intercepting right edge swipes to open Quick Settings.
-    pub fn route_touch_gesture(
-        &mut self,
-        gesture: HandheldTouchGesture,
-        quick_settings: &mut QuickSettingsOverlay,
-    ) -> InputEventRoutingTarget {
-        match gesture {
-            HandheldTouchGesture::SwipeRightEdge => {
-                quick_settings.visible = true;
-                self.active_routing_target = InputEventRoutingTarget::QuickSettingsOverlay;
-                InputEventRoutingTarget::QuickSettingsOverlay
+    // Compose active surface hierarchy into target display buffer.
+    pub fn compose_frame(&mut self) -> usize {
+        self.total_frames_composed = self.total_frames_composed.saturating_add(1);
+        // Sync quick settings visibility to quick settings layer
+        for layer in &mut self.layers {
+            if layer.layer_type == CompositorLayerType::QuickSettingsMenu {
+                layer.visible = self.quick_settings.visible;
             }
-            _ => {
-                if quick_settings.visible {
-                    InputEventRoutingTarget::QuickSettingsOverlay
-                } else {
-                    InputEventRoutingTarget::ActiveGameProcess
-                }
+            if layer.layer_type == CompositorLayerType::HardwareHudOverlay {
+                layer.visible = self.quick_settings.hud_level != HudDetailLevel::Off;
             }
         }
+        self.layers.iter().filter(|l| l.visible).count()
+    }
+
+    // Get total composed frame count.
+    pub fn total_frames_composed(&self) -> u64 {
+        self.total_frames_composed
+    }
+
+    // Get layer count.
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
     }
 }
 
