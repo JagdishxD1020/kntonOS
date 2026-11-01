@@ -701,3 +701,237 @@ impl BinauralHrtfSpatializer {
         }
     }
 }
+
+
+/// Steam Deck Dual-Microphone Beamforming & Active Noise Suppression (ANS) Pipeline.
+/// Focuses voice capture on the player's mouth while suppressing top fan exhaust and button clicks.
+
+pub const DUAL_MIC_SEPARATION_MM: u16 = 65; // Physical separation distance on Steam Deck bezel
+pub const MIC_DELAY_BUFFER_SIZE: usize = 16;
+
+/// Voice Activity Detector (VAD) analyzing short-term energy and zero crossings.
+#[derive(Debug, Clone)]
+pub struct VoiceActivityDetector {
+    energy_threshold: u32,
+    hangover_frames: u8,
+    hangover_counter: u8,
+    is_speech_active: bool,
+}
+
+impl VoiceActivityDetector {
+    pub const fn new() -> Self {
+        Self {
+            energy_threshold: 400, // Energy baseline for speech detection
+            hangover_frames: 8,    // 8 frames (~21ms) hangover to keep trailing syllables
+            hangover_counter: 0,
+            is_speech_active: false,
+        }
+    }
+
+    pub fn is_speech(&self) -> bool {
+        self.is_speech_active
+    }
+
+    /// Analyze a PCM block and classify as speech or non-speech.
+    pub fn process_frame(&mut self, frame: &[i16]) -> bool {
+        if frame.is_empty() {
+            return false;
+        }
+
+        let mut energy_sum: u64 = 0;
+        let mut zero_crossings: usize = 0;
+        let mut prev_sign = frame[0] >= 0;
+
+        for &sample in frame {
+            let s = sample as i64;
+            energy_sum += (s * s) as u64;
+
+            let cur_sign = sample >= 0;
+            if cur_sign != prev_sign {
+                zero_crossings += 1;
+                prev_sign = cur_sign;
+            }
+        }
+
+        let mean_energy = (energy_sum / frame.len() as u64) as u32;
+
+        // Speech criterion: significant energy above background noise floor or voiced ZCR
+        let raw_speech = mean_energy > self.energy_threshold || (mean_energy > self.energy_threshold / 2 && zero_crossings > 10);
+
+        if raw_speech {
+            self.hangover_counter = self.hangover_frames;
+            self.is_speech_active = true;
+        } else if self.hangover_counter > 0 {
+            self.hangover_counter -= 1;
+            self.is_speech_active = true;
+        } else {
+            self.is_speech_active = false;
+        }
+
+        self.is_speech_active
+    }
+}
+
+/// Dual-Microphone Broadside Delay-and-Sum Beamformer with Spatial Nulling.
+#[derive(Debug, Clone)]
+pub struct DualMicBeamformer {
+    delay_line_left: [i16; MIC_DELAY_BUFFER_SIZE],
+    delay_line_right: [i16; MIC_DELAY_BUFFER_SIZE],
+    w_idx: usize,
+    null_delay_samples: usize,
+    is_enabled: bool,
+}
+
+impl DualMicBeamformer {
+    pub const fn new() -> Self {
+        Self {
+            delay_line_left: [0; MIC_DELAY_BUFFER_SIZE],
+            delay_line_right: [0; MIC_DELAY_BUFFER_SIZE],
+            w_idx: 0,
+            null_delay_samples: 4, // Steers spatial cardioid null toward rear/top exhaust vents
+            is_enabled: true,
+        }
+    }
+
+    /// Process raw dual-microphone inputs and produce beamformed voice signal.
+    pub fn process_beam(&mut self, mic_left: &[i16], mic_right: &[i16], out_beam: &mut [i16]) {
+        let len = mic_left.len().min(mic_right.len()).min(out_beam.len());
+        if !self.is_enabled {
+            for i in 0..len {
+                out_beam[i] = ((mic_left[i] as i32 + mic_right[i] as i32) / 2) as i16;
+            }
+            return;
+        }
+
+        for i in 0..len {
+            let l = mic_left[i] as i32;
+            let r = mic_right[i] as i32;
+
+            self.delay_line_left[self.w_idx] = mic_left[i];
+            self.delay_line_right[self.w_idx] = mic_right[i];
+
+            // In-phase broadside sum: broadside signals (user mouth in front) add constructively (+6dB)
+            // Off-axis reverberations add with phase cancellation
+            let sum = (l + r) / 2;
+
+            // Delayed right channel for rear nulling
+            let r_idx = if self.w_idx >= self.null_delay_samples {
+                self.w_idx - self.null_delay_samples
+            } else {
+                self.w_idx + MIC_DELAY_BUFFER_SIZE - self.null_delay_samples
+            };
+            let r_delayed = self.delay_line_right[r_idx] as i32;
+
+            // Spatial cardioid combination: enhances front sensitivity while attenuating rear exhaust
+            let cardioid = (sum * 3 - r_delayed) / 2;
+
+            self.w_idx = (self.w_idx + 1) % MIC_DELAY_BUFFER_SIZE;
+
+            out_beam[i] = if cardioid > 32767 {
+                32767
+            } else if cardioid < -32768 {
+                -32768
+            } else {
+                cardioid as i16
+            };
+        }
+    }
+}
+
+/// Active Noise Suppression (ANS) filter attenuating stationary fan drone and trackpad clicks.
+#[derive(Debug, Clone)]
+pub struct ActiveNoiseSuppressor {
+    noise_energy_floor: u32,
+    suppression_gain_q8: u16, // Gain applied during speech vs non-speech
+    comfort_noise_level: u16,
+    vad: VoiceActivityDetector,
+    is_enabled: bool,
+}
+
+impl ActiveNoiseSuppressor {
+    pub const fn new() -> Self {
+        Self {
+            noise_energy_floor: 150,
+            suppression_gain_q8: 256,
+            comfort_noise_level: 20,
+            vad: VoiceActivityDetector::new(),
+            is_enabled: true,
+        }
+    }
+
+    pub fn is_speech_active(&self) -> bool {
+        self.vad.is_speech()
+    }
+
+    /// Process audio frame and attenuate background fan noise.
+    pub fn process_frame(&mut self, input: &[i16], output: &mut [i16]) {
+        let len = input.len().min(output.len());
+        if len == 0 {
+            return;
+        }
+
+        let is_speech = self.vad.process_frame(&input[..len]);
+
+        // Frame RMS calculation
+        let mut sum_sq: u64 = 0;
+        for i in 0..len {
+            let s = input[i] as i64;
+            sum_sq += (s * s) as u64;
+        }
+        let frame_energy = (sum_sq / len as u64) as u32;
+
+        if !is_speech {
+            // Update stationary background noise floor estimate during silence
+            // Leaky integrator: noise_floor = 0.9 * noise_floor + 0.1 * frame_energy
+            self.noise_energy_floor = ((self.noise_energy_floor as u64 * 230) + (frame_energy as u64 * 26)) as u32 >> 8;
+
+            // During non-speech, attenuate by 15 dB (gain = 45 / 256)
+            self.suppression_gain_q8 = 45;
+        } else {
+            // During speech, calculate SNR and apply spectral subtraction gain
+            if frame_energy > self.noise_energy_floor * 4 {
+                self.suppression_gain_q8 = 256; // Full voice pass
+            } else {
+                // Low SNR speech: subtle attenuation to reduce background hiss
+                self.suppression_gain_q8 = 192; // -2.5 dB
+            }
+        }
+
+        let g = self.suppression_gain_q8 as i32;
+        for i in 0..len {
+            let s = ((input[i] as i32) * g) >> 8;
+            output[i] = if s > 32767 { 32767 } else if s < -32768 { -32768 } else { s as i16 };
+        }
+    }
+}
+
+/// Integrated Voice Chat Capture Processor combining dual-mic beamforming and ANS.
+pub struct VoiceChatCaptureProcessor {
+    pub beamformer: DualMicBeamformer,
+    pub noise_suppressor: ActiveNoiseSuppressor,
+    intermediate_beam: [i16; AUDIO_FRAME_SIZE],
+}
+
+impl VoiceChatCaptureProcessor {
+    pub const fn new() -> Self {
+        Self {
+            beamformer: DualMicBeamformer::new(),
+            noise_suppressor: ActiveNoiseSuppressor::new(),
+            intermediate_beam: [0; AUDIO_FRAME_SIZE],
+        }
+    }
+
+    /// Process stereo microphone inputs and return cleaned voice stream.
+    pub fn process_capture(&mut self, mic_left: &[i16], mic_right: &[i16], out_clean: &mut [i16]) {
+        let len = mic_left.len().min(mic_right.len()).min(out_clean.len()).min(AUDIO_FRAME_SIZE);
+        self.beamformer.process_beam(
+            &mic_left[..len],
+            &mic_right[..len],
+            &mut self.intermediate_beam[..len],
+        );
+        self.noise_suppressor.process_frame(
+            &self.intermediate_beam[..len],
+            &mut out_clean[..len],
+        );
+    }
+}
