@@ -1610,6 +1610,13 @@ pub extern "C" fn kmain() -> ! {
     } else {
         serial_write_str("[KNT-PANIC] Motion sensor service self-test failed!\r\n");
     }
+
+    // Verify kntonOS SteamDeck Audio Haptic Feedback & DSP Rumble Synthesis Driver (TASK-KNT-332)
+    if knton_os::service::verify_haptics_subsystem() {
+        serial_write_str("[KNT-OS-HAPTIC-PASS] kntonOS SteamDeck audio haptic feedback & DSP rumble driver verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] SteamDeck audio haptic daemon self-test failed!\r\n");
+    }
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
