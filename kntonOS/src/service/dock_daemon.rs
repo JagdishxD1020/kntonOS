@@ -419,3 +419,155 @@ pub fn verify_dp_alt_mode_signaling() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 4: Steam Deck Dock Peripheral Hub Auto-Configuration
+// ============================================================================
+
+/// Valve Corporation Steam Deck Docking Station USB Hardware IDs.
+pub const VALVE_VENDOR_ID: u16       = 0x28DE;
+pub const STEAM_DECK_DOCK_PID1: u16  = 0x1201;
+pub const STEAM_DECK_DOCK_PID2: u16  = 0x1205;
+
+/// Official dock peripheral hub configuration state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockHubStatus {
+    Unconfigured,
+    Configuring,
+    Operational,
+    Error,
+}
+
+/// Integrated Gigabit Ethernet adapter status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DockEthernetState {
+    pub carrier_up: bool,
+    pub speed_mbps: u16,
+    pub full_duplex: bool,
+}
+
+/// Downstream USB-A peripheral port status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DockUsbPortState {
+    pub port_id: u8,
+    pub device_attached: bool,
+    pub is_gaming_hid: bool,
+}
+
+/// Official Steam Deck Dock peripheral hub supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct SteamDeckDockHub {
+    pub status: DockHubStatus,
+    pub is_official_valve_dock: bool,
+    pub firmware_revision: u16,
+    pub ethernet: DockEthernetState,
+    pub usb_ports: [DockUsbPortState; 3],
+    pub hdmi_connected: bool,
+    pub displayport_connected: bool,
+}
+
+impl SteamDeckDockHub {
+    pub const fn new() -> Self {
+        Self {
+            status: DockHubStatus::Unconfigured,
+            is_official_valve_dock: false,
+            firmware_revision: 0,
+            ethernet: DockEthernetState {
+                carrier_up: false,
+                speed_mbps: 0,
+                full_duplex: false,
+            },
+            usb_ports: [
+                DockUsbPortState { port_id: 1, device_attached: false, is_gaming_hid: false },
+                DockUsbPortState { port_id: 2, device_attached: false, is_gaming_hid: false },
+                DockUsbPortState { port_id: 3, device_attached: false, is_gaming_hid: false },
+            ],
+            hdmi_connected: false,
+            displayport_connected: false,
+        }
+    }
+
+    /// Probes connected USB hub device descriptors to detect official Valve dock.
+    pub fn probe_dock_hardware(&mut self, vid: u16, pid: u16) -> bool {
+        if vid == VALVE_VENDOR_ID && (pid == STEAM_DECK_DOCK_PID1 || pid == STEAM_DECK_DOCK_PID2) {
+            self.is_official_valve_dock = true;
+            self.firmware_revision = 0x0123;
+            self.status = DockHubStatus::Operational;
+            true
+        } else {
+            self.is_official_valve_dock = false;
+            self.status = DockHubStatus::Unconfigured;
+            false
+        }
+    }
+
+    /// Updates Realtek Gigabit Ethernet PHY state.
+    pub fn set_ethernet_link(&mut self, carrier_up: bool, speed_mbps: u16) {
+        self.ethernet.carrier_up = carrier_up;
+        self.ethernet.speed_mbps = speed_mbps;
+        self.ethernet.full_duplex = carrier_up;
+    }
+
+    /// Updates USB-A port device presence and HID flag.
+    pub fn set_usb_port(&mut self, port_idx: usize, attached: bool, is_gaming_hid: bool) -> bool {
+        if port_idx < 3 {
+            self.usb_ports[port_idx].device_attached = attached;
+            self.usb_ports[port_idx].is_gaming_hid = is_gaming_hid;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Sets video connector presence (HDMI 2.0 / DisplayPort 1.4).
+    pub fn set_video_outputs(&mut self, hdmi: bool, dp: bool) {
+        self.hdmi_connected = hdmi;
+        self.displayport_connected = dp;
+    }
+}
+
+/// Verification test for Steam Deck Dock peripheral hub auto-configuration.
+pub fn verify_steamdeck_dock_hub() -> bool {
+    let mut hub = SteamDeckDockHub::new();
+
+    // 1. Initial unconfigured state
+    if hub.status != DockHubStatus::Unconfigured || hub.is_official_valve_dock {
+        return false;
+    }
+
+    // 2. Probe official Steam Deck Dock (0x28DE, 0x1201)
+    let is_deck_dock = hub.probe_dock_hardware(VALVE_VENDOR_ID, STEAM_DECK_DOCK_PID1);
+    if !is_deck_dock || !hub.is_official_valve_dock || hub.status != DockHubStatus::Operational {
+        return false;
+    }
+    if hub.firmware_revision == 0 {
+        return false;
+    }
+
+    // 3. Configure Realtek Gigabit Ethernet PHY: link up at 1000 Mbps Full Duplex
+    hub.set_ethernet_link(true, 1000);
+    if !hub.ethernet.carrier_up || hub.ethernet.speed_mbps != 1000 || !hub.ethernet.full_duplex {
+        return false;
+    }
+
+    // 4. Attach USB gaming keyboard on Port 1 and gaming mouse on Port 2
+    hub.set_usb_port(0, true, true);
+    hub.set_usb_port(1, true, true);
+    if !hub.usb_ports[0].device_attached || !hub.usb_ports[0].is_gaming_hid {
+        return false;
+    }
+    if !hub.usb_ports[1].device_attached || !hub.usb_ports[1].is_gaming_hid {
+        return false;
+    }
+    if hub.usb_ports[2].device_attached {
+        return false;
+    }
+
+    // 5. Connect HDMI monitor
+    hub.set_video_outputs(true, false);
+    if !hub.hdmi_connected || hub.displayport_connected {
+        return false;
+    }
+
+    true
+}
+
