@@ -598,3 +598,161 @@ pub fn verify_dp_alt_mode_hotplug() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 4: Audio Volume Mixer Channel Management & Acoustic Loudness Governor
+// ============================================================================
+
+/// Number of distinct audio mixer streams.
+pub const AUDIO_CHANNEL_COUNT: usize = 5;
+
+/// Audio mixer stream channel category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum AudioChannel {
+    /// Overall hardware output amplifier volume.
+    Master = 0,
+    /// Foreground 3D game audio.
+    GameStream = 1,
+    /// Discord / Steam / VoIP party chat.
+    VoiceChat = 2,
+    /// OS sound effects and button click notifications.
+    SystemUi = 3,
+    /// Media player / Spotify background stream.
+    Music = 4,
+}
+
+/// Volume and mute attributes for a single audio stream channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelVolume {
+    /// Volume slider percentage (0 to 100%).
+    pub volume_pct: u8,
+    /// Whether channel is explicitly muted.
+    pub is_muted: bool,
+    /// Peak digital audio level in negative decibels relative to full scale (e.g. -6 dBFS).
+    pub peak_dbfs: i8,
+}
+
+impl ChannelVolume {
+    /// Creates a channel volume with default percentage.
+    pub const fn new(default_pct: u8) -> Self {
+        Self {
+            volume_pct: default_pct,
+            is_muted: false,
+            peak_dbfs: -60,
+        }
+    }
+}
+
+/// Audio volume mixer and handheld acoustic loudness governor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioVolumeMixer {
+    /// Volume and mute state for each channel.
+    pub channels: [ChannelVolume; AUDIO_CHANNEL_COUNT],
+    /// Dynamic Range Compression (DRC) limiter active (caps max speaker power to prevent distortion / brownouts).
+    pub drc_limiter_active: bool,
+    /// Speaker acoustic protection factor in percent (e.g. 80% limit when battery low).
+    pub acoustic_limit_pct: u8,
+}
+
+impl AudioVolumeMixer {
+    /// Initializes mixer with standard handheld gaming sound balances.
+    pub const fn new() -> Self {
+        Self {
+            channels: [
+                ChannelVolume::new(75),  // Master 75%
+                ChannelVolume::new(100), // Game 100%
+                ChannelVolume::new(85),  // Voice 85%
+                ChannelVolume::new(50),  // UI 50%
+                ChannelVolume::new(60),  // Music 60%
+            ],
+            drc_limiter_active: false,
+            acoustic_limit_pct: 100,
+        }
+    }
+
+    /// Sets volume percentage for a channel.
+    pub fn set_channel_volume(&mut self, channel: AudioChannel, volume_pct: u8) {
+        self.channels[channel as usize].volume_pct = volume_pct.min(100);
+    }
+
+    /// Toggles or sets mute flag for a channel.
+    pub fn set_channel_mute(&mut self, channel: AudioChannel, muted: bool) {
+        self.channels[channel as usize].is_muted = muted;
+    }
+
+    /// Updates acoustic protection and DRC limiter based on battery status.
+    pub fn update_acoustic_governor(&mut self, battery_low: bool) {
+        if battery_low {
+            // Under low battery, clamp master volume to 80% to avoid sudden speaker amplifier current spikes
+            self.drc_limiter_active = true;
+            self.acoustic_limit_pct = 80;
+        } else {
+            self.drc_limiter_active = false;
+            self.acoustic_limit_pct = 100;
+        }
+    }
+
+    /// Calculates final effective output volume percentage for an audio channel (0 to 100%).
+    pub fn calculate_effective_volume(&self, channel: AudioChannel) -> u8 {
+        let ch = &self.channels[channel as usize];
+        if ch.is_muted {
+            return 0;
+        }
+
+        let master = &self.channels[AudioChannel::Master as usize];
+        if master.is_muted {
+            return 0;
+        }
+
+        // Apply acoustic limit to master volume
+        let clamped_master = (master.volume_pct * self.acoustic_limit_pct) / 100;
+
+        if channel == AudioChannel::Master {
+            clamped_master
+        } else {
+            ((ch.volume_pct as u32 * clamped_master as u32) / 100) as u8
+        }
+    }
+}
+
+/// Verification test for audio volume mixer and acoustic governor.
+pub fn verify_audio_volume_mixer() -> bool {
+    let mut mixer = AudioVolumeMixer::new();
+
+    // 1. Initial defaults check
+    if mixer.channels[AudioChannel::Master as usize].volume_pct != 75 {
+        return false;
+    }
+    // Effective volume of GameStream (100% * 75% master = 75%)
+    if mixer.calculate_effective_volume(AudioChannel::GameStream) != 75 {
+        return false;
+    }
+
+    // 2. Adjust volume and test effective calculation
+    mixer.set_channel_volume(AudioChannel::Master, 100);
+    mixer.set_channel_volume(AudioChannel::GameStream, 80);
+    if mixer.calculate_effective_volume(AudioChannel::GameStream) != 80 {
+        return false;
+    }
+
+    // 3. Test muting
+    mixer.set_channel_mute(AudioChannel::GameStream, true);
+    if mixer.calculate_effective_volume(AudioChannel::GameStream) != 0 {
+        return false;
+    }
+    mixer.set_channel_mute(AudioChannel::GameStream, false);
+
+    // 4. Test Acoustic Governor under low battery (clamps to 80% max)
+    mixer.update_acoustic_governor(true);
+    if !mixer.drc_limiter_active || mixer.acoustic_limit_pct != 80 {
+        return false;
+    }
+    // Master 100% clamped to 80%; Game 80% * 80% = 64%
+    if mixer.calculate_effective_volume(AudioChannel::GameStream) != 64 {
+        return false;
+    }
+
+    true
+}
