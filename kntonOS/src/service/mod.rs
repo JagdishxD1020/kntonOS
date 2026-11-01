@@ -49,6 +49,9 @@ pub use speaker_dsp::*;
 pub mod sd_indexer;
 pub use sd_indexer::*;
 
+pub mod display_modeswitch;
+pub use display_modeswitch::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {

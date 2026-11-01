@@ -1636,6 +1636,11 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-SDINDEX-PASS] kntonOS SteamDeck microSD gaming library indexer verified\r\n");
     } else {
         serial_write_str("[KNT-PANIC] SteamDeck microSD gaming library indexer self-test failed!\r\n");
+    // Verify kntonOS SteamDeck External Monitor Hotplug & Multi-Resolution Display Modeswitching (TASK-KNT-338)
+    if knton_os::service::verify_display_modeswitch_subsystem() {
+        serial_write_str("[KNT-OS-MODESWITCH-PASS] kntonOS SteamDeck display modeswitch manager verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] Display modeswitch manager self-test failed!\r\n");
     }
 
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)

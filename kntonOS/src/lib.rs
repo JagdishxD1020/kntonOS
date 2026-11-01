@@ -25,6 +25,7 @@ pub use service::verify_haptics_subsystem;
 pub use service::verify_battery_manager_subsystem;
 pub use service::verify_speaker_dsp_subsystem;
 pub use service::verify_sd_indexer_subsystem;
+pub use service::verify_display_modeswitch_subsystem;
 
 /// Verification sentinel proving full userspace OS subsystem readiness.
 pub fn verify_knton_os_userspace() -> bool {
@@ -49,6 +50,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && service::verify_battery_manager_subsystem()
         && service::verify_speaker_dsp_subsystem()
         && service::verify_sd_indexer_subsystem()
+        && service::verify_display_modeswitch_subsystem()
         && ipc::verify_ipc_ports()
         && ipc::verify_ipc_dispatcher_subsystem()
         && shell::verify_game_mode_shell()
