@@ -571,3 +571,133 @@ pub fn verify_steamdeck_dock_hub() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 5: Dynamic Display Hotplug Modesetting & Audio Sink Routing
+// ============================================================================
+
+/// Display video timing mode descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DockDisplayTiming {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_hz: u32,
+    pub is_external: bool,
+}
+
+impl DockDisplayTiming {
+    /// Native handheld screen: 1280x800 60Hz 16:10 aspect ratio.
+    pub const fn internal_native() -> Self {
+        Self {
+            width: 1280,
+            height: 800,
+            refresh_hz: 60,
+            is_external: false,
+        }
+    }
+
+    /// External monitor timing.
+    pub const fn external(width: u32, height: u32, refresh_hz: u32) -> Self {
+        Self {
+            width,
+            height,
+            refresh_hz,
+            is_external: true,
+        }
+    }
+}
+
+/// Active audio output routing sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockAudioSink {
+    InternalSpeakers,
+    ExternalDigitalHdmiDp,
+}
+
+/// Automated display modesetting and audio sink coordinator.
+#[derive(Debug, Clone, Copy)]
+pub struct DockModesettingCoordinator {
+    pub is_docked: bool,
+    pub active_timing: DockDisplayTiming,
+    pub active_audio: DockAudioSink,
+    pub modeset_count: u32,
+    pub audio_reroute_count: u32,
+}
+
+impl DockModesettingCoordinator {
+    /// Initializes coordinator in native undocked handheld mode.
+    pub const fn new() -> Self {
+        Self {
+            is_docked: false,
+            active_timing: DockDisplayTiming::internal_native(),
+            active_audio: DockAudioSink::InternalSpeakers,
+            modeset_count: 0,
+            audio_reroute_count: 0,
+        }
+    }
+
+    /// Triggers display modeset and audio routing when docked to an external monitor.
+    pub fn on_dock_attached(&mut self, width: u32, height: u32, refresh_hz: u32) {
+        self.is_docked = true;
+        self.active_timing = DockDisplayTiming::external(width, height, refresh_hz);
+        self.active_audio = DockAudioSink::ExternalDigitalHdmiDp;
+        self.modeset_count = self.modeset_count.saturating_add(1);
+        self.audio_reroute_count = self.audio_reroute_count.saturating_add(1);
+    }
+
+    /// Triggers seamless restore to internal display and speakers when undocked.
+    pub fn on_dock_detached(&mut self) {
+        if self.is_docked {
+            self.is_docked = false;
+            self.active_timing = DockDisplayTiming::internal_native();
+            self.active_audio = DockAudioSink::InternalSpeakers;
+            self.modeset_count = self.modeset_count.saturating_add(1);
+            self.audio_reroute_count = self.audio_reroute_count.saturating_add(1);
+        }
+    }
+}
+
+/// Verification test for dynamic display hotplug modesetting and audio sink routing.
+pub fn verify_dock_modesetting_and_audio() -> bool {
+    let mut coord = DockModesettingCoordinator::new();
+
+    // 1. Initial handheld native defaults
+    if coord.is_docked || coord.active_timing != DockDisplayTiming::internal_native() {
+        return false;
+    }
+    if coord.active_audio != DockAudioSink::InternalSpeakers || coord.modeset_count != 0 {
+        return false;
+    }
+
+    // 2. Dock to external 1080p 120Hz gaming monitor
+    coord.on_dock_attached(1920, 1080, 120);
+    if !coord.is_docked || coord.active_timing != DockDisplayTiming::external(1920, 1080, 120) {
+        return false;
+    }
+    if coord.active_audio != DockAudioSink::ExternalDigitalHdmiDp {
+        return false;
+    }
+    if coord.modeset_count != 1 || coord.audio_reroute_count != 1 {
+        return false;
+    }
+
+    // 3. Switch external modeset to 4K 60Hz
+    coord.on_dock_attached(3840, 2160, 60);
+    if coord.active_timing != DockDisplayTiming::external(3840, 2160, 60) || coord.modeset_count != 2 {
+        return false;
+    }
+
+    // 4. Undock: restore native 800p screen and internal speakers
+    coord.on_dock_detached();
+    if coord.is_docked || coord.active_timing != DockDisplayTiming::internal_native() {
+        return false;
+    }
+    if coord.active_audio != DockAudioSink::InternalSpeakers {
+        return false;
+    }
+    if coord.modeset_count != 3 || coord.audio_reroute_count != 3 {
+        return false;
+    }
+
+    true
+}
+
