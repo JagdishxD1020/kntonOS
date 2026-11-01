@@ -296,3 +296,126 @@ pub fn verify_usb_pd_contract_negotiation() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: DisplayPort Alternate Mode Pin Assignment & HPD Signaling
+// ============================================================================
+
+/// DisplayPort Alt-Mode pin assignments over Type-C connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum DpPinAssignment {
+    Disabled,
+    /// Pin Assignment C: Dedicated DP 4-lane (supports up to 4K120 / 8K, USB 2.0 data only).
+    PinAssignmentC_4Lane,
+    /// Pin Assignment D: DP 2-lane + USB 3.2 Gen2 10Gbps data (Steam Deck Docking default).
+    PinAssignmentD_2LaneUsb3,
+}
+
+/// Hot-Plug Detect (HPD) electrical line state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HpdSignalState {
+    Low,
+    High,
+    IrqPulse,
+}
+
+/// DisplayPort Alt-Mode signaling controller.
+#[derive(Debug, Clone, Copy)]
+pub struct DpAltModeController {
+    pub pin_assignment: DpPinAssignment,
+    pub hpd: HpdSignalState,
+    pub lane_count: u8,
+    pub link_rate_mbps: u32,
+    pub usb3_concurrent: bool,
+    pub mst_enabled: bool,
+}
+
+impl DpAltModeController {
+    pub const fn new() -> Self {
+        Self {
+            pin_assignment: DpPinAssignment::Disabled,
+            hpd: HpdSignalState::Low,
+            lane_count: 0,
+            link_rate_mbps: 0,
+            usb3_concurrent: false,
+            mst_enabled: false,
+        }
+    }
+
+    /// Negotiates VDM pin assignment with dock partner.
+    pub fn configure_pin_assignment(&mut self, assignment: DpPinAssignment) {
+        self.pin_assignment = assignment;
+        match assignment {
+            DpPinAssignment::PinAssignmentD_2LaneUsb3 => {
+                self.lane_count = 2;
+                self.link_rate_mbps = 8100; // HBR3 8.1 Gbps per lane
+                self.usb3_concurrent = true; // Enables USB 3.2 Gen2 hub on dock
+                self.mst_enabled = true;      // Multi-Stream Transport for dual displays
+            }
+            DpPinAssignment::PinAssignmentC_4Lane => {
+                self.lane_count = 4;
+                self.link_rate_mbps = 8100; // HBR3 8.1 Gbps per lane
+                self.usb3_concurrent = false; // All 4 differential pairs dedicated to DP
+                self.mst_enabled = true;
+            }
+            DpPinAssignment::Disabled => {
+                self.lane_count = 0;
+                self.link_rate_mbps = 0;
+                self.usb3_concurrent = false;
+                self.mst_enabled = false;
+            }
+        }
+    }
+
+    /// Processes HPD state changes from external sink.
+    pub fn update_hpd(&mut self, hpd: HpdSignalState) {
+        self.hpd = hpd;
+    }
+
+    /// Checks if video scanout transmission is ready.
+    pub const fn is_scanout_ready(&self) -> bool {
+        matches!(self.hpd, HpdSignalState::High) && !matches!(self.pin_assignment, DpPinAssignment::Disabled)
+    }
+}
+
+/// Verification test for DisplayPort Alt-Mode pin assignment and HPD signaling.
+pub fn verify_dp_alt_mode_signaling() -> bool {
+    let mut dp = DpAltModeController::new();
+
+    // 1. Initial disabled state
+    if dp.pin_assignment != DpPinAssignment::Disabled || dp.is_scanout_ready() {
+        return false;
+    }
+
+    // 2. Configure Pin Assignment D (Steam Deck Dock default: 2-lane DP + USB 3.2 data)
+    dp.configure_pin_assignment(DpPinAssignment::PinAssignmentD_2LaneUsb3);
+    if dp.lane_count != 2 || !dp.usb3_concurrent || !dp.mst_enabled {
+        return false;
+    }
+    // HPD is still Low, so scanout not ready yet
+    if dp.is_scanout_ready() {
+        return false;
+    }
+
+    // 3. Monitor asserts HPD High
+    dp.update_hpd(HpdSignalState::High);
+    if !dp.is_scanout_ready() || dp.hpd != HpdSignalState::High {
+        return false;
+    }
+
+    // 4. Test HPD IRQ pulse (link retraining request)
+    dp.update_hpd(HpdSignalState::IrqPulse);
+    if dp.hpd != HpdSignalState::IrqPulse {
+        return false;
+    }
+
+    // 5. Cable disconnect: HPD Low, Pin Assignment Disabled
+    dp.update_hpd(HpdSignalState::Low);
+    dp.configure_pin_assignment(DpPinAssignment::Disabled);
+    if dp.is_scanout_ready() || dp.lane_count != 0 {
+        return false;
+    }
+
+    true
+}
+
