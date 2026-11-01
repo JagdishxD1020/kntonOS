@@ -448,4 +448,209 @@ impl ProcessLaunchBroker {
     }
 }
 
+// Handheld dynamic refresh rate switching (DRRS) targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrrsRefreshRate {
+    Hz40 = 40,
+    Hz60 = 60,
+    Hz120 = 120,
+}
+
+impl DrrsRefreshRate {
+    // Return frequency value in hertz.
+    pub fn hz(self) -> u16 {
+        self as u16
+    }
+}
+
+// Handheld GPU power and frequency profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuClockProfile {
+    Auto,
+    PowerSave,
+    Boost,
+}
+
+// Quick-Access hardware drawer managing power, display and audio parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuickAccessDrawer {
+    pub is_open: bool,
+    pub target_tdp_watts: u8,
+    pub refresh_rate: DrrsRefreshRate,
+    pub gpu_profile: GpuClockProfile,
+    pub fps_limit: u16,
+    pub brightness_pct: u8,
+    pub volume_pct: u8,
+    pub hud_level: u8,
+}
+
+impl QuickAccessDrawer {
+    // Initialize quick-access hardware drawer with balanced defaults.
+    pub const fn new() -> Self {
+        Self {
+            is_open: false,
+            target_tdp_watts: 15,
+            refresh_rate: DrrsRefreshRate::Hz60,
+            gpu_profile: GpuClockProfile::Auto,
+            fps_limit: 60,
+            brightness_pct: 80,
+            volume_pct: 70,
+            hud_level: 1,
+        }
+    }
+
+    // Toggle drawer visibility between open and closed.
+    pub fn toggle(&mut self) {
+        self.is_open = !self.is_open;
+    }
+
+    // Open quick-access drawer.
+    pub fn open(&mut self) {
+        self.is_open = true;
+    }
+
+    // Close quick-access drawer.
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+
+    // Set thermal design power target clamped between 5W and 30W.
+    pub fn set_tdp(&mut self, tdp: u8) {
+        self.target_tdp_watts = tdp.clamp(5, 30);
+    }
+
+    // Adjust thermal design power by relative delta clamped between 5W and 30W.
+    pub fn adjust_tdp(&mut self, delta: i8) {
+        let val = self.target_tdp_watts as i16 + delta as i16;
+        self.target_tdp_watts = val.clamp(5, 30) as u8;
+    }
+
+    // Configure display dynamic refresh rate.
+    pub fn set_refresh_rate(&mut self, rate: DrrsRefreshRate) {
+        self.refresh_rate = rate;
+    }
+
+    // Cycle refresh rate through 40Hz -> 60Hz -> 120Hz -> 40Hz.
+    pub fn cycle_refresh_rate(&mut self) {
+        self.refresh_rate = match self.refresh_rate {
+            DrrsRefreshRate::Hz40 => DrrsRefreshRate::Hz60,
+            DrrsRefreshRate::Hz60 => DrrsRefreshRate::Hz120,
+            DrrsRefreshRate::Hz120 => DrrsRefreshRate::Hz40,
+        };
+    }
+
+    // Set GPU clock frequency mode.
+    pub fn set_gpu_profile(&mut self, profile: GpuClockProfile) {
+        self.gpu_profile = profile;
+    }
+
+    // Cycle GPU clock profile through Auto -> PowerSave -> Boost -> Auto.
+    pub fn cycle_gpu_profile(&mut self) {
+        self.gpu_profile = match self.gpu_profile {
+            GpuClockProfile::Auto => GpuClockProfile::PowerSave,
+            GpuClockProfile::PowerSave => GpuClockProfile::Boost,
+            GpuClockProfile::Boost => GpuClockProfile::Auto,
+        };
+    }
+
+    // Adjust screen brightness level clamped between 0% and 100%.
+    pub fn adjust_brightness(&mut self, delta: i8) {
+        let val = self.brightness_pct as i16 + delta as i16;
+        self.brightness_pct = val.clamp(0, 100) as u8;
+    }
+
+    // Adjust master audio volume clamped between 0% and 100%.
+    pub fn adjust_volume(&mut self, delta: i8) {
+        let val = self.volume_pct as i16 + delta as i16;
+        self.volume_pct = val.clamp(0, 100) as u8;
+    }
+}
+
+// Integrated Handheld Deck Game Launcher combining catalog, grid, broker and hardware drawer.
+pub struct DeckGameLauncher {
+    pub catalog: GameLibraryCatalog,
+    pub grid: ThumbnailGrid,
+    pub launch_broker: ProcessLaunchBroker,
+    pub drawer: QuickAccessDrawer,
+}
+
+impl DeckGameLauncher {
+    // Construct fully configured handheld launcher environment.
+    pub const fn new(
+        columns: usize,
+        rows_visible: usize,
+        cell_width: u32,
+        cell_height: u32,
+        padding_x: u32,
+        padding_y: u32,
+    ) -> Self {
+        Self {
+            catalog: GameLibraryCatalog::new(),
+            grid: ThumbnailGrid::new(columns, rows_visible, cell_width, cell_height, padding_x, padding_y),
+            launch_broker: ProcessLaunchBroker::new(),
+            drawer: QuickAccessDrawer::new(),
+        }
+    }
+
+    // Register a new game title into catalog and update grid capacity.
+    pub fn register_title(&mut self, metadata: GameTitleMetadata) -> Result<usize, &'static str> {
+        let idx = self.catalog.register_game(metadata)?;
+        self.grid.set_total_items(self.catalog.total_games());
+        Ok(idx)
+    }
+
+    // Launch currently selected game from grid.
+    pub fn launch_selected(&mut self, tick: u64) -> Result<u32, &'static str> {
+        let selected = self.grid.selected_cell;
+        self.launch_broker.request_launch(selected, &self.catalog, tick)
+    }
+
+    // Handle Quick-Access physical hardware button press (QAM).
+    pub fn handle_quick_access_button(&mut self) {
+        self.drawer.toggle();
+        if self.drawer.is_open && self.launch_broker.is_game_running() {
+            let _ = self.launch_broker.suspend();
+        } else if !self.drawer.is_open && matches!(self.launch_broker.state(), LaunchState::Suspended { .. }) {
+            let _ = self.launch_broker.resume(0);
+        }
+    }
+
+    // Handle controller D-pad left navigation.
+    pub fn handle_dpad_left(&mut self) -> bool {
+        if !self.drawer.is_open {
+            self.grid.move_left()
+        } else {
+            false
+        }
+    }
+
+    // Handle controller D-pad right navigation.
+    pub fn handle_dpad_right(&mut self) -> bool {
+        if !self.drawer.is_open {
+            self.grid.move_right()
+        } else {
+            false
+        }
+    }
+
+    // Handle controller D-pad up navigation.
+    pub fn handle_dpad_up(&mut self) -> bool {
+        if !self.drawer.is_open {
+            self.grid.move_up()
+        } else {
+            false
+        }
+    }
+
+    // Handle controller D-pad down navigation.
+    pub fn handle_dpad_down(&mut self) -> bool {
+        if !self.drawer.is_open {
+            self.grid.move_down()
+        } else {
+            false
+        }
+    }
+}
+
+
 
