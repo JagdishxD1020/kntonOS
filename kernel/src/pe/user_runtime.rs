@@ -207,3 +207,74 @@ impl SyscallCallgateDispatcher {
 }
 
 pub static SYSCALL_CALLGATE: SyscallCallgateDispatcher = SyscallCallgateDispatcher::new();
+
+/// Userland CPU execution context holding user registers across syscall/sysret transitions.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UserExecutionContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub rflags: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+}
+
+/// Userland Syscall and Sysret Transition Handler.
+pub struct UserSyscallCallgate;
+
+impl UserSyscallCallgate {
+    /// Construct initial user-mode execution frame.
+    pub fn setup_user_entry_frame(
+        entry_point: u64,
+        stack_base: u64,
+        stack_size: usize,
+    ) -> UserExecutionContext {
+        let layout = UserStackLayout::new(stack_base, stack_size);
+        UserExecutionContext {
+            rip: entry_point,
+            rsp: layout.initial_rsp,
+            rflags: 0x0202,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0x0202,
+        }
+    }
+
+    /// Execute a simulated high-performance syscall/sysret context switch.
+    pub fn execute_user_syscall(
+        ctx: &mut UserExecutionContext,
+        syscall_id: u32,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+        arg4: u64,
+    ) -> u32 {
+        // Syscall entry: RCX captures user RIP, R11 captures user RFLAGS
+        ctx.rcx = ctx.rip;
+        ctx.r11 = ctx.rflags;
+        ctx.rax = syscall_id as u64;
+        ctx.r10 = arg1;
+        ctx.rdx = arg2;
+        ctx.r8 = arg3;
+        ctx.r9 = arg4;
+
+        // Execute kernel callgate dispatch
+        let status = SYSCALL_CALLGATE.dispatch(syscall_id, arg1, arg2, arg3, arg4);
+
+        // Sysret return: RAX stores NTSTATUS, resume execution at RCX
+        ctx.rax = status as u64;
+        ctx.rip = ctx.rcx;
+        ctx.rflags = ctx.r11;
+
+        status
+    }
+}
