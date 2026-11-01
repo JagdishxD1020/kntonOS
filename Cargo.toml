@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "boot",
     "kernel",
+    "kntonOS",
 ]
 
 [profile.dev]

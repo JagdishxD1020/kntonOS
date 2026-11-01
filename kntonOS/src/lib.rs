@@ -1,0 +1,21 @@
+//! # KntonOS Userspace Operating System & Gaming Environment
+//!
+//! Autonomous userspace environment providing session management, background system services,
+//! low-latency IPC ports, user-mode runtime callgates, and handheld game mode shell.
+
+#![no_std]
+
+pub mod ipc;
+pub mod runtime;
+pub mod service;
+pub mod session;
+pub mod shell;
+
+/// Verification sentinel proving full userspace OS subsystem readiness.
+pub fn verify_knton_os_userspace() -> bool {
+    runtime::verify_user_runtime()
+        && session::verify_session_manager()
+        && service::verify_service_manager()
+        && ipc::verify_ipc_ports()
+        && shell::verify_game_mode_shell()
+}

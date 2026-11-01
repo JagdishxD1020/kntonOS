@@ -10,5 +10,9 @@ dependencies = [
 ]
 
 [[package]]
+name = "kntonOS"
+version = "0.1.0"
+
+[[package]]
 name = "kntonk"
 version = "0.1.0"

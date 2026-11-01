@@ -1,0 +1,61 @@
+//! Background system service supervisor and crash recovery manager.
+
+/// Service operational state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Stopped,
+    Starting,
+    Running,
+    Failed,
+}
+
+/// Service definition descriptor.
+#[derive(Debug, Clone, Copy)]
+pub struct SystemService {
+    pub service_id: u16,
+    pub state: ServiceState,
+    pub restart_count: u32,
+    pub auto_restart: bool,
+}
+
+impl SystemService {
+    pub const fn new(service_id: u16, auto_restart: bool) -> Self {
+        Self {
+            service_id,
+            state: ServiceState::Stopped,
+            restart_count: 0,
+            auto_restart,
+        }
+    }
+
+    pub fn start(&mut self) {
+        self.state = ServiceState::Running;
+    }
+
+    pub fn handle_crash(&mut self) -> bool {
+        self.state = ServiceState::Failed;
+        if self.auto_restart && self.restart_count < 5 {
+            self.restart_count += 1;
+            self.state = ServiceState::Running;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Verification test for service manager.
+pub fn verify_service_manager() -> bool {
+    let mut svc = SystemService::new(1, true);
+    svc.start();
+    if svc.state != ServiceState::Running {
+        return false;
+    }
+
+    let recovered = svc.handle_crash();
+    if !recovered || svc.state != ServiceState::Running || svc.restart_count != 1 {
+        return false;
+    }
+
+    true
+}

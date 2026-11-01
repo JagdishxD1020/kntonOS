@@ -1,0 +1,12 @@
+[package]
+name = "kntonOS"
+version = "0.1.0"
+edition = "2021"
+authors = ["JagdishxD1020 <JagdishxD1020@users.noreply.github.com>"]
+license = "ARR"
+description = "KntonOS Userspace Operating System & Gaming Shell"
+
+[lib]
+name = "knton_os"
+path = "src/lib.rs"
+crate-type = ["rlib"]
