@@ -462,3 +462,242 @@ impl VoiceCoilThermalProtector {
         }
     }
 }
+
+
+/// 3.5mm Headphone Binaural HRTF 3D Surround Spatializer.
+/// Performs virtual 7.1 surround sound positioning and downmix to binaural stereo headphones.
+
+pub const SURROUND_7_1_CHANNELS: usize = 8;
+pub const HRTF_MAX_DELAY_SAMPLES: usize = 48;
+
+/// Virtual 7.1 surround channel indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurroundChannel {
+    FrontLeft = 0,
+    FrontRight = 1,
+    Center = 2,
+    Lfe = 3,
+    BackLeft = 4,
+    BackRight = 5,
+    SideLeft = 6,
+    SideRight = 7,
+}
+
+/// Binaural acoustic parameters per virtual loudspeaker position.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelHrtfParams {
+    pub azimuth_deg: i16,
+    pub itd_left_samples: usize,
+    pub itd_right_samples: usize,
+    pub ild_left_gain_q8: u16,
+    pub ild_right_gain_q8: u16,
+    pub head_shadow_coeff_q14: i32, // One-pole low-pass coefficient for contralateral ear
+}
+
+/// Precalculated HRTF parameters for 7.1 virtual speaker layout (ITU-R BS.775):
+/// Angles: FL(-30°), FR(+30°), FC(0°), LFE(0°), BL(-135°), BR(+135°), SL(-90°), SR(+90°).
+pub const VIRTUAL_7_1_HRTF_TABLE: [ChannelHrtfParams; SURROUND_7_1_CHANNELS] = [
+    // 0: Front Left (-30°) - Ipsi: Left (0 delay, gain 256), Contra: Right (14 samples, gain 170)
+    ChannelHrtfParams {
+        azimuth_deg: -30,
+        itd_left_samples: 0,
+        itd_right_samples: 14,
+        ild_left_gain_q8: 256,
+        ild_right_gain_q8: 170,
+        head_shadow_coeff_q14: 9800,
+    },
+    // 1: Front Right (+30°) - Ipsi: Right (0 delay, gain 256), Contra: Left (14 samples, gain 170)
+    ChannelHrtfParams {
+        azimuth_deg: 30,
+        itd_left_samples: 14,
+        itd_right_samples: 0,
+        ild_left_gain_q8: 170,
+        ild_right_gain_q8: 256,
+        head_shadow_coeff_q14: 9800,
+    },
+    // 2: Center (0°) - Symmetric arrival to both ears, slightly reduced to fit stereo power sum
+    ChannelHrtfParams {
+        azimuth_deg: 0,
+        itd_left_samples: 2,
+        itd_right_samples: 2,
+        ild_left_gain_q8: 181, // 1/sqrt(2) approx = 0.707 * 256 = 181
+        ild_right_gain_q8: 181,
+        head_shadow_coeff_q14: 16384, // No shadow
+    },
+    // 3: LFE (Subwoofer) - Omnidirectional non-spatialized bass split equally
+    ChannelHrtfParams {
+        azimuth_deg: 0,
+        itd_left_samples: 0,
+        itd_right_samples: 0,
+        ild_left_gain_q8: 181,
+        ild_right_gain_q8: 181,
+        head_shadow_coeff_q14: 16384,
+    },
+    // 4: Back Left (-135°) - Left ipsi (2 samples, gain 220), Right contra (22 samples, gain 120)
+    ChannelHrtfParams {
+        azimuth_deg: -135,
+        itd_left_samples: 2,
+        itd_right_samples: 22,
+        ild_left_gain_q8: 220,
+        ild_right_gain_q8: 120,
+        head_shadow_coeff_q14: 7500, // Stronger rear pinna shadow
+    },
+    // 5: Back Right (+135°) - Right ipsi (2 samples, gain 220), Left contra (22 samples, gain 120)
+    ChannelHrtfParams {
+        azimuth_deg: 135,
+        itd_left_samples: 22,
+        itd_right_samples: 2,
+        ild_left_gain_q8: 120,
+        ild_right_gain_q8: 220,
+        head_shadow_coeff_q14: 7500,
+    },
+    // 6: Side Left (-90°) - Maximum ITD/ILD separation (0 vs 30 samples delay, 256 vs 90 gain)
+    ChannelHrtfParams {
+        azimuth_deg: -90,
+        itd_left_samples: 0,
+        itd_right_samples: 30,
+        ild_left_gain_q8: 256,
+        ild_right_gain_q8: 90,
+        head_shadow_coeff_q14: 6200, // Maximum head shadow
+    },
+    // 7: Side Right (+90°) - Maximum ITD/ILD separation (30 vs 0 samples delay, 90 vs 256 gain)
+    ChannelHrtfParams {
+        azimuth_deg: 90,
+        itd_left_samples: 30,
+        itd_right_samples: 0,
+        ild_left_gain_q8: 90,
+        ild_right_gain_q8: 256,
+        head_shadow_coeff_q14: 6200,
+    },
+];
+
+/// Binaural 3D Surround Spatializer Engine for 3.5mm Headphone Jack.
+#[derive(Debug, Clone)]
+pub struct BinauralHrtfSpatializer {
+    delay_rings: [[i16; HRTF_MAX_DELAY_SAMPLES]; SURROUND_7_1_CHANNELS],
+    write_indices: [usize; SURROUND_7_1_CHANNELS],
+    shadow_filters_left: [i32; SURROUND_7_1_CHANNELS],
+    shadow_filters_right: [i32; SURROUND_7_1_CHANNELS],
+    is_enabled: bool,
+}
+
+impl BinauralHrtfSpatializer {
+    pub const fn new() -> Self {
+        Self {
+            delay_rings: [[0; HRTF_MAX_DELAY_SAMPLES]; SURROUND_7_1_CHANNELS],
+            write_indices: [0; SURROUND_7_1_CHANNELS],
+            shadow_filters_left: [0; SURROUND_7_1_CHANNELS],
+            shadow_filters_right: [0; SURROUND_7_1_CHANNELS],
+            is_enabled: true,
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.is_enabled = enabled;
+    }
+
+    pub fn reset(&mut self) {
+        self.delay_rings = [[0; HRTF_MAX_DELAY_SAMPLES]; SURROUND_7_1_CHANNELS];
+        self.write_indices = [0; SURROUND_7_1_CHANNELS];
+        self.shadow_filters_left = [0; SURROUND_7_1_CHANNELS];
+        self.shadow_filters_right = [0; SURROUND_7_1_CHANNELS];
+    }
+
+    /// Downmix 8-channel 7.1 surround buffers to binaural stereo headphones.
+    pub fn spatial_downmix_7_1(
+        &mut self,
+        inputs: &[&[i16]; SURROUND_7_1_CHANNELS],
+        out_left: &mut [i16],
+        out_right: &mut [i16],
+    ) {
+        let len = out_left.len().min(out_right.len());
+        if len == 0 {
+            return;
+        }
+
+        // Initialize accumulators
+        let mut acc_l = [0i32; AUDIO_FRAME_SIZE];
+        let mut acc_r = [0i32; AUDIO_FRAME_SIZE];
+        let frame_len = len.min(AUDIO_FRAME_SIZE);
+
+        for ch in 0..SURROUND_7_1_CHANNELS {
+            let hrtf = &VIRTUAL_7_1_HRTF_TABLE[ch];
+            let in_buf = inputs[ch];
+            let in_len = in_buf.len().min(frame_len);
+            let ring = &mut self.delay_rings[ch];
+            let mut w_idx = self.write_indices[ch];
+
+            for i in 0..in_len {
+                let sample = in_buf[i];
+
+                // Write current sample to delay ring
+                ring[w_idx] = sample;
+
+                // Read left ear delayed sample
+                let r_left_idx = if w_idx >= hrtf.itd_left_samples {
+                    w_idx - hrtf.itd_left_samples
+                } else {
+                    w_idx + HRTF_MAX_DELAY_SAMPLES - hrtf.itd_left_samples
+                };
+                let mut s_left = ring[r_left_idx] as i32;
+
+                // Read right ear delayed sample
+                let r_right_idx = if w_idx >= hrtf.itd_right_samples {
+                    w_idx - hrtf.itd_right_samples
+                } else {
+                    w_idx + HRTF_MAX_DELAY_SAMPLES - hrtf.itd_right_samples
+                };
+                let mut s_right = ring[r_right_idx] as i32;
+
+                // Apply one-pole head shadow filter if contralateral
+                if hrtf.itd_left_samples > 0 {
+                    // Contralateral left ear shadow
+                    let alpha = hrtf.head_shadow_coeff_q14;
+                    let prev = self.shadow_filters_left[ch];
+                    let filtered = ((alpha as i64 * s_left as i64) + ((16384 - alpha) as i64 * prev as i64)) >> 14;
+                    self.shadow_filters_left[ch] = filtered as i32;
+                    s_left = filtered as i32;
+                }
+                if hrtf.itd_right_samples > 0 {
+                    // Contralateral right ear shadow
+                    let alpha = hrtf.head_shadow_coeff_q14;
+                    let prev = self.shadow_filters_right[ch];
+                    let filtered = ((alpha as i64 * s_right as i64) + ((16384 - alpha) as i64 * prev as i64)) >> 14;
+                    self.shadow_filters_right[ch] = filtered as i32;
+                    s_right = filtered as i32;
+                }
+
+                // Accumulate with ILD gains
+                acc_l[i] += (s_left * (hrtf.ild_left_gain_q8 as i32)) >> 8;
+                acc_r[i] += (s_right * (hrtf.ild_right_gain_q8 as i32)) >> 8;
+
+                w_idx = (w_idx + 1) % HRTF_MAX_DELAY_SAMPLES;
+            }
+
+            self.write_indices[ch] = w_idx;
+        }
+
+        // Soft clip / master normalize into output buffers
+        for i in 0..frame_len {
+            // Master gain scaling: 0.65 to maintain headroom
+            let l_scaled = (acc_l[i] * 166) >> 8;
+            let r_scaled = (acc_r[i] * 166) >> 8;
+
+            out_left[i] = if l_scaled > 32767 {
+                32767
+            } else if l_scaled < -32768 {
+                -32768
+            } else {
+                l_scaled as i16
+            };
+
+            out_right[i] = if r_scaled > 32767 {
+                32767
+            } else if r_scaled < -32768 {
+                -32768
+            } else {
+                r_scaled as i16
+            };
+        }
+    }
+}
