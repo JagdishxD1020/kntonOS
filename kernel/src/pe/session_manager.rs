@@ -1158,3 +1158,46 @@ pub fn verify_session_manager_daemon_pipeline() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 6: Comprehensive Subsystem Self-Test Suite & kmain Integration
+// ============================================================================
+
+/// Comprehensive verification self-test suite for Userspace Session Manager (smss) & Core Service Supervisor.
+pub fn test_session_manager_subsystem() -> bool {
+    crate::serial_write_str("[KNT-OS-SMSS] Initiating userspace session manager & core service supervisor self-test...\r\n");
+
+    // 1. Verify Session 0 and Session 1 models and security isolation boundaries
+    if !verify_session_descriptor_models() {
+        crate::serial_write_str("[KNT-OS-SMSS-FAIL] Session descriptor models and isolation verification failed!\r\n");
+        return false;
+    }
+
+    // 2. Verify process spawn rules and environment block inheritance
+    if !verify_environment_inheritance_and_spawn_rules() {
+        crate::serial_write_str("[KNT-OS-SMSS-FAIL] Process spawn rules and environment inheritance failed!\r\n");
+        return false;
+    }
+
+    // 3. Verify service registry and crash recovery auto-restart supervisor
+    if !verify_service_registry_and_recovery() {
+        crate::serial_write_str("[KNT-OS-SMSS-FAIL] Service registry and crash recovery failed!\r\n");
+        return false;
+    }
+
+    // 4. Verify KntPort LPC endpoints and cross-session rendezvous routing
+    if !verify_knt_port_ipc_rendezvous() {
+        crate::serial_write_str("[KNT-OS-SMSS-FAIL] KntPort IPC rendezvous and routing failed!\r\n");
+        return false;
+    }
+
+    // 5. Verify end-to-end SessionManager daemon orchestrator pipeline
+    if !verify_session_manager_daemon_pipeline() {
+        crate::serial_write_str("[KNT-OS-SMSS-FAIL] Session manager daemon pipeline verification failed!\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-OS-SMSS-PASS] Userspace session manager & core service supervisor verified\r\n");
+    true
+}
