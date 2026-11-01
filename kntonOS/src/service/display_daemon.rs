@@ -639,3 +639,158 @@ impl FramePresentationPacer {
 
 pub static DRRS_SWITCHER: DynamicRefreshRateSwitcher = DynamicRefreshRateSwitcher::new();
 pub static PRESENTATION_PACER: FramePresentationPacer = FramePresentationPacer::new();
+
+pub const LATENCY_HISTORY_LEN: usize = 32;
+
+/// VSync synchronization fence for lock-step frame presentation.
+pub struct VsyncFence {
+    vsync_counter: AtomicU64,
+    last_vsync_timestamp_us: AtomicU64,
+}
+
+impl VsyncFence {
+    pub const fn new() -> Self {
+        Self {
+            vsync_counter: AtomicU64::new(0),
+            last_vsync_timestamp_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Signals arrival of a hardware or simulated VSync blanking interval.
+    pub fn signal_vsync(&self, timestamp_us: u64) -> u64 {
+        self.last_vsync_timestamp_us.store(timestamp_us, Ordering::Release);
+        self.vsync_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Returns current cumulative VSync tick count.
+    pub fn get_vsync_count(&self) -> u64 {
+        self.vsync_counter.load(Ordering::Acquire)
+    }
+
+    /// Returns timestamp of the most recent VSync event.
+    pub fn get_last_vsync_timestamp(&self) -> u64 {
+        self.last_vsync_timestamp_us.load(Ordering::Acquire)
+    }
+}
+
+struct LatencyTrackerInner {
+    history_us: [u32; LATENCY_HISTORY_LEN],
+    history_idx: usize,
+    history_count: usize,
+    total_frames: u64,
+    missed_vsyncs: u64,
+    max_latency_us: u32,
+    min_latency_us: u32,
+}
+
+/// Presentation latency and frame-timing telemetry tracker.
+pub struct PresentationLatencyTracker {
+    inner: UnsafeCell<LatencyTrackerInner>,
+    lock: AtomicBool,
+}
+
+unsafe impl Sync for PresentationLatencyTracker {}
+unsafe impl Send for PresentationLatencyTracker {}
+
+impl PresentationLatencyTracker {
+    pub const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(LatencyTrackerInner {
+                history_us: [0; LATENCY_HISTORY_LEN],
+                history_idx: 0,
+                history_count: 0,
+                total_frames: 0,
+                missed_vsyncs: 0,
+                max_latency_us: 0,
+                min_latency_us: u32::MAX,
+            }),
+            lock: AtomicBool::new(false),
+        }
+    }
+
+    fn acquire(&self) {
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn release(&self) {
+        self.lock.store(false, Ordering::Release);
+    }
+
+    /// Records queue-to-display latency metrics for a completed frame flip.
+    pub fn record_frame(&self, queue_time_us: u64, display_time_us: u64, missed: bool) {
+        let latency = display_time_us.saturating_sub(queue_time_us) as u32;
+
+        self.acquire();
+        let inner = unsafe { &mut *self.inner.get() };
+
+        let idx = inner.history_idx;
+        inner.history_us[idx] = latency;
+        inner.history_idx = (idx + 1) % LATENCY_HISTORY_LEN;
+        if inner.history_count < LATENCY_HISTORY_LEN {
+            inner.history_count += 1;
+        }
+
+        inner.total_frames += 1;
+        if missed {
+            inner.missed_vsyncs += 1;
+        }
+
+        if latency > inner.max_latency_us {
+            inner.max_latency_us = latency;
+        }
+        if latency < inner.min_latency_us {
+            inner.min_latency_us = latency;
+        }
+
+        self.release();
+    }
+
+    /// Calculates rolling average presentation latency across the recent history buffer.
+    pub fn average_latency_us(&self) -> u32 {
+        self.acquire();
+        let inner = unsafe { &*self.inner.get() };
+
+        if inner.history_count == 0 {
+            self.release();
+            return 0;
+        }
+
+        let mut sum = 0u64;
+        for i in 0..inner.history_count {
+            sum += inner.history_us[i] as u64;
+        }
+        let avg = (sum / inner.history_count as u64) as u32;
+        self.release();
+        avg
+    }
+
+    pub fn get_total_frames(&self) -> u64 {
+        self.acquire();
+        let inner = unsafe { &*self.inner.get() };
+        let count = inner.total_frames;
+        self.release();
+        count
+    }
+
+    pub fn get_missed_vsyncs(&self) -> u64 {
+        self.acquire();
+        let inner = unsafe { &*self.inner.get() };
+        let count = inner.missed_vsyncs;
+        self.release();
+        count
+    }
+
+    pub fn get_min_max_latency(&self) -> (u32, u32) {
+        self.acquire();
+        let inner = unsafe { &*self.inner.get() };
+        let min = if inner.min_latency_us == u32::MAX { 0 } else { inner.min_latency_us };
+        let max = inner.max_latency_us;
+        self.release();
+        (min, max)
+    }
+}
+
+pub static VSYNC_FENCE: VsyncFence = VsyncFence::new();
+pub static LATENCY_TRACKER: PresentationLatencyTracker = PresentationLatencyTracker::new();
