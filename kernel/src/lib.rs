@@ -1590,6 +1590,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-DOCK-PASS] kntonOS SteamDeck USB-C PD & DP Alt-Mode dock daemon verified\r\n");
     }
 
+    // Verify kntonOS SteamDeck Ambient Light & HDR Display Auto-Calibrator Service (TASK-KNT-333)
+    if !knton_os::service::verify_backlight_daemon_subsystem() {
+        serial_write_str("[KNT-PANIC] Backlight auto-calibrator daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-ALS-PASS] kntonOS SteamDeck ambient light & HDR auto-calibrator verified\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

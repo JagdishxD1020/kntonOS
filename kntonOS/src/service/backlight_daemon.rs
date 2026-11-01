@@ -977,3 +977,209 @@ impl HdrAutoCalibrator {
         out[25] = (self.content_light_level.max_fall_nits & 0xFF) as u8;
     }
 }
+
+
+/// Unified userspace coordinator for ambient light monitoring, backlight modulation,
+/// night mode CCT color warmth, and HDR tone mapping.
+pub struct BacklightDaemon {
+    pub als_driver: AlsDriver,
+    pub curve_mapper: ExponentialCurveMapper,
+    pub interpolator: SmoothBacklightInterpolator,
+    pub night_mode: NightModeGovernor,
+    pub hdr_calibrator: HdrAutoCalibrator,
+    pub auto_brightness_enabled: bool,
+}
+
+impl BacklightDaemon {
+    pub fn new(panel_type: HdrPanelType) -> Self {
+        let mut daemon = Self {
+            als_driver: AlsDriver::new(AlsSensorConfig::default()),
+            curve_mapper: ExponentialCurveMapper::new(),
+            interpolator: SmoothBacklightInterpolator::new(180),
+            night_mode: NightModeGovernor::new(),
+            hdr_calibrator: HdrAutoCalibrator::new(panel_type),
+            auto_brightness_enabled: true,
+        };
+        daemon.als_driver.init();
+        daemon
+    }
+
+    /// Run cyclic service tick with elapsed milliseconds and current time.
+    pub fn tick(&mut self, delta_ms: u32, minute_of_day: u16) {
+        let current_lux = self.als_driver.filtered_lux();
+
+        if self.auto_brightness_enabled {
+            let target_nits = self.curve_mapper.lux_to_target_nits(current_lux);
+            self.interpolator.set_target_nits(target_nits);
+        }
+
+        self.interpolator.advance_time(delta_ms);
+
+        self.night_mode.update_policy_state(minute_of_day, current_lux);
+        self.night_mode.advance_time(delta_ms);
+
+        if self.hdr_calibrator.is_hdr_active() {
+            self.hdr_calibrator.recalibrate_for_ambient_lux(current_lux);
+        }
+    }
+}
+
+/// Verification self-test suite for Ambient Light & HDR Display Auto-Calibrator subsystem (TASK-KNT-333).
+pub fn verify_backlight_daemon_subsystem() -> bool {
+    // 1. Verify ALS optical filter, jitter rejection, and occlusion dampening
+    let mut als = AlsDriver::new(AlsSensorConfig::default());
+    if !als.init() {
+        return false;
+    }
+
+    // Ingest stable indoor light samples (200 lux)
+    for _ in 0..10 {
+        als.ingest_direct_lux(200, 100);
+    }
+    let stable_lux = als.filtered_lux();
+    if stable_lux < 180 || stable_lux > 220 {
+        return false;
+    }
+
+    // Ingest sudden transient finger occlusion (e.g. 20 lux)
+    let dampened = als.ingest_direct_lux(20, 200);
+    // Optical filter must reject/damp sudden 90% single-frame occlusion
+    if dampened < 100 {
+        return false;
+    }
+
+    // 2. Verify exponential lux-to-nits curve mapping and user bias
+    let mut mapper = ExponentialCurveMapper::new();
+    let nits_dark = mapper.lux_to_target_nits(0);
+    if nits_dark < 5 || nits_dark > 15 {
+        return false; // Minimum readable floor must be preserved
+    }
+
+    let nits_indoor = mapper.lux_to_target_nits(200);
+    if nits_indoor < 160 || nits_indoor > 200 {
+        return false;
+    }
+
+    let nits_bright = mapper.lux_to_target_nits(1200);
+    if nits_bright != 400 {
+        return false;
+    }
+
+    // User bias test: +25% bias
+    mapper.set_user_bias(25);
+    let nits_biased = mapper.lux_to_target_nits(200);
+    if nits_biased < 210 || nits_biased > 240 {
+        return false;
+    }
+
+    // 3. Verify temporal smooth backlight rate-limiting
+    let mut interp = SmoothBacklightInterpolator::new(50);
+    interp.set_target_nits(200);
+    // Advance 500ms -> at 120 nits/s ramp up, step should be ~60 nits
+    let nits_mid = interp.advance_time(500);
+    if nits_mid < 90 || nits_mid > 130 {
+        return false;
+    }
+    // Advance another 1500ms -> should reach 200 nits target
+    let nits_final = interp.advance_time(1500);
+    if nits_final != 200 {
+        return false;
+    }
+
+    // Verify ramp down (slower adaptation)
+    interp.set_target_nits(50);
+    // Advance 1000ms -> at 40 nits/s ramp down, step should be ~40 nits
+    let nits_down = interp.advance_time(1000);
+    if nits_down < 140 || nits_down > 175 {
+        return false;
+    }
+
+    // 4. Verify Night Mode CCT Kelvin governor & RGB gain calculation
+    let mut governor = NightModeGovernor::new();
+    // Default daylight: 6500K
+    let gain_d65 = governor.compute_rgb_gain();
+    if gain_d65.r_q8 != 256 || gain_d65.g_q8 != 256 || gain_d65.b_q8 != 256 {
+        return false;
+    }
+    if gain_d65.blue_reduction_pct() != 0 {
+        return false;
+    }
+
+    // Warm white night mode: 3500K
+    governor.set_warm_target(3500);
+    governor.set_policy(NightModePolicy::Manual);
+    governor.update_policy_state(0, 50);
+    // Advance transition by 20 seconds (more than enough for 150K/s ramp of 3000K)
+    governor.advance_time(20_000);
+    if governor.current_cct() != 3500 {
+        return false;
+    }
+
+    let gain_warm = governor.compute_rgb_gain();
+    if gain_warm.r_q8 != 256 || gain_warm.b_q8 >= 200 || gain_warm.blue_reduction_pct() < 30 {
+        return false;
+    }
+
+    // Test CTM matrix generation
+    let ctm = governor.to_display_ctm();
+    if ctm.matrix_q8[0][0] != 256 || ctm.matrix_q8[2][2] != gain_warm.b_q8 {
+        return false;
+    }
+
+    // Test midnight schedule wrap-around: 22:00 (1320) to 06:00 (360)
+    governor.set_policy(NightModePolicy::Scheduled {
+        start_minute: 1320,
+        end_minute: 360,
+    });
+    governor.update_policy_state(100, 100); // 01:40 AM -> should be active
+    if !governor.is_night_mode_active() {
+        return false;
+    }
+    governor.update_policy_state(720, 100); // 12:00 PM -> should be inactive
+    if governor.is_night_mode_active() {
+        return false;
+    }
+
+    // 5. Verify HDR10 OLED metadata injection and ambient tone-mapping
+    let mut hdr = HdrAutoCalibrator::new(HdrPanelType::SteamDeckOledHdr10);
+    if !hdr.is_hdr_supported() || !hdr.is_hdr_active() {
+        return false;
+    }
+    let meta = hdr.mastering_metadata();
+    if meta.max_luminance_nits != 1000 || meta.min_luminance_subnits != 5 {
+        return false;
+    }
+
+    // Ambient recalibration in dark room
+    hdr.recalibrate_for_ambient_lux(10);
+    if hdr.tone_mapping_params().paper_white_nits > 160 {
+        return false;
+    }
+
+    // Ambient recalibration in bright room
+    hdr.recalibrate_for_ambient_lux(500);
+    if hdr.tone_mapping_params().paper_white_nits < 250 {
+        return false;
+    }
+
+    // CTA-861-G metadata serialization
+    let mut cta_block = [0u8; 26];
+    hdr.serialize_cta861_metadata_block(&mut cta_block);
+    if cta_block[0] != 0x07 || cta_block[1] != 0x02 {
+        return false;
+    }
+    let max_lum = (cta_block[19] as u16) | ((cta_block[20] as u16) << 8);
+    if max_lum != 1000 {
+        return false;
+    }
+
+    // 6. Verify end-to-end BacklightDaemon integration loop
+    let mut daemon = BacklightDaemon::new(HdrPanelType::SteamDeckOledHdr10);
+    daemon.als_driver.ingest_direct_lux(150, 1000);
+    daemon.tick(100, 600);
+    if daemon.interpolator.current_nits() == 0 {
+        return false;
+    }
+
+    true
+}
