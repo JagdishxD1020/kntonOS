@@ -63,6 +63,8 @@ pub mod pmu_sampler;
 pub mod safe_seh_guard;
 pub mod cfi_unwind;
 pub mod user_runtime;
+pub mod session_manager;
+pub use session_manager::*;
 
 pub use header::*;
 pub use ntdll::*;
