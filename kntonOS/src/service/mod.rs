@@ -24,6 +24,9 @@ pub use storage_daemon::*;
 pub mod bluetooth_daemon;
 pub use bluetooth_daemon::*;
 
+pub mod dock_daemon;
+pub use dock_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
