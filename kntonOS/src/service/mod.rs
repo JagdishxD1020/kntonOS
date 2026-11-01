@@ -18,6 +18,9 @@ pub use gamepad_mapper::*;
 pub mod net_daemon;
 pub use net_daemon::*;
 
+pub mod perf_overlay;
+pub use perf_overlay::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
