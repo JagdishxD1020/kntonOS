@@ -33,6 +33,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && service::verify_storage_daemon_subsystem()
         && service::verify_bluetooth_daemon_subsystem()
         && service::verify_perf_overlay_subsystem()
+        && service::verify_dock_daemon_subsystem()
         && ipc::verify_ipc_ports()
         && ipc::verify_ipc_dispatcher_subsystem()
         && shell::verify_game_mode_shell()

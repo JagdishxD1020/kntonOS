@@ -27,6 +27,9 @@ pub use bluetooth_daemon::*;
 pub mod perf_overlay;
 pub use perf_overlay::*;
 
+pub mod dock_daemon;
+pub use dock_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
