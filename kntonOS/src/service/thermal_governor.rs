@@ -694,3 +694,114 @@ impl EmergencyThermalRelief {
 
 pub static FAN_FAULT_DETECTOR: FanFaultDetector = FanFaultDetector::new();
 pub static EMERGENCY_RELIEF: EmergencyThermalRelief = EmergencyThermalRelief::new();
+
+
+// ============================================================================
+// Verification Self-Test Suite & Subsystem Sentinel
+// ============================================================================
+
+/// Comprehensive verification self-test for SteamDeck Thermal & Fan Acoustic Profile Governor.
+pub fn verify_thermal_governor_subsystem() -> bool {
+    // 1. Multi-Zone Thermal Sensor Matrix
+    SENSOR_MATRIX.reset();
+    SENSOR_MATRIX.update_sensor(ThermalZone::ApuCore, 72_000, 100);
+    SENSOR_MATRIX.update_sensor(ThermalZone::Ambient, 30_000, 100);
+    SENSOR_MATRIX.update_sensor(ThermalZone::BatteryCell, 34_000, 100);
+    SENSOR_MATRIX.update_sensor(ThermalZone::NvmeDrive, 48_000, 100);
+
+    // Initial APU default was 35_000, updated with 72_000 -> (35000*3 + 72000)/4 = 44250
+    let apu_temp = SENSOR_MATRIX.get_temperature(ThermalZone::ApuCore);
+    if apu_temp < 40_000 || apu_temp > 50_000 {
+        return false;
+    }
+
+    // Push more samples to converge APU near 90°C (Hot alert)
+    let mut i = 0;
+    while i < 25 {
+        SENSOR_MATRIX.update_sensor(ThermalZone::ApuCore, 90_000, 200 + i * 10);
+        i += 1;
+    }
+    if SENSOR_MATRIX.get_alert_level(ThermalZone::ApuCore) != ZoneAlertLevel::Hot {
+        return false;
+    }
+    if SENSOR_MATRIX.highest_alert_level() != ZoneAlertLevel::Hot {
+        return false;
+    }
+    if SENSOR_MATRIX.has_critical_overtemp() {
+        return false;
+    }
+
+    // 2. Low-Noise Acoustic Fan Curve & Hysteresis Governor
+    let curve = AcousticFanCurve::DEFAULT;
+    let rpm_at_40 = curve.evaluate_rpm(40_000);
+    let rpm_at_68 = curve.evaluate_rpm(68_000);
+    let rpm_at_100 = curve.evaluate_rpm(100_000);
+    if rpm_at_40 != 0 || rpm_at_68 != 3_200 || rpm_at_100 != 6_800 {
+        return false;
+    }
+
+    // Test hysteresis governor step
+    FAN_GOVERNOR.force_rpm(2000);
+    let step1_rpm = FAN_GOVERNOR.step(70_000);
+    // Target at 70°C is ~3440 RPM. With max ramp up step 150 RPM, step1 should be 2150 RPM
+    if step1_rpm != 2150 || FAN_GOVERNOR.get_commanded_rpm() != 2150 {
+        return false;
+    }
+
+    // 3. Handheld Skin Comfort & Throttling Prevention
+    let skin_stat = SKIN_COMFORT.update(85_000, 32_000, 42_000);
+    // Flux: apu_flux = 53_000, bat_flux = 10_000
+    // Grip = 32_000 + 9540 + 3500 = 45_040 m°C -> ExceededLimit (> 44.0°C)
+    if skin_stat != SkinComfortStatus::ExceededLimit {
+        return false;
+    }
+    if SKIN_COMFORT.get_recommended_tdp() != 9 {
+        return false;
+    }
+    if SKIN_COMFORT.get_acoustic_rpm_boost() != 1400 {
+        return false;
+    }
+
+    // Test Throttling Prevention gradient
+    THROTTLING_PREVENTION.evaluate(80_000, 1000);
+    let risk = THROTTLING_PREVENTION.evaluate(85_000, 2000); // +5°C/sec rise
+    if risk != ThrottlingRiskLevel::High {
+        return false;
+    }
+    if THROTTLING_PREVENTION.get_anticipatory_fan_boost() != 900 {
+        return false;
+    }
+
+    // 4. Fan Tachometer Fault Detection & Emergency Relief
+    FAN_FAULT_DETECTOR.update(3000, 3000);
+    if !FAN_FAULT_DETECTOR.is_fan_operational() {
+        return false;
+    }
+
+    // Simulate rotor stall: commanded 4000 RPM, measured 0 RPM across 3 debounced cycles
+    FAN_FAULT_DETECTOR.update(4000, 0);
+    FAN_FAULT_DETECTOR.update(4000, 0);
+    let fault = FAN_FAULT_DETECTOR.update(4000, 0);
+    if fault != FanFaultState::RotorStalled || FAN_FAULT_DETECTOR.is_fan_operational() {
+        return false;
+    }
+
+    // Engage Emergency Relief
+    let relief_active = EMERGENCY_RELIEF.evaluate(fault, 88_000);
+    if !relief_active || !EMERGENCY_RELIEF.is_emergency_active() {
+        return false;
+    }
+    if EMERGENCY_RELIEF.get_emergency_pwm_duty() != 100 {
+        return false;
+    }
+    if EMERGENCY_RELIEF.get_emergency_tdp_cap() != 4 {
+        return false;
+    }
+
+    // Reset components to clean baseline
+    SENSOR_MATRIX.reset();
+    FAN_GOVERNOR.force_rpm(0);
+    FAN_FAULT_DETECTOR.update(0, 0);
+
+    true
+}
