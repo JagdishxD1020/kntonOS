@@ -1562,6 +1562,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-NET-PASS] kntonOS userspace network manager & wi-fi daemon verified\r\n");
     }
 
+    // Verify kntonOS Userspace Bluetooth HID & Peripheral Manager (TASK-KNT-328)
+    if !knton_os::service::verify_bluetooth_daemon_subsystem() {
+        serial_write_str("[KNT-PANIC] Bluetooth peripheral daemon self-test failed!\r\n");
+    } else {
+        serial_write_str("[KNT-OS-BT-PASS] kntonOS userspace bluetooth peripheral manager verified\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

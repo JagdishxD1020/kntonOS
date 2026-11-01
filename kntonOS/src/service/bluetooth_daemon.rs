@@ -857,3 +857,113 @@ pub fn verify_packet_ring_and_loss_compensator() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 6: Bluetooth Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// Handheld userspace Bluetooth HID & peripheral supervisor orchestrator.
+#[derive(Debug, Clone, Copy)]
+pub struct BluetoothDaemon {
+    pub adapter_mgr: HciAdapterManager,
+    pub hid_desc: ControllerHidDescriptor,
+    pub security_store: BluetoothSecurityStore,
+    pub battery_telemetry: ControllerBatteryTelemetry,
+    pub loss_compensator: PacketLossCompensator,
+    pub cycles_polled: u64,
+}
+
+impl BluetoothDaemon {
+    /// Initializes Bluetooth peripheral daemon orchestrator.
+    pub const fn new() -> Self {
+        Self {
+            adapter_mgr: HciAdapterManager::new(),
+            hid_desc: ControllerHidDescriptor::new(),
+            security_store: BluetoothSecurityStore::new(),
+            battery_telemetry: ControllerBatteryTelemetry::new(),
+            loss_compensator: PacketLossCompensator::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic Bluetooth daemon maintenance cycle.
+    pub fn poll_bluetooth_cycle(&mut self, _dt_ms: u32) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Userspace
+/// Bluetooth HID & Peripheral Manager subsystem.
+pub fn verify_bluetooth_daemon_subsystem() -> bool {
+    if !verify_hci_adapter_manager() {
+        return false;
+    }
+    if !verify_gamepad_hid_handshake() {
+        return false;
+    }
+    if !verify_pairing_and_security_store() {
+        return false;
+    }
+    if !verify_controller_battery_telemetry() {
+        return false;
+    }
+    if !verify_packet_ring_and_loss_compensator() {
+        return false;
+    }
+
+    // Integrated coordinator verification
+    let mut daemon = BluetoothDaemon::new();
+
+    // 1. Initial state
+    if daemon.cycles_polled != 0 || daemon.adapter_mgr.state != HciAdapterState::PoweredOff {
+        return false;
+    }
+
+    // 2. Power on adapter
+    if !daemon.adapter_mgr.power_on() {
+        return false;
+    }
+
+    // 3. Connect DualSense controller
+    let ds5_mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    daemon.security_store.save_bonded_device(
+        ds5_mac,
+        b"Wireless Controller",
+        ControllerModel::DualSense,
+        [0x99; 16],
+    );
+    daemon.hid_desc.initiate_handshake(0x054C, 0x0CE6, HidTransport::ClassicL2capHid);
+    if !daemon.hid_desc.advance_sdp_gatt() || !daemon.hid_desc.finalize_operational() {
+        return false;
+    }
+
+    // 4. Ingest battery telemetry (step 8 = 80%)
+    daemon.battery_telemetry.parse_playstation_battery(0x08);
+    if daemon.battery_telemetry.level_pct != 80 {
+        return false;
+    }
+
+    // 5. Ingest packet stream
+    let pkt = BtInputReport {
+        seq: 1,
+        buttons: 0x0004,
+        stick_lx: 500,
+        stick_ly: -200,
+        stick_rx: 0,
+        stick_ry: 0,
+        timestamp_us: 1000,
+        is_synthesized: false,
+    };
+    daemon.loss_compensator.ingest_packet(pkt);
+    if daemon.loss_compensator.count != 1 {
+        return false;
+    }
+
+    // 6. Tick supervisor cycle
+    daemon.poll_bluetooth_cycle(16);
+    if daemon.cycles_polled != 1 {
+        return false;
+    }
+
+    true
+}
+
