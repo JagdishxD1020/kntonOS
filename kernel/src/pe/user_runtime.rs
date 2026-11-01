@@ -278,3 +278,124 @@ impl UserSyscallCallgate {
         status
     }
 }
+
+/// Comprehensive self-test suite for User-Mode Runtime & Syscall Callgate.
+pub fn test_win32_user_runtime_subsystem() -> bool {
+    crate::serial_write_str("[KNT-USER-RT] Initializing User-Mode Runtime & Syscall Callgate self-test...\r\n");
+
+    // 1. Verify TEB/PEB Userland Layout and 16-Byte Stack Alignment
+    let pid = 10u32;
+    let tid = 100u64;
+    let entry_rip = 0x0000_0000_0040_1000u64;
+    let image_base = 0x0000_0000_0040_0000u64;
+
+    let rt = UserRuntimePebTeb::new(pid, tid, entry_rip, image_base);
+    USER_RUNTIME_MGR.register_runtime(rt.clone());
+
+    if USER_RUNTIME_MGR.get_runtime(pid).is_none() {
+        crate::serial_write_str("[KNT-TEST-ERR] User runtime registration lookup failed\r\n");
+        return false;
+    }
+
+    if !rt.stack_layout.is_rsp_valid(rt.stack_layout.initial_rsp) {
+        crate::serial_write_str("[KNT-TEST-ERR] Initial user RSP failed boundary or alignment check\r\n");
+        return false;
+    }
+
+    let misaligned_rsp = rt.stack_layout.initial_rsp | 0x07;
+    if rt.stack_layout.is_rsp_valid(misaligned_rsp) {
+        crate::serial_write_str("[KNT-TEST-ERR] Misaligned RSP passed validation\r\n");
+        return false;
+    }
+
+    // 2. Verify Initial User Execution Frame Setup
+    let mut ctx = UserSyscallCallgate::setup_user_entry_frame(
+        entry_rip,
+        DEFAULT_USER_STACK_BASE,
+        DEFAULT_USER_STACK_SIZE,
+    );
+
+    if ctx.rip != entry_rip || (ctx.rsp & 0x0F) != 0 || ctx.rflags != 0x0202 {
+        crate::serial_write_str("[KNT-TEST-ERR] User entry frame initial register state mismatch\r\n");
+        return false;
+    }
+
+    // 3. Verify Fast Syscall Callgate Dispatch & Argument Passing (RCX, RDX, R8, R9)
+    // A: NtAllocateVirtualMemory
+    let alloc_status = UserSyscallCallgate::execute_user_syscall(
+        &mut ctx,
+        SYS_NT_ALLOCATE_VIRTUAL_MEMORY,
+        0xFFFF_FFFF_FFFF_FFFF, // CurrentProcess
+        0x0000_0001_0000_0000, // BaseAddress
+        0x10000,              // 64 KB RegionSize
+        0x04,                 // PAGE_READWRITE
+    );
+    if alloc_status != STATUS_SUCCESS || ctx.rax != STATUS_SUCCESS as u64 {
+        crate::serial_write_str("[KNT-TEST-ERR] NtAllocateVirtualMemory syscall failed\r\n");
+        return false;
+    }
+
+    // B: NtAllocateVirtualMemory invalid parameter handling
+    let err_status = UserSyscallCallgate::execute_user_syscall(
+        &mut ctx,
+        SYS_NT_ALLOCATE_VIRTUAL_MEMORY,
+        0, // Invalid handle
+        0,
+        0, // Zero size
+        0,
+    );
+    if err_status != STATUS_INVALID_PARAMETER || ctx.rax != STATUS_INVALID_PARAMETER as u64 {
+        crate::serial_write_str("[KNT-TEST-ERR] NtAllocateVirtualMemory error translation mismatch\r\n");
+        return false;
+    }
+
+    // C: NtCreateThreadEx
+    let thread_status = UserSyscallCallgate::execute_user_syscall(
+        &mut ctx,
+        SYS_NT_CREATE_THREAD_EX,
+        0,                     // ThreadHandle out
+        0x1FFFFF,              // THREAD_ALL_ACCESS
+        0x0000_0000_0040_2000, // StartRoutine
+        0xFFFF_FFFF_FFFF_FFFF, // ProcessHandle
+    );
+    if thread_status != STATUS_SUCCESS || ctx.rax != STATUS_SUCCESS as u64 {
+        crate::serial_write_str("[KNT-TEST-ERR] NtCreateThreadEx syscall failed\r\n");
+        return false;
+    }
+
+    // D: NtWaitForSingleObject
+    let wait_status = UserSyscallCallgate::execute_user_syscall(
+        &mut ctx,
+        SYS_NT_WAIT_FOR_SINGLE_OBJECT,
+        0x1234, // Valid handle
+        0,      // Non-alertable
+        0,      // Infinite timeout
+        0,
+    );
+    if wait_status != STATUS_SUCCESS || ctx.rax != STATUS_SUCCESS as u64 {
+        crate::serial_write_str("[KNT-TEST-ERR] NtWaitForSingleObject syscall failed\r\n");
+        return false;
+    }
+
+    // E: NtYieldExecution
+    let yield_status = UserSyscallCallgate::execute_user_syscall(
+        &mut ctx,
+        SYS_NT_YIELD_EXECUTION,
+        0,
+        0,
+        0,
+        0,
+    );
+    if yield_status != STATUS_SUCCESS || ctx.rax != STATUS_SUCCESS as u64 {
+        crate::serial_write_str("[KNT-TEST-ERR] NtYieldExecution syscall failed\r\n");
+        return false;
+    }
+
+    if SYSCALL_CALLGATE.get_total_dispatched() < 5 {
+        crate::serial_write_str("[KNT-TEST-ERR] Total dispatched syscall counter mismatch\r\n");
+        return false;
+    }
+
+    crate::serial_write_str("[KNT-USER-RT-PASS] User-mode runtime and high-performance syscall callgate verified\r\n");
+    true
+}
