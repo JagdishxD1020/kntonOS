@@ -1,4 +1,7 @@
-//! Background system service supervisor and crash recovery manager.
+//! Background system service supervisor and device hardware daemon.
+
+pub mod device_daemon;
+pub use device_daemon::*;
 
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
