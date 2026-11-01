@@ -532,4 +532,370 @@ impl RollingFrameTimeBuffer {
     }
 }
 
+// Screen quadrant anchor for overlay positioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenAnchor {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl ScreenAnchor {
+    // Cycle to next corner anchor position clockwise.
+    pub fn next(self) -> Self {
+        match self {
+            Self::TopLeft => Self::TopRight,
+            Self::TopRight => Self::BottomRight,
+            Self::BottomRight => Self::BottomLeft,
+            Self::BottomLeft => Self::TopLeft,
+        }
+    }
+}
+
+// Layout configuration for overlay scale, opacity, and positioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HudLayoutConfig {
+    pub anchor: ScreenAnchor,
+    pub scale_pct: u8,
+    pub opacity_pct: u8,
+    pub margin_x: u16,
+    pub margin_y: u16,
+    pub screen_width: u16,
+    pub screen_height: u16,
+}
+
+impl HudLayoutConfig {
+    // Construct default layout configuration for display dimensions.
+    pub const fn new(screen_width: u16, screen_height: u16) -> Self {
+        Self {
+            anchor: ScreenAnchor::TopLeft,
+            scale_pct: 100,
+            opacity_pct: 90,
+            margin_x: 12,
+            margin_y: 12,
+            screen_width,
+            screen_height,
+        }
+    }
+
+    // Configure overlay screen corner anchor.
+    pub fn set_anchor(&mut self, anchor: ScreenAnchor) {
+        self.anchor = anchor;
+    }
+
+    // Cycle screen corner anchor.
+    pub fn cycle_anchor(&mut self) {
+        self.anchor = self.anchor.next();
+    }
+
+    // Set background opacity percentage [20..=100].
+    pub fn set_opacity(&mut self, opacity: u8) {
+        self.opacity_pct = opacity.clamp(20, 100);
+    }
+
+    // Set scaling factor percentage [50..=200].
+    pub fn set_scale(&mut self, scale: u8) {
+        self.scale_pct = scale.clamp(50, 200);
+    }
+
+    // Compute top-left origin coordinates (x, y) for an overlay of given dimensions.
+    pub fn calculate_origin(&self, overlay_w: u16, overlay_h: u16) -> (u16, u16) {
+        let scaled_w = ((overlay_w as u32 * self.scale_pct as u32) / 100) as u16;
+        let scaled_h = ((overlay_h as u32 * self.scale_pct as u32) / 100) as u16;
+
+        match self.anchor {
+            ScreenAnchor::TopLeft => (self.margin_x, self.margin_y),
+            ScreenAnchor::TopRight => (
+                self.screen_width.saturating_sub(scaled_w + self.margin_x),
+                self.margin_y,
+            ),
+            ScreenAnchor::BottomLeft => (
+                self.margin_x,
+                self.screen_height.saturating_sub(scaled_h + self.margin_y),
+            ),
+            ScreenAnchor::BottomRight => (
+                self.screen_width.saturating_sub(scaled_w + self.margin_x),
+                self.screen_height.saturating_sub(scaled_h + self.margin_y),
+            ),
+        }
+    }
+}
+
+impl PerfOverlayRenderer {
+    // Emit drawing commands corresponding to the active overlay detail level.
+    pub fn generate_commands(
+        &self,
+        telemetry: &HardwareTelemetry,
+        stats: &FrameTimeStats,
+        layout: &HudLayoutConfig,
+        out_buffer: &mut HudCommandBuffer,
+    ) {
+        out_buffer.clear();
+        if self.level == HudOverlayLevel::Off {
+            return;
+        }
+
+        let bg_alpha = ((layout.opacity_pct as u32 * 220) / 100) as u8;
+        let bg_color = HudColor::rgba(16, 20, 26, bg_alpha);
+        let fps_color = if stats.instantaneous_fps >= 55 {
+            HudColor::GREEN
+        } else if stats.instantaneous_fps >= 30 {
+            HudColor::YELLOW
+        } else {
+            HudColor::RED
+        };
+
+        match self.level {
+            HudOverlayLevel::Off => {}
+            HudOverlayLevel::FpsOnly => {
+                let (ox, oy) = layout.calculate_origin(68, 26);
+                out_buffer.push(HudRenderCommand::DrawRect {
+                    rect: HudRect::new(ox, oy, 68, 26),
+                    color: bg_color,
+                    filled: true,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 6,
+                    prefix: "",
+                    value: stats.instantaneous_fps,
+                    suffix: " FPS",
+                    color: fps_color,
+                });
+            }
+            HudOverlayLevel::FpsBatteryTdp => {
+                let (ox, oy) = layout.calculate_origin(160, 42);
+                out_buffer.push(HudRenderCommand::DrawRect {
+                    rect: HudRect::new(ox, oy, 160, 42),
+                    color: bg_color,
+                    filled: true,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 6,
+                    prefix: "",
+                    value: stats.instantaneous_fps,
+                    suffix: " FPS | ",
+                    color: fps_color,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 80,
+                    y: oy + 6,
+                    prefix: "",
+                    value: telemetry.target_tdp_watts as u32,
+                    suffix: "W TDP",
+                    color: HudColor::CYAN,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 22,
+                    prefix: "BAT: ",
+                    value: telemetry.battery.charge_pct as u32,
+                    suffix: "%",
+                    color: HudColor::WHITE,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 80,
+                    y: oy + 22,
+                    prefix: "",
+                    value: telemetry.battery.remaining_time_minutes as u32,
+                    suffix: "m rem",
+                    color: HudColor::WHITE,
+                });
+            }
+            HudOverlayLevel::FullMetrics => {
+                let (ox, oy) = layout.calculate_origin(210, 88);
+                out_buffer.push(HudRenderCommand::DrawRect {
+                    rect: HudRect::new(ox, oy, 210, 88),
+                    color: bg_color,
+                    filled: true,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 6,
+                    prefix: "",
+                    value: stats.instantaneous_fps,
+                    suffix: " FPS",
+                    color: fps_color,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 100,
+                    y: oy + 6,
+                    prefix: "AVG: ",
+                    value: stats.avg_frame_time_us / 1000,
+                    suffix: " ms",
+                    color: HudColor::WHITE,
+                });
+
+                // CPU Load Progress Bar
+                let cpu_load = telemetry.average_cpu_load();
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 22,
+                    prefix: "CPU: ",
+                    value: cpu_load as u32,
+                    suffix: "%",
+                    color: HudColor::CYAN,
+                });
+                out_buffer.push(HudRenderCommand::DrawProgressBar {
+                    rect: HudRect::new(ox + 80, oy + 25, 70, 8),
+                    pct: cpu_load,
+                    fill_color: HudColor::CYAN,
+                    bg_color: HudColor::rgba(40, 50, 65, 200),
+                });
+
+                // GPU Load Progress Bar
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 38,
+                    prefix: "GPU: ",
+                    value: telemetry.gpu.shader_load_pct as u32,
+                    suffix: "%",
+                    color: HudColor::ORANGE,
+                });
+                out_buffer.push(HudRenderCommand::DrawProgressBar {
+                    rect: HudRect::new(ox + 80, oy + 41, 70, 8),
+                    pct: telemetry.gpu.shader_load_pct,
+                    fill_color: HudColor::ORANGE,
+                    bg_color: HudColor::rgba(40, 50, 65, 200),
+                });
+
+                // VRAM & Fan
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 54,
+                    prefix: "VRAM: ",
+                    value: telemetry.gpu.vram_used_mb as u32,
+                    suffix: " MB",
+                    color: HudColor::WHITE,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 70,
+                    prefix: "FAN: ",
+                    value: telemetry.fan.current_rpm as u32,
+                    suffix: " RPM",
+                    color: HudColor::WHITE,
+                });
+            }
+            HudOverlayLevel::DiagnosticsHistogram => {
+                let (ox, oy) = layout.calculate_origin(240, 132);
+                out_buffer.push(HudRenderCommand::DrawRect {
+                    rect: HudRect::new(ox, oy, 240, 132),
+                    color: bg_color,
+                    filled: true,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 6,
+                    prefix: "",
+                    value: stats.instantaneous_fps,
+                    suffix: " FPS",
+                    color: fps_color,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 80,
+                    y: oy + 6,
+                    prefix: "P99: ",
+                    value: stats.p99_frame_time_us / 1000,
+                    suffix: " ms",
+                    color: HudColor::YELLOW,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 160,
+                    y: oy + 6,
+                    prefix: "STUT: ",
+                    value: stats.stutter_count,
+                    suffix: "",
+                    color: if stats.stutter_count > 0 { HudColor::RED } else { HudColor::GREEN },
+                });
+
+                // CPU & GPU metrics
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 6,
+                    y: oy + 22,
+                    prefix: "CPU: ",
+                    value: telemetry.average_cpu_load() as u32,
+                    suffix: "%",
+                    color: HudColor::CYAN,
+                });
+                out_buffer.push(HudRenderCommand::DrawValue {
+                    x: ox + 120,
+                    y: oy + 22,
+                    prefix: "GPU: ",
+                    value: telemetry.gpu.shader_load_pct as u32,
+                    suffix: "%",
+                    color: HudColor::ORANGE,
+                });
+
+                out_buffer.push(HudRenderCommand::DrawText {
+                    x: ox + 6,
+                    y: oy + 40,
+                    text: "LATENCY HISTOGRAM",
+                    color: HudColor::WHITE,
+                });
+
+                // Render 8 histogram bars for latency distribution
+                for i in 0..HISTOGRAM_BUCKETS {
+                    let bar_x = ox + 6 + (i as u16 * 26);
+                    let bar_y = oy + 60;
+                    let height = (stats.histogram_buckets[i] as u16 * 4).min(40);
+                    let bar_color = if i < 2 {
+                        HudColor::GREEN
+                    } else if i < 5 {
+                        HudColor::YELLOW
+                    } else {
+                        HudColor::RED
+                    };
+                    out_buffer.push(HudRenderCommand::DrawHistogramBar {
+                        x: bar_x,
+                        y: bar_y,
+                        width: 20,
+                        height,
+                        bucket_index: i as u8,
+                        color: bar_color,
+                    });
+                }
+            }
+        }
+    }
+}
+
+// Integrated Gamescope-style Performance Overlay & Telemetry Service daemon.
+pub struct GamescopeOverlayService {
+    pub renderer: PerfOverlayRenderer,
+    pub collector: HardwareTelemetryCollector,
+    pub frame_buffer: RollingFrameTimeBuffer,
+    pub layout: HudLayoutConfig,
+    pub command_buffer: HudCommandBuffer,
+}
+
+impl GamescopeOverlayService {
+    // Construct unified performance overlay service for display viewport.
+    pub const fn new(screen_width: u16, screen_height: u16) -> Self {
+        Self {
+            renderer: PerfOverlayRenderer::new(HudOverlayLevel::FpsOnly),
+            collector: HardwareTelemetryCollector::new(),
+            frame_buffer: RollingFrameTimeBuffer::new(),
+            layout: HudLayoutConfig::new(screen_width, screen_height),
+            command_buffer: HudCommandBuffer::new(),
+        }
+    }
+
+    // Record frame latency and rebuild HUD presentation commands.
+    pub fn record_frame(&mut self, frame_time_us: u32) {
+        self.frame_buffer.record_frame(frame_time_us);
+    }
+
+    // Refresh overlay render commands based on latest frame and hardware stats.
+    pub fn update_render_commands(&mut self) -> usize {
+        let stats = self.frame_buffer.compute_stats();
+        let telemetry = self.collector.snapshot();
+        self.renderer.generate_commands(&telemetry, &stats, &self.layout, &mut self.command_buffer);
+        self.command_buffer.count()
+    }
+}
+
+
 
