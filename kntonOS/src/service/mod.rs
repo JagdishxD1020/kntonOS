@@ -30,6 +30,9 @@ pub use perf_overlay::*;
 pub mod dock_daemon;
 pub use dock_daemon::*;
 
+pub mod backlight_daemon;
+pub use backlight_daemon::*;
+
 /// Service operational state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
