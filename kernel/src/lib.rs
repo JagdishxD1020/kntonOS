@@ -1583,6 +1583,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-PANIC] Performance overlay daemon self-test failed!\r\n");
     }
 
+    // Verify kntonOS SteamDeck Audio Haptic Feedback & DSP Rumble Synthesis Driver (TASK-KNT-332)
+    if knton_os::service::verify_haptics_subsystem() {
+        serial_write_str("[KNT-OS-HAPTIC-PASS] kntonOS SteamDeck audio haptic feedback & DSP rumble driver verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] SteamDeck audio haptic daemon self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");

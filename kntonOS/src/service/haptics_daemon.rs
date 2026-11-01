@@ -470,7 +470,7 @@ impl TrackpadHapticGenerator {
                 WaveformParameters::new(
                     HapticWaveform::Sine,
                     resonant_freq_hz,
-                    (self.config.click_intensity_pct * 40) / 100,
+                    ((self.config.click_intensity_pct as u16 * 40) / 100) as u8,
                     8,
                 )
             }
@@ -479,7 +479,7 @@ impl TrackpadHapticGenerator {
                 WaveformParameters::new(
                     HapticWaveform::Pulse,
                     resonant_freq_hz,
-                    (self.config.click_intensity_pct * 30) / 100,
+                    ((self.config.click_intensity_pct as u16 * 30) / 100) as u8,
                     4,
                 )
             }
@@ -488,7 +488,7 @@ impl TrackpadHapticGenerator {
                 WaveformParameters::new(
                     HapticWaveform::Sine,
                     120,
-                    (self.config.click_intensity_pct * 60) / 100,
+                    ((self.config.click_intensity_pct as u16 * 60) / 100) as u8,
                     60,
                 )
             }
@@ -497,7 +497,7 @@ impl TrackpadHapticGenerator {
                 WaveformParameters::new(
                     HapticWaveform::Pulse,
                     resonant_freq_hz + 30,
-                    (self.config.click_intensity_pct * 55) / 100,
+                    ((self.config.click_intensity_pct as u16 * 55) / 100) as u8,
                     3,
                 )
             }
@@ -570,7 +570,7 @@ impl MotorThermalLimiter {
         // Passive convective/conductive heat dissipation towards ambient
         let cur_temp = self.heat_accumulator / 1000;
         let diff_to_ambient = cur_temp.saturating_sub(self.ambient_temp_c as u32);
-        let heat_dissipated = (diff_to_ambient * 4 * delta) / 10;
+        let heat_dissipated = diff_to_ambient * 6 * delta;
 
         self.heat_accumulator = self.heat_accumulator
             .saturating_add(heat_added)
@@ -731,4 +731,123 @@ impl SteamDeckHapticsDaemon {
 
         self.dual_lra.tick_ms(delta_ms);
     }
+}
+
+// Comprehensive self-test suite verifying Dual LRA, DSP audio transcode, trackpad clicks, and thermal safety.
+pub fn verify_haptics_subsystem() -> bool {
+    let mut daemon = SteamDeckHapticsDaemon::new();
+
+    // 1. Verify Dual LRA Configuration and Waveform Synthesizer
+    if daemon.dual_lra.left.config.resonant_freq_hz != 175 {
+        return false;
+    }
+    if daemon.dual_lra.right.config.resonant_freq_hz != 230 {
+        return false;
+    }
+
+    if WaveSynthesizer::sin_sample(0) != 0 || WaveSynthesizer::sin_sample(90) != 127 {
+        return false;
+    }
+
+    let wave_cmd = WaveformParameters::new(HapticWaveform::Sine, 175, 80, 20);
+    let launched = daemon.trigger_haptic(HapticChannel::Left, wave_cmd);
+    if !launched || !daemon.dual_lra.left.is_active() {
+        return false;
+    }
+
+    daemon.tick_ms(10);
+    if daemon.dual_lra.left.elapsed_ms != 10 {
+        return false;
+    }
+
+    daemon.dual_lra.left.stop_with_braking();
+    if daemon.dual_lra.left.mode != MotorMode::ActiveBraking {
+        return false;
+    }
+    daemon.tick_ms(8);
+    if daemon.dual_lra.left.is_active() {
+        return false;
+    }
+
+    // 2. Verify Audio-to-Haptics DSP Transcode Filter (< 150 Hz)
+    let silence = [0i16; 64];
+    let silence_res = daemon.audio_filter.process_chunk(&silence);
+    if silence_res.punch_detected {
+        return false;
+    }
+
+    // High amplitude sub-100Hz bass punch pulse
+    let mut bass_samples = [0i16; 64];
+    for sample in bass_samples.iter_mut() {
+        *sample = 20_000;
+    }
+
+    let bass_res = daemon.audio_filter.process_chunk(&bass_samples);
+    if !bass_res.punch_detected || bass_res.recommended_amplitude_pct == 0 {
+        return false;
+    }
+
+    let transcode = daemon.audio_filter.transcode_to_haptic(&bass_samples, 175);
+    if transcode.is_none() {
+        return false;
+    }
+    let p = transcode.unwrap();
+    if p.frequency_hz != 175 || p.amplitude_pct == 0 {
+        return false;
+    }
+
+    // 3. Verify Trackpad Tactile Profiles and Rolling Ratchet
+    let sharp = daemon.trackpad_left.synthesize_profile(TrackpadClickProfile::SharpClick, 175);
+    if sharp.duration_ms != 6 || sharp.amplitude_pct != 85 {
+        return false;
+    }
+
+    let soft = daemon.trackpad_left.synthesize_profile(TrackpadClickProfile::SoftTap, 175);
+    if soft.duration_ms != 8 {
+        return false;
+    }
+
+    // Step delta below ratchet step (threshold 32)
+    let detent1 = daemon.trackpad_left.on_trackpad_motion(20, 175);
+    if detent1.is_some() {
+        return false;
+    }
+    // Cumulative motion now 20 + 15 = 35 >= 32 -> fires detent
+    let detent2 = daemon.trackpad_left.on_trackpad_motion(15, 175);
+    if detent2.is_none() {
+        return false;
+    }
+    let (clicks, ratchets) = daemon.trackpad_left.stats();
+    if clicks < 3 || ratchets != 1 {
+        return false;
+    }
+
+    // 4. Verify Motor Thermal Limiter and Overload Protection
+    let mut thermal = MotorThermalLimiter::new(35);
+    if thermal.state != ThermalSafetyState::Normal {
+        return false;
+    }
+
+    // Heat up coil with sustained 100% duty-cycle load (P = 600 per ms)
+    thermal.tick_ms(100, 50);
+    if thermal.estimated_temp_c < 60 || thermal.state != ThermalSafetyState::WarningThrottled {
+        return false;
+    }
+    if thermal.regulate_amplitude(100) != 50 {
+        return false;
+    }
+
+    // Push into thermal overload trip (>= 75 C)
+    thermal.tick_ms(100, 30);
+    if !thermal.is_tripped() || thermal.regulate_amplitude(100) != 0 {
+        return false;
+    }
+
+    // Cool down to safe ambient levels
+    thermal.tick_ms(0, 500);
+    if thermal.is_tripped() {
+        return false;
+    }
+
+    true
 }

@@ -17,6 +17,7 @@ pub use service::verify_display_daemon_subsystem;
 pub use service::verify_gamepad_mapper_subsystem;
 pub use service::verify_storage_daemon_subsystem;
 pub use service::verify_perf_overlay_subsystem;
+pub use service::verify_haptics_subsystem;
 
 /// Verification sentinel proving full userspace OS subsystem readiness.
 pub fn verify_knton_os_userspace() -> bool {
@@ -33,6 +34,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && service::verify_storage_daemon_subsystem()
         && service::verify_bluetooth_daemon_subsystem()
         && service::verify_perf_overlay_subsystem()
+        && service::verify_haptics_subsystem()
         && ipc::verify_ipc_ports()
         && ipc::verify_ipc_dispatcher_subsystem()
         && shell::verify_game_mode_shell()
