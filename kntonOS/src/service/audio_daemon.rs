@@ -528,3 +528,133 @@ pub fn verify_audio_frame_mixer() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 5: Handheld Headphone Hotplug Auto-Mute / Sink Switch Coordinator
+// ============================================================================
+
+/// Handheld 3.5mm headphone jack insertion detector and auto-mute safety switch.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadphoneJackHotplug {
+    /// Physical 3.5mm jack mechanical switch state.
+    pub is_jack_inserted: bool,
+    /// Total hotplug insertion/extraction cycles recorded.
+    pub hotplug_cycles: u32,
+    /// Public privacy protection: auto-mute Master when headphones are unplugged.
+    pub auto_mute_on_unplug: bool,
+    /// Preserved volume level for internal speakers (0 to 100%).
+    pub saved_speaker_vol: u8,
+    /// Preserved volume level for headphones (0 to 100%).
+    pub saved_headphone_vol: u8,
+}
+
+impl HeadphoneJackHotplug {
+    /// Initializes headphone hotplug coordinator with privacy auto-mute enabled.
+    pub const fn new() -> Self {
+        Self {
+            is_jack_inserted: false,
+            hotplug_cycles: 0,
+            auto_mute_on_unplug: true,
+            saved_speaker_vol: 60,
+            saved_headphone_vol: 45,
+        }
+    }
+
+    /// Handles mechanical jack insertion event.
+    pub fn on_headphone_inserted(
+        &mut self,
+        router: &mut AudioRouter,
+        scaler: &mut VolumeScaler,
+        limiter: &mut AcousticLimiter,
+    ) {
+        if !self.is_jack_inserted {
+            // Save current speaker volume before switching
+            self.saved_speaker_vol = scaler.volumes[StreamType::Master as usize];
+            self.is_jack_inserted = true;
+            self.hotplug_cycles = self.hotplug_cycles.saturating_add(1);
+
+            // Connect and route to headphone endpoint
+            router.set_endpoint_connected(AudioEndpoint::HeadphoneJack35mm, true);
+
+            // Restore saved headphone volume and ensure unmuted
+            scaler.set_volume(StreamType::Master, self.saved_headphone_vol);
+            scaler.set_mute(StreamType::Master, false);
+
+            // Headphones do not stress internal speaker amps; relax battery safe limiter
+            limiter.set_battery_safe_mode(false);
+        }
+    }
+
+    /// Handles mechanical jack extraction event (unplugged).
+    pub fn on_headphone_extracted(
+        &mut self,
+        router: &mut AudioRouter,
+        scaler: &mut VolumeScaler,
+        limiter: &mut AcousticLimiter,
+    ) {
+        if self.is_jack_inserted {
+            // Save current headphone volume before switching
+            self.saved_headphone_vol = scaler.volumes[StreamType::Master as usize];
+            self.is_jack_inserted = false;
+            self.hotplug_cycles = self.hotplug_cycles.saturating_add(1);
+
+            // Disconnect headphone endpoint and fall back to internal speakers
+            router.set_endpoint_connected(AudioEndpoint::HeadphoneJack35mm, false);
+
+            if self.auto_mute_on_unplug {
+                // Privacy protection: mute master volume immediately so sound does not blast in public
+                scaler.set_mute(StreamType::Master, true);
+            } else {
+                scaler.set_volume(StreamType::Master, self.saved_speaker_vol);
+            }
+
+            // Restore acoustic limiter protection for internal micro-speakers
+            limiter.set_battery_safe_mode(true);
+        }
+    }
+}
+
+/// Verification test for handheld headphone hotplug auto-mute and sink switch coordinator.
+pub fn verify_headphone_hotplug_coordinator() -> bool {
+    let mut hotplug = HeadphoneJackHotplug::new();
+    let mut router = AudioRouter::new();
+    let mut scaler = VolumeScaler::new();
+    let mut limiter = AcousticLimiter::new();
+
+    scaler.set_volume(StreamType::Master, 75);
+
+    // 1. Initial state: speakers active, volume 75%
+    if hotplug.is_jack_inserted || router.active_sink != AudioEndpoint::InternalSpeakers {
+        return false;
+    }
+
+    // 2. Insert headphones
+    hotplug.on_headphone_inserted(&mut router, &mut scaler, &mut limiter);
+    if !hotplug.is_jack_inserted || router.active_sink != AudioEndpoint::HeadphoneJack35mm {
+        return false;
+    }
+    // Speaker volume 75% should be saved, and headphone volume (45%) restored
+    if hotplug.saved_speaker_vol != 75 || scaler.volumes[StreamType::Master as usize] != 45 {
+        return false;
+    }
+    if hotplug.hotplug_cycles != 1 {
+        return false;
+    }
+
+    // Adjust headphone volume to 55%
+    scaler.set_volume(StreamType::Master, 55);
+
+    // 3. Unplug headphones: should auto-mute master, save 55%, route back to InternalSpeakers
+    hotplug.on_headphone_extracted(&mut router, &mut scaler, &mut limiter);
+    if hotplug.is_jack_inserted || router.active_sink != AudioEndpoint::InternalSpeakers {
+        return false;
+    }
+    if !scaler.muted[StreamType::Master as usize] || hotplug.saved_headphone_vol != 55 {
+        return false;
+    }
+    if hotplug.hotplug_cycles != 2 {
+        return false;
+    }
+
+    true
+}
+
