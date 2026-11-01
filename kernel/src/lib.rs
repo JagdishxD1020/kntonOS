@@ -1397,6 +1397,10 @@ pub extern "C" fn kmain() -> ! {
     if !pe::test_win32_cfi_unwind_subsystem() {
         serial_write_str("[KNT-PANIC] Win32 CFI Unwind subsystem self-test failed!\r\n");
     }
+    // Verify User-Mode Runtime & High-Performance Syscall Callgate (TASK-KNT-314)
+    if !pe::test_win32_user_runtime_subsystem() {
+        serial_write_str("[KNT-PANIC] User-mode runtime subsystem self-test failed!\r\n");
+    }
 
     // Verify Win32 Large Page (2MB/1GB) Allocations & VirtualAlloc2 Engine (TASK-KNT-266)
     if !pe::test_win32_large_page_valloc_subsystem() {
