@@ -6,6 +6,9 @@ authors = ["Knton OS Contributors"]
 license = "ARR"
 description = "Minimal independently developed KntonOS micro-kernel entry"
 
+[dependencies]
+kntonOS = { package = "kntonOS", path = "../kntonOS" }
+
 [lib]
 name = "kntonk"
 path = "src/lib.rs"
