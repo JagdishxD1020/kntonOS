@@ -234,3 +234,218 @@ impl VirtualGamepadDriver {
         };
     }
 }
+
+// Fast integer square root algorithm for `#![no_std]` stick radius calculations.
+pub const fn isqrt(n: u64) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x0 = (n >> 1) as u32;
+    if x0 == 0 {
+        x0 = 1;
+    }
+    let mut x1 = ((x0 as u64 + n / x0 as u64) >> 1) as u32;
+    while x1 < x0 {
+        x0 = x1;
+        x1 = ((x0 as u64 + n / x0 as u64) >> 1) as u32;
+    }
+    x0
+}
+
+// Geometric shape profile for analog deadzone boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadzoneShape {
+    Radial,
+    Axial,
+    Cross,
+}
+
+// Non-linear transfer function curve for stick deflection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseCurve {
+    Linear,
+    Exponential,
+    Aggressive,
+    WideAim,
+}
+
+// Adaptive rolling filter eliminating analog thumbstick zero-point resting drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicDriftFilter {
+    pub accum_x: i32,
+    pub accum_y: i32,
+    pub sample_count: u16,
+    pub bias_x: i16,
+    pub bias_y: i16,
+    pub max_drift_threshold: u16,
+}
+
+impl DynamicDriftFilter {
+    // Construct drift filter with specified drift clamp window.
+    pub const fn new(max_drift: u16) -> Self {
+        Self {
+            accum_x: 0,
+            accum_y: 0,
+            sample_count: 0,
+            bias_x: 0,
+            bias_y: 0,
+            max_drift_threshold: max_drift,
+        }
+    }
+
+    // Feed stick sample when stick is near center resting position.
+    pub fn feed_idle_sample(&mut self, raw_x: i16, raw_y: i16) {
+        let abs_x = raw_x.unsigned_abs();
+        let abs_y = raw_y.unsigned_abs();
+        if abs_x <= self.max_drift_threshold && abs_y <= self.max_drift_threshold {
+            self.accum_x += raw_x as i32;
+            self.accum_y += raw_y as i32;
+            self.sample_count += 1;
+            if self.sample_count >= 64 {
+                self.bias_x = (self.accum_x / 64) as i16;
+                self.bias_y = (self.accum_y / 64) as i16;
+                self.accum_x = 0;
+                self.accum_y = 0;
+                self.sample_count = 0;
+            }
+        }
+    }
+
+    // Reset accumulated drift calibration state.
+    pub fn reset(&mut self) {
+        self.accum_x = 0;
+        self.accum_y = 0;
+        self.sample_count = 0;
+        self.bias_x = 0;
+        self.bias_y = 0;
+    }
+}
+
+// Calibration settings configuring deadzone, response curve, and anti-drift parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickCalibration {
+    pub inner_deadzone: u16,
+    pub outer_deadzone: u16,
+    pub shape: DeadzoneShape,
+    pub curve: ResponseCurve,
+    pub drift_filter: DynamicDriftFilter,
+}
+
+impl StickCalibration {
+    // Construct custom stick calibration profile.
+    pub const fn new(
+        inner_deadzone: u16,
+        outer_deadzone: u16,
+        shape: DeadzoneShape,
+        curve: ResponseCurve,
+        max_drift: u16,
+    ) -> Self {
+        Self {
+            inner_deadzone,
+            outer_deadzone,
+            shape,
+            curve,
+            drift_filter: DynamicDriftFilter::new(max_drift),
+        }
+    }
+
+    // Default configuration optimized for SteamDeck left movement stick.
+    pub const fn default_left() -> Self {
+        Self::new(2800, 31500, DeadzoneShape::Radial, ResponseCurve::Linear, 1500)
+    }
+
+    // Default configuration optimized for SteamDeck right aim stick with exponential curve.
+    pub const fn default_right() -> Self {
+        Self::new(2400, 31800, DeadzoneShape::Radial, ResponseCurve::Exponential, 1200)
+    }
+}
+
+// Analog stick processor applying anti-drift, deadzone normalization, and curve shaping.
+pub struct AnalogStickProcessor {
+    pub calibration: StickCalibration,
+}
+
+impl AnalogStickProcessor {
+    // Initialize processor with active calibration parameters.
+    pub const fn new(calibration: StickCalibration) -> Self {
+        Self { calibration }
+    }
+
+    // Apply response curve transfer function to normalized value [0..32767].
+    fn apply_curve(val: u32, curve: ResponseCurve) -> u32 {
+        match curve {
+            ResponseCurve::Linear => val,
+            ResponseCurve::Exponential => ((val as u64 * val as u64) / 32767) as u32,
+            ResponseCurve::Aggressive => isqrt(val as u64 * 32767),
+            ResponseCurve::WideAim => {
+                let v = val as u64;
+                ((v * v + v * 16384) / 49151) as u32
+            }
+        }
+    }
+
+    // Transform raw analog stick input into calibrated anti-drift output coordinates.
+    pub fn process(&mut self, raw_x: i16, raw_y: i16) -> (i16, i16) {
+        self.calibration.drift_filter.feed_idle_sample(raw_x, raw_y);
+
+        // Correct hardware resting bias
+        let xc = (raw_x as i32 - self.calibration.drift_filter.bias_x as i32).clamp(-32768, 32767);
+        let yc = (raw_y as i32 - self.calibration.drift_filter.bias_y as i32).clamp(-32768, 32767);
+
+        let inner = self.calibration.inner_deadzone as u32;
+        let outer = self.calibration.outer_deadzone as u32;
+
+        match self.calibration.shape {
+            DeadzoneShape::Radial => {
+                let radius_sq = (xc as i64 * xc as i64 + yc as i64 * yc as i64) as u64;
+                let radius = isqrt(radius_sq);
+
+                if radius <= inner {
+                    return (0, 0);
+                }
+
+                let span = if outer > inner { outer - inner } else { 1 };
+                let clamped_r = if radius >= outer { outer } else { radius };
+                let norm_r = ((clamped_r - inner) as u64 * 32767 / span as u64) as u32;
+                let curved_r = Self::apply_curve(norm_r, self.calibration.curve);
+
+                let out_x = ((xc as i64 * curved_r as i64) / radius as i64).clamp(-32768, 32767) as i16;
+                let out_y = ((yc as i64 * curved_r as i64) / radius as i64).clamp(-32768, 32767) as i16;
+                (out_x, out_y)
+            }
+            DeadzoneShape::Axial => {
+                let scale_axis = |val: i32| -> i16 {
+                    let sign = if val < 0 { -1i64 } else { 1i64 };
+                    let mag = val.unsigned_abs() as u32;
+                    if mag <= inner {
+                        return 0;
+                    }
+                    let span = if outer > inner { outer - inner } else { 1 };
+                    let clamped = if mag >= outer { outer } else { mag };
+                    let norm = ((clamped - inner) as u64 * 32767 / span as u64) as u32;
+                    let curved = Self::apply_curve(norm, self.calibration.curve);
+                    (sign * curved as i64).clamp(-32768, 32767) as i16
+                };
+                (scale_axis(xc), scale_axis(yc))
+            }
+            DeadzoneShape::Cross => {
+                let mag_x = xc.unsigned_abs() as u32;
+                let mag_y = yc.unsigned_abs() as u32;
+                let ax = if mag_x <= inner { 0 } else { xc };
+                let ay = if mag_y <= inner { 0 } else { yc };
+                let r = isqrt((ax as i64 * ax as i64 + ay as i64 * ay as i64) as u64);
+                if r == 0 {
+                    return (0, 0);
+                }
+                let span = if outer > inner { outer - inner } else { 1 };
+                let clamped_r = if r >= outer { outer } else { r };
+                let norm_r = ((clamped_r - inner) as u64 * 32767 / span as u64) as u32;
+                let curved_r = Self::apply_curve(norm_r, self.calibration.curve);
+                let out_x = ((ax as i64 * curved_r as i64) / r as i64).clamp(-32768, 32767) as i16;
+                let out_y = ((ay as i64 * curved_r as i64) / r as i64).clamp(-32768, 32767) as i16;
+                (out_x, out_y)
+            }
+        }
+    }
+}
+
