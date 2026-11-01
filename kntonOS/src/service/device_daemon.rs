@@ -414,3 +414,187 @@ pub fn verify_usb_pd_charging_contracts() -> bool {
 
     true
 }
+
+
+// ============================================================================
+// Feature 3: USB-C DP Alt Mode Display Hot-Plug Detector & Modesetting Events
+// ============================================================================
+
+/// Hot-Plug Detect (HPD) pin status for USB-C DisplayPort Alternate Mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayHpdStatus {
+    /// No external display connected to USB-C port.
+    Disconnected,
+    /// Stable external display monitor detected and powered.
+    Connected,
+    /// Short HPD pulse (0.5ms - 1.0ms) requesting DisplayPort link retraining / IRQ.
+    HpdPulseInterrupt,
+}
+
+/// Active DisplayPort video timing and link configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPortMode {
+    /// Number of active USB-C differential lanes allocated to DisplayPort (2 or 4).
+    pub lanes: u8,
+    /// Link rate per lane in megabits per second (e.g. 5400 for HBR2, 8100 for HBR3).
+    pub link_rate_mbps: u32,
+    /// Horizontal pixel resolution (e.g. 1920, 2560, 3840).
+    pub width: u16,
+    /// Vertical pixel resolution (e.g. 1080, 1440, 2160).
+    pub height: u16,
+    /// Vertical refresh rate in Hertz (e.g. 60, 120, 144).
+    pub refresh_rate_hz: u16,
+    /// High Dynamic Range (HDR10) metadata transmission active.
+    pub hdr_enabled: bool,
+}
+
+impl DisplayPortMode {
+    /// Standard 1080p @ 120Hz gaming dock profile.
+    pub const fn fhd_120hz() -> Self {
+        Self {
+            lanes: 4,
+            link_rate_mbps: 5400, // HBR2
+            width: 1920,
+            height: 1080,
+            refresh_rate_hz: 120,
+            hdr_enabled: true,
+        }
+    }
+
+    /// 4K @ 60Hz high-resolution desktop profile.
+    pub const fn uhd_60hz() -> Self {
+        Self {
+            lanes: 4,
+            link_rate_mbps: 8100, // HBR3
+            width: 3840,
+            height: 2160,
+            refresh_rate_hz: 60,
+            hdr_enabled: true,
+        }
+    }
+
+    /// Calculates required uncompressed pixel bandwidth in megabits per second.
+    pub fn required_bandwidth_mbps(&self) -> u32 {
+        let bpp = if self.hdr_enabled { 30 } else { 24 }; // 10-bit vs 8-bit color
+        let pixels_per_sec = (self.width as u64) * (self.height as u64) * (self.refresh_rate_hz as u64);
+        let bps = pixels_per_sec * bpp;
+        // Add 20% blanking overhead
+        ((bps * 12) / 10 / 1_000_000) as u32
+    }
+}
+
+/// USB-C DisplayPort Alt Mode display hot-plug detector and modesetting coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayHotPlugManager {
+    /// Physical HPD line status.
+    pub hpd_status: DisplayHpdStatus,
+    /// Whether an external monitor is actively driving scanout.
+    pub is_external_monitor_active: bool,
+    /// Currently active video timing mode, if connected.
+    pub active_mode: Option<DisplayPortMode>,
+    /// Counter tracking connection / disconnection cycles.
+    pub hotplug_event_counter: u32,
+    /// Counter tracking modesetting changes.
+    pub modeset_event_counter: u32,
+    /// Counter tracking link retraining pulses.
+    pub hpd_pulse_counter: u32,
+}
+
+impl DisplayHotPlugManager {
+    /// Initializes hot-plug detector in disconnected state.
+    pub const fn new() -> Self {
+        Self {
+            hpd_status: DisplayHpdStatus::Disconnected,
+            is_external_monitor_active: false,
+            active_mode: None,
+            hotplug_event_counter: 0,
+            modeset_event_counter: 0,
+            hpd_pulse_counter: 0,
+        }
+    }
+
+    /// Handles display connection event on USB-C port.
+    pub fn on_hpd_asserted(&mut self, default_mode: DisplayPortMode) {
+        self.hpd_status = DisplayHpdStatus::Connected;
+        self.is_external_monitor_active = true;
+        self.active_mode = Some(default_mode);
+        self.hotplug_event_counter += 1;
+        self.modeset_event_counter += 1;
+    }
+
+    /// Applies a new display modeset (e.g. user toggles 60Hz to 120Hz in Game Mode UI).
+    pub fn apply_modeset(&mut self, new_mode: DisplayPortMode) -> bool {
+        if !self.is_external_monitor_active {
+            return false;
+        }
+
+        // Validate link capacity: lanes * link_rate must accommodate bandwidth
+        let total_link_capacity_mbps = (new_mode.lanes as u32) * new_mode.link_rate_mbps;
+        if new_mode.required_bandwidth_mbps() > total_link_capacity_mbps {
+            return false; // Mode exceeds physical link capacity
+        }
+
+        self.active_mode = Some(new_mode);
+        self.modeset_event_counter += 1;
+        true
+    }
+
+    /// Handles HPD short pulse (link retraining / sink IRQ).
+    pub fn on_hpd_pulse(&mut self) -> bool {
+        if self.is_external_monitor_active {
+            self.hpd_pulse_counter += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles display disconnection event on USB-C port.
+    pub fn on_hpd_deasserted(&mut self) {
+        self.hpd_status = DisplayHpdStatus::Disconnected;
+        self.is_external_monitor_active = false;
+        self.active_mode = None;
+        self.hotplug_event_counter += 1;
+    }
+}
+
+/// Verification test for USB-C DP Alt Mode display hot-plug detector and modesetting.
+pub fn verify_dp_alt_mode_hotplug() -> bool {
+    let mut mgr = DisplayHotPlugManager::new();
+
+    // 1. Initial state
+    if mgr.hpd_status != DisplayHpdStatus::Disconnected || mgr.is_external_monitor_active {
+        return false;
+    }
+
+    // 2. Connect external monitor (docking to 1080p 120Hz display)
+    let fhd_mode = DisplayPortMode::fhd_120hz();
+    mgr.on_hpd_asserted(fhd_mode);
+    if !mgr.is_external_monitor_active || mgr.hpd_status != DisplayHpdStatus::Connected {
+        return false;
+    }
+    if mgr.active_mode != Some(fhd_mode) || mgr.hotplug_event_counter != 1 {
+        return false;
+    }
+
+    // 3. Switch modeset to 4K 60Hz
+    let uhd_mode = DisplayPortMode::uhd_60hz();
+    let modeset_ok = mgr.apply_modeset(uhd_mode);
+    if !modeset_ok || mgr.active_mode != Some(uhd_mode) || mgr.modeset_event_counter != 2 {
+        return false;
+    }
+
+    // 4. Test HPD pulse (link retraining)
+    let pulse_ok = mgr.on_hpd_pulse();
+    if !pulse_ok || mgr.hpd_pulse_counter != 1 {
+        return false;
+    }
+
+    // 5. Disconnect monitor (undocking handheld)
+    mgr.on_hpd_deasserted();
+    if mgr.is_external_monitor_active || mgr.active_mode.is_some() || mgr.hotplug_event_counter != 2 {
+        return false;
+    }
+
+    true
+}
