@@ -378,3 +378,174 @@ pub fn verify_gamepad_hid_handshake() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 3: Bluetooth Pairing Agent, Security Key Store & Auto-Reconnect
+// ============================================================================
+
+/// Maximum bonded Bluetooth peripheral security records stored in NVM.
+pub const MAX_PAIRED_DEVICES: usize = 8;
+
+/// Persistent security credentials record for a bonded gaming peripheral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairedDeviceRecord {
+    pub mac: [u8; 6],
+    pub name: [u8; 32],
+    pub name_len: u8,
+    pub model: ControllerModel,
+    pub link_key: [u8; 16],
+    pub is_trusted: bool,
+    pub auto_reconnect: bool,
+    pub is_valid: bool,
+}
+
+impl PairedDeviceRecord {
+    pub const fn empty() -> Self {
+        Self {
+            mac: [0; 6],
+            name: [0; 32],
+            name_len: 0,
+            model: ControllerModel::Unknown,
+            link_key: [0; 16],
+            is_trusted: false,
+            auto_reconnect: false,
+            is_valid: false,
+        }
+    }
+}
+
+/// Bluetooth pairing agent and security database.
+#[derive(Debug, Clone, Copy)]
+pub struct BluetoothSecurityStore {
+    pub bonded: [PairedDeviceRecord; MAX_PAIRED_DEVICES],
+    pub bonded_count: usize,
+    pub last_paired_mac: Option<[u8; 6]>,
+}
+
+impl BluetoothSecurityStore {
+    pub const fn new() -> Self {
+        Self {
+            bonded: [PairedDeviceRecord::empty(); MAX_PAIRED_DEVICES],
+            bonded_count: 0,
+            last_paired_mac: None,
+        }
+    }
+
+    /// Stores or updates pairing encryption link key for a device.
+    pub fn save_bonded_device(
+        &mut self,
+        mac: [u8; 6],
+        name: &[u8],
+        model: ControllerModel,
+        link_key: [u8; 16],
+    ) -> bool {
+        // If device already registered, update link key
+        for i in 0..self.bonded_count {
+            if self.bonded[i].is_valid && self.bonded[i].mac == mac {
+                self.bonded[i].link_key = link_key;
+                self.bonded[i].model = model;
+                self.last_paired_mac = Some(mac);
+                return true;
+            }
+        }
+
+        if self.bonded_count < MAX_PAIRED_DEVICES {
+            let mut name_buf = [0u8; 32];
+            let len = name.len().min(32);
+            name_buf[..len].copy_from_slice(&name[..len]);
+
+            self.bonded[self.bonded_count] = PairedDeviceRecord {
+                mac,
+                name: name_buf,
+                name_len: len as u8,
+                model,
+                link_key,
+                is_trusted: true,
+                auto_reconnect: true,
+                is_valid: true,
+            };
+            self.bonded_count += 1;
+            self.last_paired_mac = Some(mac);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Searches for a bonded peripheral by MAC address.
+    pub fn find_device(&self, mac: [u8; 6]) -> Option<&PairedDeviceRecord> {
+        for record in &self.bonded {
+            if record.is_valid && record.mac == mac {
+                return Some(record);
+            }
+        }
+        None
+    }
+
+    /// Removes a paired device bond.
+    pub fn remove_device(&mut self, mac: [u8; 6]) -> bool {
+        for i in 0..self.bonded_count {
+            if self.bonded[i].is_valid && self.bonded[i].mac == mac {
+                self.bonded[i].is_valid = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Finds candidate device for auto-reconnection upon handheld boot or wake.
+    pub fn get_auto_reconnect_candidate(&self) -> Option<[u8; 6]> {
+        for record in &self.bonded {
+            if record.is_valid && record.auto_reconnect && record.is_trusted {
+                return Some(record.mac);
+            }
+        }
+        None
+    }
+}
+
+/// Verification test for Bluetooth pairing agent, security key store, and auto-reconnect.
+pub fn verify_pairing_and_security_store() -> bool {
+    let mut store = BluetoothSecurityStore::new();
+
+    // 1. Initial empty state
+    if store.bonded_count != 0 || store.last_paired_mac.is_some() {
+        return false;
+    }
+
+    let ds5_mac = [0x00, 0x1A, 0x7D, 0xAA, 0xBB, 0xCC];
+    let ds5_key = [0xAB; 16];
+
+    // 2. Bond Sony DualSense controller
+    let saved = store.save_bonded_device(
+        ds5_mac,
+        b"Wireless Controller",
+        ControllerModel::DualSense,
+        ds5_key,
+    );
+    if !saved || store.bonded_count != 1 || store.last_paired_mac != Some(ds5_mac) {
+        return false;
+    }
+
+    // 3. Lookup bonded device
+    let dev = store.find_device(ds5_mac);
+    if dev.is_none() || dev.unwrap().model != ControllerModel::DualSense || !dev.unwrap().is_trusted {
+        return false;
+    }
+
+    // 4. Test auto-reconnect coordinator
+    let auto_mac = store.get_auto_reconnect_candidate();
+    if auto_mac != Some(ds5_mac) {
+        return false;
+    }
+
+    // 5. Unpair device
+    if !store.remove_device(ds5_mac) {
+        return false;
+    }
+    if store.find_device(ds5_mac).is_some() {
+        return false;
+    }
+
+    true
+}
+
