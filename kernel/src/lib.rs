@@ -1562,6 +1562,13 @@ pub extern "C" fn kmain() -> ! {
         serial_write_str("[KNT-OS-NET-PASS] kntonOS userspace network manager & wi-fi daemon verified\r\n");
     }
 
+    // Verify kntonOS SteamDeck Storage & SD Card Automount Daemon (TASK-KNT-327)
+    if knton_os::service::verify_storage_daemon_subsystem() {
+        serial_write_str("[KNT-OS-STORAGE-PASS] kntonOS SteamDeck storage and sd card automount daemon verified\r\n");
+    } else {
+        serial_write_str("[KNT-PANIC] Storage automount daemon self-test failed!\r\n");
+    }
+
     // Spawn and execute initial Win32 PE64 userland process (/bin/init.exe)
     if !pe::run_init_process() {
         serial_write_str("[KNT-PANIC] Initial Win32 user process execution failed!\r\n");
