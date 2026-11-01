@@ -665,3 +665,121 @@ pub fn verify_suspend_coordinator() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 5: Power Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// Handheld userspace power management and thermal profile supervisor orchestrator.
+#[derive(Debug, Clone, Copy)]
+pub struct PowerDaemon {
+    pub battery_gov: BatteryChargeGovernor,
+    pub tdp_gov: TdpGovernor,
+    pub fan_ctrl: PlatformFanController,
+    pub suspend_coord: SuspendCoordinator,
+    pub cycles_polled: u64,
+}
+
+impl PowerDaemon {
+    /// Initializes power daemon orchestrator with default handheld configuration.
+    pub const fn new() -> Self {
+        Self {
+            battery_gov: BatteryChargeGovernor::new(),
+            tdp_gov: TdpGovernor::new(),
+            fan_ctrl: PlatformFanController::new(),
+            suspend_coord: SuspendCoordinator::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic hardware polling loop cycle.
+    pub fn poll_power_cycle(
+        &mut self,
+        _dt_ms: u32,
+        soc_pct: u8,
+        is_charging: bool,
+        on_ac: bool,
+        temp_c: u8,
+    ) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+
+        // 1. Ingest battery telemetry
+        self.battery_gov.update_telemetry(soc_pct, is_charging, (temp_c as i16) * 10);
+
+        // 2. Update fan acoustic governor & thermal safety backoff
+        self.fan_ctrl.update_temperature(temp_c);
+
+        // 3. Update TDP governor power limits
+        self.tdp_gov.evaluate_power_source(on_ac, soc_pct);
+
+        // 4. If thermal backoff is active, apply deduction to effective PL1
+        if self.fan_ctrl.throttle_backoff_watts > 0 {
+            self.tdp_gov.active_pl1_watts = self.tdp_gov.active_pl1_watts
+                .saturating_sub(self.fan_ctrl.throttle_backoff_watts)
+                .max(4); // Keep minimum floor 4W to stay stable
+        }
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Userspace Power
+/// Management and Thermal Profile Daemon subsystem.
+pub fn verify_power_daemon_subsystem() -> bool {
+    if !verify_battery_charge_governor() {
+        return false;
+    }
+    if !verify_tdp_governor() {
+        return false;
+    }
+    if !verify_fan_curve_and_throttling() {
+        return false;
+    }
+    if !verify_suspend_coordinator() {
+        return false;
+    }
+
+    // Verify integrated coordinator
+    let mut daemon = PowerDaemon::new();
+
+    // 1. Initial defaults
+    if daemon.cycles_polled != 0 || !daemon.suspend_coord.is_fully_awake() {
+        return false;
+    }
+
+    // 2. Normal gaming cycle: 70C, on AC, 85% SoC
+    daemon.tdp_gov.set_profile(TdpProfile::Turbo);
+    daemon.poll_power_cycle(16, 85, true, true, 70);
+    if daemon.cycles_polled != 1 {
+        return false;
+    }
+    if daemon.tdp_gov.active_pl1_watts != 28 || daemon.fan_ctrl.safety_status != ThermalSafetyStatus::Normal {
+        return false;
+    }
+
+    // 3. High thermal load cycle: temp jumps to 90C (thermal warning backoff 5W)
+    daemon.poll_power_cycle(16, 85, true, true, 90);
+    if daemon.fan_ctrl.safety_status != ThermalSafetyStatus::ThrottlingWarning {
+        return false;
+    }
+    // Turbo 28W - 5W backoff = 23W
+    if daemon.tdp_gov.active_pl1_watts != 23 {
+        return false;
+    }
+
+    // 4. Suspend / resume cycle integration
+    if !daemon.suspend_coord.initiate_suspend(2000) {
+        return false;
+    }
+    daemon.suspend_coord.acknowledge_subsystem_ready(ALL_SUBSYSTEMS_READY);
+    if daemon.suspend_coord.phase != SuspendPhase::Sleeping {
+        return false;
+    }
+
+    if !daemon.suspend_coord.trigger_resume(WakeReason::GamepadHome, 3500) {
+        return false;
+    }
+    if !daemon.suspend_coord.is_fully_awake() {
+        return false;
+    }
+
+    true
+}
+

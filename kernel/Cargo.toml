@@ -8,7 +8,6 @@ description = "Minimal independently developed KntonOS micro-kernel entry"
 
 [dependencies]
 kntonOS = { package = "kntonOS", path = "../kntonOS" }
-knton_os = { package = "kntonOS", path = "../kntonOS" }
 
 [lib]
 name = "kntonk"

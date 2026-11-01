@@ -20,6 +20,7 @@ pub fn verify_knton_os_userspace() -> bool {
         && session::verify_session_manager()
         && service::verify_service_manager()
         && service::verify_device_daemon_subsystem()
+        && service::verify_power_daemon_subsystem()
         && ipc::verify_ipc_ports()
         && shell::verify_game_mode_shell()
 }
