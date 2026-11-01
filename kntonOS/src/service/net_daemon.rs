@@ -716,3 +716,107 @@ pub fn verify_offline_and_captive_portal() -> bool {
     true
 }
 
+// ============================================================================
+// Feature 5: Network Daemon Orchestrator & Boot Verification Sentinel
+// ============================================================================
+
+/// Handheld userspace network manager and Wi-Fi station supervisor.
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkDaemon {
+    pub station_mgr: WifiStationManager,
+    pub dhcp_client: DhcpClient,
+    pub dns_cache: DnsResolverCache,
+    pub portal_detector: CaptivePortalDetector,
+    pub offline_mgr: OfflineModeManager,
+    pub cycles_polled: u64,
+}
+
+impl NetworkDaemon {
+    /// Initializes network daemon orchestrator with default handheld configuration.
+    pub const fn new() -> Self {
+        Self {
+            station_mgr: WifiStationManager::new(),
+            dhcp_client: DhcpClient::new(),
+            dns_cache: DnsResolverCache::new(),
+            portal_detector: CaptivePortalDetector::new(),
+            offline_mgr: OfflineModeManager::new(),
+            cycles_polled: 0,
+        }
+    }
+
+    /// Periodic network manager maintenance cycle.
+    pub fn poll_network_cycle(&mut self, dt_sec: u32) {
+        self.cycles_polled = self.cycles_polled.saturating_add(1);
+        self.dhcp_client.tick_timer(dt_sec);
+    }
+}
+
+/// Comprehensive verification function for the complete Handheld Userspace
+/// Network Manager & Wi-Fi Station Daemon subsystem.
+pub fn verify_network_daemon_subsystem() -> bool {
+    if !verify_wifi_station_manager() {
+        return false;
+    }
+    if !verify_dhcp_client() {
+        return false;
+    }
+    if !verify_dns_resolver_cache() {
+        return false;
+    }
+    if !verify_offline_and_captive_portal() {
+        return false;
+    }
+
+    // Integrated coordinator verification
+    let mut daemon = NetworkDaemon::new();
+
+    // 1. Initial defaults
+    if daemon.cycles_polled != 0 || daemon.offline_mgr.offline_mode_active {
+        return false;
+    }
+
+    // 2. Discover and connect AP
+    let bss = WifiBssEntry::new(
+        b"Knton_Steam_Dock",
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        44,
+        -50,
+        SecurityProtocol::Wpa3Sae,
+    );
+    daemon.station_mgr.add_scan_result(bss);
+    let prof = WifiProfile::new(b"Knton_Steam_Dock", [0x99; 32], SecurityProtocol::Wpa3Sae);
+    daemon.station_mgr.save_profile(prof);
+    if daemon.station_mgr.find_saved_profile(b"Knton_Steam_Dock").is_none() {
+        return false;
+    }
+
+    // 3. DHCP address negotiation
+    daemon.dhcp_client.start_discovery(0xCAFE);
+    daemon.dhcp_client.process_offer([10, 0, 0, 50], [255, 255, 255, 0], [10, 0, 0, 1], 7200);
+    daemon.dhcp_client.process_ack([1, 1, 1, 1], [1, 0, 0, 1]);
+    if daemon.dhcp_client.state != DhcpState::Bound {
+        return false;
+    }
+
+    // 4. DNS resolution & caching
+    daemon.dns_cache.insert(b"game.knton.os", [10, 0, 0, 200], 600, 1000);
+    let resolved = daemon.dns_cache.lookup(b"game.knton.os", 1010);
+    if resolved != Some([10, 0, 0, 200]) {
+        return false;
+    }
+
+    // 5. Captive portal test (probe returns 204 => online)
+    let reach = daemon.portal_detector.process_probe_result(204, None);
+    if reach != NetworkReachability::FullyOnline {
+        return false;
+    }
+
+    // 6. Polling cycle
+    daemon.poll_network_cycle(10);
+    if daemon.cycles_polled != 1 || daemon.dhcp_client.lease_remaining_sec != 7190 {
+        return false;
+    }
+
+    true
+}
+
